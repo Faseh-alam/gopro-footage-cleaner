@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+.env
+recovery/
+*.log
+*.zip
+*.numbers
+
+# Optional local binaries (add your platform build if needed)
+bin/udtacopy

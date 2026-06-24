@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GoPro Footage Cleaner</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <h1>GoPro Footage Cleaner</h1>
+          <p>Queue multiple clips per video. Trimming runs in the background.</p>
+        </div>
+        <div class="header-actions">
+          <label for="volume-select">Quick open</label>
+          <select id="volume-select">
+            <option value="">Choose a drive or folder...</option>
+          </select>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel browser-panel">
+          <div class="panel-header">
+            <h2>Footage browser</h2>
+            <button id="refresh-btn" type="button" class="secondary">Refresh</button>
+          </div>
+          <div id="breadcrumb" class="breadcrumb"></div>
+          <div id="file-list" class="file-list"></div>
+        </section>
+
+        <section class="panel workflow-panel">
+          <div class="panel-header">
+            <h2>Selected video</h2>
+            <button id="clear-selection-btn" type="button" class="secondary hidden">Clear</button>
+          </div>
+          <div id="selected-video" class="empty-state">
+            Select a GoPro video from the browser, paste all useful timestamps, then queue the batch.
+          </div>
+
+          <div id="video-details" class="hidden">
+            <div class="video-card">
+              <div class="video-title" id="video-name"></div>
+              <div class="video-meta" id="video-meta"></div>
+              <div id="gpmf-status" class="badge"></div>
+            </div>
+
+            <div class="clip-form">
+              <h3>Useful clips</h3>
+              <p class="hint">
+                Enter one clip per line as <code>start - end</code>. Clips save beside the original as
+                <code>filename-1.MP4</code>, <code>filename-2.MP4</code>, and so on.
+              </p>
+              <label for="clips-input">Timestamps</label>
+              <textarea
+                id="clips-input"
+                rows="8"
+                placeholder="00:00 - 7:45&#10;10:00 - 12:00&#10;16:00 - 17:00"
+              ></textarea>
+
+              <label class="checkbox-row">
+                <input id="delete-original-checkbox" type="checkbox" checked />
+                Delete original raw footage after all clips export successfully
+              </label>
+
+              <div class="button-row">
+                <button id="queue-btn" type="button" class="primary">Queue all clips</button>
+                <button id="add-row-btn" type="button" class="secondary">Add example line</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <section class="import-panel panel">
+        <div class="panel-header">
+          <div>
+            <h2>Bulk import from sheet</h2>
+            <p class="hint">
+              Download a pre-filled list of every video on a drive. Helpers only fill the
+              <code>timestamps</code> column, then you upload the completed sheet here.
+            </p>
+          </div>
+          <div class="button-row">
+            <label>
+              Generate inventory
+              <select id="generate-date-select">
+                <option value="">All dates on drive</option>
+              </select>
+            </label>
+            <button id="generate-sheet-btn" type="button" class="secondary">Download footage list</button>
+            <a class="button-link secondary" href="/api/template/guide">Helper guide</a>
+          </div>
+        </div>
+
+        <div class="import-controls secondary-row">
+          <label>
+            Drive for this sheet
+            <select id="import-drive-select">
+              <option value="">Choose drive...</option>
+            </select>
+          </label>
+          <input id="sheet-file-input" type="file" accept=".csv,.json,text/csv,application/json" />
+          <label class="checkbox-row compact">
+            <input id="import-delete-original" type="checkbox" checked />
+            Delete originals after all clips export
+          </label>
+          <div class="button-row">
+            <button id="preview-sheet-btn" type="button" class="secondary">Preview sheet</button>
+            <button id="queue-sheet-btn" type="button" class="primary" disabled>Queue entire sheet</button>
+          </div>
+        </div>
+
+        <div id="import-preview" class="import-preview hidden">
+          <div id="import-summary" class="import-summary"></div>
+          <div id="import-errors" class="import-errors hidden"></div>
+          <div id="import-warnings" class="import-warnings hidden"></div>
+          <div class="import-table-wrap">
+            <table class="import-table">
+              <thead>
+                <tr>
+                  <th>Footage</th>
+                  <th>Found at</th>
+                  <th>Clips</th>
+                </tr>
+              </thead>
+              <tbody id="import-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="queue-panel">
+        <div class="queue-header">
+          <h2>Background queue</h2>
+          <span id="queue-summary" class="queue-summary">No jobs queued</span>
+        </div>
+        <div id="queue-list" class="queue-list"></div>
+      </section>
+
+      <footer class="footer">
+        <span>Requires ffmpeg. IMU / GPMF preserved. App v<span id="app-version">…</span></span>
+        <span id="status-line">Ready</span>
+      </footer>
+    </div>
+
+    <template id="file-row-template">
+      <button class="file-row" type="button">
+        <span class="file-icon"></span>
+        <span class="file-name"></span>
+        <span class="file-meta"></span>
+      </button>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
