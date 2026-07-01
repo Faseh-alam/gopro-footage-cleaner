@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Eager Review Station</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/eager.css?v={{ version }}" />
+  </head>
+  <body>
+    <div class="eager-app">
+      <header class="eager-header">
+        <div>
+          <p class="eyebrow"><a href="/">← Bulk trimmer</a></p>
+          <h1>Eager Review Station</h1>
+          <p class="hint">Review SD card footage, tag tasks, mark useful ranges, export on Next.</p>
+        </div>
+        <div class="eager-setup">
+          <label>
+            SD / source folder
+            <div class="row">
+              <select id="source-volume"></select>
+              <input id="source-path" type="text" placeholder="/Volumes/Untitled or E:\" />
+              <button id="scan-btn" type="button" class="primary">Scan MP4</button>
+            </div>
+          </label>
+          <label>
+            Output folder (task subfolders created here)
+            <div class="row">
+              <select id="output-volume"></select>
+              <input id="output-path" type="text" placeholder="/Volumes/Drive 2/archive/Tasks" />
+            </div>
+          </label>
+        </div>
+      </header>
+
+      <main class="eager-main">
+        <aside class="eager-list panel">
+          <div class="list-head">
+            <h2>Footage</h2>
+            <span id="list-summary" class="hint">0 files</span>
+          </div>
+          <input id="file-filter" type="search" placeholder="Filter by filename..." />
+          <div id="file-list" class="file-list"></div>
+        </aside>
+
+        <section class="eager-player panel">
+          <div class="player-top">
+            <div>
+              <h2 id="current-name">No file loaded</h2>
+              <p id="current-meta" class="hint"></p>
+            </div>
+            <div class="player-time">
+              <span id="time-display">00:00:00 / 00:00:00</span>
+            </div>
+          </div>
+          <div id="player-wrap" class="player-wrap" tabindex="0">
+            <video id="player" playsinline muted preload="auto"></video>
+            <div class="scrub-overlay">
+              <span id="scrub-hint">Scroll or drag to scrub · Space to play/pause</span>
+              <span id="preview-status" class="preview-status"></span>
+            </div>
+            <div id="scrub-track" class="scrub-track">
+              <div id="scrub-fill" class="scrub-fill"></div>
+              <div id="scrub-playhead" class="scrub-playhead"></div>
+            </div>
+          </div>
+          <div class="mark-toolbar">
+            <button id="mark-in-btn" type="button" class="secondary" title="Shortcut: I">Mark start</button>
+            <button id="mark-out-btn" type="button" class="secondary" title="Shortcut: O">Mark end</button>
+            <button id="undo-clip-btn" type="button" class="secondary">Undo last clip</button>
+            <span id="pending-in" class="hint">No start marked</span>
+          </div>
+          <ul id="clip-list" class="clip-list"></ul>
+        </section>
+
+        <aside class="eager-side panel">
+          <h2>Task</h2>
+          <input id="task-search" type="search" placeholder="Search tasks..." />
+          <div id="task-list" class="task-list"></div>
+          <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
+          <div class="row">
+            <input id="new-task-input" type="text" placeholder="New task name" />
+            <button id="add-task-btn" type="button" class="secondary">Add</button>
+          </div>
+          <p id="task-added-msg" class="task-added"></p>
+
+          <h3>Footage quality</h3>
+          <label class="radio-card">
+            <input type="radio" name="quality" value="keep" checked />
+            <span>Keep entire file (no garbage)</span>
+          </label>
+          <label class="radio-card">
+            <input type="radio" name="quality" value="trim" />
+            <span>Has garbage — trim marked clips</span>
+          </label>
+
+          <label class="check-row">
+            <input id="delete-source" type="checkbox" checked />
+            Remove from SD after export
+          </label>
+
+          <div class="action-stack">
+            <button id="finish-btn" type="button" class="primary">Next — export &amp; continue</button>
+            <button id="skip-btn" type="button" class="secondary">Skip (no export)</button>
+          </div>
+          <p id="status-line" class="status-line"></p>
+        </aside>
+      </main>
+
+      <footer class="footer">
+        <span>Scroll on video to scrub · <kbd>I</kbd> start · <kbd>O</kbd> end · <kbd>N</kbd> next · <kbd>Space</kbd> play/pause</span>
+        <span id="app-version"></span>
+      </footer>
+    </div>
+    <script src="/static/eager.js?v={{ version }}"></script>
+  </body>
+</html>

@@ -4,6 +4,19 @@ Trim useful segments from large GoPro egocentric recordings **without losing IMU
 
 Most video editors strip GoPro's metadata track when you trim. This tool uses `ffmpeg` stream copy with explicit GPMF (`gpmd`) mapping so gyro/accelerometer data stays attached to each exported clip.
 
+## Eager Review Station (SD card workflow)
+
+For reviewing fresh SD card footage one file at a time:
+
+1. Run `./run.sh` and open [http://127.0.0.1:8765/review](http://127.0.0.1:8765/review)
+2. Point **source** at the SD card — scans all `.MP4` files
+3. Point **output** at your archive/tasks folder
+4. Scroll each video, pick a **task** (searchable list — add new tasks anytime)
+5. If the file is clean: **Keep entire file**. If it has garbage: click **Mark start** / **Mark end** for each useful segment
+6. Click **Next** — clips export to `output/<task-name>/` and you move to the next file
+
+Shortcuts: `I` start · `O` end · `N` next · `S` skip · arrow keys between files
+
 ## Helper sheet (only 2 columns)
 
 Give your team `trim_sheet_template.csv` and `TRIM_SHEET_GUIDE.md`.

@@ -8,6 +8,7 @@ recovery/
 *.log
 *.zip
 *.numbers
+eager_tasks.json
 
 # Optional local binaries (add your platform build if needed)
 bin/udtacopy

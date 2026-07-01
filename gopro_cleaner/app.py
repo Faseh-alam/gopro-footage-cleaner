@@ -8,15 +8,17 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
+from .eager_routes import create_eager_blueprint
 from .core.probe import MediaInfo, is_video_file, looks_like_gopro, probe_media
 from .core.queue import trim_queue
 from .core.sheet_import import parse_sheet, preview_to_dict, queue_import
 from .core.timestamps import format_timestamp, parse_clip_lines
 from .core.trimmer import job_store, move_to_trash
+from .core.volumes import list_volume_roots
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.2"
 
 
 def create_app() -> Flask:
@@ -25,6 +27,8 @@ def create_app() -> Flask:
         template_folder=str(APP_ROOT / "templates"),
         static_folder=str(APP_ROOT / "static"),
     )
+
+    app.register_blueprint(create_eager_blueprint(str(APP_ROOT / "templates"), APP_VERSION))
 
     @app.get("/")
     def index():
@@ -36,15 +40,7 @@ def create_app() -> Flask:
 
     @app.get("/api/volumes")
     def volumes():
-        volume_root = Path("/Volumes")
-        items = []
-        if volume_root.exists():
-            for entry in sorted(volume_root.iterdir(), key=lambda p: p.name.lower()):
-                if entry.is_dir() and not entry.name.startswith("."):
-                    items.append({"name": entry.name, "path": str(entry)})
-        home = str(Path.home())
-        items.insert(0, {"name": "Home", "path": home})
-        return jsonify({"volumes": items})
+        return jsonify({"volumes": list_volume_roots()})
 
     @app.get("/api/browse")
     def browse():
