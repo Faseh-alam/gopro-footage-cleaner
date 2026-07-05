@@ -175,6 +175,111 @@
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(5, 8, 12, 0.92);
+  display: grid;
+  place-items: center;
+}
+
+.loading-overlay.hidden {
+  display: none;
+}
+
+.loading-card {
+  width: min(420px, 90vw);
+  padding: 1.5rem;
+  border-radius: 16px;
+  border: 1px solid var(--panel-border);
+  background: #111820;
+  text-align: center;
+}
+
+.loading-card h2 {
+  margin: 0 0 0.5rem;
+}
+
+.loading-bar {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 99px;
+  overflow: hidden;
+  margin: 1rem 0;
+}
+
+.loading-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.filmstrip-panel {
+  margin: 0.5rem 0;
+}
+
+.filmstrip-head {
+  margin-bottom: 0.35rem;
+}
+
+.filmstrip {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  padding: 0.35rem 0.15rem 0.5rem;
+  scroll-behavior: smooth;
+  min-height: 88px;
+}
+
+.filmstrip-item {
+  flex: 0 0 auto;
+  width: 112px;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: #0d1117;
+  cursor: pointer;
+  padding: 0;
+  overflow: hidden;
+  text-align: left;
+}
+
+.filmstrip-item img {
+  display: block;
+  width: 112px;
+  height: 63px;
+  object-fit: cover;
+  background: #000;
+}
+
+.filmstrip-item span {
+  display: block;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.35rem;
+  color: var(--muted);
+}
+
+.filmstrip-item.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(62, 166, 255, 0.35);
+}
+
+.filmstrip-item.mark-start {
+  border-color: var(--success);
+}
+
+.filmstrip-item.mark-end {
+  border-color: var(--warning);
+}
+
+.mark-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin: 0.35rem 0;
+}
+
 .step-toolbar {
   display: grid;
   grid-template-columns: 1fr auto auto 1fr;

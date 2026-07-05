@@ -17,6 +17,7 @@ from .core.eager import (
     trim_single_clip,
 )
 from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
+from .core.snapshot_strip import cancel_snapshots, resolve_snapshot_frame, snapshot_plan, snapshot_status
 from .core.task_store import add_task, load_tasks
 from .core.volumes import list_volume_roots, normalize_path
 
@@ -215,5 +216,52 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": str(exc)}), 400
 
         return jsonify({"ok": True, **result})
+
+    @eager.get("/api/eager/snapshots/plan")
+    def eager_snapshots_plan():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            return jsonify(snapshot_plan(Path(raw_path)))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+
+    @eager.get("/api/eager/snapshots/status")
+    def eager_snapshots_status():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        try:
+            return jsonify(snapshot_status(Path(raw_path), start=start))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+
+    @eager.post("/api/eager/snapshots/cancel")
+    def eager_snapshots_cancel():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path", request.args.get("path", ""))).strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        cancel_snapshots(Path(raw_path))
+        return jsonify({"ok": True})
+
+    @eager.get("/api/eager/snapshots/frame")
+    def eager_snapshots_frame():
+        raw_path = request.args.get("path", "").strip()
+        try:
+            index = int(request.args.get("index", "0"))
+        except ValueError:
+            return jsonify({"error": "index must be an integer"}), 400
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            path = resolve_snapshot_frame(Path(raw_path), index)
+        except FileNotFoundError:
+            return jsonify({"error": "Frame not found"}), 404
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return send_file(path, mimetype="image/jpeg", conditional=True)
 
     return eager

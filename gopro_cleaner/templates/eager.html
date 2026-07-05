@@ -8,6 +8,14 @@
     <link rel="stylesheet" href="/static/eager.css?v={{ version }}" />
   </head>
   <body>
+    <div id="loading-overlay" class="loading-overlay hidden">
+      <div class="loading-card">
+        <h2 id="loading-title">Loading footage</h2>
+        <p id="loading-detail" class="hint">Preparing snapshots…</p>
+        <div class="loading-bar"><div id="loading-bar-fill" class="loading-bar-fill"></div></div>
+        <p id="loading-hint" class="hint"></p>
+      </div>
+    </div>
     <div class="eager-app">
       <header class="eager-header">
         <div>
@@ -74,13 +82,23 @@
               <div id="scrub-playhead" class="scrub-playhead"></div>
             </div>
           </div>
+          <div id="filmstrip-panel" class="filmstrip-panel">
+            <div class="filmstrip-head">
+              <span id="filmstrip-meta" class="hint">Snapshots every —s · 4+ idle frames ≈ garbage</span>
+            </div>
+            <div id="filmstrip" class="filmstrip" tabindex="0"></div>
+          </div>
           <div class="step-toolbar">
-            <button id="step-back-btn" type="button" class="step-btn" title="Shortcut: Left arrow">◀◀ Back</button>
+            <button id="snap-prev-btn" type="button" class="step-btn" title="Previous snapshot (←)">◀ Snapshot</button>
+            <button id="fine-back-btn" type="button" class="secondary mark-btn" title="Fine -3s">−3s</button>
+            <button id="fine-fwd-btn" type="button" class="secondary mark-btn" title="Fine +3s">+3s</button>
+            <button id="snap-next-btn" type="button" class="step-btn" title="Next snapshot (→)">Snapshot ▶</button>
+          </div>
+          <div class="mark-row">
             <button id="mark-start-btn" type="button" class="secondary mark-btn" title="Shortcut: I">Mark start</button>
             <button id="mark-end-btn" type="button" class="secondary mark-btn" title="Shortcut: O">Mark end</button>
-            <button id="step-fwd-btn" type="button" class="step-btn" title="Shortcut: Right arrow">Forward ▶▶</button>
           </div>
-          <p id="step-hint" class="step-hint">Use Back / Forward — each click jumps farther (2s → 4s → 8s → …)</p>
+          <p id="step-hint" class="step-hint"><kbd>←</kbd><kbd>→</kbd> jump snapshots · <kbd>,</kbd><kbd>.</kbd> ±1s fine-tune · <kbd>I</kbd>/<kbd>O</kbd> mark</p>
           <div class="mark-toolbar">
             <button id="undo-clip-btn" type="button" class="secondary">Undo mark</button>
             <span id="pending-in" class="hint">Load a file, then step through footage</span>
@@ -92,7 +110,7 @@
           <div id="clean-panel">
             <h2>Clean</h2>
             <p class="hint panel-desc">
-              Mark useful ranges with <strong>Mark start</strong> / <strong>Mark end</strong>, step with Back/Forward buttons, press <kbd>T</kbd> to trim.
+              Scroll snapshots to spot garbage (4+ idle frames in a row). Fine-tune trim points with <kbd>,</kbd><kbd>.</kbd> or ±3s, then <kbd>I</kbd>/<kbd>O</kbd> and <kbd>T</kbd>.
             </p>
             <label class="check-row">
               <input id="delete-source" type="checkbox" checked />
@@ -130,7 +148,7 @@
       </main>
 
       <footer class="footer">
-        <span id="footer-hints"><kbd>◀</kbd><kbd>▶</kbd> step · faster jumps on repeat clicks · <kbd>I</kbd>/<kbd>O</kbd> mark · <kbd>T</kbd> trim · <kbd>N</kbd> next</span>
+        <span id="footer-hints"><kbd>←</kbd><kbd>→</kbd> snapshots · <kbd>,</kbd><kbd>.</kbd> ±1s · ±3s buttons · <kbd>I</kbd>/<kbd>O</kbd> mark · <kbd>T</kbd> trim · <kbd>N</kbd> next</span>
         <span id="app-version"></span>
       </footer>
     </div>

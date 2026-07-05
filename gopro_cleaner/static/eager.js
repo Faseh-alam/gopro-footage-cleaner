@@ -14,9 +14,9 @@ const state = {
   seekTimer: null,
   pendingSeek: null,
   lastVideoPath: "",
-  stepLevel: 0,
-  lastStepAt: 0,
-  lastStepDir: 0,
+  snapshots: null,
+  snapshotIndex: 0,
+  snapshotBuildToken: 0,
 };
 
 const el = {
@@ -39,8 +39,18 @@ const el = {
   scrubPlayhead: document.getElementById("scrub-playhead"),
   scrubHint: document.getElementById("scrub-hint"),
   previewStatus: document.getElementById("preview-status"),
-  stepBackBtn: document.getElementById("step-back-btn"),
-  stepFwdBtn: document.getElementById("step-fwd-btn"),
+  loadingOverlay: document.getElementById("loading-overlay"),
+  loadingTitle: document.getElementById("loading-title"),
+  loadingDetail: document.getElementById("loading-detail"),
+  loadingBarFill: document.getElementById("loading-bar-fill"),
+  loadingHint: document.getElementById("loading-hint"),
+  filmstripPanel: document.getElementById("filmstrip-panel"),
+  filmstripMeta: document.getElementById("filmstrip-meta"),
+  filmstrip: document.getElementById("filmstrip"),
+  snapPrevBtn: document.getElementById("snap-prev-btn"),
+  snapNextBtn: document.getElementById("snap-next-btn"),
+  fineBackBtn: document.getElementById("fine-back-btn"),
+  fineFwdBtn: document.getElementById("fine-fwd-btn"),
   markStartBtn: document.getElementById("mark-start-btn"),
   markEndBtn: document.getElementById("mark-end-btn"),
   stepHint: document.getElementById("step-hint"),
@@ -141,7 +151,13 @@ function setPhase(phase) {
   const showMark = phase === "clean";
   if (el.markStartBtn) el.markStartBtn.style.display = showMark ? "" : "none";
   if (el.markEndBtn) el.markEndBtn.style.display = showMark ? "" : "none";
-  resetStepBurst();
+  if (el.filmstripPanel) el.filmstripPanel.classList.toggle("hidden", !showMark);
+  if (el.snapPrevBtn) el.snapPrevBtn.style.display = showMark ? "" : "none";
+  if (el.snapNextBtn) el.snapNextBtn.style.display = showMark ? "" : "none";
+  if (el.fineBackBtn) el.fineBackBtn.style.display = showMark ? "" : "none";
+  if (el.fineFwdBtn) el.fineFwdBtn.style.display = showMark ? "" : "none";
+  state.snapshots = null;
+  state.snapshotIndex = 0;
   state.videos = [];
   state.index = -1;
   state.donePaths = new Set();
@@ -189,24 +205,134 @@ function renderClips() {
   } else if (state.pendingClip) {
     el.pendingIn.textContent = "Press T to trim this clip";
   } else {
-    el.pendingIn.textContent = "Mark start, step through footage, Mark end";
+    el.pendingIn.textContent = "← → snapshots to spot garbage · , . to fine-tune trim point";
   }
-  updateStepHint();
 }
 
-const STEP_LEVELS_SEC = [2, 4, 8, 15, 30, 60];
-
-function resetStepBurst() {
-  state.stepLevel = 0;
-  state.lastStepAt = 0;
-  state.lastStepDir = 0;
-  updateStepHint();
+function showLoading(title, detail, pct = 0, hint = "") {
+  if (!el.loadingOverlay) return;
+  el.loadingOverlay.classList.remove("hidden");
+  el.loadingTitle.textContent = title;
+  el.loadingDetail.textContent = detail || "";
+  el.loadingBarFill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+  el.loadingHint.textContent = hint || "";
 }
 
-function updateStepHint() {
-  if (!el.stepHint) return;
-  const next = STEP_LEVELS_SEC[Math.min(state.stepLevel, STEP_LEVELS_SEC.length - 1)];
-  el.stepHint.textContent = `Next jump: ~${next}s — click the same button repeatedly for bigger jumps`;
+function hideLoading() {
+  el.loadingOverlay?.classList.add("hidden");
+}
+
+function updateFilmstripMeta() {
+  if (!el.filmstripMeta || !state.snapshots) return;
+  const m = state.snapshots;
+  const idx = state.snapshotIndex + 1;
+  const total = m.frames?.length || 0;
+  el.filmstripMeta.textContent =
+    `Every ${m.interval_seconds}s · snapshot ${idx}/${total} · ${m.garbage_hint || ""}`;
+}
+
+function renderFilmstrip() {
+  if (!el.filmstrip) return;
+  el.filmstrip.innerHTML = "";
+  if (!state.snapshots?.frames?.length) {
+    el.filmstrip.innerHTML = '<div class="hint">No snapshots yet</div>';
+    return;
+  }
+  const video = currentVideo();
+  if (!video) return;
+
+  state.snapshots.frames.forEach((frame) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "filmstrip-item";
+    if (frame.index === state.snapshotIndex) btn.classList.add("active");
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = formatTime(frame.t);
+    img.src = `/api/eager/snapshots/frame?path=${encodeURIComponent(video.path)}&index=${frame.index}`;
+    const label = document.createElement("span");
+    label.textContent = formatTime(frame.t);
+    btn.appendChild(img);
+    btn.appendChild(label);
+    btn.addEventListener("click", () => goToSnapshotIndex(frame.index));
+    el.filmstrip.appendChild(btn);
+  });
+  updateFilmstripMeta();
+  const active = el.filmstrip.querySelector(".filmstrip-item.active");
+  active?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+}
+
+async function waitForSnapshots(video, token) {
+  await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}&start=1`);
+  for (let i = 0; i < 3600; i += 1) {
+    if (token !== state.snapshotBuildToken) return null;
+    const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+    if (status.status === "running") {
+      showLoading(
+        `Building snapshots`,
+        video.name,
+        status.progress || 0,
+        status.plan?.garbage_hint || "",
+      );
+    }
+    if (status.status === "ready" && status.manifest) {
+      return status.manifest;
+    }
+    if (status.status === "error") {
+      throw new Error(status.error || "Snapshot build failed");
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  throw new Error("Snapshot build timed out");
+}
+
+async function ensureSnapshots(video, showOverlay = true) {
+  const token = ++state.snapshotBuildToken;
+  if (showOverlay) {
+    showLoading("Checking snapshots", video.name, 5);
+  }
+  const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+  if (status.status === "ready" && status.manifest) {
+    if (token !== state.snapshotBuildToken) return null;
+    state.snapshots = status.manifest;
+    state.snapshotIndex = 0;
+    renderFilmstrip();
+    hideLoading();
+    return status.manifest;
+  }
+  if (showOverlay) {
+    showLoading("Building snapshots", video.name, 0, status.plan?.garbage_hint || "");
+  }
+  const manifest = await waitForSnapshots(video, token);
+  if (token !== state.snapshotBuildToken || !manifest) return null;
+  state.snapshots = manifest;
+  state.snapshotIndex = 0;
+  renderFilmstrip();
+  hideLoading();
+  return manifest;
+}
+
+function goToSnapshotIndex(index) {
+  if (!state.snapshots?.frames?.length) return;
+  const frames = state.snapshots.frames;
+  const clamped = Math.max(0, Math.min(frames.length - 1, index));
+  state.snapshotIndex = clamped;
+  const t = frames[clamped].t;
+  scheduleSeek(t, true);
+  renderFilmstrip();
+  updateFilmstripMeta();
+}
+
+function goToSnapshot(delta) {
+  goToSnapshotIndex(state.snapshotIndex + delta);
+}
+
+function fineTune(seconds) {
+  if (!currentVideo()) return;
+  flushSeek();
+  const duration = el.player.duration || currentVideo()?.duration || 0;
+  if (!duration) return;
+  scheduleSeek(el.player.currentTime + seconds, true);
 }
 
 function flushSeek() {
@@ -292,35 +418,6 @@ function seekToFraction(fraction) {
   scheduleSeek(fraction * duration, true);
 }
 
-function stepSeconds(direction) {
-  const now = Date.now();
-  if (now - state.lastStepAt > 1500 || direction !== state.lastStepDir) {
-    state.stepLevel = 0;
-  }
-  state.lastStepAt = now;
-  state.lastStepDir = direction;
-  const level = Math.min(state.stepLevel, STEP_LEVELS_SEC.length - 1);
-  const seconds = STEP_LEVELS_SEC[level];
-  state.stepLevel = Math.min(state.stepLevel + 1, STEP_LEVELS_SEC.length - 1);
-  updateStepHint();
-  return seconds;
-}
-
-function stepVideo(direction) {
-  if (!currentVideo()) return;
-  flushSeek();
-  const duration = el.player.duration || currentVideo()?.duration || 0;
-  if (!duration) return;
-
-  const video = currentVideo();
-  const large = (video?.size_bytes || 0) > 2_000_000_000;
-  let jump = stepSeconds(direction);
-  if (large) jump *= 1.5;
-  jump = Math.min(jump, duration * 0.08);
-
-  scheduleSeek(el.player.currentTime + direction * jump, true);
-}
-
 function markStart() {
   if (!currentVideo()) return;
   flushSeek();
@@ -378,6 +475,15 @@ async function loadVideo(index) {
   const previous = currentVideo();
   if (previous?.path && previous.path !== state.videos[index]?.path) {
     await cancelPreviewJob(previous.path);
+    try {
+      await fetch("/api/eager/snapshots/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: previous.path }),
+      });
+    } catch {
+      /* ignore */
+    }
   }
 
   state.index = index;
@@ -385,7 +491,8 @@ async function loadVideo(index) {
   state.pendingClip = null;
   state.savedClips = [];
   state.pendingSeek = null;
-  resetStepBurst();
+  state.snapshots = null;
+  state.snapshotIndex = 0;
   if (state.seekTimer) {
     clearTimeout(state.seekTimer);
     state.seekTimer = null;
@@ -407,17 +514,26 @@ async function loadVideo(index) {
   el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
   el.player.load();
 
-  const onReady = () => {
+  const onReady = async () => {
     if (token !== state.previewToken) return;
     el.playerWrap.classList.remove("loading");
     el.player.pause();
     el.player.currentTime = 0;
     updateScrubUi();
-    const gb = (video.size_bytes || 0) / 1_000_000_000;
-    if (gb >= 1.5) {
-      el.previewStatus.textContent = "Large file — scrubbing original (no background processing)";
+    if (state.phase === "clean") {
+      try {
+        await ensureSnapshots(video, true);
+        if (state.snapshots?.frames?.length) {
+          goToSnapshotIndex(0);
+        }
+        setStatus(`Ready — use snapshot strip (${video.name})`, "ok");
+      } catch (error) {
+        hideLoading();
+        setStatus(error.message, "error");
+      }
+    } else {
+      setStatus(`Ready — ${video.name}`, "ok");
     }
-    setStatus(`Ready — use Back/Forward to step (${video.name})`, "ok");
   };
 
   el.player.addEventListener("loadedmetadata", onReady, { once: true });
@@ -521,8 +637,13 @@ async function scanSource() {
     renderFileList();
     el.scanSummary.textContent = `${data.count} ${mode === "raw" ? "raw" : "trimmed"} files`;
     if (state.videos.length) {
+      if (mode === "raw") {
+        showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
+      }
       await loadVideo(0);
+      if (mode === "raw") hideLoading();
       setStatus(`Found ${state.videos.length} files`, "ok");
+      prefetchSnapshotsBackground(1);
     } else {
       setStatus(`No ${mode} MP4 files found`, "error");
     }
@@ -531,6 +652,23 @@ async function scanSource() {
   } finally {
     el.scanBtn.disabled = false;
   }
+}
+
+function prefetchSnapshotsBackground(startIndex) {
+  if (state.phase !== "clean") return;
+  (async () => {
+    for (let i = startIndex; i < state.videos.length; i += 1) {
+      const video = state.videos[i];
+      try {
+        const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+        if (status.status !== "ready") {
+          await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}&start=1`);
+        }
+      } catch {
+        /* background prefetch — ignore */
+      }
+    }
+  })();
 }
 
 async function trimMarkedClip() {
@@ -679,7 +817,6 @@ function advanceToNext() {
   if (next < state.videos.length) {
     loadVideo(next);
   } else {
-    resetStepBurst();
     setStatus(state.phase === "clean" ? "All files cleaned" : "All clips labeled", "ok");
     renderFileList();
   }
@@ -693,8 +830,10 @@ function skipCurrent() {
   advanceToNext();
 }
 
-el.stepBackBtn.addEventListener("click", () => stepVideo(-1));
-el.stepFwdBtn.addEventListener("click", () => stepVideo(1));
+el.snapPrevBtn?.addEventListener("click", () => goToSnapshot(-1));
+el.snapNextBtn?.addEventListener("click", () => goToSnapshot(1));
+el.fineBackBtn?.addEventListener("click", () => fineTune(-3));
+el.fineFwdBtn?.addEventListener("click", () => fineTune(3));
 el.markStartBtn.addEventListener("click", markStart);
 el.markEndBtn.addEventListener("click", markEnd);
 
@@ -743,15 +882,27 @@ document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;
   const key = event.key.toLowerCase();
 
-  if (event.key === "ArrowLeft") {
-    event.preventDefault();
-    stepVideo(-1);
-    return;
-  }
-  if (event.key === "ArrowRight") {
-    event.preventDefault();
-    stepVideo(1);
-    return;
+  if (state.phase === "clean") {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      goToSnapshot(-1);
+      return;
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      goToSnapshot(1);
+      return;
+    }
+    if (event.key === ",") {
+      event.preventDefault();
+      fineTune(-1);
+      return;
+    }
+    if (event.key === ".") {
+      event.preventDefault();
+      fineTune(1);
+      return;
+    }
   }
 
   if (state.phase === "clean") {
