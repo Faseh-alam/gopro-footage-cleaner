@@ -18,7 +18,7 @@ def _cache_dir() -> Path:
     return path
 
 
-_PREVIEW_VERSION = "v2-1080p"
+_PREVIEW_VERSION = "v3-720p"
 
 
 def _cache_key(source: Path) -> str:
@@ -34,10 +34,10 @@ def _cached_preview_path(source: Path) -> Path:
 
 
 def _preview_encoder_args() -> list[str]:
-    # 1080p review proxy — readable detail without full GoPro file weight.
+    # 720p review proxy — balanced quality and speed (Windows + Mac).
     if platform.system() == "Darwin":
-        return ["-c:v", "h264_videotoolbox", "-b:v", "4500k", "-maxrate", "5500k", "-bufsize", "9000k"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+        return ["-c:v", "h264_videotoolbox", "-b:v", "2800k", "-maxrate", "3500k", "-bufsize", "7000k"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
 
 
 def _hwaccel_input_args() -> list[str]:
@@ -58,7 +58,7 @@ def _build_preview(source: Path, dest: Path, job_key: str) -> None:
         str(source),
         "-an",
         "-vf",
-        "scale='min(1920,iw)':-2,fps=24",
+        "scale='min(1280,iw)':-2,fps=24",
         *_preview_encoder_args(),
         "-movflags",
         "+faststart",

@@ -51,7 +51,7 @@ if ! curl -fsS "${URL}/api/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-open "${URL}" 2>/dev/null || true
+open "${URL}/review" 2>/dev/null || true
 echo "GoPro Footage Cleaner is running at ${URL}"
 echo "Press Ctrl+C to stop."
 

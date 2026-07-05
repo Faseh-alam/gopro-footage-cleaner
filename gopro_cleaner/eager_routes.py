@@ -7,7 +7,15 @@ from pathlib import Path
 
 from flask import Blueprint, jsonify, render_template, request, send_file
 
-from .core.eager import process_reviewed_video, scan_mp4_files
+from .core.eager import (
+    LABELED_FOLDER,
+    assign_clip_to_task,
+    finish_cleaning_file,
+    list_camera_folders,
+    process_reviewed_video,
+    scan_mp4_files,
+    trim_single_clip,
+)
 from .core.preview_proxy import preview_status, resolve_preview
 from .core.task_store import add_task, load_tasks
 from .core.volumes import list_volume_roots, normalize_path
@@ -38,21 +46,38 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": str(exc)}), 400
         return jsonify({"tasks": tasks})
 
+    @eager.get("/api/eager/cameras")
+    def eager_cameras():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            root = normalize_path(raw_path)
+            cameras = list_camera_folders(root)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"root": str(root), "cameras": cameras})
+
     @eager.post("/api/eager/scan")
     def eager_scan():
         payload = request.get_json(silent=True) or {}
         raw_path = str(payload.get("path", "")).strip()
         recursive = bool(payload.get("recursive", True))
+        mode = str(payload.get("mode", "all")).strip().lower()
+        if mode not in {"all", "raw", "clips"}:
+            return jsonify({"error": "mode must be all, raw, or clips"}), 400
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         try:
             root = normalize_path(raw_path)
-            videos = scan_mp4_files(root, recursive=recursive)
+            videos = scan_mp4_files(root, recursive=recursive, mode=mode)
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 404
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"root": str(root), "count": len(videos), "videos": videos})
+        return jsonify({"root": str(root), "count": len(videos), "videos": videos, "mode": mode})
 
     @eager.get("/api/eager/preview/status")
     def eager_preview_status():
@@ -91,6 +116,54 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": "Only MP4 streaming is supported"}), 400
         mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
         return send_file(path, mimetype=mime, conditional=True)
+
+    @eager.post("/api/eager/trim")
+    def eager_trim():
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        try:
+            start = float(payload.get("start", 0))
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "start and end must be numbers"}), 400
+        if not raw_source:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = trim_single_clip(Path(raw_source), start, end)
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/clean")
+    def eager_clean():
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        delete_source = bool(payload.get("delete_source", True))
+        if not raw_source:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = finish_cleaning_file(Path(raw_source), delete_source=delete_source)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/label")
+    def eager_label():
+        payload = request.get_json(silent=True) or {}
+        raw_clip = str(payload.get("path", "")).strip()
+        raw_root = str(payload.get("label_root", "")).strip()
+        task_name = str(payload.get("task", "")).strip()
+        if not raw_clip or not raw_root or not task_name:
+            return jsonify({"error": "path, label_root, and task are required"}), 400
+        try:
+            result = assign_clip_to_task(Path(raw_clip), Path(raw_root), task_name)
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result, "labeled_folder": LABELED_FOLDER})
 
     @eager.post("/api/eager/finish")
     def eager_finish():

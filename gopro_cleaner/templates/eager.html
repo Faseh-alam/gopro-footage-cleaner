@@ -13,31 +13,40 @@
         <div>
           <p class="eyebrow"><a href="/">← Bulk trimmer</a></p>
           <h1>Eager Review Station</h1>
-          <p class="hint">Review SD card footage, tag tasks, mark useful ranges, export on Next.</p>
+          <p class="hint">Phase 1: clean raw footage · Phase 2: label trimmed clips into task folders</p>
         </div>
         <div class="eager-setup">
+          <div class="phase-tabs">
+            <button type="button" id="phase-clean" class="phase-tab active">1 · Clean footage</button>
+            <button type="button" id="phase-label" class="phase-tab">2 · Label tasks</button>
+          </div>
           <label>
-            SD / source folder
+            Drive / archive folder
             <div class="row">
               <select id="source-volume"></select>
-              <input id="source-path" type="text" placeholder="/Volumes/Untitled or E:\" />
-              <button id="scan-btn" type="button" class="primary">Scan MP4</button>
+              <input id="source-path" type="text" placeholder="E:\ or D:\Tribes" />
             </div>
           </label>
-          <label>
-            Output folder (task subfolders created here)
+          <label id="camera-row" class="camera-row">
+            Camera folder (C####)
             <div class="row">
-              <select id="output-volume"></select>
-              <input id="output-path" type="text" placeholder="/Volumes/Drive 2/archive/Tasks" />
+              <select id="camera-select">
+                <option value="">SD card root (MP4s directly on drive)</option>
+              </select>
+              <button id="refresh-cameras-btn" type="button" class="secondary">Refresh</button>
             </div>
           </label>
+          <div class="row">
+            <button id="scan-btn" type="button" class="primary">Scan footage</button>
+            <span id="scan-summary" class="hint"></span>
+          </div>
         </div>
       </header>
 
       <main class="eager-main">
         <aside class="eager-list panel">
           <div class="list-head">
-            <h2>Footage</h2>
+            <h2 id="list-title">Footage</h2>
             <span id="list-summary" class="hint">0 files</span>
           </div>
           <input id="file-filter" type="search" placeholder="Filter by filename..." />
@@ -57,7 +66,7 @@
           <div id="player-wrap" class="player-wrap" tabindex="0">
             <video id="player" playsinline muted preload="auto"></video>
             <div class="scrub-overlay">
-              <span id="scrub-hint">Scroll or drag to scrub · Space to play/pause</span>
+              <span id="scrub-hint">Click video to scrub · Click again to mark · T trim · Esc exit</span>
               <span id="preview-status" class="preview-status"></span>
             </div>
             <div id="scrub-track" class="scrub-track">
@@ -66,50 +75,56 @@
             </div>
           </div>
           <div class="mark-toolbar">
-            <button id="mark-in-btn" type="button" class="secondary" title="Shortcut: I">Mark start</button>
-            <button id="mark-out-btn" type="button" class="secondary" title="Shortcut: O">Mark end</button>
-            <button id="undo-clip-btn" type="button" class="secondary">Undo last clip</button>
-            <span id="pending-in" class="hint">No start marked</span>
+            <button id="undo-clip-btn" type="button" class="secondary">Undo mark</button>
+            <span id="pending-in" class="hint">Click video to start scrubbing</span>
           </div>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
 
         <aside class="eager-side panel">
-          <h2>Task</h2>
-          <input id="task-search" type="search" placeholder="Search tasks..." />
-          <div id="task-list" class="task-list"></div>
-          <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
-          <div class="row">
-            <input id="new-task-input" type="text" placeholder="New task name" />
-            <button id="add-task-btn" type="button" class="secondary">Add</button>
+          <div id="clean-panel">
+            <h2>Clean</h2>
+            <p class="hint panel-desc">
+              Mark useful ranges with clicks, press <kbd>T</kbd> to trim each clip. Clips save beside the raw file as
+              <code>NAME-1.MP4</code>. Press <kbd>N</kbd> when done to remove the raw file and continue.
+            </p>
+            <label class="check-row">
+              <input id="delete-source" type="checkbox" checked />
+              Remove raw file after cleaning
+            </label>
+            <div class="action-stack">
+              <button id="trim-btn" type="button" class="primary">Trim marked clip (T)</button>
+              <button id="next-clean-btn" type="button" class="secondary">Next file — finish cleaning (N)</button>
+              <button id="keep-whole-btn" type="button" class="secondary">Keep entire file (K)</button>
+              <button id="skip-btn" type="button" class="secondary">Skip file (S)</button>
+            </div>
           </div>
-          <p id="task-added-msg" class="task-added"></p>
 
-          <h3>Footage quality</h3>
-          <label class="radio-card">
-            <input type="radio" name="quality" value="keep" checked />
-            <span>Keep entire file (no garbage)</span>
-          </label>
-          <label class="radio-card">
-            <input type="radio" name="quality" value="trim" />
-            <span>Has garbage — trim marked clips</span>
-          </label>
-
-          <label class="check-row">
-            <input id="delete-source" type="checkbox" checked />
-            Remove from SD after export
-          </label>
-
-          <div class="action-stack">
-            <button id="finish-btn" type="button" class="primary">Next — export &amp; continue</button>
-            <button id="skip-btn" type="button" class="secondary">Skip (no export)</button>
+          <div id="label-panel" class="hidden">
+            <h2>Task</h2>
+            <p class="hint panel-desc">
+              Pick a task for this trimmed clip. It moves into <code>Labeled/&lt;task&gt;/</code> on the same drive.
+            </p>
+            <input id="task-search" type="search" placeholder="Search tasks..." />
+            <div id="task-list" class="task-list"></div>
+            <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
+            <div class="row">
+              <input id="new-task-input" type="text" placeholder="New task name" />
+              <button id="add-task-btn" type="button" class="secondary">Add</button>
+            </div>
+            <p id="task-added-msg" class="task-added"></p>
+            <div class="action-stack">
+              <button id="label-btn" type="button" class="primary">Move to task &amp; next (N)</button>
+              <button id="skip-label-btn" type="button" class="secondary">Skip clip (S)</button>
+            </div>
           </div>
+
           <p id="status-line" class="status-line"></p>
         </aside>
       </main>
 
       <footer class="footer">
-        <span>Scroll on video to scrub · <kbd>I</kbd> start · <kbd>O</kbd> end · <kbd>N</kbd> next · <kbd>Space</kbd> play/pause</span>
+        <span id="footer-hints">Click video · move mouse left/right to scrub · click mark start/end · <kbd>T</kbd> trim · <kbd>N</kbd> next · <kbd>Esc</kbd> show cursor</span>
         <span id="app-version"></span>
       </footer>
     </div>

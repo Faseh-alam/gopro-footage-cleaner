@@ -1,23 +1,33 @@
 const state = {
+  phase: "clean",
   videos: [],
   index: -1,
   tasks: [],
-  clips: [],
+  scanRoot: "",
+  labelRoot: "",
   pendingIn: null,
+  pendingClip: null,
+  savedClips: [],
   donePaths: new Set(),
   busy: false,
-  scrubbing: false,
+  scrubMode: false,
   previewToken: 0,
+  lastScrubX: null,
+  scrubRaf: null,
 };
 
 const el = {
+  phaseClean: document.getElementById("phase-clean"),
+  phaseLabel: document.getElementById("phase-label"),
   sourceVolume: document.getElementById("source-volume"),
   sourcePath: document.getElementById("source-path"),
-  outputVolume: document.getElementById("output-volume"),
-  outputPath: document.getElementById("output-path"),
+  cameraSelect: document.getElementById("camera-select"),
+  refreshCamerasBtn: document.getElementById("refresh-cameras-btn"),
   scanBtn: document.getElementById("scan-btn"),
+  scanSummary: document.getElementById("scan-summary"),
   fileFilter: document.getElementById("file-filter"),
   fileList: document.getElementById("file-list"),
+  listTitle: document.getElementById("list-title"),
   listSummary: document.getElementById("list-summary"),
   playerWrap: document.getElementById("player-wrap"),
   player: document.getElementById("player"),
@@ -29,21 +39,26 @@ const el = {
   currentName: document.getElementById("current-name"),
   currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
-  markInBtn: document.getElementById("mark-in-btn"),
-  markOutBtn: document.getElementById("mark-out-btn"),
   undoClipBtn: document.getElementById("undo-clip-btn"),
   pendingIn: document.getElementById("pending-in"),
   clipList: document.getElementById("clip-list"),
+  cleanPanel: document.getElementById("clean-panel"),
+  labelPanel: document.getElementById("label-panel"),
+  deleteSource: document.getElementById("delete-source"),
+  trimBtn: document.getElementById("trim-btn"),
+  nextCleanBtn: document.getElementById("next-clean-btn"),
+  keepWholeBtn: document.getElementById("keep-whole-btn"),
+  skipBtn: document.getElementById("skip-btn"),
   taskSearch: document.getElementById("task-search"),
   taskList: document.getElementById("task-list"),
   taskSelect: document.getElementById("task-select"),
   newTaskInput: document.getElementById("new-task-input"),
   addTaskBtn: document.getElementById("add-task-btn"),
   taskAddedMsg: document.getElementById("task-added-msg"),
-  deleteSource: document.getElementById("delete-source"),
-  finishBtn: document.getElementById("finish-btn"),
-  skipBtn: document.getElementById("skip-btn"),
+  labelBtn: document.getElementById("label-btn"),
+  skipLabelBtn: document.getElementById("skip-label-btn"),
   statusLine: document.getElementById("status-line"),
+  footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
 };
 
@@ -85,12 +100,10 @@ function setStatus(message, kind = "") {
   el.statusLine.className = `status-line ${kind}`.trim();
 }
 
-function qualityMode() {
-  return document.querySelector('input[name="quality"]:checked')?.value || "keep";
-}
-
-function outputRoot() {
-  return el.outputPath.value.trim();
+function scanTargetPath() {
+  const camera = el.cameraSelect.value.trim();
+  if (camera) return camera;
+  return el.sourcePath.value.trim();
 }
 
 function filteredVideos() {
@@ -107,6 +120,23 @@ function selectedTask() {
   const picked = el.taskSelect.value.trim();
   if (picked) return picked;
   return el.newTaskInput.value.trim();
+}
+
+function setPhase(phase) {
+  state.phase = phase;
+  el.phaseClean.classList.toggle("active", phase === "clean");
+  el.phaseLabel.classList.toggle("active", phase === "label");
+  el.cleanPanel.classList.toggle("hidden", phase !== "clean");
+  el.labelPanel.classList.toggle("hidden", phase !== "label");
+  el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Trimmed clips";
+  el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan trimmed clips";
+  exitScrubMode();
+  state.videos = [];
+  state.index = -1;
+  state.donePaths = new Set();
+  renderFileList();
+  el.currentName.textContent = "No file loaded";
+  el.currentMeta.textContent = "";
 }
 
 function renderFileList() {
@@ -131,15 +161,26 @@ function renderFileList() {
 
 function renderClips() {
   el.clipList.innerHTML = "";
-  state.clips.forEach((clip, index) => {
+  for (const clip of state.savedClips) {
     const item = document.createElement("li");
-    item.textContent = `Clip ${index + 1}: ${formatTime(clip.start)} → ${formatTime(clip.end)}`;
+    item.className = "saved";
+    item.textContent = `Saved: ${clip.name || clip.output || "clip"}`;
     el.clipList.appendChild(item);
-  });
-  if (state.pendingIn === null) {
-    el.pendingIn.textContent = "No start marked";
+  }
+  if (state.pendingClip) {
+    const item = document.createElement("li");
+    item.className = "pending";
+    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T`;
+    el.clipList.appendChild(item);
+  }
+  if (state.pendingIn !== null) {
+    el.pendingIn.textContent = `Start at ${formatTime(state.pendingIn)} — scrub and click to set end`;
+  } else if (state.pendingClip) {
+    el.pendingIn.textContent = "Press T to trim this clip";
+  } else if (state.scrubMode) {
+    el.pendingIn.textContent = "Scrubbing — click to mark start";
   } else {
-    el.pendingIn.textContent = `Start marked at ${formatTime(state.pendingIn)} — now mark end`;
+    el.pendingIn.textContent = "Click video to start scrubbing";
   }
 }
 
@@ -156,7 +197,6 @@ function renderTasks(preferred = "") {
 
   for (const task of state.tasks) {
     if (q && !task.toLowerCase().includes(q)) continue;
-
     const option = document.createElement("option");
     option.value = task;
     option.textContent = task;
@@ -199,24 +239,82 @@ function seekToFraction(fraction) {
   updateScrubUi();
 }
 
-function scrubByDelta(deltaPx, width) {
-  const duration = el.player.duration || currentVideo()?.duration || 0;
-  if (!duration || !width) return;
-  const secondsPerPixel = duration / width;
-  const next = el.player.currentTime + deltaPx * secondsPerPixel;
-  el.player.pause();
-  el.player.currentTime = Math.min(duration - 0.04, Math.max(0, next));
-  updateScrubUi();
-}
+function scrubByPosition(clientX) {
+  const rect = el.playerWrap.getBoundingClientRect();
+  const width = rect.width || 1;
+  const rel = (clientX - rect.left) / width;
+  const center = 0.5;
+  const delta = rel - center;
+  if (Math.abs(delta) < 0.06) return;
 
-function scrubByWheel(delta) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
-  const base = Math.max(0.08, duration / 1200);
-  const step = Math.sign(delta) * Math.max(base, Math.abs(delta) * base * 0.35);
+
+  const speed = delta * 2;
+  const step = speed * Math.max(0.15, duration / 800);
   el.player.pause();
   el.player.currentTime = Math.min(duration - 0.04, Math.max(0, el.player.currentTime + step));
   updateScrubUi();
+}
+
+function scrubLoop() {
+  if (!state.scrubMode || state.lastScrubX === null) {
+    state.scrubRaf = null;
+    return;
+  }
+  scrubByPosition(state.lastScrubX);
+  state.scrubRaf = requestAnimationFrame(scrubLoop);
+}
+
+function enterScrubMode() {
+  if (!currentVideo() || state.phase !== "clean") return;
+  state.scrubMode = true;
+  document.body.classList.add("scrub-cursor-hidden");
+  el.playerWrap.classList.add("scrub-active");
+  el.scrubHint.textContent = "Move mouse left/right · click mark · T trim · Esc exit";
+  renderClips();
+}
+
+function exitScrubMode() {
+  state.scrubMode = false;
+  state.lastScrubX = null;
+  document.body.classList.remove("scrub-cursor-hidden");
+  el.playerWrap.classList.remove("scrub-active");
+  if (state.scrubRaf) {
+    cancelAnimationFrame(state.scrubRaf);
+    state.scrubRaf = null;
+  }
+  renderClips();
+}
+
+function handleScrubClick() {
+  if (!currentVideo() || state.phase !== "clean") return;
+  const time = el.player.currentTime;
+
+  if (state.pendingIn === null) {
+    state.pendingIn = time;
+    state.pendingClip = null;
+  } else {
+    const end = time;
+    if (end <= state.pendingIn + 0.05) {
+      setStatus("End must be after start", "error");
+      return;
+    }
+    state.pendingClip = { start: state.pendingIn, end };
+    state.pendingIn = null;
+  }
+  renderClips();
+}
+
+function undoMark() {
+  if (state.pendingClip) {
+    state.pendingClip = null;
+  } else if (state.pendingIn !== null) {
+    state.pendingIn = null;
+  } else {
+    state.savedClips.pop();
+  }
+  renderClips();
 }
 
 async function upgradePreviewInBackground(video, token) {
@@ -228,7 +326,7 @@ async function upgradePreviewInBackground(video, token) {
       if (status.status === "running") {
         const pct = status.progress || 0;
         el.previewStatus.textContent =
-          pct > 0 ? `Building 1080p preview: ${pct}%` : "Building 1080p preview in background...";
+          pct > 0 ? `Building preview: ${pct}%` : "Building preview in background...";
       }
       if (status.status === "ready") {
         if (token !== state.previewToken) return;
@@ -243,11 +341,11 @@ async function upgradePreviewInBackground(video, token) {
           },
           { once: true },
         );
-        el.previewStatus.textContent = "Using 1080p preview for smoother scrubbing";
+        el.previewStatus.textContent = "Using preview for smoother scrubbing";
         return;
       }
       if (status.status === "error") {
-        el.previewStatus.textContent = "Preview skipped — using original file";
+        el.previewStatus.textContent = "";
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 400));
@@ -260,8 +358,11 @@ async function upgradePreviewInBackground(video, token) {
 async function loadVideo(index) {
   if (index < 0 || index >= state.videos.length) return;
   state.index = index;
-  state.clips = [];
   state.pendingIn = null;
+  state.pendingClip = null;
+  state.savedClips = [];
+  exitScrubMode();
+
   const video = state.videos[index];
   const token = ++state.previewToken;
 
@@ -283,8 +384,7 @@ async function loadVideo(index) {
     el.player.pause();
     el.player.currentTime = 0;
     updateScrubUi();
-    setStatus(`Ready — scroll on video to scrub (${video.name})`, "ok");
-    el.playerWrap.focus();
+    setStatus(`Ready — ${video.name}`, "ok");
     upgradePreviewInBackground(video, token);
   };
 
@@ -302,43 +402,34 @@ async function loadVideo(index) {
 
 async function loadVolumes() {
   const data = await api("/api/eager/volumes");
-  for (const select of [el.sourceVolume, el.outputVolume]) {
-    select.innerHTML = '<option value="">Choose...</option>';
-    for (const volume of data.volumes) {
+  el.sourceVolume.innerHTML = '<option value="">Choose drive...</option>';
+  for (const volume of data.volumes) {
+    const option = document.createElement("option");
+    option.value = volume.path;
+    option.textContent = volume.name;
+    el.sourceVolume.appendChild(option);
+  }
+}
+
+async function loadCameras() {
+  const path = el.sourcePath.value.trim();
+  if (!path) return;
+  try {
+    const data = await api(`/api/eager/cameras?path=${encodeURIComponent(path)}`);
+    const selected = el.cameraSelect.value;
+    el.cameraSelect.innerHTML = '<option value="">SD card root (MP4s on drive)</option>';
+    for (const camera of data.cameras || []) {
       const option = document.createElement("option");
-      option.value = volume.path;
-      option.textContent = volume.name;
-      select.appendChild(option);
+      option.value = camera.path;
+      option.textContent = `${camera.name} (${camera.raw_count} raw · ${camera.clip_count} clips)`;
+      el.cameraSelect.appendChild(option);
     }
+    if (selected && [...el.cameraSelect.options].some((opt) => opt.value === selected)) {
+      el.cameraSelect.value = selected;
+    }
+  } catch {
+    el.cameraSelect.innerHTML = '<option value="">SD card root (MP4s on drive)</option>';
   }
-}
-
-function markIn() {
-  if (!currentVideo()) return;
-  state.pendingIn = el.player.currentTime;
-  renderClips();
-}
-
-function markOut() {
-  if (!currentVideo() || state.pendingIn === null) return;
-  const end = el.player.currentTime;
-  if (end <= state.pendingIn + 0.05) {
-    setStatus("End must be after start", "error");
-    return;
-  }
-  state.clips.push({ start: state.pendingIn, end });
-  state.pendingIn = null;
-  document.querySelector('input[name="quality"][value="trim"]').checked = true;
-  renderClips();
-}
-
-function undoClip() {
-  if (state.pendingIn !== null) {
-    state.pendingIn = null;
-  } else {
-    state.clips.pop();
-  }
-  renderClips();
 }
 
 async function loadTasks() {
@@ -353,9 +444,7 @@ async function addTask() {
     setStatus("Type a task name first", "error");
     return;
   }
-
   el.addTaskBtn.disabled = true;
-  el.taskAddedMsg.textContent = "";
   try {
     const data = await api("/api/eager/tasks", {
       method: "POST",
@@ -366,7 +455,6 @@ async function addTask() {
     el.taskSearch.value = "";
     el.newTaskInput.value = "";
     renderTasks(name);
-    el.taskSelect.value = name;
     el.taskAddedMsg.textContent = `Added: ${name}`;
     setStatus(`Task added: ${name}`, "ok");
   } catch (error) {
@@ -377,28 +465,34 @@ async function addTask() {
 }
 
 async function scanSource() {
-  const path = el.sourcePath.value.trim();
+  const path = scanTargetPath();
   if (!path) {
-    setStatus("Choose a source folder first", "error");
+    setStatus("Choose a folder first", "error");
     return;
   }
-  setStatus("Scanning for MP4 files...");
+
+  state.scanRoot = path;
+  state.labelRoot = path;
+  const mode = state.phase === "clean" ? "raw" : "clips";
+
+  setStatus("Scanning...");
   el.scanBtn.disabled = true;
   try {
     const data = await api("/api/eager/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, recursive: true }),
+      body: JSON.stringify({ path, recursive: true, mode }),
     });
     state.videos = data.videos || [];
     state.donePaths = new Set();
     state.index = -1;
     renderFileList();
+    el.scanSummary.textContent = `${data.count} ${mode === "raw" ? "raw" : "trimmed"} files`;
     if (state.videos.length) {
       await loadVideo(0);
-      setStatus(`Found ${state.videos.length} MP4 files`, "ok");
+      setStatus(`Found ${state.videos.length} files`, "ok");
     } else {
-      setStatus("No MP4 files found in that folder", "error");
+      setStatus(`No ${mode} MP4 files found`, "error");
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -407,19 +501,102 @@ async function scanSource() {
   }
 }
 
-async function finishCurrent(advance = true) {
+async function trimMarkedClip() {
+  if (state.busy) return;
+  const video = currentVideo();
+  if (!video || !state.pendingClip) {
+    setStatus("Mark a clip first (click start, click end)", "error");
+    return;
+  }
+
+  state.busy = true;
+  el.trimBtn.disabled = true;
+  setStatus("Trimming clip...");
+  try {
+    const data = await api("/api/eager/trim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: video.path,
+        start: state.pendingClip.start,
+        end: state.pendingClip.end,
+      }),
+    });
+    state.savedClips.push({
+      output: data.output,
+      name: data.output.split(/[/\\]/).pop(),
+      start: data.start_seconds,
+      end: data.end_seconds,
+    });
+    state.pendingClip = null;
+    renderClips();
+    setStatus(`Saved ${data.output.split(/[/\\]/).pop()}`, "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    state.busy = false;
+    el.trimBtn.disabled = false;
+  }
+}
+
+async function finishCleaningFile() {
+  if (state.busy) return;
+  const video = currentVideo();
+  if (!video) return;
+
+  if (state.pendingClip) {
+    setStatus("Press T to trim the marked clip first", "error");
+    return;
+  }
+
+  state.busy = true;
+  el.nextCleanBtn.disabled = true;
+  setStatus("Finishing file...");
+  try {
+    if (el.deleteSource.checked && state.savedClips.length > 0) {
+      await api("/api/eager/clean", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: video.path, delete_source: true }),
+      });
+    } else if (el.deleteSource.checked) {
+      setStatus("No clips saved — raw file kept", "ok");
+    }
+    state.donePaths.add(video.path);
+    setStatus(`Finished ${video.name}`, "ok");
+    advanceToNext();
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    state.busy = false;
+    el.nextCleanBtn.disabled = false;
+  }
+}
+
+async function keepWholeFile() {
+  if (state.busy) return;
+  const video = currentVideo();
+  if (!video) return;
+
+  const duration = el.player.duration || video.duration || 0;
+  if (!duration) {
+    setStatus("Wait for video to load", "error");
+    return;
+  }
+
+  state.pendingClip = { start: 0, end: duration - 0.05 };
+  await trimMarkedClip();
+  await finishCleaningFile();
+}
+
+async function labelCurrentClip() {
   if (state.busy) return;
   const video = currentVideo();
   if (!video) return;
 
   let task = selectedTask();
-  const out = outputRoot();
   if (!task) {
     setStatus("Choose or add a task first", "error");
-    return;
-  }
-  if (!out) {
-    setStatus("Set an output folder first", "error");
     return;
   }
 
@@ -438,38 +615,27 @@ async function finishCurrent(advance = true) {
     }
   }
 
-  const keepEntire = qualityMode() === "keep";
-  if (!keepEntire && !state.clips.length) {
-    setStatus("Mark clips or switch to Keep entire file", "error");
-    return;
-  }
-
   state.busy = true;
-  el.finishBtn.disabled = true;
-  setStatus(keepEntire ? "Copying full-quality file..." : `Trimming ${state.clips.length} clip(s)...`);
-
+  el.labelBtn.disabled = true;
+  setStatus(`Moving to ${task}...`);
   try {
-    const payload = {
-      path: video.path,
-      output_root: out,
-      task,
-      keep_entire: keepEntire,
-      delete_source: el.deleteSource.checked,
-      clips: state.clips.map((clip) => [clip.start, clip.end]),
-    };
-    const data = await api("/api/eager/finish", {
+    const data = await api("/api/eager/label", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        path: video.path,
+        label_root: state.labelRoot || state.scanRoot,
+        task,
+      }),
     });
     state.donePaths.add(video.path);
-    setStatus(`Saved to ${data.task_dir}`, "ok");
-    if (advance) advanceToNext();
+    setStatus(`Moved to ${data.task_dir}`, "ok");
+    advanceToNext();
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
     state.busy = false;
-    el.finishBtn.disabled = false;
+    el.labelBtn.disabled = false;
   }
 }
 
@@ -481,7 +647,8 @@ function advanceToNext() {
   if (next < state.videos.length) {
     loadVideo(next);
   } else {
-    setStatus("All files reviewed", "ok");
+    exitScrubMode();
+    setStatus(state.phase === "clean" ? "All files cleaned" : "All clips labeled", "ok");
     renderFileList();
   }
 }
@@ -494,65 +661,59 @@ function skipCurrent() {
   advanceToNext();
 }
 
-function moveSelection(delta) {
-  if (!state.videos.length) return;
-  const next = Math.min(state.videos.length - 1, Math.max(0, state.index + delta));
-  loadVideo(next);
-}
-
-let dragScrubbing = false;
-let lastDragX = 0;
-
-el.playerWrap.addEventListener(
-  "wheel",
-  (event) => {
-    if (!currentVideo()) return;
-    event.preventDefault();
-    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-    scrubByWheel(delta);
-  },
-  { passive: false },
-);
-
-el.playerWrap.addEventListener("mousedown", (event) => {
+el.playerWrap.addEventListener("click", (event) => {
   if (!currentVideo()) return;
-  dragScrubbing = true;
-  lastDragX = event.clientX;
-  const rect = el.scrubTrack.getBoundingClientRect();
-  seekToFraction((event.clientX - rect.left) / rect.width);
+  if (event.target.closest("#scrub-track")) return;
+
+  if (state.phase === "label") return;
+
+  if (!state.scrubMode) {
+    enterScrubMode();
+    return;
+  }
+
+  handleScrubClick();
 });
 
-window.addEventListener("mousemove", (event) => {
-  if (!dragScrubbing) return;
-  const deltaX = event.clientX - lastDragX;
-  lastDragX = event.clientX;
-  scrubByDelta(deltaX, el.scrubTrack.clientWidth);
+el.playerWrap.addEventListener("mousemove", (event) => {
+  if (!state.scrubMode) return;
+  state.lastScrubX = event.clientX;
+  if (!state.scrubRaf) {
+    state.scrubRaf = requestAnimationFrame(scrubLoop);
+  }
 });
 
-window.addEventListener("mouseup", () => {
-  dragScrubbing = false;
+el.playerWrap.addEventListener("mouseleave", () => {
+  state.lastScrubX = null;
 });
 
 el.scrubTrack.addEventListener("mousedown", (event) => {
   if (!currentVideo()) return;
   event.stopPropagation();
-  dragScrubbing = true;
-  lastDragX = event.clientX;
   const rect = el.scrubTrack.getBoundingClientRect();
   seekToFraction((event.clientX - rect.left) / rect.width);
 });
 
 el.sourceVolume.addEventListener("change", () => {
-  if (el.sourceVolume.value) el.sourcePath.value = el.sourceVolume.value;
+  if (el.sourceVolume.value) {
+    el.sourcePath.value = el.sourceVolume.value;
+    loadCameras();
+  }
 });
-el.outputVolume.addEventListener("change", () => {
-  if (el.outputVolume.value) el.outputPath.value = el.outputVolume.value;
+el.sourcePath.addEventListener("change", loadCameras);
+el.refreshCamerasBtn.addEventListener("click", loadCameras);
+el.cameraSelect.addEventListener("change", () => {
+  if (el.cameraSelect.value) setStatus(`Camera folder: ${el.cameraSelect.value}`);
 });
 el.scanBtn.addEventListener("click", scanSource);
 el.fileFilter.addEventListener("input", renderFileList);
-el.markInBtn.addEventListener("click", markIn);
-el.markOutBtn.addEventListener("click", markOut);
-el.undoClipBtn.addEventListener("click", undoClip);
+el.undoClipBtn.addEventListener("click", undoMark);
+el.trimBtn.addEventListener("click", trimMarkedClip);
+el.nextCleanBtn.addEventListener("click", finishCleaningFile);
+el.keepWholeBtn.addEventListener("click", keepWholeFile);
+el.skipBtn.addEventListener("click", skipCurrent);
+el.phaseClean.addEventListener("click", () => setPhase("clean"));
+el.phaseLabel.addEventListener("click", () => setPhase("label"));
 el.taskSearch.addEventListener("input", () => renderTasks());
 el.addTaskBtn.addEventListener("click", addTask);
 el.newTaskInput.addEventListener("keydown", (event) => {
@@ -561,8 +722,8 @@ el.newTaskInput.addEventListener("keydown", (event) => {
     addTask();
   }
 });
-el.finishBtn.addEventListener("click", () => finishCurrent(true));
-el.skipBtn.addEventListener("click", skipCurrent);
+el.labelBtn.addEventListener("click", labelCurrentClip);
+el.skipLabelBtn.addEventListener("click", skipCurrent);
 el.player.addEventListener("timeupdate", updateScrubUi);
 el.player.addEventListener("loadedmetadata", updateScrubUi);
 el.player.addEventListener("seeked", updateScrubUi);
@@ -570,19 +731,40 @@ el.player.addEventListener("seeked", updateScrubUi);
 document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;
   const key = event.key.toLowerCase();
-  if (key === " ") {
-    event.preventDefault();
-    if (el.player.paused) el.player.play();
-    else el.player.pause();
+
+  if (key === "escape") {
+    exitScrubMode();
+    return;
   }
-  if (key === "i") markIn();
-  if (key === "o") markOut();
-  if (key === "n") finishCurrent(true);
-  if (key === "s") skipCurrent();
-  if (event.key === "ArrowDown") moveSelection(1);
-  if (event.key === "ArrowUp") moveSelection(-1);
-  if (event.key === "ArrowLeft") scrubByWheel(-40);
-  if (event.key === "ArrowRight") scrubByWheel(40);
+
+  if (state.phase === "clean") {
+    if (key === "t") {
+      event.preventDefault();
+      trimMarkedClip();
+    }
+    if (key === "n") {
+      event.preventDefault();
+      finishCleaningFile();
+    }
+    if (key === "k") {
+      event.preventDefault();
+      keepWholeFile();
+    }
+    if (key === "s") skipCurrent();
+    if (key === " ") {
+      event.preventDefault();
+      if (el.player.paused) el.player.play();
+      else el.player.pause();
+    }
+  }
+
+  if (state.phase === "label") {
+    if (key === "n" || key === "enter") {
+      event.preventDefault();
+      labelCurrentClip();
+    }
+    if (key === "s") skipCurrent();
+  }
 });
 
 loadVolumes()

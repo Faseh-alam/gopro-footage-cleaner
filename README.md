@@ -4,18 +4,59 @@ Trim useful segments from large GoPro egocentric recordings **without losing IMU
 
 Most video editors strip GoPro's metadata track when you trim. This tool uses `ffmpeg` stream copy with explicit GPMF (`gpmd`) mapping so gyro/accelerometer data stays attached to each exported clip.
 
-## Eager Review Station (SD card workflow)
+## Eager Review Station (SD card + camera folders)
 
-For reviewing fresh SD card footage one file at a time:
+Two-phase workflow for Windows and Mac — review in the browser at `http://127.0.0.1:8765/review`.
 
-1. Run `./run.sh` and open [http://127.0.0.1:8765/review](http://127.0.0.1:8765/review)
-2. Point **source** at the SD card — scans all `.MP4` files
-3. Point **output** at your archive/tasks folder
-4. Scroll each video, pick a **task** (searchable list — add new tasks anytime)
-5. If the file is clean: **Keep entire file**. If it has garbage: click **Mark start** / **Mark end** for each useful segment
-6. Click **Next** — clips export to `output/<task-name>/` and you move to the next file
+### Windows — one command
 
-Shortcuts: `I` start · `O` end · `N` next · `S` skip · arrow keys between files
+1. Install [Python 3.10+](https://www.python.org/downloads/) and [ffmpeg](https://ffmpeg.org/download.html) (add both to PATH)
+2. Clone or download this repo
+3. Double-click **`run.bat`** (or run it from Command Prompt)
+
+The script creates a virtual environment, installs dependencies, starts the server, and opens the review page in your browser.
+
+### macOS
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+### Workflow
+
+**Phase 1 — Clean footage**
+
+1. Choose a drive (`E:\`, `D:\Tribes`, etc.) or a camera folder (`C1234`)
+2. Click **Scan raw footage**
+3. Click the video to enter scrub mode (cursor hides)
+4. Move the mouse **left/right** to scrub through the footage
+5. **Click** to mark start, scrub to the end, **click** again to mark end
+6. Press **T** to trim and save the clip (`FILENAME-1.MP4` beside the raw file)
+7. Repeat for more useful segments, then press **N** to remove the raw file and go to the next one
+
+**Phase 2 — Label tasks**
+
+1. Switch to **2 · Label tasks** and scan the same folder (now shows trimmed clips)
+2. Pick a task from the list (or add a new one)
+3. Press **N** — the clip **moves** into `Labeled/<task-name>/` on the same drive
+
+Shortcuts: **Esc** show cursor · **T** trim · **N** next · **K** keep entire file · **S** skip
+
+### Folder layout after labeling
+
+```text
+E:\                          (SD card or C1234 camera folder)
+  GH012330-1.MP4             (during phase 1, beside raw file)
+  GH012330-2.MP4
+  Labeled\
+    task-stitching\
+      GH012330-1.MP4
+    picking\
+      GH012330-2.MP4
+```
+
+Camera serial folders (`C1234`, `C8278`, …) are auto-detected under your archive/tribes drive.
 
 ## Helper sheet (only 2 columns)
 
@@ -59,8 +100,9 @@ Use `7:45` rather than `745` for seven minutes forty-five seconds.
 
 ## Requirements
 
-- macOS (tested workflow) or any OS with Python 3.10+
-- [ffmpeg](https://ffmpeg.org/) installed and available on your `PATH`
+- Windows 10/11 or macOS
+- Python 3.10+
+- [ffmpeg](https://ffmpeg.org/) on your `PATH`
 
 Optional but recommended for best metadata compatibility:
 
@@ -68,26 +110,15 @@ Optional but recommended for best metadata compatibility:
 
 ## Quick start
 
+**Windows:** double-click `run.bat`
+
+**macOS:**
+
 ```bash
-cd "/Users/faz/Documents/Footage cleaning"
+cd "/path/to/Footage cleaning"
 chmod +x run.sh
 ./run.sh
 ```
-
-This creates a virtual environment, installs dependencies, starts the local app, and opens your browser.
-
-Manual start:
-
-```bash
-cd "/Users/faz/Documents/Footage cleaning"
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export PYTHONPATH=.
-python -m gopro_cleaner
-```
-
-Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
 ## Timestamp formats
 

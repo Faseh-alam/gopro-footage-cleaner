@@ -175,6 +175,64 @@
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
+#player-wrap.scrub-active {
+  cursor: none;
+}
+
+body.scrub-cursor-hidden,
+body.scrub-cursor-hidden * {
+  cursor: none !important;
+}
+
+.phase-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.phase-tab {
+  flex: 1;
+  background: #111820;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 0.55rem 0.75rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.phase-tab.active {
+  border-color: var(--accent);
+  background: rgba(62, 166, 255, 0.14);
+}
+
+.camera-row {
+  margin-top: 0.25rem;
+}
+
+.panel-desc {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  margin: 0 0 0.75rem;
+}
+
+.panel-desc code {
+  font-size: 0.8rem;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.clip-list li.pending {
+  border-color: var(--warning);
+}
+
+.clip-list li.saved {
+  border-color: var(--success);
+  opacity: 0.9;
+}
+
 #player-wrap.loading::after {
   content: "Loading footage...";
   position: absolute;
