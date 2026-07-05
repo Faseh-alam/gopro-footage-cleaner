@@ -316,24 +316,42 @@ function renderFilmstrip() {
 
 async function waitForSnapshots(video, token) {
   await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}&start=1`);
+  let uiOpen = false;
   for (let i = 0; i < 3600; i += 1) {
     if (token !== state.snapshotBuildToken) return null;
     const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
-    if (status.status === "running") {
+    const partial = status.manifest;
+    const frameCount = partial?.frames?.length || 0;
+
+    if (partial?.frames?.length) {
+      state.snapshots = partial;
+      renderFilmstrip();
+      if (!uiOpen && (status.status === "ready" || frameCount >= 3)) {
+        uiOpen = true;
+        hideLoading();
+        if (frameCount >= 3 && status.status === "running") {
+          setStatus(`Review started — loading remaining snapshots (${frameCount}/${partial.snapshot_count || "?"})`, "ok");
+        }
+      }
+    }
+
+    if (status.status === "running" && !uiOpen) {
       showLoading(
-        `Building snapshots`,
-        video.name,
-        status.progress || 0,
+        "Building snapshots",
+        `${video.name} — ${frameCount}/${status.plan?.snapshot_count || "?"} frames`,
+        status.progress || Math.min(95, Math.round((frameCount / (status.plan?.snapshot_count || 1)) * 100)),
         status.plan?.garbage_hint || "",
       );
     }
+
     if (status.status === "ready" && status.manifest) {
+      hideLoading();
       return status.manifest;
     }
     if (status.status === "error") {
       throw new Error(status.error || "Snapshot build failed");
     }
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, uiOpen ? 250 : 150));
   }
   throw new Error("Snapshot build timed out");
 }
@@ -358,10 +376,33 @@ async function ensureSnapshots(video, showOverlay = true) {
   const manifest = await waitForSnapshots(video, token);
   if (token !== state.snapshotBuildToken || !manifest) return null;
   state.snapshots = manifest;
-  state.snapshotIndex = 0;
   renderFilmstrip();
   hideLoading();
   return manifest;
+}
+
+function continueSnapshotRefresh(video) {
+  const token = state.snapshotBuildToken;
+  (async () => {
+    for (let i = 0; i < 600; i += 1) {
+      if (token !== state.snapshotBuildToken) return;
+      if (currentVideo()?.path !== video.path) return;
+      const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+      if (status.manifest?.frames?.length) {
+        const prev = state.snapshots?.frames?.length || 0;
+        state.snapshots = status.manifest;
+        if (status.manifest.frames.length !== prev) renderFilmstrip();
+      }
+      if (status.status === "ready") {
+        state.snapshots = status.manifest;
+        renderFilmstrip();
+        updateFilmstripMeta();
+        return;
+      }
+      if (status.status === "error") return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  })();
 }
 
 function goToSnapshotIndex(index) {
@@ -579,6 +620,7 @@ async function loadVideo(index) {
         if (state.snapshots?.frames?.length) {
           goToSnapshotIndex(0);
         }
+        continueSnapshotRefresh(video);
         setStatus(`Ready — use snapshot strip (${video.name})`, "ok");
         updateContextHint();
       } catch (error) {

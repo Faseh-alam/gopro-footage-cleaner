@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import platform
 import subprocess
 import threading
 from pathlib import Path
@@ -18,7 +18,8 @@ GARBAGE_RATIO = 0.10
 GARBAGE_SNAPSHOT_THRESHOLD = 4
 INTERVAL_MIN_SEC = 5.0
 MAX_SNAPSHOTS = 120
-SNAPSHOT_WIDTH = 320
+SNAPSHOT_WIDTH = 240
+MIN_FRAMES_BEFORE_UI = 3
 
 
 def _cache_root() -> Path:
@@ -30,7 +31,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path) -> str:
     stat = source.stat()
     digest = hashlib.sha256(
-        f"v2-10pct:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
+        f"v3-fastseek:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
     return digest.hexdigest()[:20]
 
@@ -107,78 +108,81 @@ def _load_manifest(source: Path) -> dict | None:
         return None
 
 
-def _build_snapshots(source: Path, job_key: str) -> None:
-    source = source.expanduser().resolve()
-    plan = snapshot_plan(source)
-    interval = plan["interval_seconds"]
-    out_dir = _snapshot_dir(source)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _hwaccel_args() -> list[str]:
+    if platform.system() == "Darwin":
+        return ["-hwaccel", "videotoolbox"]
+    if platform.system() == "Windows":
+        return ["-hwaccel", "auto"]
+    return []
 
-    for old in out_dir.glob("frame_*.jpg"):
-        old.unlink()
 
-    pattern = str(out_dir / "frame_%05d.jpg")
+def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
+    """Fast seek + single frame — avoids decoding the entire clip."""
     command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        *_hwaccel_args(),
+        "-ss",
+        f"{timestamp:.3f}",
         "-i",
         str(source),
+        "-frames:v",
+        "1",
+        "-an",
         "-vf",
-        f"fps=1/{interval},scale={SNAPSHOT_WIDTH}:-1",
+        f"scale={SNAPSHOT_WIDTH}:-1",
         "-q:v",
-        "7",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        pattern,
+        "8",
+        str(dest),
     ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffmpeg frame extract failed")
+
+
+def _job_cancelled(job_key: str) -> bool:
     with _lock:
-        if job_key in _jobs:
-            _jobs[job_key]["process"] = process
+        job = _jobs.get(job_key)
+        return not job or job.get("status") != "running"
 
-    expected = max(plan["snapshot_count"], 1)
-    assert process.stdout is not None
-    for line in process.stdout:
-        with _lock:
-            if _jobs.get(job_key, {}).get("status") != "running":
-                process.terminate()
-                break
-        if line.startswith("frame="):
-            try:
-                frame_no = int(line.split("=", 1)[1].strip())
-            except ValueError:
-                continue
-            pct = min(95, int(frame_no / expected * 100))
-            with _lock:
-                if job_key in _jobs and _jobs[job_key].get("status") == "running":
-                    _jobs[job_key]["progress"] = max(_jobs[job_key].get("progress", 0), pct)
 
-    code = process.wait()
-    if code != 0:
-        raise RuntimeError("ffmpeg failed while extracting snapshots")
+def _update_job_progress(job_key: str, plan: dict, frames: list[dict], pct: int) -> None:
+    partial = {**plan, "frames": list(frames), "ready": False, "partial": True}
+    with _lock:
+        if job_key in _jobs and _jobs[job_key].get("status") == "running":
+            _jobs[job_key]["progress"] = pct
+            _jobs[job_key]["manifest"] = partial
 
-    frames = sorted(out_dir.glob("frame_*.jpg"), key=lambda p: p.name)
+
+def _build_snapshots(source: Path, job_key: str) -> None:
+    source = source.expanduser().resolve()
+    plan = snapshot_plan(source)
     times = plan["times"]
-    manifest_frames = []
-    for index, frame_path in enumerate(frames):
-        t = times[index] if index < len(times) else index * interval
-        manifest_frames.append({"index": index, "t": t, "file": frame_path.name})
+    out_dir = _snapshot_dir(source)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = {
-        **plan,
-        "frames": manifest_frames,
-        "ready": True,
-    }
+    for old in out_dir.glob("frame_*.jpg"):
+        old.unlink()
+    if _manifest_path(source).exists():
+        _manifest_path(source).unlink()
+
+    total = max(len(times), 1)
+    frames: list[dict] = []
+
+    for index, timestamp in enumerate(times):
+        if _job_cancelled(job_key):
+            return
+
+        dest = out_dir / f"frame_{index:05d}.jpg"
+        _extract_frame(source, timestamp, dest)
+        frames.append({"index": index, "t": timestamp, "file": dest.name})
+        pct = min(99, int((index + 1) / total * 100))
+        _update_job_progress(job_key, plan, frames, pct)
+
+    manifest = {**plan, "frames": frames, "ready": True, "partial": False}
     _manifest_path(source).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
@@ -200,7 +204,8 @@ def snapshot_status(source: Path, *, start: bool = False) -> dict:
     with _lock:
         job = _jobs.get(key)
         if job and job.get("status") == "running":
-            return {k: v for k, v in job.items() if k != "process"}
+            result = {k: v for k, v in job.items() if k not in {"process"}}
+            return result
         if job and job.get("status") == "error":
             return job
 
@@ -216,6 +221,8 @@ def snapshot_status(source: Path, *, start: bool = False) -> dict:
             _build_snapshots(source, key)
             manifest = _load_manifest(source)
             with _lock:
+                if _jobs.get(key, {}).get("status") != "running":
+                    return
                 _jobs[key] = {
                     "status": "ready",
                     "progress": 100,
@@ -224,7 +231,8 @@ def snapshot_status(source: Path, *, start: bool = False) -> dict:
                 }
         except Exception as exc:  # noqa: BLE001
             with _lock:
-                _jobs[key] = {"status": "error", "error": str(exc), "progress": 0}
+                if _jobs.get(key, {}).get("status") == "running":
+                    _jobs[key] = {"status": "error", "error": str(exc), "progress": 0}
 
     threading.Thread(target=worker, daemon=True, name=f"snapshots-{source.name}").start()
     return {"status": "running", "progress": 0, "plan": plan}
@@ -236,6 +244,7 @@ def cancel_snapshots(source: Path) -> None:
     with _lock:
         job = _jobs.get(key)
         if job:
+            job["status"] = "cancelled"
             proc = job.get("process")
             if proc is not None:
                 try:
@@ -251,9 +260,16 @@ def cancel_snapshots(source: Path) -> None:
 
 def resolve_snapshot_frame(source: Path, index: int) -> Path:
     manifest = _load_manifest(source)
-    if not manifest or not manifest.get("frames"):
+    frames = (manifest or {}).get("frames") or []
+
+    with _lock:
+        job = _jobs.get(str(source.expanduser().resolve()))
+        if job and job.get("manifest"):
+            frames = job["manifest"].get("frames") or frames
+
+    if not frames:
         raise RuntimeError("Snapshots not ready")
-    for frame in manifest["frames"]:
+    for frame in frames:
         if frame["index"] == index:
             path = _snapshot_dir(source) / frame["file"]
             if path.exists():
