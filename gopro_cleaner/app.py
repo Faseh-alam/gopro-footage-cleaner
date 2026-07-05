@@ -18,7 +18,7 @@ from .core.volumes import list_volume_roots
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 
 def create_app() -> Flask:

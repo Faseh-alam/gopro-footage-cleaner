@@ -175,13 +175,57 @@
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
+.step-toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto auto 1fr;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.5rem 0 0.25rem;
+}
+
+.step-btn {
+  font-size: 1.05rem;
+  font-weight: 700;
+  padding: 0.85rem 1rem;
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+  background: #1a2430;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.step-btn:hover {
+  border-color: var(--accent);
+  background: rgba(62, 166, 255, 0.12);
+}
+
+.step-btn:active {
+  transform: scale(0.98);
+}
+
+.mark-btn {
+  padding: 0.7rem 0.85rem;
+  white-space: nowrap;
+}
+
+.step-hint {
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+#player-wrap {
+  cursor: default;
+}
+
 #player-wrap.scrub-active {
-  cursor: none;
+  cursor: default;
 }
 
 body.scrub-cursor-hidden,
 body.scrub-cursor-hidden * {
-  cursor: none !important;
+  cursor: auto !important;
 }
 
 .phase-tabs {

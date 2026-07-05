@@ -29,11 +29,10 @@ chmod +x run.sh
 
 1. Choose a drive (`E:\`, `D:\Tribes`, etc.) or a camera folder (`C1234`)
 2. Click **Scan raw footage**
-3. Click the video to enter scrub mode (cursor hides)
-4. Move the mouse **left/right** to scrub through the footage
-5. **Click** to mark start, scrub to the end, **click** again to mark end
-6. Press **T** to trim and save the clip (`FILENAME-1.MP4` beside the raw file)
-7. Repeat for more useful segments, then press **N** to remove the raw file and go to the next one
+3. Use **◀◀ Back** / **Forward ▶▶** to step through footage (each click jumps farther: 2s → 4s → 8s → …)
+4. Click **Mark start**, step to where work ends, click **Mark end**
+5. Press **T** to trim and save the clip (`FILENAME-1.MP4` beside the raw file)
+6. Repeat for more useful segments, then press **N** to remove the raw file and go to the next one
 
 **Phase 2 — Label tasks**
 
@@ -41,7 +40,7 @@ chmod +x run.sh
 2. Pick a task from the list (or add a new one)
 3. Press **N** — the clip **moves** into `Labeled/<task-name>/` on the same drive
 
-Shortcuts: **Esc** show cursor · **T** trim · **N** next · **K** keep entire file · **S** skip
+Shortcuts: **←** **→** step · **I** mark start · **O** mark end · **T** trim · **N** next · **K** keep entire file · **S** skip
 
 ### Folder layout after labeling
 

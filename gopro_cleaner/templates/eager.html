@@ -66,7 +66,7 @@
           <div id="player-wrap" class="player-wrap" tabindex="0">
             <video id="player" playsinline muted preload="metadata"></video>
             <div class="scrub-overlay">
-              <span id="scrub-hint">Click video to scrub · Click again to mark · T trim · Esc exit</span>
+              <span id="scrub-hint">Use Back / Forward buttons below the video</span>
               <span id="preview-status" class="preview-status"></span>
             </div>
             <div id="scrub-track" class="scrub-track">
@@ -74,9 +74,16 @@
               <div id="scrub-playhead" class="scrub-playhead"></div>
             </div>
           </div>
+          <div class="step-toolbar">
+            <button id="step-back-btn" type="button" class="step-btn" title="Shortcut: Left arrow">◀◀ Back</button>
+            <button id="mark-start-btn" type="button" class="secondary mark-btn" title="Shortcut: I">Mark start</button>
+            <button id="mark-end-btn" type="button" class="secondary mark-btn" title="Shortcut: O">Mark end</button>
+            <button id="step-fwd-btn" type="button" class="step-btn" title="Shortcut: Right arrow">Forward ▶▶</button>
+          </div>
+          <p id="step-hint" class="step-hint">Use Back / Forward — each click jumps farther (2s → 4s → 8s → …)</p>
           <div class="mark-toolbar">
             <button id="undo-clip-btn" type="button" class="secondary">Undo mark</button>
-            <span id="pending-in" class="hint">Click video to start scrubbing</span>
+            <span id="pending-in" class="hint">Load a file, then step through footage</span>
           </div>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
@@ -85,8 +92,7 @@
           <div id="clean-panel">
             <h2>Clean</h2>
             <p class="hint panel-desc">
-              Mark useful ranges with clicks, press <kbd>T</kbd> to trim each clip. Clips save beside the raw file as
-              <code>NAME-1.MP4</code>. Press <kbd>N</kbd> when done to remove the raw file and continue.
+              Mark useful ranges with <strong>Mark start</strong> / <strong>Mark end</strong>, step with Back/Forward buttons, press <kbd>T</kbd> to trim.
             </p>
             <label class="check-row">
               <input id="delete-source" type="checkbox" checked />
@@ -124,7 +130,7 @@
       </main>
 
       <footer class="footer">
-        <span id="footer-hints">Click video · move mouse left/right to scrub · click mark start/end · <kbd>T</kbd> trim · <kbd>N</kbd> next · <kbd>Esc</kbd> show cursor</span>
+        <span id="footer-hints"><kbd>◀</kbd><kbd>▶</kbd> step · faster jumps on repeat clicks · <kbd>I</kbd>/<kbd>O</kbd> mark · <kbd>T</kbd> trim · <kbd>N</kbd> next</span>
         <span id="app-version"></span>
       </footer>
     </div>

@@ -10,14 +10,13 @@ const state = {
   savedClips: [],
   donePaths: new Set(),
   busy: false,
-  scrubMode: false,
   previewToken: 0,
-  lastScrubX: null,
-  scrubRaf: null,
-  lastScrubAt: 0,
   seekTimer: null,
   pendingSeek: null,
   lastVideoPath: "",
+  stepLevel: 0,
+  lastStepAt: 0,
+  lastStepDir: 0,
 };
 
 const el = {
@@ -40,6 +39,11 @@ const el = {
   scrubPlayhead: document.getElementById("scrub-playhead"),
   scrubHint: document.getElementById("scrub-hint"),
   previewStatus: document.getElementById("preview-status"),
+  stepBackBtn: document.getElementById("step-back-btn"),
+  stepFwdBtn: document.getElementById("step-fwd-btn"),
+  markStartBtn: document.getElementById("mark-start-btn"),
+  markEndBtn: document.getElementById("mark-end-btn"),
+  stepHint: document.getElementById("step-hint"),
   currentName: document.getElementById("current-name"),
   currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
@@ -134,7 +138,10 @@ function setPhase(phase) {
   el.labelPanel.classList.toggle("hidden", phase !== "label");
   el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Trimmed clips";
   el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan trimmed clips";
-  exitScrubMode();
+  const showMark = phase === "clean";
+  if (el.markStartBtn) el.markStartBtn.style.display = showMark ? "" : "none";
+  if (el.markEndBtn) el.markEndBtn.style.display = showMark ? "" : "none";
+  resetStepBurst();
   state.videos = [];
   state.index = -1;
   state.donePaths = new Set();
@@ -178,13 +185,39 @@ function renderClips() {
     el.clipList.appendChild(item);
   }
   if (state.pendingIn !== null) {
-    el.pendingIn.textContent = `Start at ${formatTime(state.pendingIn)} — scrub and click to set end`;
+    el.pendingIn.textContent = `Start at ${formatTime(state.pendingIn)} — step to end, then Mark end`;
   } else if (state.pendingClip) {
     el.pendingIn.textContent = "Press T to trim this clip";
-  } else if (state.scrubMode) {
-    el.pendingIn.textContent = "Scrubbing — click to mark start";
   } else {
-    el.pendingIn.textContent = "Click video to start scrubbing";
+    el.pendingIn.textContent = "Mark start, step through footage, Mark end";
+  }
+  updateStepHint();
+}
+
+const STEP_LEVELS_SEC = [2, 4, 8, 15, 30, 60];
+
+function resetStepBurst() {
+  state.stepLevel = 0;
+  state.lastStepAt = 0;
+  state.lastStepDir = 0;
+  updateStepHint();
+}
+
+function updateStepHint() {
+  if (!el.stepHint) return;
+  const next = STEP_LEVELS_SEC[Math.min(state.stepLevel, STEP_LEVELS_SEC.length - 1)];
+  el.stepHint.textContent = `Next jump: ~${next}s — click the same button repeatedly for bigger jumps`;
+}
+
+function flushSeek() {
+  if (state.seekTimer) {
+    clearTimeout(state.seekTimer);
+    state.seekTimer = null;
+  }
+  if (state.pendingSeek !== null) {
+    el.player.pause();
+    el.player.currentTime = state.pendingSeek;
+    state.pendingSeek = null;
   }
 }
 
@@ -234,107 +267,84 @@ function updateScrubUi(overrideTime = null) {
   el.timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
 }
 
-function scheduleSeek(time) {
+function scheduleSeek(time, immediate = false) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
   const clamped = Math.min(duration - 0.04, Math.max(0, time));
   state.pendingSeek = clamped;
   updateScrubUi(clamped);
 
+  if (immediate) {
+    flushSeek();
+    return;
+  }
+
   if (state.seekTimer) return;
   state.seekTimer = setTimeout(() => {
     state.seekTimer = null;
-    if (state.pendingSeek !== null) {
-      el.player.pause();
-      el.player.currentTime = state.pendingSeek;
-      state.pendingSeek = null;
-    }
-  }, 180);
+    flushSeek();
+  }, 120);
 }
 
 function seekToFraction(fraction) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
-  scheduleSeek(fraction * duration);
+  scheduleSeek(fraction * duration, true);
 }
 
-function scrubByPosition(clientX) {
-  const rect = el.playerWrap.getBoundingClientRect();
-  const width = rect.width || 1;
-  const rel = (clientX - rect.left) / width;
-  const center = 0.5;
-  const delta = rel - center;
-  if (Math.abs(delta) < 0.08) return;
+function stepSeconds(direction) {
+  const now = Date.now();
+  if (now - state.lastStepAt > 1500 || direction !== state.lastStepDir) {
+    state.stepLevel = 0;
+  }
+  state.lastStepAt = now;
+  state.lastStepDir = direction;
+  const level = Math.min(state.stepLevel, STEP_LEVELS_SEC.length - 1);
+  const seconds = STEP_LEVELS_SEC[level];
+  state.stepLevel = Math.min(state.stepLevel + 1, STEP_LEVELS_SEC.length - 1);
+  updateStepHint();
+  return seconds;
+}
 
+function stepVideo(direction) {
+  if (!currentVideo()) return;
+  flushSeek();
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
 
   const video = currentVideo();
-  const largeFile = (video?.size_bytes || 0) > 2_000_000_000;
-  const speed = delta * (largeFile ? 2.8 : 2);
-  const step = speed * Math.max(largeFile ? 0.35 : 0.15, duration / (largeFile ? 250 : 800));
-  const base = state.pendingSeek ?? el.player.currentTime;
-  scheduleSeek(base + step);
+  const large = (video?.size_bytes || 0) > 2_000_000_000;
+  let jump = stepSeconds(direction);
+  if (large) jump *= 1.5;
+  jump = Math.min(jump, duration * 0.08);
+
+  scheduleSeek(el.player.currentTime + direction * jump, true);
 }
 
-function scrubLoop(timestamp) {
-  if (!state.scrubMode || state.lastScrubX === null) {
-    state.scrubRaf = null;
+function markStart() {
+  if (!currentVideo()) return;
+  flushSeek();
+  state.pendingIn = el.player.currentTime;
+  state.pendingClip = null;
+  setStatus(`Start marked at ${formatTime(state.pendingIn)}`, "ok");
+  renderClips();
+}
+
+function markEnd() {
+  if (!currentVideo()) return;
+  if (state.pendingIn === null) {
+    setStatus("Mark start first", "error");
     return;
   }
-  if (timestamp - state.lastScrubAt >= 130) {
-    scrubByPosition(state.lastScrubX);
-    state.lastScrubAt = timestamp;
+  flushSeek();
+  const end = el.player.currentTime;
+  if (end <= state.pendingIn + 0.05) {
+    setStatus("End must be after start — step forward first", "error");
+    return;
   }
-  state.scrubRaf = requestAnimationFrame(scrubLoop);
-}
-
-function enterScrubMode() {
-  if (!currentVideo() || state.phase !== "clean") return;
-  state.scrubMode = true;
-  state.lastScrubAt = 0;
-  document.body.classList.add("scrub-cursor-hidden");
-  el.playerWrap.classList.add("scrub-active");
-  el.scrubHint.textContent = "Move mouse left/right · click mark · T trim · Esc exit";
-  renderClips();
-}
-
-function exitScrubMode() {
-  state.scrubMode = false;
-  state.lastScrubX = null;
-  document.body.classList.remove("scrub-cursor-hidden");
-  el.playerWrap.classList.remove("scrub-active");
-  if (state.scrubRaf) {
-    cancelAnimationFrame(state.scrubRaf);
-    state.scrubRaf = null;
-  }
-  renderClips();
-}
-
-function handleScrubClick() {
-  if (!currentVideo() || state.phase !== "clean") return;
-  if (state.seekTimer) {
-    clearTimeout(state.seekTimer);
-    state.seekTimer = null;
-    if (state.pendingSeek !== null) {
-      el.player.currentTime = state.pendingSeek;
-      state.pendingSeek = null;
-    }
-  }
-  const time = el.player.currentTime;
-
-  if (state.pendingIn === null) {
-    state.pendingIn = time;
-    state.pendingClip = null;
-  } else {
-    const end = time;
-    if (end <= state.pendingIn + 0.05) {
-      setStatus("End must be after start", "error");
-      return;
-    }
-    state.pendingClip = { start: state.pendingIn, end };
-    state.pendingIn = null;
-  }
+  state.pendingClip = { start: state.pendingIn, end };
+  state.pendingIn = null;
+  setStatus(`Marked ${formatTime(state.pendingClip.start)} → ${formatTime(end)}`, "ok");
   renderClips();
 }
 
@@ -375,11 +385,11 @@ async function loadVideo(index) {
   state.pendingClip = null;
   state.savedClips = [];
   state.pendingSeek = null;
+  resetStepBurst();
   if (state.seekTimer) {
     clearTimeout(state.seekTimer);
     state.seekTimer = null;
   }
-  exitScrubMode();
 
   const video = state.videos[index];
   const token = ++state.previewToken;
@@ -407,7 +417,7 @@ async function loadVideo(index) {
     if (gb >= 1.5) {
       el.previewStatus.textContent = "Large file — scrubbing original (no background processing)";
     }
-    setStatus(`Ready — click video to scrub (${video.name})`, "ok");
+    setStatus(`Ready — use Back/Forward to step (${video.name})`, "ok");
   };
 
   el.player.addEventListener("loadedmetadata", onReady, { once: true });
@@ -669,7 +679,7 @@ function advanceToNext() {
   if (next < state.videos.length) {
     loadVideo(next);
   } else {
-    exitScrubMode();
+    resetStepBurst();
     setStatus(state.phase === "clean" ? "All files cleaned" : "All clips labeled", "ok");
     renderFileList();
   }
@@ -683,31 +693,10 @@ function skipCurrent() {
   advanceToNext();
 }
 
-el.playerWrap.addEventListener("click", (event) => {
-  if (!currentVideo()) return;
-  if (event.target.closest("#scrub-track")) return;
-
-  if (state.phase === "label") return;
-
-  if (!state.scrubMode) {
-    enterScrubMode();
-    return;
-  }
-
-  handleScrubClick();
-});
-
-el.playerWrap.addEventListener("mousemove", (event) => {
-  if (!state.scrubMode) return;
-  state.lastScrubX = event.clientX;
-  if (!state.scrubRaf) {
-    state.scrubRaf = requestAnimationFrame(scrubLoop);
-  }
-});
-
-el.playerWrap.addEventListener("mouseleave", () => {
-  state.lastScrubX = null;
-});
+el.stepBackBtn.addEventListener("click", () => stepVideo(-1));
+el.stepFwdBtn.addEventListener("click", () => stepVideo(1));
+el.markStartBtn.addEventListener("click", markStart);
+el.markEndBtn.addEventListener("click", markEnd);
 
 el.scrubTrack.addEventListener("mousedown", (event) => {
   if (!currentVideo()) return;
@@ -754,12 +743,26 @@ document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;
   const key = event.key.toLowerCase();
 
-  if (key === "escape") {
-    exitScrubMode();
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    stepVideo(-1);
+    return;
+  }
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    stepVideo(1);
     return;
   }
 
   if (state.phase === "clean") {
+    if (key === "i") {
+      event.preventDefault();
+      markStart();
+    }
+    if (key === "o") {
+      event.preventDefault();
+      markEnd();
+    }
     if (key === "t") {
       event.preventDefault();
       trimMarkedClip();
