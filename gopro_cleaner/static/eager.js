@@ -47,13 +47,16 @@ const el = {
   filmstripPanel: document.getElementById("filmstrip-panel"),
   filmstripMeta: document.getElementById("filmstrip-meta"),
   filmstrip: document.getElementById("filmstrip"),
+  contextBanner: document.getElementById("context-banner"),
+  contextStep: document.getElementById("context-step"),
+  contextMessage: document.getElementById("context-message"),
   snapPrevBtn: document.getElementById("snap-prev-btn"),
   snapNextBtn: document.getElementById("snap-next-btn"),
   fineBackBtn: document.getElementById("fine-back-btn"),
   fineFwdBtn: document.getElementById("fine-fwd-btn"),
   markStartBtn: document.getElementById("mark-start-btn"),
   markEndBtn: document.getElementById("mark-end-btn"),
-  stepHint: document.getElementById("step-hint"),
+  cleanHotkeys: document.getElementById("clean-hotkeys"),
   currentName: document.getElementById("current-name"),
   currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
@@ -149,13 +152,11 @@ function setPhase(phase) {
   el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Trimmed clips";
   el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan trimmed clips";
   const showMark = phase === "clean";
-  if (el.markStartBtn) el.markStartBtn.style.display = showMark ? "" : "none";
-  if (el.markEndBtn) el.markEndBtn.style.display = showMark ? "" : "none";
   if (el.filmstripPanel) el.filmstripPanel.classList.toggle("hidden", !showMark);
-  if (el.snapPrevBtn) el.snapPrevBtn.style.display = showMark ? "" : "none";
-  if (el.snapNextBtn) el.snapNextBtn.style.display = showMark ? "" : "none";
-  if (el.fineBackBtn) el.fineBackBtn.style.display = showMark ? "" : "none";
-  if (el.fineFwdBtn) el.fineFwdBtn.style.display = showMark ? "" : "none";
+  if (el.contextBanner) el.contextBanner.classList.remove("hidden");
+  document.querySelectorAll(".control-section").forEach((node) => {
+    node.classList.toggle("hidden", !showMark);
+  });
   state.snapshots = null;
   state.snapshotIndex = 0;
   state.videos = [];
@@ -164,6 +165,7 @@ function setPhase(phase) {
   renderFileList();
   el.currentName.textContent = "No file loaded";
   el.currentMeta.textContent = "";
+  updateContextHint();
 }
 
 function renderFileList() {
@@ -201,12 +203,62 @@ function renderClips() {
     el.clipList.appendChild(item);
   }
   if (state.pendingIn !== null) {
-    el.pendingIn.textContent = `Start at ${formatTime(state.pendingIn)} — step to end, then Mark end`;
+    el.pendingIn.textContent = `Start locked at ${formatTime(state.pendingIn)} — step forward, then press O or Mark end`;
+    el.pendingIn.className = "pending-status active";
   } else if (state.pendingClip) {
-    el.pendingIn.textContent = "Press T to trim this clip";
+    el.pendingIn.textContent = `Range marked ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T to trim`;
+    el.pendingIn.className = "pending-status warn";
+  } else if (state.savedClips.length) {
+    el.pendingIn.textContent = `${state.savedClips.length} clip(s) saved — mark more or press N for next file`;
+    el.pendingIn.className = "pending-status active";
   } else {
-    el.pendingIn.textContent = "← → snapshots to spot garbage · , . to fine-tune trim point";
+    el.pendingIn.textContent = "At useful footage? Press I or Mark start";
+    el.pendingIn.className = "pending-status";
   }
+  updateContextHint();
+}
+
+function updateContextHint() {
+  if (!el.contextStep || !el.contextMessage) return;
+
+  if (state.phase === "label") {
+    el.contextStep.textContent = "Label";
+    if (!currentVideo()) {
+      el.contextMessage.textContent = "Scan trimmed clips, then pick a task and press N";
+    } else if (!selectedTask()) {
+      el.contextMessage.textContent = "Choose a task for this clip, then press N to move it";
+    } else {
+      el.contextMessage.textContent = `Ready — press N to move to "${selectedTask()}"`;
+    }
+    return;
+  }
+
+  if (!currentVideo()) {
+    el.contextStep.textContent = "Setup";
+    el.contextMessage.textContent = "Choose folder → Scan footage → wait for snapshots";
+    return;
+  }
+
+  if (state.pendingClip) {
+    el.contextStep.textContent = "Step 4";
+    el.contextMessage.textContent = "Press T to trim and save this clip, then find the next useful section";
+    return;
+  }
+
+  if (state.pendingIn !== null) {
+    el.contextStep.textContent = "Step 3";
+    el.contextMessage.textContent = "Use → to find where work ends, fine-tune with , . then press O or Mark end";
+    return;
+  }
+
+  if (state.savedClips.length) {
+    el.contextStep.textContent = "Step 5";
+    el.contextMessage.textContent = "More useful footage in this file? Keep marking. Otherwise press N for next file";
+    return;
+  }
+
+  el.contextStep.textContent = "Step 2";
+  el.contextMessage.textContent = "Scroll filmstrip with ← → — 4+ idle thumbnails in a row means garbage to trim away";
 }
 
 function showLoading(title, detail, pct = 0, hint = "") {
@@ -382,6 +434,7 @@ function renderTasks(preferred = "") {
   } else if (el.taskSelect.options.length) {
     el.taskSelect.selectedIndex = 0;
   }
+  updateContextHint();
 }
 
 function updateScrubUi(overrideTime = null) {
@@ -527,6 +580,7 @@ async function loadVideo(index) {
           goToSnapshotIndex(0);
         }
         setStatus(`Ready — use snapshot strip (${video.name})`, "ok");
+        updateContextHint();
       } catch (error) {
         hideLoading();
         setStatus(error.message, "error");
@@ -584,6 +638,7 @@ async function loadTasks() {
   const data = await api("/api/eager/tasks");
   state.tasks = data.tasks || [];
   renderTasks();
+  updateContextHint();
 }
 
 async function addTask() {
