@@ -14,6 +14,10 @@ const state = {
   previewToken: 0,
   lastScrubX: null,
   scrubRaf: null,
+  lastScrubAt: 0,
+  seekTimer: null,
+  pendingSeek: null,
+  lastVideoPath: "",
 };
 
 const el = {
@@ -221,22 +225,37 @@ function renderTasks(preferred = "") {
   }
 }
 
-function updateScrubUi() {
+function updateScrubUi(overrideTime = null) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
-  const current = el.player.currentTime || 0;
+  const current = overrideTime ?? el.player.currentTime ?? 0;
   const pct = duration > 0 ? (current / duration) * 100 : 0;
   el.scrubFill.style.width = `${pct}%`;
   el.scrubPlayhead.style.left = `${pct}%`;
   el.timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
 }
 
+function scheduleSeek(time) {
+  const duration = el.player.duration || currentVideo()?.duration || 0;
+  if (!duration) return;
+  const clamped = Math.min(duration - 0.04, Math.max(0, time));
+  state.pendingSeek = clamped;
+  updateScrubUi(clamped);
+
+  if (state.seekTimer) return;
+  state.seekTimer = setTimeout(() => {
+    state.seekTimer = null;
+    if (state.pendingSeek !== null) {
+      el.player.pause();
+      el.player.currentTime = state.pendingSeek;
+      state.pendingSeek = null;
+    }
+  }, 180);
+}
+
 function seekToFraction(fraction) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
-  const clamped = Math.min(0.999, Math.max(0, fraction));
-  el.player.pause();
-  el.player.currentTime = clamped * duration;
-  updateScrubUi();
+  scheduleSeek(fraction * duration);
 }
 
 function scrubByPosition(clientX) {
@@ -245,30 +264,35 @@ function scrubByPosition(clientX) {
   const rel = (clientX - rect.left) / width;
   const center = 0.5;
   const delta = rel - center;
-  if (Math.abs(delta) < 0.06) return;
+  if (Math.abs(delta) < 0.08) return;
 
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
 
-  const speed = delta * 2;
-  const step = speed * Math.max(0.15, duration / 800);
-  el.player.pause();
-  el.player.currentTime = Math.min(duration - 0.04, Math.max(0, el.player.currentTime + step));
-  updateScrubUi();
+  const video = currentVideo();
+  const largeFile = (video?.size_bytes || 0) > 2_000_000_000;
+  const speed = delta * (largeFile ? 2.8 : 2);
+  const step = speed * Math.max(largeFile ? 0.35 : 0.15, duration / (largeFile ? 250 : 800));
+  const base = state.pendingSeek ?? el.player.currentTime;
+  scheduleSeek(base + step);
 }
 
-function scrubLoop() {
+function scrubLoop(timestamp) {
   if (!state.scrubMode || state.lastScrubX === null) {
     state.scrubRaf = null;
     return;
   }
-  scrubByPosition(state.lastScrubX);
+  if (timestamp - state.lastScrubAt >= 130) {
+    scrubByPosition(state.lastScrubX);
+    state.lastScrubAt = timestamp;
+  }
   state.scrubRaf = requestAnimationFrame(scrubLoop);
 }
 
 function enterScrubMode() {
   if (!currentVideo() || state.phase !== "clean") return;
   state.scrubMode = true;
+  state.lastScrubAt = 0;
   document.body.classList.add("scrub-cursor-hidden");
   el.playerWrap.classList.add("scrub-active");
   el.scrubHint.textContent = "Move mouse left/right · click mark · T trim · Esc exit";
@@ -289,6 +313,14 @@ function exitScrubMode() {
 
 function handleScrubClick() {
   if (!currentVideo() || state.phase !== "clean") return;
+  if (state.seekTimer) {
+    clearTimeout(state.seekTimer);
+    state.seekTimer = null;
+    if (state.pendingSeek !== null) {
+      el.player.currentTime = state.pendingSeek;
+      state.pendingSeek = null;
+    }
+  }
   const time = el.player.currentTime;
 
   if (state.pendingIn === null) {
@@ -317,54 +349,41 @@ function undoMark() {
   renderClips();
 }
 
-async function upgradePreviewInBackground(video, token) {
+async function cancelPreviewJob(path) {
+  if (!path) return;
   try {
-    await api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}`);
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (token !== state.previewToken) return;
-      const status = await api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}`);
-      if (status.status === "running") {
-        const pct = status.progress || 0;
-        el.previewStatus.textContent =
-          pct > 0 ? `Building preview: ${pct}%` : "Building preview in background...";
-      }
-      if (status.status === "ready") {
-        if (token !== state.previewToken) return;
-        const savedTime = el.player.currentTime || 0;
-        el.player.src = `/api/eager/preview?path=${encodeURIComponent(video.path)}&t=${Date.now()}`;
-        el.player.load();
-        el.player.addEventListener(
-          "loadedmetadata",
-          () => {
-            el.player.currentTime = Math.min(savedTime, el.player.duration || savedTime);
-            updateScrubUi();
-          },
-          { once: true },
-        );
-        el.previewStatus.textContent = "Using preview for smoother scrubbing";
-        return;
-      }
-      if (status.status === "error") {
-        el.previewStatus.textContent = "";
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 400));
-    }
+    await fetch("/api/eager/preview/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
   } catch {
-    el.previewStatus.textContent = "";
+    /* ignore */
   }
 }
 
 async function loadVideo(index) {
   if (index < 0 || index >= state.videos.length) return;
+
+  const previous = currentVideo();
+  if (previous?.path && previous.path !== state.videos[index]?.path) {
+    await cancelPreviewJob(previous.path);
+  }
+
   state.index = index;
   state.pendingIn = null;
   state.pendingClip = null;
   state.savedClips = [];
+  state.pendingSeek = null;
+  if (state.seekTimer) {
+    clearTimeout(state.seekTimer);
+    state.seekTimer = null;
+  }
   exitScrubMode();
 
   const video = state.videos[index];
   const token = ++state.previewToken;
+  state.lastVideoPath = video.path;
 
   el.currentName.textContent = video.name;
   el.currentMeta.textContent = `${video.relative || video.path} · ${video.duration_label || "?"}`;
@@ -384,8 +403,11 @@ async function loadVideo(index) {
     el.player.pause();
     el.player.currentTime = 0;
     updateScrubUi();
-    setStatus(`Ready — ${video.name}`, "ok");
-    upgradePreviewInBackground(video, token);
+    const gb = (video.size_bytes || 0) / 1_000_000_000;
+    if (gb >= 1.5) {
+      el.previewStatus.textContent = "Large file — scrubbing original (no background processing)";
+    }
+    setStatus(`Ready — click video to scrub (${video.name})`, "ok");
   };
 
   el.player.addEventListener("loadedmetadata", onReady, { once: true });

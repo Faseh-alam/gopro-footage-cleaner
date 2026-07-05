@@ -16,7 +16,7 @@ from .core.eager import (
     scan_mp4_files,
     trim_single_clip,
 )
-from .core.preview_proxy import preview_status, resolve_preview
+from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
 from .core.task_store import add_task, load_tasks
 from .core.volumes import list_volume_roots, normalize_path
 
@@ -84,10 +84,22 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         raw_path = request.args.get("path", "").strip()
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
+        start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
         try:
-            return jsonify(preview_status(Path(raw_path)))
+            return jsonify(preview_status(Path(raw_path), start=start))
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
+
+    @eager.post("/api/eager/preview/cancel")
+    def eager_preview_cancel():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            payload = request.get_json(silent=True) or {}
+            raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        cancel_preview(Path(raw_path))
+        return jsonify({"ok": True})
 
     @eager.get("/api/eager/preview")
     def eager_preview():
