@@ -56,6 +56,16 @@
   padding: 0.55rem 0.75rem;
 }
 
+.folder-row input[readonly] {
+  cursor: default;
+  color: var(--text-muted);
+}
+
+#browse-folder-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .eager-main {
   display: grid;
   grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(240px, 300px);
@@ -302,6 +312,17 @@
 #context-message {
   font-size: 0.9rem;
   line-height: 1.4;
+}
+
+.workflow-brief {
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+  margin: 0 0 1rem;
+}
+
+.workflow-brief kbd {
+  font-size: 0.78rem;
 }
 
 .control-section {
@@ -584,13 +605,100 @@ body.scrub-cursor-hidden * {
   display: none !important;
 }
 
+.clip-list li.saved {
+  border-color: var(--success);
+  opacity: 0.9;
+}
+
+.gpmf-badge {
+  display: inline-block;
+  margin-top: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.gpmf-badge.ok {
+  background: rgba(46, 160, 67, 0.15);
+  color: var(--success);
+  border: 1px solid rgba(46, 160, 67, 0.35);
+}
+
+.gpmf-badge.warn {
+  background: rgba(210, 153, 34, 0.12);
+  color: var(--warning);
+  border: 1px solid rgba(210, 153, 34, 0.35);
+}
+
+.trim-progress-panel {
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(88, 166, 255, 0.08);
+  border: 1px solid rgba(88, 166, 255, 0.25);
+}
+
+.trim-progress-head {
+  font-size: 0.82rem;
+  margin-bottom: 0.4rem;
+  color: var(--text-muted);
+}
+
+.trim-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.trim-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+.clip-progress {
+  height: 4px;
+  margin-top: 0.35rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.clip-progress-fill {
+  height: 100%;
+  background: var(--warning);
+  transition: width 0.35s ease;
+}
+
 .clip-list li.pending {
   border-color: var(--warning);
 }
 
-.clip-list li.saved {
-  border-color: var(--success);
-  opacity: 0.9;
+.clip-list li.queued {
+  border-color: var(--accent);
+  opacity: 0.85;
+}
+
+.clip-list li.running {
+  border-color: var(--warning);
+  animation: pulse-trim 1.2s ease-in-out infinite;
+}
+
+.clip-list li.failed {
+  border-color: var(--danger);
+}
+
+@keyframes pulse-trim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.65;
+  }
 }
 
 #player-wrap.loading::after {

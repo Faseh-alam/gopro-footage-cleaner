@@ -4,16 +4,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-if [[ ! -d .venv ]]; then
+VENV_PY="${ROOT}/.venv/bin/python"
+PORT="${GOPRO_CLEANER_PORT:-8765}"
+URL="http://127.0.0.1:${PORT}"
+
+if [[ ! -x "${VENV_PY}" ]]; then
+  echo "Creating virtual environment..."
   python3 -m venv .venv
 fi
 
-source .venv/bin/activate
-pip install -q -r requirements.txt
+echo "Installing dependencies..."
+"${VENV_PY}" -m pip install -q --upgrade pip
+"${VENV_PY}" -m pip install -q -r requirements.txt
 
-export PYTHONPATH="$ROOT"
-PORT="${GOPRO_CLEANER_PORT:-8765}"
-URL="http://127.0.0.1:${PORT}"
+export PYTHONPATH="${ROOT}"
 
 stop_existing() {
   local pids
@@ -27,7 +31,8 @@ stop_existing() {
 
 stop_existing
 
-python -m gopro_cleaner &
+echo "Starting GoPro Footage Cleaner on port ${PORT}..."
+"${VENV_PY}" -m gopro_cleaner &
 APP_PID=$!
 
 cleanup() {
@@ -35,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for _ in {1..20}; do
+for _ in {1..30}; do
   if ! kill -0 "${APP_PID}" 2>/dev/null; then
     echo "Failed to start GoPro Footage Cleaner."
     exit 1
@@ -52,7 +57,9 @@ if ! curl -fsS "${URL}/api/health" >/dev/null 2>&1; then
 fi
 
 open "${URL}/review" 2>/dev/null || true
-echo "GoPro Footage Cleaner is running at ${URL}"
+echo ""
+echo "GoPro Footage Cleaner is running at ${URL}/review"
 echo "Press Ctrl+C to stop."
+echo ""
 
 wait "${APP_PID}"

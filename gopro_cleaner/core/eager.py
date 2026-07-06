@@ -8,14 +8,41 @@ import uuid
 from pathlib import Path
 
 from .probe import probe_media
-from .task_store import task_folder_name
+from .task_store import load_tasks, task_folder_name
 from .timestamps import format_timestamp
-from .trimmer import TrimJob, _execute_trim, build_output_path, job_store, move_to_trash
+from .trimmer import TrimJob, _execute_trim, build_output_path, clip_base_stem, job_store, move_to_trash
 
-LABELED_FOLDER = "Labeled"
+LABELED_FOLDER = "Labeled"  # legacy folder name — no longer created for new labels
 TRIMMED_SUFFIX_RE = re.compile(r"-\d+$", re.IGNORECASE)
 CAMERA_FOLDER_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
 SKIP_DIR_NAMES = {LABELED_FOLDER.lower(), "labeled", "tasks", ".trash"}
+
+
+def task_directory(label_root: Path, task_name: str) -> Path:
+    """Task folder directly beside the footage (no Labeled/ wrapper)."""
+    return label_root.expanduser().resolve() / task_folder_name(task_name)
+
+
+def is_under_task_folder(path: Path, root: Path) -> bool:
+    root = root.expanduser().resolve()
+    try:
+        rel = path.parent.relative_to(root)
+    except ValueError:
+        return False
+    if not rel.parts:
+        return False
+    task_slugs = {task_folder_name(task) for task in load_tasks()}
+    first = rel.parts[0]
+    if CAMERA_FOLDER_RE.match(first):
+        return len(rel.parts) > 1 and rel.parts[1] in task_slugs
+    return first in task_slugs
+
+
+def _footage_blocked(path: Path, root: Path | None = None) -> bool:
+    for part in path.parts:
+        if part.lower() in SKIP_DIR_NAMES:
+            return True
+    return bool(root and is_under_task_folder(path, root))
 
 
 def _probe_duration(path: Path) -> float | None:
@@ -29,15 +56,19 @@ def is_trimmed_clip(path: Path) -> bool:
     return path.suffix.upper() == ".MP4" and bool(TRIMMED_SUFFIX_RE.search(path.stem))
 
 
-def is_raw_footage(path: Path) -> bool:
+def is_labelable_footage(path: Path, *, root: Path | None = None) -> bool:
+    """Trimmed clips and whole files in the scan folder (not already in a task folder)."""
+    if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
+        return False
+    return not _footage_blocked(path, root)
+
+
+def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
     if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
         return False
     if is_trimmed_clip(path):
         return False
-    for part in path.parts:
-        if part.lower() in SKIP_DIR_NAMES:
-            return False
-    return True
+    return not _footage_blocked(path, root)
 
 
 def _video_dict(path: Path, root: Path) -> dict:
@@ -87,7 +118,7 @@ def scan_mp4_files(
     recursive: bool = True,
     mode: str = "all",
 ) -> list[dict]:
-    """mode: all | raw | clips"""
+    """mode: all | raw | clips | label"""
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
@@ -97,9 +128,11 @@ def scan_mp4_files(
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            if mode == "raw" and is_raw_footage(path):
+            if mode == "raw" and is_raw_footage(path, root=root):
                 candidates.append(path)
             elif mode == "clips" and is_trimmed_clip(path):
+                candidates.append(path)
+            elif mode == "label" and is_labelable_footage(path, root=root):
                 candidates.append(path)
             elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
                 candidates.append(path)
@@ -107,9 +140,11 @@ def scan_mp4_files(
         for path in root.iterdir():
             if not path.is_file():
                 continue
-            if mode == "raw" and is_raw_footage(path):
+            if mode == "raw" and is_raw_footage(path, root=root):
                 candidates.append(path)
             elif mode == "clips" and is_trimmed_clip(path):
+                candidates.append(path)
+            elif mode == "label" and is_labelable_footage(path, root=root):
                 candidates.append(path)
             elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
                 candidates.append(path)
@@ -120,12 +155,12 @@ def scan_mp4_files(
 
 def _next_clip_number(source: Path) -> int:
     parent = source.parent
-    stem = source.stem
+    base = clip_base_stem(source)
     existing = 0
     for path in parent.iterdir():
         if not path.is_file() or path.suffix.upper() != ".MP4":
             continue
-        if path.stem.startswith(f"{stem}-") and path.stem[len(stem) + 1 :].isdigit():
+        if path.stem.startswith(f"{base}-") and path.stem[len(base) + 1 :].isdigit():
             existing = max(existing, int(path.stem.rsplit("-", 1)[-1]))
     return existing + 1
 
@@ -165,11 +200,19 @@ def trim_single_clip(source: Path, start_seconds: float, end_seconds: float) -> 
     }
 
 
-def finish_cleaning_file(source: Path, *, delete_source: bool = True) -> dict:
-    """Remove the raw file after all useful clips have been trimmed."""
+def _finish_source_after_trims(source: Path, *, delete_source: bool = True) -> dict:
+    """Remove the raw file once all trims for this source are done."""
+    from .eager_trim_queue import eager_trim_queue
+
     source = source.expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"Source not found: {source}")
+
+    failed = [j for j in eager_trim_queue.jobs_for_source(source) if j.status == "failed"]
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} trim job(s) failed — fix errors before removing the raw file"
+        )
 
     deleted = False
     if delete_source and is_raw_footage(source):
@@ -179,16 +222,28 @@ def finish_cleaning_file(source: Path, *, delete_source: bool = True) -> dict:
     return {"deleted_source": deleted, "source": str(source)}
 
 
+def finish_cleaning_file(source: Path, *, delete_source: bool = True) -> dict:
+    """Block until trims finish, then remove the raw file."""
+    from .eager_trim_queue import eager_trim_queue
+
+    source = source.expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    eager_trim_queue.wait_for_source(source)
+    return _finish_source_after_trims(source, delete_source=delete_source)
+
+
 def assign_clip_to_task(clip_path: Path, label_root: Path, task_name: str) -> dict:
-    """Move a trimmed clip into Labeled/<task>/ under label_root."""
+    """Move footage into <task>/ directly under the footage folder."""
     clip_path = clip_path.expanduser().resolve()
     label_root = label_root.expanduser().resolve()
     if not clip_path.exists():
         raise FileNotFoundError(f"Clip not found: {clip_path}")
-    if not is_trimmed_clip(clip_path):
-        raise ValueError("Only trimmed clips (filename-N.MP4) can be labeled")
+    if not is_labelable_footage(clip_path, root=label_root):
+        raise ValueError("This file cannot be labeled (already in a task folder or not an MP4)")
 
-    task_dir = label_root / LABELED_FOLDER / task_folder_name(task_name)
+    task_dir = task_directory(label_root, task_name)
     task_dir.mkdir(parents=True, exist_ok=True)
     dest = task_dir / clip_path.name
     if dest.exists():

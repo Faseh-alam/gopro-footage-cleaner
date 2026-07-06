@@ -21,7 +21,7 @@
         <div>
           <p class="eyebrow"><a href="/">← Bulk trimmer</a></p>
           <h1>Eager Review Station</h1>
-          <p class="hint">Phase 1: clean raw footage · Phase 2: label trimmed clips into task folders</p>
+          <p class="hint">Phase 1: clean footage · Phase 2: label all footage into task folders</p>
         </div>
         <div class="eager-setup">
           <div class="phase-tabs">
@@ -29,10 +29,10 @@
             <button type="button" id="phase-label" class="phase-tab">2 · Label tasks</button>
           </div>
           <label>
-            Drive / archive folder
-            <div class="row">
-              <select id="source-volume"></select>
-              <input id="source-path" type="text" placeholder="E:\ or D:\Tribes" />
+            Footage folder
+            <div class="row folder-row">
+              <input id="source-path" type="text" readonly placeholder="Choose a folder…" />
+              <button id="browse-folder-btn" type="button" class="primary">Choose folder…</button>
             </div>
           </label>
           <label id="camera-row" class="camera-row">
@@ -66,6 +66,7 @@
             <div>
               <h2 id="current-name">No file loaded</h2>
               <p id="current-meta" class="hint"></p>
+              <span id="gpmf-status" class="gpmf-badge hidden"></span>
             </div>
             <div class="player-time">
               <span id="time-display">00:00:00 / 00:00:00</span>
@@ -74,7 +75,6 @@
           <div id="player-wrap" class="player-wrap" tabindex="0">
             <video id="player" playsinline muted preload="metadata"></video>
             <div class="scrub-overlay">
-              <span id="scrub-hint">Use Back / Forward buttons below the video</span>
               <span id="preview-status" class="preview-status"></span>
             </div>
             <div id="scrub-track" class="scrub-track">
@@ -84,33 +84,37 @@
           </div>
           <div id="filmstrip-panel" class="filmstrip-panel">
             <div class="filmstrip-head">
-              <span class="filmstrip-label">① Scan for garbage</span>
-              <span id="filmstrip-meta" class="hint">Snapshots · 4+ idle frames in a row ≈ trim this section</span>
+              <span class="filmstrip-label">Filmstrip</span>
+              <span id="filmstrip-meta" class="hint"></span>
             </div>
             <div id="filmstrip" class="filmstrip" tabindex="0"></div>
           </div>
           <div id="context-banner" class="context-banner">
-            <span id="context-step" class="context-step">Step 1</span>
-            <span id="context-message">Scan footage, then use ← → on the filmstrip above</span>
+            <span id="context-message">Scan footage to begin</span>
           </div>
           <div class="control-section">
-            <p class="control-label">② Navigate</p>
             <div class="step-toolbar">
-              <button id="snap-prev-btn" type="button" class="step-btn" title="Previous snapshot (←)">◀ Snapshot <kbd>←</kbd></button>
+              <button id="snap-prev-btn" type="button" class="step-btn" title="Previous snapshot (←)">◀ <kbd>←</kbd></button>
               <button id="fine-back-btn" type="button" class="secondary mark-btn" title="Fine -3s">−3s</button>
               <button id="fine-fwd-btn" type="button" class="secondary mark-btn" title="Fine +3s">+3s</button>
-              <button id="snap-next-btn" type="button" class="step-btn" title="Next snapshot (→)">Snapshot ▶ <kbd>→</kbd></button>
+              <button id="snap-next-btn" type="button" class="step-btn" title="Next snapshot (→)"><kbd>→</kbd> ▶</button>
             </div>
-            <p class="control-hint">Jump between snapshots with <kbd>←</kbd> <kbd>→</kbd> or click a thumbnail. Use <kbd>,</kbd> <kbd>.</kbd> for ±1s at trim points.</p>
           </div>
-          <div class="control-section">
-            <p class="control-label">③ Mark useful range</p>
+          <div id="mark-section" class="control-section">
             <div class="mark-row">
-              <button id="mark-start-btn" type="button" class="secondary mark-btn" title="Shortcut: I">Mark start <kbd>I</kbd></button>
-              <button id="mark-end-btn" type="button" class="secondary mark-btn" title="Shortcut: O">Mark end <kbd>O</kbd></button>
+              <button id="mark-start-btn" type="button" class="secondary mark-btn" title="Shortcut: I">Start <kbd>I</kbd></button>
+              <button id="mark-end-btn" type="button" class="secondary mark-btn" title="Shortcut: O">End <kbd>O</kbd></button>
               <button id="undo-clip-btn" type="button" class="secondary">Undo</button>
             </div>
             <p id="pending-in" class="pending-status">Load a file to begin</p>
+          </div>
+          <div id="trim-progress-panel" class="trim-progress-panel hidden">
+            <div class="trim-progress-head">
+              <span>Background trims</span>
+              <span id="trim-active-count">0</span> active ·
+              <span id="trim-eta-total">~0s</span> left
+            </div>
+            <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
           </div>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
@@ -118,77 +122,19 @@
         <aside class="eager-side panel">
           <div id="clean-panel">
             <h2>Clean footage</h2>
-
-            <details class="guide-panel" open>
-              <summary>How to use (click to collapse)</summary>
-              <ol class="workflow-steps">
-                <li><strong>Scan</strong> your folder — wait for snapshots to build.</li>
-                <li><strong>Filmstrip:</strong> use <kbd>←</kbd> <kbd>→</kbd> to jump. If <em>4+ thumbnails in a row</em> show no work, that block is garbage.</li>
-                <li><strong>Mark start</strong> <kbd>I</kbd> at the first useful frame. Fine-tune with <kbd>,</kbd> <kbd>.</kbd> or ±3s.</li>
-                <li><strong>Mark end</strong> <kbd>O</kbd> at the last useful frame.</li>
-                <li><strong>Trim</strong> <kbd>T</kbd> — saves <code>NAME-1.MP4</code> beside the raw file. Repeat for more clips.</li>
-                <li><strong>Next file</strong> <kbd>N</kbd> — removes the raw file (if clips were saved) and continues.</li>
-              </ol>
-            </details>
-
-            <div class="hotkey-guide" id="clean-hotkeys">
-              <h3>Shortcuts</h3>
-              <div class="hotkey-grid">
-                <div class="hotkey-group">
-                  <span class="hotkey-group-title">Navigate snapshots</span>
-                  <div class="hotkey-row"><kbd>←</kbd> <kbd>→</kbd> <span>Previous / next snapshot</span></div>
-                  <div class="hotkey-row"><kbd>,</kbd> <kbd>.</kbd> <span>Fine-tune ±1 second (at trim point)</span></div>
-                </div>
-                <div class="hotkey-group">
-                  <span class="hotkey-group-title">Mark &amp; trim</span>
-                  <div class="hotkey-row"><kbd>I</kbd> <span>Mark clip start</span></div>
-                  <div class="hotkey-row"><kbd>O</kbd> <span>Mark clip end</span></div>
-                  <div class="hotkey-row"><kbd>T</kbd> <span>Trim &amp; save marked clip</span></div>
-                </div>
-                <div class="hotkey-group">
-                  <span class="hotkey-group-title">File actions</span>
-                  <div class="hotkey-row"><kbd>N</kbd> <span>Finish file &amp; go to next</span></div>
-                  <div class="hotkey-row"><kbd>K</kbd> <span>Keep entire file as one clip</span></div>
-                  <div class="hotkey-row"><kbd>S</kbd> <span>Skip file (no changes)</span></div>
-                </div>
-              </div>
-            </div>
-
-            <label class="check-row">
-              <input id="delete-source" type="checkbox" checked />
-              Remove raw file after cleaning
-            </label>
+            <p class="workflow-brief">
+              <strong>Garbage in clip:</strong> mark each useful part (<kbd>I</kbd> → <kbd>O</kbd> → <kbd>T</kbd>), then <kbd>N</kbd>. Trims run in the background; raw file is removed when done.<br />
+              <strong>No garbage:</strong> press <kbd>N</kbd> — raw file is left untouched.
+            </p>
             <div class="action-stack">
-              <button id="trim-btn" type="button" class="primary">Trim marked clip <kbd>T</kbd></button>
-              <button id="next-clean-btn" type="button" class="secondary">Next file <kbd>N</kbd></button>
-              <button id="keep-whole-btn" type="button" class="secondary">Keep entire file <kbd>K</kbd></button>
-              <button id="skip-btn" type="button" class="secondary">Skip <kbd>S</kbd></button>
+              <button id="trim-btn" type="button" class="secondary">Trim <kbd>T</kbd></button>
+              <button id="next-clean-btn" type="button" class="primary">Next file <kbd>N</kbd></button>
             </div>
           </div>
 
           <div id="label-panel" class="hidden">
             <h2>Label tasks</h2>
-
-            <details class="guide-panel" open>
-              <summary>How to use (click to collapse)</summary>
-              <ol class="workflow-steps">
-                <li>Switch here after cleaning. <strong>Scan trimmed clips</strong> on the same folder.</li>
-                <li>Watch each <code>NAME-1.MP4</code> clip quickly.</li>
-                <li>Pick a <strong>task</strong> from the list (or add a new one).</li>
-                <li>Press <kbd>N</kbd> — clip <strong>moves</strong> to <code>Labeled/&lt;task&gt;/</code>.</li>
-              </ol>
-            </details>
-
-            <div class="hotkey-guide">
-              <h3>Shortcuts</h3>
-              <div class="hotkey-grid">
-                <div class="hotkey-group">
-                  <span class="hotkey-group-title">Labeling</span>
-                  <div class="hotkey-row"><kbd>N</kbd> <span>Move to task &amp; next clip</span></div>
-                  <div class="hotkey-row"><kbd>S</kbd> <span>Skip clip</span></div>
-                </div>
-              </div>
-            </div>
+            <p class="workflow-brief">Scan the same folder. A short opening preview loads automatically — then use <kbd>,</kbd> <kbd>.</kbd> and <kbd>±3s</kbd> to scrub. Press <kbd>N</kbd> to move the file into <code>&lt;task-name&gt;/</code>.</p>
 
             <input id="task-search" type="search" placeholder="Search tasks..." />
             <div id="task-list" class="task-list"></div>
@@ -199,8 +145,7 @@
             </div>
             <p id="task-added-msg" class="task-added"></p>
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Move to task &amp; next <kbd>N</kbd></button>
-              <button id="skip-label-btn" type="button" class="secondary">Skip clip <kbd>S</kbd></button>
+              <button id="label-btn" type="button" class="primary">Move to task <kbd>N</kbd></button>
             </div>
           </div>
 
@@ -209,7 +154,7 @@
       </main>
 
       <footer class="footer">
-        <span id="footer-hints">Focus the page (click outside inputs) so keyboard shortcuts work</span>
+        <span id="footer-hints"><kbd>I</kbd> <kbd>O</kbd> <kbd>T</kbd> <kbd>N</kbd> · <kbd>←</kbd> <kbd>→</kbd> <kbd>,</kbd> <kbd>.</kbd></span>
         <span id="app-version"></span>
       </footer>
     </div>

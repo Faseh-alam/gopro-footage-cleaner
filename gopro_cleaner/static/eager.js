@@ -8,6 +8,9 @@ const state = {
   pendingIn: null,
   pendingClip: null,
   savedClips: [],
+  trimPollTimer: null,
+  trimEtaTotal: 0,
+  currentHasGpmf: null,
   donePaths: new Set(),
   busy: false,
   previewToken: 0,
@@ -17,13 +20,15 @@ const state = {
   snapshots: null,
   snapshotIndex: 0,
   snapshotBuildToken: 0,
+  scrubTime: 0,
+  snapshotPurpose: "clean",
 };
 
 const el = {
   phaseClean: document.getElementById("phase-clean"),
   phaseLabel: document.getElementById("phase-label"),
-  sourceVolume: document.getElementById("source-volume"),
   sourcePath: document.getElementById("source-path"),
+  browseFolderBtn: document.getElementById("browse-folder-btn"),
   cameraSelect: document.getElementById("camera-select"),
   refreshCamerasBtn: document.getElementById("refresh-cameras-btn"),
   scanBtn: document.getElementById("scan-btn"),
@@ -37,7 +42,6 @@ const el = {
   scrubTrack: document.getElementById("scrub-track"),
   scrubFill: document.getElementById("scrub-fill"),
   scrubPlayhead: document.getElementById("scrub-playhead"),
-  scrubHint: document.getElementById("scrub-hint"),
   previewStatus: document.getElementById("preview-status"),
   loadingOverlay: document.getElementById("loading-overlay"),
   loadingTitle: document.getElementById("loading-title"),
@@ -48,7 +52,6 @@ const el = {
   filmstripMeta: document.getElementById("filmstrip-meta"),
   filmstrip: document.getElementById("filmstrip"),
   contextBanner: document.getElementById("context-banner"),
-  contextStep: document.getElementById("context-step"),
   contextMessage: document.getElementById("context-message"),
   snapPrevBtn: document.getElementById("snap-prev-btn"),
   snapNextBtn: document.getElementById("snap-next-btn"),
@@ -56,20 +59,22 @@ const el = {
   fineFwdBtn: document.getElementById("fine-fwd-btn"),
   markStartBtn: document.getElementById("mark-start-btn"),
   markEndBtn: document.getElementById("mark-end-btn"),
-  cleanHotkeys: document.getElementById("clean-hotkeys"),
+  markSection: document.getElementById("mark-section"),
   currentName: document.getElementById("current-name"),
   currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
   undoClipBtn: document.getElementById("undo-clip-btn"),
   pendingIn: document.getElementById("pending-in"),
+  gpmfStatus: document.getElementById("gpmf-status"),
+  trimProgressPanel: document.getElementById("trim-progress-panel"),
+  trimActiveCount: document.getElementById("trim-active-count"),
+  trimEtaTotal: document.getElementById("trim-eta-total"),
+  trimProgressFill: document.getElementById("trim-progress-fill"),
   clipList: document.getElementById("clip-list"),
   cleanPanel: document.getElementById("clean-panel"),
   labelPanel: document.getElementById("label-panel"),
-  deleteSource: document.getElementById("delete-source"),
   trimBtn: document.getElementById("trim-btn"),
   nextCleanBtn: document.getElementById("next-clean-btn"),
-  keepWholeBtn: document.getElementById("keep-whole-btn"),
-  skipBtn: document.getElementById("skip-btn"),
   taskSearch: document.getElementById("task-search"),
   taskList: document.getElementById("task-list"),
   taskSelect: document.getElementById("task-select"),
@@ -77,7 +82,6 @@ const el = {
   addTaskBtn: document.getElementById("add-task-btn"),
   taskAddedMsg: document.getElementById("task-added-msg"),
   labelBtn: document.getElementById("label-btn"),
-  skipLabelBtn: document.getElementById("skip-label-btn"),
   statusLine: document.getElementById("status-line"),
   footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
@@ -116,6 +120,17 @@ function formatBytes(bytes) {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
+function formatDurationShort(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
+  const whole = Math.ceil(seconds);
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60);
+  const s = whole % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function setStatus(message, kind = "") {
   el.statusLine.textContent = message || "";
   el.statusLine.className = `status-line ${kind}`.trim();
@@ -143,20 +158,27 @@ function selectedTask() {
   return el.newTaskInput.value.trim();
 }
 
+function snapshotQuery(video) {
+  const purpose = state.snapshotPurpose || "clean";
+  return `path=${encodeURIComponent(video.path)}&purpose=${purpose}`;
+}
+
+function scrubStepSeconds() {
+  return state.phase === "label" ? 3 : 1;
+}
+
 function setPhase(phase) {
   state.phase = phase;
+  state.snapshotPurpose = phase === "clean" ? "clean" : "label";
   el.phaseClean.classList.toggle("active", phase === "clean");
   el.phaseLabel.classList.toggle("active", phase === "label");
   el.cleanPanel.classList.toggle("hidden", phase !== "clean");
   el.labelPanel.classList.toggle("hidden", phase !== "label");
-  el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Trimmed clips";
-  el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan trimmed clips";
-  const showMark = phase === "clean";
-  if (el.filmstripPanel) el.filmstripPanel.classList.toggle("hidden", !showMark);
-  if (el.contextBanner) el.contextBanner.classList.remove("hidden");
-  document.querySelectorAll(".control-section").forEach((node) => {
-    node.classList.toggle("hidden", !showMark);
-  });
+  el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Footage to label";
+  el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan footage";
+  if (el.markSection) el.markSection.classList.toggle("hidden", phase !== "clean");
+  if (el.clipList) el.clipList.classList.toggle("hidden", phase !== "clean");
+  if (el.trimProgressPanel && phase !== "clean") el.trimProgressPanel.classList.add("hidden");
   state.snapshots = null;
   state.snapshotIndex = 0;
   state.videos = [];
@@ -179,7 +201,9 @@ function renderFileList() {
     btn.className = "file-item";
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
     if (state.donePaths.has(video.path)) btn.classList.add("done");
-    btn.innerHTML = `<span class="name">${video.name}</span><span class="meta">${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
+    const typeHint =
+      state.phase === "label" ? `${video.is_trimmed ? "clip" : "whole"} · ` : "";
+    btn.innerHTML = `<span class="name">${video.name}</span><span class="meta">${typeHint}${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
     btn.addEventListener("click", () => {
       const idx = state.videos.findIndex((item) => item.path === video.path);
       if (idx >= 0) loadVideo(idx);
@@ -190,26 +214,64 @@ function renderFileList() {
 
 function renderClips() {
   el.clipList.innerHTML = "";
-  for (const clip of state.savedClips) {
+  for (const job of state.savedClips) {
     const item = document.createElement("li");
-    item.className = "saved";
-    item.textContent = `Saved: ${clip.name || clip.output || "clip"}`;
+    let cls = "saved";
+    let label = "";
+    const range = `${formatTime(job.start)} → ${formatTime(job.end)}`;
+    if (job.status === "queued") {
+      cls = "queued";
+      label = `Queued: ${range}`;
+    } else if (job.status === "running") {
+      cls = "running";
+      const pct = Number.isFinite(job.progress) ? ` · ${Math.round(job.progress)}%` : "";
+      const left =
+        job.remaining_seconds > 0 ? ` · ~${formatDurationShort(job.remaining_seconds)} left` : "";
+      label = `Trimming: ${range}${pct}${left}`;
+    } else if (job.status === "failed") {
+      cls = "failed";
+      label = `Failed: ${job.error || "trim error"}`;
+    } else {
+      const imu =
+        job.output_has_gpmf === true
+          ? " · IMU ✓"
+          : job.source_has_gpmf === true && job.output_has_gpmf === false
+            ? " · IMU missing"
+            : "";
+      label = `Saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}${imu}`;
+    }
+    item.className = cls;
+    if (job.status === "running" && job.progress > 0) {
+      const bar = document.createElement("div");
+      bar.className = "clip-progress";
+      bar.innerHTML = `<div class="clip-progress-fill" style="width:${Math.min(100, job.progress)}%"></div>`;
+      item.appendChild(document.createTextNode(label));
+      item.appendChild(bar);
+    } else {
+      item.textContent = label;
+    }
     el.clipList.appendChild(item);
   }
   if (state.pendingClip) {
     const item = document.createElement("li");
     item.className = "pending";
-    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T`;
+    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T to queue`;
     el.clipList.appendChild(item);
   }
+  const activeTrims = state.savedClips.filter((j) => j.status === "queued" || j.status === "running").length;
   if (state.pendingIn !== null) {
-    el.pendingIn.textContent = `Start locked at ${formatTime(state.pendingIn)} — step forward, then press O or Mark end`;
+    el.pendingIn.textContent = `Start locked at ${formatTime(state.pendingIn)} — step forward, then Mark end`;
     el.pendingIn.className = "pending-status active";
   } else if (state.pendingClip) {
-    el.pendingIn.textContent = `Range marked ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T to trim`;
+    el.pendingIn.textContent = "Press T to queue trim — you can mark the next clip immediately after";
     el.pendingIn.className = "pending-status warn";
-  } else if (state.savedClips.length) {
-    el.pendingIn.textContent = `${state.savedClips.length} clip(s) saved — mark more or press N for next file`;
+  } else if (activeTrims > 0) {
+    const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
+    el.pendingIn.textContent = `${activeTrims} trim(s) in background${eta} — keep marking or press N when done`;
+    el.pendingIn.className = "pending-status active";
+  } else if (state.savedClips.some((j) => j.status === "completed" || j.output)) {
+    const done = state.savedClips.filter((j) => j.status === "completed" || j.output).length;
+    el.pendingIn.textContent = `${done} clip(s) saved — mark more or press N for next file`;
     el.pendingIn.className = "pending-status active";
   } else {
     el.pendingIn.textContent = "At useful footage? Press I or Mark start";
@@ -218,47 +280,155 @@ function renderClips() {
   updateContextHint();
 }
 
+function updateTrimEtaPanel(data) {
+  state.trimEtaTotal = data?.eta_total_seconds || 0;
+  const active = activeTrimCount();
+  if (!el.trimProgressPanel) return;
+
+  if (active === 0) {
+    el.trimProgressPanel.classList.add("hidden");
+    if (el.trimProgressFill) el.trimProgressFill.style.width = "0%";
+    return;
+  }
+
+  el.trimProgressPanel.classList.remove("hidden");
+  if (el.trimActiveCount) el.trimActiveCount.textContent = String(active);
+  if (el.trimEtaTotal) {
+    el.trimEtaTotal.textContent = `~${formatDurationShort(state.trimEtaTotal)}`;
+  }
+
+  const jobs = state.savedClips.filter((j) => j.status === "queued" || j.status === "running");
+  const totalDuration = jobs.reduce((sum, j) => sum + (j.duration_seconds || j.end - j.start || 0), 0);
+  const doneDuration = jobs.reduce((sum, j) => {
+    const dur = j.duration_seconds || j.end - j.start || 0;
+    if (j.status === "running") return sum + dur * (j.progress || 0) / 100;
+    return sum;
+  }, 0);
+  const overallPct = totalDuration > 0 ? (doneDuration / totalDuration) * 100 : 0;
+  if (el.trimProgressFill) {
+    el.trimProgressFill.style.width = `${Math.min(100, overallPct)}%`;
+  }
+}
+
+function syncTrimJobsFromServer(jobs) {
+  const byId = new Map(state.savedClips.map((j) => [j.job_id, j]));
+  for (const job of jobs || []) {
+    const existing = byId.get(job.job_id);
+    if (existing) {
+      Object.assign(existing, job);
+      if (job.output) existing.name = job.output.split(/[/\\]/).pop();
+      existing.start = job.start_seconds;
+      existing.end = job.end_seconds;
+    } else {
+      state.savedClips.push({
+        job_id: job.job_id,
+        status: job.status,
+        start: job.start_seconds,
+        end: job.end_seconds,
+        duration_seconds: job.duration_seconds,
+        progress: job.progress,
+        remaining_seconds: job.remaining_seconds,
+        output: job.output,
+        name: job.output ? job.output.split(/[/\\]/).pop() : null,
+        error: job.error,
+        source_has_gpmf: job.source_has_gpmf,
+        output_has_gpmf: job.output_has_gpmf,
+      });
+    }
+  }
+  state.savedClips.sort((a, b) => (a.start || 0) - (b.start || 0));
+  renderClips();
+}
+
+async function pollTrimStatus() {
+  const video = currentVideo();
+  if (!video || state.phase !== "clean") return;
+  try {
+    const data = await api(`/api/eager/trim/status?path=${encodeURIComponent(video.path)}`);
+    syncTrimJobsFromServer(data.jobs);
+    updateTrimEtaPanel(data);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function loadMediaProbe(path) {
+  if (!el.gpmfStatus) return;
+  try {
+    const info = await api(`/api/probe?path=${encodeURIComponent(path)}`);
+    state.currentHasGpmf = info.has_gpmf;
+    el.gpmfStatus.classList.remove("hidden");
+    if (info.has_gpmf) {
+      el.gpmfStatus.textContent = "IMU / GPMF detected — copied with clip timestamps on trim";
+      el.gpmfStatus.className = "gpmf-badge ok";
+    } else {
+      el.gpmfStatus.textContent = "No IMU track on this file";
+      el.gpmfStatus.className = "gpmf-badge warn";
+    }
+  } catch {
+    state.currentHasGpmf = null;
+    el.gpmfStatus.classList.add("hidden");
+  }
+}
+
+function startTrimPolling() {
+  stopTrimPolling();
+  pollTrimStatus();
+  state.trimPollTimer = setInterval(pollTrimStatus, 800);
+}
+
+function stopTrimPolling() {
+  if (state.trimPollTimer) {
+    clearInterval(state.trimPollTimer);
+    state.trimPollTimer = null;
+  }
+}
+
+function activeTrimCount() {
+  return state.savedClips.filter((j) => j.status === "queued" || j.status === "running").length;
+}
+
 function updateContextHint() {
-  if (!el.contextStep || !el.contextMessage) return;
+  if (!el.contextMessage) return;
 
   if (state.phase === "label") {
-    el.contextStep.textContent = "Label";
     if (!currentVideo()) {
-      el.contextMessage.textContent = "Scan trimmed clips, then pick a task and press N";
+      el.contextMessage.textContent = "Choose folder and scan — use ← → filmstrip to identify task";
     } else if (!selectedTask()) {
-      el.contextMessage.textContent = "Choose a task for this clip, then press N to move it";
+      el.contextMessage.textContent = "Use , . ±3s to scrub · ← → for opening previews";
     } else {
-      el.contextMessage.textContent = `Ready — press N to move to "${selectedTask()}"`;
+      el.contextMessage.textContent = `Press N to move to "${selectedTask()}"`;
     }
     return;
   }
 
   if (!currentVideo()) {
-    el.contextStep.textContent = "Setup";
-    el.contextMessage.textContent = "Choose folder → Scan footage → wait for snapshots";
+    el.contextMessage.textContent = "Choose a footage folder, then scan";
     return;
   }
 
   if (state.pendingClip) {
-    el.contextStep.textContent = "Step 4";
-    el.contextMessage.textContent = "Press T to trim and save this clip, then find the next useful section";
+    el.contextMessage.textContent = "Press T to queue trim, then mark the next useful section";
+    return;
+  }
+
+  if (activeTrimCount() > 0) {
+    const eta = state.trimEtaTotal > 0 ? ` (~${formatDurationShort(state.trimEtaTotal)} left)` : "";
+    el.contextMessage.textContent = `Trims running in background${eta} — press N when done to move on`;
     return;
   }
 
   if (state.pendingIn !== null) {
-    el.contextStep.textContent = "Step 3";
-    el.contextMessage.textContent = "Use → to find where work ends, fine-tune with , . then press O or Mark end";
+    el.contextMessage.textContent = "Find the end of useful footage, then press O";
     return;
   }
 
-  if (state.savedClips.length) {
-    el.contextStep.textContent = "Step 5";
-    el.contextMessage.textContent = "More useful footage in this file? Keep marking. Otherwise press N for next file";
+  if (state.savedClips.some((j) => j.status === "completed" || j.output)) {
+    el.contextMessage.textContent = "More useful parts? Keep marking. Otherwise press N";
     return;
   }
 
-  el.contextStep.textContent = "Step 2";
-  el.contextMessage.textContent = "Scroll filmstrip with ← → — 4+ idle thumbnails in a row means garbage to trim away";
+  el.contextMessage.textContent = "Garbage? I → O → T for each part. All useful? Press N";
 }
 
 function showLoading(title, detail, pct = 0, hint = "") {
@@ -280,7 +450,9 @@ function updateFilmstripMeta() {
   const idx = state.snapshotIndex + 1;
   const total = m.frames?.length || 0;
   el.filmstripMeta.textContent =
-    `Every ${m.interval_seconds}s · snapshot ${idx}/${total} · ${m.garbage_hint || ""}`;
+    state.snapshotPurpose === "label"
+      ? `Opening preview ${idx}/${total} · use , . ±3s to scrub`
+      : `Every ${m.interval_seconds}s · snapshot ${idx}/${total} · ${m.garbage_hint || ""}`;
 }
 
 function renderFilmstrip() {
@@ -301,7 +473,7 @@ function renderFilmstrip() {
     const img = document.createElement("img");
     img.loading = "lazy";
     img.alt = formatTime(frame.t);
-    img.src = `/api/eager/snapshots/frame?path=${encodeURIComponent(video.path)}&index=${frame.index}`;
+    img.src = `/api/eager/snapshots/frame?${snapshotQuery(video)}&index=${frame.index}`;
     const label = document.createElement("span");
     label.textContent = formatTime(frame.t);
     btn.appendChild(img);
@@ -315,27 +487,30 @@ function renderFilmstrip() {
 }
 
 async function waitForSnapshots(video, token) {
-  await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}&start=1`);
+  const isLabel = state.snapshotPurpose === "label";
+  await api(`/api/eager/snapshots/status?${snapshotQuery(video)}&start=1`);
   let uiOpen = false;
-  for (let i = 0; i < 3600; i += 1) {
+  const maxPolls = isLabel ? 120 : 3600;
+  for (let i = 0; i < maxPolls; i += 1) {
     if (token !== state.snapshotBuildToken) return null;
-    const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+    const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
     const partial = status.manifest;
     const frameCount = partial?.frames?.length || 0;
+    const minFrames = isLabel ? 1 : 3;
 
     if (partial?.frames?.length) {
       state.snapshots = partial;
       renderFilmstrip();
-      if (!uiOpen && (status.status === "ready" || frameCount >= 3)) {
+      if (!uiOpen && (status.status === "ready" || frameCount >= minFrames)) {
         uiOpen = true;
         hideLoading();
-        if (frameCount >= 3 && status.status === "running") {
+        if (!isLabel && frameCount >= 3 && status.status === "running") {
           setStatus(`Review started — loading remaining snapshots (${frameCount}/${partial.snapshot_count || "?"})`, "ok");
         }
       }
     }
 
-    if (status.status === "running" && !uiOpen) {
+    if (status.status === "running" && !uiOpen && !isLabel) {
       showLoading(
         "Building snapshots",
         `${video.name} — ${frameCount}/${status.plan?.snapshot_count || "?"} frames`,
@@ -357,11 +532,14 @@ async function waitForSnapshots(video, token) {
 }
 
 async function ensureSnapshots(video, showOverlay = true) {
+  const isLabel = state.snapshotPurpose === "label";
   const token = ++state.snapshotBuildToken;
-  if (showOverlay) {
+  if (showOverlay && !isLabel) {
     showLoading("Checking snapshots", video.name, 5);
+  } else if (isLabel) {
+    setStatus(`Loading opening preview for ${video.name}...`);
   }
-  const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+  const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
   if (status.status === "ready" && status.manifest) {
     if (token !== state.snapshotBuildToken) return null;
     state.snapshots = status.manifest;
@@ -370,7 +548,7 @@ async function ensureSnapshots(video, showOverlay = true) {
     hideLoading();
     return status.manifest;
   }
-  if (showOverlay) {
+  if (showOverlay && !isLabel) {
     showLoading("Building snapshots", video.name, 0, status.plan?.garbage_hint || "");
   }
   const manifest = await waitForSnapshots(video, token);
@@ -382,12 +560,13 @@ async function ensureSnapshots(video, showOverlay = true) {
 }
 
 function continueSnapshotRefresh(video) {
+  if (state.snapshotPurpose === "label") return;
   const token = state.snapshotBuildToken;
   (async () => {
     for (let i = 0; i < 600; i += 1) {
       if (token !== state.snapshotBuildToken) return;
       if (currentVideo()?.path !== video.path) return;
-      const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+      const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
       if (status.manifest?.frames?.length) {
         const prev = state.snapshots?.frames?.length || 0;
         state.snapshots = status.manifest;
@@ -422,10 +601,9 @@ function goToSnapshot(delta) {
 
 function fineTune(seconds) {
   if (!currentVideo()) return;
-  flushSeek();
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
-  scheduleSeek(el.player.currentTime + seconds, true);
+  scheduleSeek(state.scrubTime + seconds, true);
 }
 
 function flushSeek() {
@@ -434,10 +612,21 @@ function flushSeek() {
     state.seekTimer = null;
   }
   if (state.pendingSeek !== null) {
+    state.scrubTime = state.pendingSeek;
     el.player.pause();
-    el.player.currentTime = state.pendingSeek;
+    try {
+      el.player.currentTime = state.pendingSeek;
+    } catch {
+      /* large files may not support seek — scrub time still updates */
+    }
     state.pendingSeek = null;
+    updateScrubUi();
   }
+}
+
+function currentScrubTime() {
+  flushSeek();
+  return state.scrubTime;
 }
 
 function renderTasks(preferred = "") {
@@ -478,9 +667,9 @@ function renderTasks(preferred = "") {
   updateContextHint();
 }
 
-function updateScrubUi(overrideTime = null) {
+function updateScrubUi() {
   const duration = el.player.duration || currentVideo()?.duration || 0;
-  const current = overrideTime ?? el.player.currentTime ?? 0;
+  const current = state.scrubTime;
   const pct = duration > 0 ? (current / duration) * 100 : 0;
   el.scrubFill.style.width = `${pct}%`;
   el.scrubPlayhead.style.left = `${pct}%`;
@@ -491,8 +680,9 @@ function scheduleSeek(time, immediate = false) {
   const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration) return;
   const clamped = Math.min(duration - 0.04, Math.max(0, time));
+  state.scrubTime = clamped;
   state.pendingSeek = clamped;
-  updateScrubUi(clamped);
+  updateScrubUi();
 
   if (immediate) {
     flushSeek();
@@ -514,8 +704,7 @@ function seekToFraction(fraction) {
 
 function markStart() {
   if (!currentVideo()) return;
-  flushSeek();
-  state.pendingIn = el.player.currentTime;
+  state.pendingIn = currentScrubTime();
   state.pendingClip = null;
   setStatus(`Start marked at ${formatTime(state.pendingIn)}`, "ok");
   renderClips();
@@ -527,8 +716,7 @@ function markEnd() {
     setStatus("Mark start first", "error");
     return;
   }
-  flushSeek();
-  const end = el.player.currentTime;
+  const end = currentScrubTime();
   if (end <= state.pendingIn + 0.05) {
     setStatus("End must be after start — step forward first", "error");
     return;
@@ -573,7 +761,7 @@ async function loadVideo(index) {
       await fetch("/api/eager/snapshots/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: previous.path }),
+        body: JSON.stringify({ path: previous.path, purpose: state.snapshotPurpose }),
       });
     } catch {
       /* ignore */
@@ -584,9 +772,11 @@ async function loadVideo(index) {
   state.pendingIn = null;
   state.pendingClip = null;
   state.savedClips = [];
+  stopTrimPolling();
   state.pendingSeek = null;
   state.snapshots = null;
   state.snapshotIndex = 0;
+  state.scrubTime = 0;
   if (state.seekTimer) {
     clearTimeout(state.seekTimer);
     state.seekTimer = null;
@@ -601,6 +791,11 @@ async function loadVideo(index) {
   el.previewStatus.textContent = "";
   el.playerWrap.classList.add("loading");
   setStatus(`Loading ${video.name}...`);
+  if (state.phase === "clean") {
+    loadMediaProbe(video.path);
+  } else if (el.gpmfStatus) {
+    el.gpmfStatus.classList.add("hidden");
+  }
 
   renderFileList();
   renderClips();
@@ -612,16 +807,28 @@ async function loadVideo(index) {
     if (token !== state.previewToken) return;
     el.playerWrap.classList.remove("loading");
     el.player.pause();
-    el.player.currentTime = 0;
+    state.scrubTime = 0;
+    try {
+      el.player.currentTime = 0;
+    } catch {
+      /* ignore */
+    }
     updateScrubUi();
-    if (state.phase === "clean") {
+    if (state.phase === "clean" || state.phase === "label") {
       try {
         await ensureSnapshots(video, true);
         if (state.snapshots?.frames?.length) {
           goToSnapshotIndex(0);
         }
         continueSnapshotRefresh(video);
-        setStatus(`Ready — use snapshot strip (${video.name})`, "ok");
+        if (state.phase === "clean") {
+          startTrimPolling();
+        }
+        const readyMsg =
+          state.phase === "label"
+            ? `Ready — , . ±3s to scrub (${video.name})`
+            : `Ready — use snapshot strip (${video.name})`;
+        setStatus(readyMsg, "ok");
         updateContextHint();
       } catch (error) {
         hideLoading();
@@ -644,14 +851,27 @@ async function loadVideo(index) {
   );
 }
 
-async function loadVolumes() {
-  const data = await api("/api/eager/volumes");
-  el.sourceVolume.innerHTML = '<option value="">Choose drive...</option>';
-  for (const volume of data.volumes) {
-    const option = document.createElement("option");
-    option.value = volume.path;
-    option.textContent = volume.name;
-    el.sourceVolume.appendChild(option);
+async function chooseFootageFolder() {
+  el.browseFolderBtn.disabled = true;
+  setStatus("Choose a folder in the dialog…");
+  try {
+    const initial = el.sourcePath.value.trim();
+    const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
+    const data = await api(`/api/eager/pick-folder${query}`, { method: "POST" });
+    if (data.cancelled) {
+      setStatus("Folder selection cancelled");
+      return;
+    }
+    el.sourcePath.value = data.path;
+    state.scanRoot = data.path;
+    state.labelRoot = data.path;
+    await loadCameras();
+    setStatus(`Selected ${data.path}`, "ok");
+    updateContextHint();
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    el.browseFolderBtn.disabled = false;
   }
 }
 
@@ -694,7 +914,10 @@ async function addTask() {
     const data = await api("/api/eager/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({
+        name,
+        label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
+      }),
     });
     state.tasks = data.tasks || [];
     el.taskSearch.value = "";
@@ -712,13 +935,13 @@ async function addTask() {
 async function scanSource() {
   const path = scanTargetPath();
   if (!path) {
-    setStatus("Choose a folder first", "error");
+    setStatus("Choose a footage folder first", "error");
     return;
   }
 
   state.scanRoot = path;
   state.labelRoot = path;
-  const mode = state.phase === "clean" ? "raw" : "clips";
+  const mode = state.phase === "clean" ? "raw" : "label";
 
   setStatus("Scanning...");
   el.scanBtn.disabled = true;
@@ -732,7 +955,9 @@ async function scanSource() {
     state.donePaths = new Set();
     state.index = -1;
     renderFileList();
-    el.scanSummary.textContent = `${data.count} ${mode === "raw" ? "raw" : "trimmed"} files`;
+    const summaryLabel =
+      mode === "raw" ? "raw files" : mode === "label" ? "files to label" : "files";
+    el.scanSummary.textContent = `${data.count} ${summaryLabel}`;
     if (state.videos.length) {
       if (mode === "raw") {
         showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
@@ -740,9 +965,9 @@ async function scanSource() {
       await loadVideo(0);
       if (mode === "raw") hideLoading();
       setStatus(`Found ${state.videos.length} files`, "ok");
-      prefetchSnapshotsBackground(1);
+      if (mode === "raw") prefetchSnapshotsBackground(1);
     } else {
-      setStatus(`No ${mode} MP4 files found`, "error");
+      setStatus(mode === "label" ? "No footage to label found" : `No ${mode} MP4 files found`, "error");
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -757,9 +982,9 @@ function prefetchSnapshotsBackground(startIndex) {
     for (let i = startIndex; i < state.videos.length; i += 1) {
       const video = state.videos[i];
       try {
-        const status = await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}`);
+        const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
         if (status.status !== "ready") {
-          await api(`/api/eager/snapshots/status?path=${encodeURIComponent(video.path)}&start=1`);
+          await api(`/api/eager/snapshots/status?${snapshotQuery(video)}&start=1`);
         }
       } catch {
         /* background prefetch — ignore */
@@ -769,91 +994,88 @@ function prefetchSnapshotsBackground(startIndex) {
 }
 
 async function trimMarkedClip() {
-  if (state.busy) return;
   const video = currentVideo();
   if (!video || !state.pendingClip) {
-    setStatus("Mark a clip first (click start, click end)", "error");
+    setStatus("Mark a clip first (Mark start + Mark end)", "error");
     return;
   }
 
-  state.busy = true;
-  el.trimBtn.disabled = true;
-  setStatus("Trimming clip...");
+  const clip = { start: state.pendingClip.start, end: state.pendingClip.end };
+  state.pendingClip = null;
+  renderClips();
+
   try {
     const data = await api("/api/eager/trim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: video.path,
-        start: state.pendingClip.start,
-        end: state.pendingClip.end,
+        start: clip.start,
+        end: clip.end,
       }),
     });
     state.savedClips.push({
-      output: data.output,
-      name: data.output.split(/[/\\]/).pop(),
-      start: data.start_seconds,
-      end: data.end_seconds,
+      job_id: data.job_id,
+      status: data.status || "queued",
+      start: clip.start,
+      end: clip.end,
+      duration_seconds: clip.end - clip.start,
+      progress: 0,
+      remaining_seconds: clip.end - clip.start,
+      output: null,
+      name: null,
+      source_has_gpmf: data.source_has_gpmf,
     });
-    state.pendingClip = null;
     renderClips();
-    setStatus(`Saved ${data.output.split(/[/\\]/).pop()}`, "ok");
+    startTrimPolling();
+    const imuNote =
+      data.source_has_gpmf === true ? " (IMU will be verified)" : "";
+    setStatus(`Queued trim ${formatTime(clip.start)} → ${formatTime(clip.end)}${imuNote} — mark next clip`, "ok");
   } catch (error) {
+    state.pendingClip = clip;
+    renderClips();
     setStatus(error.message, "error");
-  } finally {
-    state.busy = false;
-    el.trimBtn.disabled = false;
   }
 }
 
 async function finishCleaningFile() {
-  if (state.busy) return;
   const video = currentVideo();
   if (!video) return;
 
   if (state.pendingClip) {
-    setStatus("Press T to trim the marked clip first", "error");
+    setStatus("Press T to queue the marked clip first", "error");
     return;
   }
 
-  state.busy = true;
-  el.nextCleanBtn.disabled = true;
-  setStatus("Finishing file...");
-  try {
-    if (el.deleteSource.checked && state.savedClips.length > 0) {
-      await api("/api/eager/clean", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: video.path, delete_source: true }),
-      });
-    } else if (el.deleteSource.checked) {
-      setStatus("No clips saved — raw file kept", "ok");
-    }
+  const hasClips = state.savedClips.some(
+    (j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running",
+  );
+
+  if (!hasClips) {
+    setStatus("Raw file kept — next file", "ok");
     state.donePaths.add(video.path);
-    setStatus(`Finished ${video.name}`, "ok");
+    stopTrimPolling();
+    advanceToNext();
+    return;
+  }
+
+  try {
+    const data = await api("/api/eager/clean", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: video.path }),
+    });
+    state.donePaths.add(video.path);
+    stopTrimPolling();
+    if (data.scheduled) {
+      setStatus(`Next file — ${data.active} trim(s) still finishing, raw will be removed when done`, "ok");
+    } else {
+      setStatus(`Finished ${video.name}`, "ok");
+    }
     advanceToNext();
   } catch (error) {
     setStatus(error.message, "error");
-  } finally {
-    state.busy = false;
-    el.nextCleanBtn.disabled = false;
   }
-}
-
-async function keepWholeFile() {
-  if (state.busy) return;
-  const video = currentVideo();
-  if (!video) return;
-
-  const duration = el.player.duration || video.duration || 0;
-  if (!duration) {
-    setStatus("Wait for video to load", "error");
-    return;
-  }
-
-  state.pendingClip = { start: 0, end: duration - 0.05 };
-  await trimMarkedClip();
-  await finishCleaningFile();
 }
 
 async function labelCurrentClip() {
@@ -872,7 +1094,10 @@ async function labelCurrentClip() {
       const data = await api("/api/eager/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: task }),
+        body: JSON.stringify({
+          name: task,
+          label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
+        }),
       });
       state.tasks = data.tasks || [];
       renderTasks(task);
@@ -919,14 +1144,6 @@ function advanceToNext() {
   }
 }
 
-function skipCurrent() {
-  const video = currentVideo();
-  if (!video) return;
-  state.donePaths.add(video.path);
-  setStatus(`Skipped ${video.name}`);
-  advanceToNext();
-}
-
 el.snapPrevBtn?.addEventListener("click", () => goToSnapshot(-1));
 el.snapNextBtn?.addEventListener("click", () => goToSnapshot(1));
 el.fineBackBtn?.addEventListener("click", () => fineTune(-3));
@@ -941,13 +1158,7 @@ el.scrubTrack.addEventListener("mousedown", (event) => {
   seekToFraction((event.clientX - rect.left) / rect.width);
 });
 
-el.sourceVolume.addEventListener("change", () => {
-  if (el.sourceVolume.value) {
-    el.sourcePath.value = el.sourceVolume.value;
-    loadCameras();
-  }
-});
-el.sourcePath.addEventListener("change", loadCameras);
+el.browseFolderBtn.addEventListener("click", chooseFootageFolder);
 el.refreshCamerasBtn.addEventListener("click", loadCameras);
 el.cameraSelect.addEventListener("change", () => {
   if (el.cameraSelect.value) setStatus(`Camera folder: ${el.cameraSelect.value}`);
@@ -957,8 +1168,6 @@ el.fileFilter.addEventListener("input", renderFileList);
 el.undoClipBtn.addEventListener("click", undoMark);
 el.trimBtn.addEventListener("click", trimMarkedClip);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
-el.keepWholeBtn.addEventListener("click", keepWholeFile);
-el.skipBtn.addEventListener("click", skipCurrent);
 el.phaseClean.addEventListener("click", () => setPhase("clean"));
 el.phaseLabel.addEventListener("click", () => setPhase("label"));
 el.taskSearch.addEventListener("input", () => renderTasks());
@@ -970,34 +1179,45 @@ el.newTaskInput.addEventListener("keydown", (event) => {
   }
 });
 el.labelBtn.addEventListener("click", labelCurrentClip);
-el.skipLabelBtn.addEventListener("click", skipCurrent);
-el.player.addEventListener("timeupdate", updateScrubUi);
+el.player.addEventListener("timeupdate", () => {
+  if (!el.player.paused && Number.isFinite(el.player.currentTime) && el.player.currentTime > 0) {
+    state.scrubTime = el.player.currentTime;
+    updateScrubUi();
+  }
+});
 el.player.addEventListener("loadedmetadata", updateScrubUi);
-el.player.addEventListener("seeked", updateScrubUi);
 
 document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;
   const key = event.key.toLowerCase();
 
-  if (state.phase === "clean") {
+  if (state.phase === "clean" || state.phase === "label") {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      goToSnapshot(-1);
+      if (state.phase === "label" && !state.snapshots?.frames?.length) {
+        fineTune(-scrubStepSeconds());
+      } else {
+        goToSnapshot(-1);
+      }
       return;
     }
     if (event.key === "ArrowRight") {
       event.preventDefault();
-      goToSnapshot(1);
+      if (state.phase === "label" && !state.snapshots?.frames?.length) {
+        fineTune(scrubStepSeconds());
+      } else {
+        goToSnapshot(1);
+      }
       return;
     }
     if (event.key === ",") {
       event.preventDefault();
-      fineTune(-1);
+      fineTune(-scrubStepSeconds());
       return;
     }
     if (event.key === ".") {
       event.preventDefault();
-      fineTune(1);
+      fineTune(scrubStepSeconds());
       return;
     }
   }
@@ -1019,11 +1239,6 @@ document.addEventListener("keydown", (event) => {
       event.preventDefault();
       finishCleaningFile();
     }
-    if (key === "k") {
-      event.preventDefault();
-      keepWholeFile();
-    }
-    if (key === "s") skipCurrent();
     if (key === " ") {
       event.preventDefault();
       if (el.player.paused) el.player.play();
@@ -1036,12 +1251,10 @@ document.addEventListener("keydown", (event) => {
       event.preventDefault();
       labelCurrentClip();
     }
-    if (key === "s") skipCurrent();
   }
 });
 
-loadVolumes()
-  .then(loadTasks)
+loadTasks()
   .then(() => api("/api/health"))
   .then((data) => {
     if (el.appVersion) el.appVersion.textContent = `v${data.version || "?"}`;

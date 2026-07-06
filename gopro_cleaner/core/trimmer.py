@@ -18,6 +18,14 @@ MIN_FREE_BYTES = 500 * 1024 * 1024
 
 
 _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+_COPY_SUFFIX_RE = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
+
+
+def clip_base_stem(path: Path | str) -> str:
+    """Base name for trimmed clips, e.g. 'GH012332 copy' -> 'GH012332'."""
+    stem = path.stem if isinstance(path, Path) else Path(str(path)).stem
+    cleaned = _COPY_SUFFIX_RE.sub("", stem).strip()
+    return cleaned or stem
 
 
 @dataclass
@@ -76,7 +84,7 @@ def build_output_path(
     output_dir: Path | None = None,
 ) -> Path:
     directory = output_dir or input_path.parent
-    stem = input_path.stem
+    stem = clip_base_stem(input_path)
     suffix = input_path.suffix or ".MP4"
     return directory / f"{stem}-{clip_number}{suffix}"
 
@@ -126,7 +134,7 @@ def build_ffmpeg_command(
             ]
         )
 
-    command.extend(["-c", "copy", str(output_path)])
+    command.extend(["-avoid_negative_ts", "make_zero", "-c", "copy", str(output_path)])
     return command
 
 
@@ -290,11 +298,21 @@ def _execute_trim(job: TrimJob) -> None:
                 "Trim completed but the output file is missing the GoPro IMU/GPMF track."
             )
 
+        imu_note = ""
+        if media.has_gpmf:
+            if trimmed.duration is not None:
+                drift = abs(trimmed.duration - duration_seconds)
+                if drift > 5.0:
+                    imu_note = (
+                        f" (duration drift {drift:.1f}s — check sync in your IMU tool)"
+                    )
+            imu_note = f" — IMU/GPMF preserved{imu_note}"
+
         job_store.update(
             job.job_id,
             status="completed",
             progress=100.0,
-            message=f"Saved {job.output_path}",
+            message=f"Saved {job.output_path}{imu_note}",
         )
     except Exception as exc:  # noqa: BLE001 - surfaced to UI
         if temp_path is not None and temp_path.exists():

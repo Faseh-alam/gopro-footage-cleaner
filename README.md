@@ -27,32 +27,32 @@ chmod +x run.sh
 
 **Phase 1 — Clean footage**
 
-1. Choose a drive (`E:\`, `D:\Tribes`, etc.) or a camera folder (`C1234`)
+1. Click **Choose folder…** — Finder (Mac) or File Explorer (Windows) opens
 2. Click **Scan raw footage**
 3. A **loading screen** builds snapshot thumbnails (spacing adapts to clip length)
 4. Scroll the **snapshot filmstrip** — if **4+ frames in a row** show no work, that region is likely garbage (~10% of clip max)
 5. **← →** jump between snapshots · **, .** fine-tune ±1s · **±3s** buttons for exact trim points
-6. **Mark start** / **Mark end**, then **T** to trim
+6. **Mark start** / **Mark end**, then **T** to queue each useful section (background trim). Press **N** when done — trims finish in the background and the raw file is removed. If the whole clip is useful, just press **N** and the raw file stays as-is.
 
 **Phase 2 — Label tasks**
 
-1. Switch to **2 · Label tasks** and scan the same folder (now shows trimmed clips)
-2. Pick a task from the list (or add a new one)
-3. Press **N** — the clip **moves** into `Labeled/<task-name>/` on the same drive
+1. Switch to **2 · Label tasks** and scan the same folder (shows trimmed clips **and** whole files kept during cleaning)
+2. Pick a task from the list (or add a new one — creates `<task-name>/` beside your footage)
+3. Press **N** — the file **moves** into `<task-name>/` on the same drive
 
-Shortcuts: **←** **→** snapshots · **,** **.** ±1s · **I** mark start · **O** mark end · **T** trim · **N** next · **K** keep entire file · **S** skip
+Shortcuts: **←** **→** snapshots · **,** **.** ±1s · **I** mark start · **O** mark end · **T** queue trim · **N** next file
 
 ### Folder layout after labeling
 
 ```text
-E:\                          (SD card or C1234 camera folder)
-  GH012330-1.MP4             (during phase 1, beside raw file)
+E:\                          (SD card or camera folder)
+  GH012330.MP4               (whole file kept during cleaning)
+  GH012330-1.MP4             (trimmed clip)
   GH012330-2.MP4
-  Labeled\
-    task-stitching\
-      GH012330-1.MP4
-    picking\
-      GH012330-2.MP4
+  task-stitching\
+    GH012330-1.MP4
+  picking\
+    GH012330-2.MP4
 ```
 
 Camera serial folders (`C1234`, `C8278`, …) are auto-detected under your archive/tribes drive.
@@ -144,9 +144,11 @@ GX010123-3.MP4
 The trimmer:
 
 1. Detects the GoPro metadata stream (`gpmd` / handler `GoPro MET`) with `ffprobe`
-2. Runs a lossless `ffmpeg` trim with video, audio, and GPMF streams copied
-3. Verifies the output still contains GPMF
+2. Runs a lossless `ffmpeg` trim with video, audio, and GPMF streams copied (timestamps aligned to your marked start/end)
+3. Verifies the output still contains GPMF — **fails the trim if IMU was on the source but missing in the clip**
 4. Optionally runs `udtacopy` to restore GoPro-specific container headers
+
+In the Eager Review Station, a green **IMU / GPMF detected** badge appears when you load a file. Saved clips show **IMU ✓** after a successful background trim.
 
 ## Recommended workflow for 15 TB
 
