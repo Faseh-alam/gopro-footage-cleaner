@@ -455,6 +455,22 @@ function updateFilmstripMeta() {
       : `Every ${m.interval_seconds}s · snapshot ${idx}/${total} · ${m.garbage_hint || ""}`;
 }
 
+function attachSnapshotImage(img, video, frameIndex) {
+  let attempt = 0;
+  const maxAttempts = 4;
+  const load = () => {
+    const retry = attempt > 0 ? `&retry=${attempt}&t=${Date.now()}` : "";
+    img.src = `/api/eager/snapshots/frame?${snapshotQuery(video)}&index=${frameIndex}${retry}`;
+  };
+  img.onerror = () => {
+    attempt += 1;
+    if (attempt < maxAttempts) {
+      setTimeout(load, 250 * attempt);
+    }
+  };
+  load();
+}
+
 function renderFilmstrip() {
   if (!el.filmstrip) return;
   el.filmstrip.innerHTML = "";
@@ -473,7 +489,7 @@ function renderFilmstrip() {
     const img = document.createElement("img");
     img.loading = "lazy";
     img.alt = formatTime(frame.t);
-    img.src = `/api/eager/snapshots/frame?${snapshotQuery(video)}&index=${frame.index}`;
+    attachSnapshotImage(img, video, frame.index);
     const label = document.createElement("span");
     label.textContent = formatTime(frame.t);
     btn.appendChild(img);

@@ -43,7 +43,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v5-label-preview" if purpose == "label" else "v3-fastseek"
+    version = "v6-win-jpeg"
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -131,6 +131,14 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
     }
 
 
+def _manifest_frames_valid(source: Path, purpose: str, manifest: dict) -> bool:
+    frames = manifest.get("frames") or []
+    if not frames:
+        return False
+    out_dir = _snapshot_dir(source, purpose)
+    return all(_frame_looks_valid(out_dir / frame["file"]) for frame in frames)
+
+
 def _load_manifest(source: Path, purpose: str) -> dict | None:
     path = _manifest_path(source, purpose)
     if not path.exists():
@@ -149,30 +157,78 @@ def _hwaccel_args() -> list[str]:
     return []
 
 
-def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
+def _snapshot_video_filter() -> str:
+    # Even height for MJPEG; full-range YUV avoids Windows FFmpeg 7+ encoder failures.
+    return f"scale={SNAPSHOT_WIDTH}:-2:flags=fast_bilinear,format=yuvj420p"
+
+
+def _frame_looks_valid(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        return path.stat().st_size >= 256
+    except OSError:
+        return False
+
+
+def _ffmpeg_snapshot_command(
+    source: Path,
+    timestamp: float,
+    dest: Path,
+    *,
+    hwaccel: bool,
+) -> list[str]:
     command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        *_hwaccel_args(),
-        "-ss",
-        f"{timestamp:.3f}",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-an",
-        "-vf",
-        f"scale={SNAPSHOT_WIDTH}:-1",
-        "-q:v",
-        "8",
-        str(dest),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "ffmpeg frame extract failed")
+    if hwaccel:
+        command.extend(_hwaccel_args())
+    command.extend(
+        [
+            "-ss",
+            f"{timestamp:.3f}",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-an",
+            "-vf",
+            _snapshot_video_filter(),
+            "-c:v",
+            "mjpeg",
+            "-pix_fmt",
+            "yuvj420p",
+            "-q:v",
+            "8",
+            str(dest),
+        ]
+    )
+    return command
+
+
+def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+
+    attempts = [True, False] if _hwaccel_args() else [False]
+    errors: list[str] = []
+    for hwaccel in attempts:
+        command = _ffmpeg_snapshot_command(source, timestamp, dest, hwaccel=hwaccel)
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0 and _frame_looks_valid(dest):
+            return
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        detail = result.stderr.strip() or "ffmpeg frame extract failed"
+        label = "hwaccel" if hwaccel else "software"
+        errors.append(f"{label}: {detail}")
+
+    raise RuntimeError(errors[-1] if errors else "ffmpeg frame extract failed")
 
 
 def _job_cancelled(job_key: str) -> bool:
@@ -229,12 +285,15 @@ def snapshot_status(source: Path, *, start: bool = False, purpose: str = "clean"
     key = _job_key(source, purpose)
     manifest = _load_manifest(source, purpose)
     if manifest and manifest.get("ready") and manifest.get("frames"):
-        return {
-            "status": "ready",
-            "progress": 100,
-            "cached": True,
-            "manifest": manifest,
-        }
+        if _manifest_frames_valid(source, purpose, manifest):
+            return {
+                "status": "ready",
+                "progress": 100,
+                "cached": True,
+                "manifest": manifest,
+            }
+        manifest_file = _manifest_path(source, purpose)
+        manifest_file.unlink(missing_ok=True)
 
     with _lock:
         job = _jobs.get(key)
@@ -315,7 +374,7 @@ def resolve_snapshot_frame(source: Path, index: int, *, purpose: str = "clean") 
     for frame in frames:
         if frame["index"] == index:
             path = _snapshot_dir(source, purpose) / frame["file"]
-            if path.exists():
+            if _frame_looks_valid(path):
                 return path
             break
     raise FileNotFoundError(f"Snapshot frame {index} not found")
