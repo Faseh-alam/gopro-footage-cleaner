@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -338,13 +339,21 @@ def move_to_trash(path: Path) -> None:
 
         send2trash(str(path))
         return
-    except ImportError:
+    except Exception:
         pass
 
-    trash_dir = Path.home() / ".Trash"
-    destination = trash_dir / path.name
-    counter = 1
-    while destination.exists():
-        destination = trash_dir / f"{path.stem}_{counter}{path.suffix}"
-        counter += 1
-    shutil.move(str(path), str(destination))
+    if platform.system() == "Darwin":
+        trash_dir = Path.home() / ".Trash"
+        destination = trash_dir / path.name
+        counter = 1
+        while destination.exists():
+            destination = trash_dir / f"{path.stem}_{counter}{path.suffix}"
+            counter += 1
+        shutil.move(str(path), str(destination))
+        return
+
+    # Windows / network drives: send2trash often fails — delete the file directly.
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise RuntimeError(f"Could not remove {path.name}: {exc}") from exc

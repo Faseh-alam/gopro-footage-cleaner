@@ -158,9 +158,11 @@ function selectedTask() {
   return el.newTaskInput.value.trim();
 }
 
-function snapshotQuery(video) {
+function snapshotQuery(video, { priority } = {}) {
   const purpose = state.snapshotPurpose || "clean";
-  return `path=${encodeURIComponent(video.path)}&purpose=${purpose}`;
+  let q = `path=${encodeURIComponent(video.path)}&purpose=${purpose}`;
+  if (priority) q += `&priority=${encodeURIComponent(priority)}`;
+  return q;
 }
 
 function scrubStepSeconds() {
@@ -504,7 +506,7 @@ function renderFilmstrip() {
 
 async function waitForSnapshots(video, token) {
   const isLabel = state.snapshotPurpose === "label";
-  await api(`/api/eager/snapshots/status?${snapshotQuery(video)}&start=1`);
+  await api(`/api/eager/snapshots/status?${snapshotQuery(video, { priority: "foreground" })}&start=1`);
   let uiOpen = false;
   const maxPolls = isLabel ? 120 : 3600;
   for (let i = 0; i < maxPolls; i += 1) {
@@ -533,6 +535,9 @@ async function waitForSnapshots(video, token) {
         status.progress || Math.min(95, Math.round((frameCount / (status.plan?.snapshot_count || 1)) * 100)),
         status.plan?.garbage_hint || "",
       );
+    }
+    if (status.status === "queued" && !uiOpen && !isLabel) {
+      showLoading("Queued for snapshots", video.name, 2, "Waiting for other files to finish…");
     }
 
     if (status.status === "ready" && status.manifest) {
@@ -773,15 +778,6 @@ async function loadVideo(index) {
   const previous = currentVideo();
   if (previous?.path && previous.path !== state.videos[index]?.path) {
     await cancelPreviewJob(previous.path);
-    try {
-      await fetch("/api/eager/snapshots/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: previous.path, purpose: state.snapshotPurpose }),
-      });
-    } catch {
-      /* ignore */
-    }
   }
 
   state.index = index;
@@ -846,6 +842,9 @@ async function loadVideo(index) {
             : `Ready — use snapshot strip (${video.name})`;
         setStatus(readyMsg, "ok");
         updateContextHint();
+        if (state.phase === "clean") {
+          prefetchSnapshotsBackground(state.index + 1);
+        }
       } catch (error) {
         hideLoading();
         setStatus(error.message, "error");
@@ -992,15 +991,26 @@ async function scanSource() {
   }
 }
 
-function prefetchSnapshotsBackground(startIndex) {
+const PREFETCH_AHEAD = 3;
+
+function prefetchSnapshotsBackground(fromIndex) {
   if (state.phase !== "clean") return;
+  const start = fromIndex ?? state.index + 1;
+  const end = Math.min(state.videos.length, start + PREFETCH_AHEAD);
   (async () => {
-    for (let i = startIndex; i < state.videos.length; i += 1) {
+    for (let i = start; i < end; i += 1) {
+      if (state.phase !== "clean") return;
       const video = state.videos[i];
+      if (!video) continue;
       try {
-        const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
-        if (status.status !== "ready") {
-          await api(`/api/eager/snapshots/status?${snapshotQuery(video)}&start=1`);
+        const q = snapshotQuery(video, { priority: "background" });
+        const status = await api(`/api/eager/snapshots/status?${q}`);
+        if (
+          status.status !== "ready"
+          && status.status !== "running"
+          && status.status !== "queued"
+        ) {
+          await api(`/api/eager/snapshots/status?${q}&start=1`);
         }
       } catch {
         /* background prefetch — ignore */
@@ -1085,10 +1095,13 @@ async function finishCleaningFile() {
     stopTrimPolling();
     if (data.scheduled) {
       setStatus(`Next file — ${data.active} trim(s) still finishing, raw will be removed when done`, "ok");
+    } else if (data.deleted_source) {
+      setStatus(`Finished ${video.name} — raw file removed`, "ok");
     } else {
       setStatus(`Finished ${video.name}`, "ok");
     }
     advanceToNext();
+    if (state.phase === "clean") prefetchSnapshotsBackground(state.index + 1);
   } catch (error) {
     setStatus(error.message, "error");
   }

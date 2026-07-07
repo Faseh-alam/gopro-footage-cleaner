@@ -34,6 +34,7 @@ class EagerTrimQueue:
         self._pending: deque[str] = deque()
         self._records: dict[str, EagerTrimRecord] = {}
         self._pending_finish: set[str] = set()
+        self._finish_errors: dict[str, str] = {}
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="eager-trim-queue")
@@ -140,12 +141,14 @@ class EagerTrimQueue:
         key = str(source.expanduser().resolve())
         with self._lock:
             finish_pending = key in self._pending_finish
+            finish_error = self._finish_errors.get(key)
 
         return {
             "jobs": jobs_out,
             "active": active,
             "eta_total_seconds": round(eta_total, 1),
             "finish_pending": finish_pending,
+            "finish_error": finish_error,
         }
 
     def wait_for_source(self, source: Path, *, timeout: float = 3600) -> bool:
@@ -179,12 +182,13 @@ class EagerTrimQueue:
             return {"scheduled": True, "deleted_source": False, "active": active}
         try:
             result = _finish_source_after_trims(source, delete_source=True)
-        except Exception:
+        except Exception as exc:
             with self._condition:
-                self._pending_finish.discard(key)
+                self._finish_errors[key] = str(exc)
             raise
         with self._condition:
             self._pending_finish.discard(key)
+            self._finish_errors.pop(key, None)
         return {"scheduled": False, "deleted_source": result.get("deleted_source", False), "active": 0}
 
     def _worker_loop(self) -> None:
@@ -245,8 +249,9 @@ class EagerTrimQueue:
             else:
                 try:
                     self._try_finish_source(source)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    with self._condition:
+                        self._finish_errors[str(source)] = str(exc)
 
 
 eager_trim_queue = EagerTrimQueue()

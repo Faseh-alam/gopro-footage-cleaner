@@ -270,11 +270,14 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
     def eager_snapshots_status():
         raw_path = request.args.get("path", "").strip()
         purpose = request.args.get("purpose", "clean")
+        priority = request.args.get("priority")
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
         try:
-            return jsonify(snapshot_status(Path(raw_path), start=start, purpose=purpose))
+            return jsonify(
+                snapshot_status(Path(raw_path), start=start, purpose=purpose, priority=priority)
+            )
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
 
