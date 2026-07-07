@@ -18,21 +18,25 @@ _jobs: dict[str, dict] = {}
 
 GARBAGE_RATIO = 0.10
 GARBAGE_SNAPSHOT_THRESHOLD = 4
-INTERVAL_MIN_SEC = 5.0
-MAX_SNAPSHOTS = 120
+INTERVAL_MIN_SEC = 8.0
+MAX_SNAPSHOTS = 36
 LABEL_PREVIEW_COUNT = 8
 LABEL_PREVIEW_INTERVAL_SEC = 5.0
 LABEL_PREVIEW_SPAN_SEC = 40.0
-SNAPSHOT_WIDTH = 200
+SNAPSHOT_WIDTH = 160
 MIN_FRAMES_BEFORE_UI = 3
 SNAPSHOT_FFMPEG_THREADS = 1
+FFMPEG_FRAME_TIMEOUT_SEC = 45
 PRIORITY_FOREGROUND = 10
 PRIORITY_BACKGROUND = 1
+BOOTSTRAP_FRAMES = 3
 
 _ffmpeg_lock = threading.Lock()
 _queue: deque[tuple[int, float, str, Path, str]] = deque()
 _queue_keys: set[str] = set()
 _queue_worker_started = False
+_active_job_key: str | None = None
+_current_ffmpeg_proc: subprocess.Popen[str] | None = None
 
 
 def _normalize_purpose(purpose: str) -> str:
@@ -53,7 +57,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v7-queue"
+    version = "v8-preempt"
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -182,11 +186,48 @@ def _input_strategies(source: Path, timestamp: float) -> list[list[str]]:
     source_arg = str(source)
     coarse = max(0.0, timestamp - 2.0)
     fine = min(2.0, timestamp)
-    return [
+    strategies = [
         ["-ss", f"{coarse:.3f}", "-i", source_arg, "-ss", f"{fine:.3f}"],
         ["-ss", f"{timestamp:.3f}", "-i", source_arg],
-        ["-i", source_arg, "-ss", f"{timestamp:.3f}"],
     ]
+    if timestamp <= 30.0:
+        strategies.append(["-i", source_arg, "-ss", f"{timestamp:.3f}"])
+    return strategies
+
+
+def _run_ffmpeg(command: list[str]) -> tuple[int, str]:
+    global _current_ffmpeg_proc
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    with _lock:
+        _current_ffmpeg_proc = proc
+    try:
+        _, stderr = proc.communicate(timeout=FFMPEG_FRAME_TIMEOUT_SEC)
+        return proc.returncode if proc.returncode is not None else -1, stderr.strip()
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return -1, "ffmpeg timed out"
+    finally:
+        with _lock:
+            if _current_ffmpeg_proc is proc:
+                _current_ffmpeg_proc = None
+
+
+def _kill_active_ffmpeg() -> None:
+    global _current_ffmpeg_proc
+    with _lock:
+        proc = _current_ffmpeg_proc
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+            proc.communicate(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
@@ -220,16 +261,16 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
                     "-pix_fmt",
                     "yuvj420p",
                     "-q:v",
-                    "9",
+                    "10",
                     str(dest),
                 ]
             )
-            result = subprocess.run(command, capture_output=True, text=True)
-            if result.returncode == 0 and _frame_looks_valid(dest):
+            code, detail = _run_ffmpeg(command)
+            if code == 0 and _frame_looks_valid(dest):
                 return
             if dest.exists():
                 dest.unlink(missing_ok=True)
-            detail = result.stderr.strip() or "ffmpeg frame extract failed"
+            detail = detail or "ffmpeg frame extract failed"
             label = "hwaccel" if hwaccel else "software"
             errors.append(f"{label}: {detail}")
 
@@ -248,6 +289,14 @@ def _update_job_progress(job_key: str, plan: dict, frames: list[dict], pct: int)
         if job_key in _jobs and _jobs[job_key].get("status") == "running":
             _jobs[job_key]["progress"] = pct
             _jobs[job_key]["manifest"] = partial
+
+
+def _ordered_times(times: list[float]) -> list[tuple[int, float]]:
+    """Bootstrap first frames at t≈0, then the rest in order."""
+    indexed = list(enumerate(times))
+    head = indexed[:BOOTSTRAP_FRAMES]
+    tail = indexed[BOOTSTRAP_FRAMES:]
+    return head + tail
 
 
 def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
@@ -269,7 +318,7 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
     failures = 0
 
     with _ffmpeg_lock:
-        for index, timestamp in enumerate(times):
+        for index, timestamp in _ordered_times(times):
             if _job_cancelled(job_key):
                 return
 
@@ -281,7 +330,8 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
                 continue
 
             frames.append({"index": index, "t": timestamp, "file": dest.name})
-            pct = min(99, int((index + 1) / total * 100))
+            frames.sort(key=lambda item: item["index"])
+            pct = min(99, int((len(frames) / total) * 100))
             _update_job_progress(job_key, plan, frames, pct)
 
     min_required = 1 if purpose == "label" else MIN_FRAMES_BEFORE_UI
@@ -313,32 +363,56 @@ def _parse_priority(raw: str | int | None) -> int:
     return PRIORITY_BACKGROUND
 
 
+def _preempt_background_for_foreground(priority: int) -> None:
+    if priority < PRIORITY_FOREGROUND:
+        return
+    global _active_job_key
+    with _lock:
+        if not _active_job_key:
+            return
+        active = _jobs.get(_active_job_key)
+        if not active or active.get("priority", PRIORITY_BACKGROUND) >= PRIORITY_FOREGROUND:
+            return
+        active["status"] = "cancelled"
+    _kill_active_ffmpeg()
+
+
+def _remove_from_queue(key: str) -> None:
+    if key not in _queue_keys:
+        return
+    rebuilt = deque(item for item in _queue if item[2] != key)
+    _queue.clear()
+    _queue.extend(rebuilt)
+    _queue_keys.discard(key)
+
+
 def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
     global _queue_worker_started
     key = _job_key(source, purpose)
     with _lock:
         job = _jobs.get(key)
-        if job and job.get("status") in {"running", "ready"}:
+        if job and job.get("status") == "running" and key == _active_job_key:
             if priority > job.get("priority", PRIORITY_BACKGROUND):
                 job["priority"] = priority
             return
 
-        if key in _queue_keys:
-            rebuilt: deque[tuple[int, float, str, Path, str]] = deque()
-            for neg_priority, queued_at, queued_key, queued_source, queued_purpose in _queue:
-                if queued_key == key:
-                    neg_priority = min(neg_priority, -priority)
-                    queued_source = source
-                    queued_purpose = purpose
-                rebuilt.append((neg_priority, queued_at, queued_key, queued_source, queued_purpose))
-            _queue.clear()
-            _queue.extend(sorted(rebuilt, key=lambda item: (item[0], item[1])))
-            if job and job.get("status") == "queued":
-                job["priority"] = max(job.get("priority", PRIORITY_BACKGROUND), priority)
-            return
+        if job and job.get("status") == "ready":
+            _jobs.pop(key, None)
 
-        _queue.append((-priority, time.time(), key, source, purpose))
+        if key in _queue_keys:
+            _remove_from_queue(key)
+
+        entry = (-priority, time.time(), key, source, purpose)
+        if priority >= PRIORITY_FOREGROUND:
+            _queue.appendleft(entry)
+        else:
+            _queue.append(entry)
         _queue_keys.add(key)
+
+        if job and job.get("status") in {"queued", "error", "cancelled"}:
+            job["status"] = "queued"
+            job["priority"] = max(job.get("priority", PRIORITY_BACKGROUND), priority)
+
         if not _queue_worker_started:
             _queue_worker_started = True
             threading.Thread(
@@ -347,8 +421,12 @@ def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
                 name="snapshot-queue",
             ).start()
 
+    if priority >= PRIORITY_FOREGROUND:
+        _preempt_background_for_foreground(priority)
+
 
 def _queue_worker_loop() -> None:
+    global _active_job_key
     while True:
         with _lock:
             if not _queue:
@@ -364,15 +442,20 @@ def _queue_worker_loop() -> None:
 
         key, source, purpose = item
         with _lock:
-            if key in _jobs and _jobs[key].get("status") in {"running", "ready"}:
+            job = _jobs.get(key)
+            if job and job.get("status") == "cancelled":
+                continue
+            if job and job.get("status") == "ready":
                 continue
             plan = snapshot_plan(source, purpose=purpose)
+            priority = (job or {}).get("priority", PRIORITY_BACKGROUND)
             _jobs[key] = {
                 "status": "running",
                 "progress": 0,
                 "plan": plan,
-                "priority": PRIORITY_FOREGROUND,
+                "priority": priority,
             }
+            _active_job_key = key
 
         try:
             _build_snapshots(source, key, purpose)
@@ -385,11 +468,16 @@ def _queue_worker_loop() -> None:
                     "progress": 100,
                     "cached": False,
                     "manifest": manifest,
+                    "priority": priority,
                 }
         except Exception as exc:  # noqa: BLE001
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":
                     _jobs[key] = {"status": "error", "error": str(exc), "progress": 0}
+        finally:
+            with _lock:
+                if _active_job_key == key:
+                    _active_job_key = None
 
 
 def snapshot_status(
@@ -421,6 +509,12 @@ def snapshot_status(
         job = _jobs.get(key)
         if job and job.get("status") in {"running", "queued"}:
             result = {k: v for k, v in job.items() if k not in {"process"}}
+            if job.get("status") == "queued":
+                position = next(
+                    (idx for idx, item in enumerate(_queue) if item[2] == key),
+                    None,
+                )
+                result["queue_position"] = position
             return result
         if job and job.get("status") == "error":
             if not start:
@@ -434,7 +528,7 @@ def snapshot_status(
     with _lock:
         _jobs[key] = {"status": "queued", "progress": 0, "plan": plan, "priority": prio}
     _enqueue_snapshot(source, purpose, priority=prio)
-    return {"status": "queued", "progress": 0, "plan": plan}
+    return {"status": "queued", "progress": 0, "plan": plan, "priority": prio}
 
 
 def cancel_snapshots(source: Path, *, purpose: str | None = None) -> None:
@@ -445,23 +539,15 @@ def cancel_snapshots(source: Path, *, purpose: str | None = None) -> None:
     else:
         keys = [_job_key(source, "clean"), _job_key(source, "label")]
 
-    with _lock:
-        for key in keys:
+    for key in keys:
+        with _lock:
             job = _jobs.get(key)
-            if not job:
-                continue
-            job["status"] = "cancelled"
-            proc = job.get("process")
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+            if job:
+                job["status"] = "cancelled"
+            _remove_from_queue(key)
             _jobs.pop(key, None)
+        if key == _active_job_key:
+            _kill_active_ffmpeg()
 
 
 def resolve_snapshot_frame(source: Path, index: int, *, purpose: str = "clean") -> Path:

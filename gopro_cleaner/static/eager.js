@@ -537,12 +537,30 @@ async function waitForSnapshots(video, token) {
       );
     }
     if (status.status === "queued" && !uiOpen && !isLabel) {
-      showLoading("Queued for snapshots", video.name, 2, "Waiting for other files to finish…");
+      if (i >= 8) {
+        hideLoading();
+        uiOpen = true;
+        setStatus(
+          `Snapshots loading in background — use the scrub bar below the video (${video.name})`,
+          "ok",
+        );
+      } else {
+        const pos = status.queue_position;
+        const waitHint =
+          typeof pos === "number" && pos > 0
+            ? `Position ${pos + 1} in queue`
+            : "Starting soon…";
+        showLoading("Queued for snapshots", video.name, 5, waitHint);
+      }
     }
 
     if (status.status === "ready" && status.manifest) {
       hideLoading();
       return status.manifest;
+    }
+    if (uiOpen && partial?.frames?.length >= minFrames && status.status === "running") {
+      // Enough frames to work — stop blocking the overlay loop.
+      return partial;
     }
     if (status.status === "error") {
       throw new Error(status.error || "Snapshot build failed");
@@ -827,28 +845,32 @@ async function loadVideo(index) {
     }
     updateScrubUi();
     if (state.phase === "clean" || state.phase === "label") {
-      try {
-        await ensureSnapshots(video, true);
-        if (state.snapshots?.frames?.length) {
-          goToSnapshotIndex(0);
-        }
-        continueSnapshotRefresh(video);
-        if (state.phase === "clean") {
-          startTrimPolling();
-        }
-        const readyMsg =
-          state.phase === "label"
-            ? `Ready — , . ±3s to scrub (${video.name})`
-            : `Ready — use snapshot strip (${video.name})`;
-        setStatus(readyMsg, "ok");
-        updateContextHint();
-        if (state.phase === "clean") {
-          prefetchSnapshotsBackground(state.index + 1);
-        }
-      } catch (error) {
-        hideLoading();
-        setStatus(error.message, "error");
+      hideLoading();
+      if (state.phase === "clean") {
+        startTrimPolling();
       }
+      setStatus(`Ready — ${video.name} (loading snapshots…)`, "ok");
+      updateContextHint();
+      ensureSnapshots(video, false)
+        .then((manifest) => {
+          if (token !== state.previewToken || !manifest) return;
+          if (manifest.frames?.length) {
+            goToSnapshotIndex(0);
+          }
+          continueSnapshotRefresh(video);
+          const readyMsg =
+            state.phase === "label"
+              ? `Ready — , . ±3s to scrub (${video.name})`
+              : `Ready — use snapshot strip (${video.name})`;
+          setStatus(readyMsg, "ok");
+          if (state.phase === "clean" && manifest.frames?.length >= 3) {
+            prefetchSnapshotsBackground(state.index + 1);
+          }
+        })
+        .catch((error) => {
+          if (token !== state.previewToken) return;
+          setStatus(error.message || "Snapshot build failed — use scrub bar", "error");
+        });
     } else {
       setStatus(`Ready — ${video.name}`, "ok");
     }
@@ -980,7 +1002,6 @@ async function scanSource() {
       await loadVideo(0);
       if (mode === "raw") hideLoading();
       setStatus(`Found ${state.videos.length} files`, "ok");
-      if (mode === "raw") prefetchSnapshotsBackground(1);
     } else {
       setStatus(mode === "label" ? "No footage to label found" : `No ${mode} MP4 files found`, "error");
     }
@@ -991,7 +1012,7 @@ async function scanSource() {
   }
 }
 
-const PREFETCH_AHEAD = 3;
+const PREFETCH_AHEAD = 1;
 
 function prefetchSnapshotsBackground(fromIndex) {
   if (state.phase !== "clean") return;
