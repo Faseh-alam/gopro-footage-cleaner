@@ -22,6 +22,13 @@ const state = {
   snapshotBuildToken: 0,
   scrubTime: 0,
   snapshotPurpose: "clean",
+  perf: {
+    lite_mode: false,
+    prefetch: true,
+    snapshot_poll_ms: 1000,
+    trim_poll_ms: 1200,
+    hint: "",
+  },
 };
 
 const el = {
@@ -376,7 +383,7 @@ async function loadMediaProbe(path) {
 function startTrimPolling() {
   stopTrimPolling();
   pollTrimStatus();
-  state.trimPollTimer = setInterval(pollTrimStatus, 800);
+  state.trimPollTimer = setInterval(pollTrimStatus, state.perf.trim_poll_ms || 1200);
 }
 
 function stopTrimPolling() {
@@ -514,7 +521,7 @@ async function waitForSnapshots(video, token) {
     const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
     const partial = status.manifest;
     const frameCount = partial?.frames?.length || 0;
-    const minFrames = isLabel ? 1 : 3;
+    const minFrames = isLabel ? 1 : state.perf.lite_mode ? 2 : 3;
 
     if (partial?.frames?.length) {
       state.snapshots = partial;
@@ -565,7 +572,7 @@ async function waitForSnapshots(video, token) {
     if (status.status === "error") {
       throw new Error(status.error || "Snapshot build failed");
     }
-    await new Promise((r) => setTimeout(r, uiOpen ? 250 : 150));
+    await new Promise((r) => setTimeout(r, uiOpen ? state.perf.snapshot_poll_ms : Math.min(800, state.perf.snapshot_poll_ms)));
   }
   throw new Error("Snapshot build timed out");
 }
@@ -601,8 +608,9 @@ async function ensureSnapshots(video, showOverlay = true) {
 function continueSnapshotRefresh(video) {
   if (state.snapshotPurpose === "label") return;
   const token = state.snapshotBuildToken;
+  const pollMs = state.perf.snapshot_poll_ms || 1000;
   (async () => {
-    for (let i = 0; i < 600; i += 1) {
+    for (let i = 0; i < 120; i += 1) {
       if (token !== state.snapshotBuildToken) return;
       if (currentVideo()?.path !== video.path) return;
       const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
@@ -618,7 +626,7 @@ function continueSnapshotRefresh(video) {
         return;
       }
       if (status.status === "error") return;
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, pollMs));
     }
   })();
 }
@@ -863,7 +871,7 @@ async function loadVideo(index) {
               ? `Ready — , . ±3s to scrub (${video.name})`
               : `Ready — use snapshot strip (${video.name})`;
           setStatus(readyMsg, "ok");
-          if (state.phase === "clean" && manifest.frames?.length >= 3) {
+          if (state.phase === "clean" && manifest.frames?.length >= 3 && state.perf.prefetch) {
             prefetchSnapshotsBackground(state.index + 1);
           }
         })
@@ -1015,7 +1023,7 @@ async function scanSource() {
 const PREFETCH_AHEAD = 1;
 
 function prefetchSnapshotsBackground(fromIndex) {
-  if (state.phase !== "clean") return;
+  if (state.phase !== "clean" || !state.perf.prefetch) return;
   const start = fromIndex ?? state.index + 1;
   const end = Math.min(state.videos.length, start + PREFETCH_AHEAD);
   (async () => {
@@ -1122,7 +1130,7 @@ async function finishCleaningFile() {
       setStatus(`Finished ${video.name}`, "ok");
     }
     advanceToNext();
-    if (state.phase === "clean") prefetchSnapshotsBackground(state.index + 1);
+    if (state.phase === "clean" && state.perf.prefetch) prefetchSnapshotsBackground(state.index + 1);
   } catch (error) {
     setStatus(error.message, "error");
   }
@@ -1305,8 +1313,12 @@ document.addEventListener("keydown", (event) => {
 });
 
 loadTasks()
-  .then(() => api("/api/health"))
-  .then((data) => {
-    if (el.appVersion) el.appVersion.textContent = `v${data.version || "?"}`;
+  .then(() => Promise.all([api("/api/health"), api("/api/eager/config")]))
+  .then(([health, perf]) => {
+    if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
+    state.perf = { ...state.perf, ...perf };
+    if (perf.lite_mode && perf.hint) {
+      setStatus(perf.hint, "ok");
+    }
   })
   .catch((error) => setStatus(error.message, "error"));

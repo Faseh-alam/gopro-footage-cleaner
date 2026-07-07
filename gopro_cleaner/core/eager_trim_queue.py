@@ -86,6 +86,10 @@ class EagerTrimQueue:
                 if r.source_path == key and r.status in {"queued", "running"}
             )
 
+    def any_active(self) -> bool:
+        with self._lock:
+            return any(r.status in {"queued", "running"} for r in self._records.values())
+
     def schedule_source_finish(self, source: Path) -> dict:
         """Delete raw file after queued trims finish; returns immediately if trims still running."""
         source = source.expanduser().resolve()

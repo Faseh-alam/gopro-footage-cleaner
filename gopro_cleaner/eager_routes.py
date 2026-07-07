@@ -17,7 +17,13 @@ from .core.eager import (
 from .core.eager_trim_queue import eager_trim_queue
 from .core.folder_picker import pick_folder
 from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
-from .core.snapshot_strip import cancel_snapshots, resolve_snapshot_frame, snapshot_plan, snapshot_status
+from .core.snapshot_strip import (
+    cancel_snapshots,
+    resolve_snapshot_frame,
+    snapshot_config,
+    snapshot_plan,
+    snapshot_status,
+)
 from .core.task_store import add_task, load_tasks
 from .core.volumes import list_volume_roots, normalize_path
 
@@ -28,6 +34,10 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
     @eager.get("/review")
     def review_page():
         return render_template("eager.html", version=version)
+
+    @eager.get("/api/eager/config")
+    def eager_config():
+        return jsonify(snapshot_config())
 
     @eager.get("/api/eager/volumes")
     def eager_volumes():

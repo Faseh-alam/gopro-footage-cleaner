@@ -11,22 +11,42 @@ import time
 from collections import deque
 from pathlib import Path
 
+from .lite_mode import lite_mode_enabled, performance_config
 from .probe import probe_media
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
+def _settings() -> dict:
+    return performance_config()
+
+
+def _max_snapshots() -> int:
+    return int(_settings()["max_snapshots"])
+
+
+def _snapshot_width() -> int:
+    return int(_settings()["snapshot_width"])
+
+
+def _interval_min() -> float:
+    return float(_settings()["interval_min_sec"])
+
+
+def _label_preview_count() -> int:
+    return int(_settings()["label_preview_count"])
+
+
+def _ffmpeg_timeout() -> int:
+    return 30 if lite_mode_enabled() else 45
+
+
 GARBAGE_RATIO = 0.10
 GARBAGE_SNAPSHOT_THRESHOLD = 4
-INTERVAL_MIN_SEC = 8.0
-MAX_SNAPSHOTS = 36
-LABEL_PREVIEW_COUNT = 8
 LABEL_PREVIEW_INTERVAL_SEC = 5.0
 LABEL_PREVIEW_SPAN_SEC = 40.0
-SNAPSHOT_WIDTH = 160
 MIN_FRAMES_BEFORE_UI = 3
 SNAPSHOT_FFMPEG_THREADS = 1
-FFMPEG_FRAME_TIMEOUT_SEC = 45
 PRIORITY_FOREGROUND = 10
 PRIORITY_BACKGROUND = 1
 BOOTSTRAP_FRAMES = 3
@@ -57,7 +77,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v8-preempt"
+    version = "v9-lite" if lite_mode_enabled() else "v9-full"
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -74,15 +94,17 @@ def _manifest_path(source: Path, purpose: str) -> Path:
 
 def compute_snapshot_interval(duration_seconds: float) -> float:
     """Spacing so GARBAGE_SNAPSHOT_THRESHOLD idle frames ≈ 10% of clip length."""
+    interval_min = _interval_min()
+    max_snaps = _max_snapshots()
     if not duration_seconds or duration_seconds <= 0:
-        return INTERVAL_MIN_SEC
+        return interval_min
     max_garbage = duration_seconds * GARBAGE_RATIO
     interval = max_garbage / GARBAGE_SNAPSHOT_THRESHOLD
-    interval = max(INTERVAL_MIN_SEC, interval)
+    interval = max(interval_min, interval)
     count = int(duration_seconds / interval) + 1
-    if count > MAX_SNAPSHOTS:
-        interval = duration_seconds / max(MAX_SNAPSHOTS - 1, 1)
-        interval = max(INTERVAL_MIN_SEC, interval)
+    if count > max_snaps:
+        interval = duration_seconds / max(max_snaps - 1, 1)
+        interval = max(interval_min, interval)
     return round(interval, 2)
 
 
@@ -114,7 +136,7 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
         interval = LABEL_PREVIEW_INTERVAL_SEC
         times: list[float] = []
         t = 0.0
-        while t < min(duration, LABEL_PREVIEW_SPAN_SEC) - 0.05 and len(times) < LABEL_PREVIEW_COUNT:
+        while t < min(duration, LABEL_PREVIEW_SPAN_SEC) - 0.05 and len(times) < _label_preview_count():
             times.append(round(t, 3))
             t += interval
         if not times:
@@ -170,7 +192,7 @@ def _hwaccel_args() -> list[str]:
 
 
 def _snapshot_video_filter() -> str:
-    return f"scale={SNAPSHOT_WIDTH}:-2:flags=fast_bilinear,format=yuvj420p"
+    return f"scale={_snapshot_width()}:-2:flags=fast_bilinear,format=yuvj420p"
 
 
 def _frame_looks_valid(path: Path) -> bool:
@@ -186,6 +208,8 @@ def _input_strategies(source: Path, timestamp: float) -> list[list[str]]:
     source_arg = str(source)
     coarse = max(0.0, timestamp - 2.0)
     fine = min(2.0, timestamp)
+    if lite_mode_enabled():
+        return [["-ss", f"{coarse:.3f}", "-i", source_arg, "-ss", f"{fine:.3f}"]]
     strategies = [
         ["-ss", f"{coarse:.3f}", "-i", source_arg, "-ss", f"{fine:.3f}"],
         ["-ss", f"{timestamp:.3f}", "-i", source_arg],
@@ -206,7 +230,7 @@ def _run_ffmpeg(command: list[str]) -> tuple[int, str]:
     with _lock:
         _current_ffmpeg_proc = proc
     try:
-        _, stderr = proc.communicate(timeout=FFMPEG_FRAME_TIMEOUT_SEC)
+        _, stderr = proc.communicate(timeout=_ffmpeg_timeout())
         return proc.returncode if proc.returncode is not None else -1, stderr.strip()
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -237,7 +261,7 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
 
     errors: list[str] = []
     vf = _snapshot_video_filter()
-    for hwaccel in ([True, False] if _hwaccel_args() else [False]):
+    for hwaccel in ([False] if lite_mode_enabled() else ([True, False] if _hwaccel_args() else [False])):
         for input_args in _input_strategies(source, timestamp):
             command = [
                 "ffmpeg",
@@ -292,11 +316,28 @@ def _update_job_progress(job_key: str, plan: dict, frames: list[dict], pct: int)
 
 
 def _ordered_times(times: list[float]) -> list[tuple[int, float]]:
-    """Bootstrap first frames at t≈0, then the rest in order."""
     indexed = list(enumerate(times))
+    if lite_mode_enabled():
+        return indexed
     head = indexed[:BOOTSTRAP_FRAMES]
     tail = indexed[BOOTSTRAP_FRAMES:]
     return head + tail
+
+
+def _wait_while_trims_active(job_key: str) -> None:
+    if not lite_mode_enabled():
+        return
+    while True:
+        if _job_cancelled(job_key):
+            return
+        try:
+            from .eager_trim_queue import eager_trim_queue
+
+            if not eager_trim_queue.any_active():
+                return
+        except Exception:
+            return
+        time.sleep(1.5)
 
 
 def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
@@ -321,6 +362,7 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
         for index, timestamp in _ordered_times(times):
             if _job_cancelled(job_key):
                 return
+            _wait_while_trims_active(job_key)
 
             dest = out_dir / f"frame_{index:05d}.jpg"
             try:
@@ -334,7 +376,7 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
             pct = min(99, int((len(frames) / total) * 100))
             _update_job_progress(job_key, plan, frames, pct)
 
-    min_required = 1 if purpose == "label" else MIN_FRAMES_BEFORE_UI
+    min_required = 1 if purpose == "label" else (2 if lite_mode_enabled() else MIN_FRAMES_BEFORE_UI)
     if len(frames) < min_required:
         raise RuntimeError(
             f"Only {len(frames)}/{len(times)} snapshots could be built"
@@ -388,6 +430,8 @@ def _remove_from_queue(key: str) -> None:
 
 def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
     global _queue_worker_started
+    if lite_mode_enabled() and priority < PRIORITY_FOREGROUND:
+        return
     key = _job_key(source, purpose)
     with _lock:
         job = _jobs.get(key)
@@ -437,10 +481,19 @@ def _queue_worker_loop() -> None:
                 item = (key, source, purpose)
 
         if item is None:
-            time.sleep(0.25)
+            time.sleep(0.5 if lite_mode_enabled() else 0.25)
             continue
 
         key, source, purpose = item
+        while lite_mode_enabled():
+            try:
+                from .eager_trim_queue import eager_trim_queue
+
+                if not eager_trim_queue.any_active():
+                    break
+            except Exception:
+                break
+            time.sleep(1.5)
         with _lock:
             job = _jobs.get(key)
             if job and job.get("status") == "cancelled":
@@ -478,6 +531,10 @@ def _queue_worker_loop() -> None:
             with _lock:
                 if _active_job_key == key:
                     _active_job_key = None
+
+
+def snapshot_config() -> dict:
+    return performance_config()
 
 
 def snapshot_status(
