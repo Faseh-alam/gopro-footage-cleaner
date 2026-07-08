@@ -81,6 +81,7 @@ const el = {
   cleanPanel: document.getElementById("clean-panel"),
   labelPanel: document.getElementById("label-panel"),
   trimBtn: document.getElementById("trim-btn"),
+  deleteFileBtn: document.getElementById("delete-file-btn"),
   nextCleanBtn: document.getElementById("next-clean-btn"),
   taskSearch: document.getElementById("task-search"),
   taskList: document.getElementById("task-list"),
@@ -163,6 +164,12 @@ function selectedTask() {
   const picked = el.taskSelect.value.trim();
   if (picked) return picked;
   return el.newTaskInput.value.trim();
+}
+
+function visibleTasks() {
+  const q = el.taskSearch.value.trim().toLowerCase();
+  if (!q) return [...state.tasks];
+  return state.tasks.filter((task) => task.toLowerCase().includes(q));
 }
 
 function snapshotQuery(video, { priority } = {}) {
@@ -684,8 +691,14 @@ function currentScrubTime() {
 }
 
 function renderTasks(preferred = "") {
-  const q = el.taskSearch.value.trim().toLowerCase();
-  const selected = preferred || el.taskSelect.value;
+  const matches = visibleTasks();
+  const current = el.taskSelect.value;
+  const selected =
+    preferred && matches.includes(preferred)
+      ? preferred
+      : matches.includes(current)
+        ? current
+        : matches[0] || "";
   el.taskList.innerHTML = "";
   el.taskSelect.innerHTML = "";
 
@@ -694,8 +707,7 @@ function renderTasks(preferred = "") {
     return;
   }
 
-  for (const task of state.tasks) {
-    if (q && !task.toLowerCase().includes(q)) continue;
+  for (const task of matches) {
     const option = document.createElement("option");
     option.value = task;
     option.textContent = task;
@@ -719,6 +731,20 @@ function renderTasks(preferred = "") {
     el.taskSelect.selectedIndex = 0;
   }
   updateContextHint();
+}
+
+function moveTaskSelection(delta) {
+  const options = [...el.taskSelect.options].map((opt) => opt.value);
+  if (!options.length) return false;
+  const current = el.taskSelect.value;
+  const idx = Math.max(0, options.indexOf(current));
+  const next = Math.max(0, Math.min(options.length - 1, idx + delta));
+  const chosen = options[next];
+  el.taskSelect.value = chosen;
+  renderTasks(chosen);
+  const active = el.taskList.querySelector(".task-item.active");
+  active?.scrollIntoView({ block: "nearest" });
+  return true;
 }
 
 function updateScrubUi() {
@@ -1143,6 +1169,34 @@ async function finishCleaningFile() {
   }
 }
 
+async function deleteCurrentFile() {
+  const video = currentVideo();
+  if (!video) return;
+  if (state.pendingClip || state.pendingIn !== null) {
+    setStatus("Clear the current mark before deleting file", "error");
+    return;
+  }
+  if (activeTrimCount() > 0) {
+    setStatus("Cannot delete while trim jobs are running for this file", "error");
+    return;
+  }
+  if (!window.confirm(`Delete whole file?\n\n${video.name}`)) return;
+
+  try {
+    const data = await api("/api/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: video.path, confirmed: true }),
+    });
+    state.donePaths.add(video.path);
+    stopTrimPolling();
+    setStatus(data.message || `Deleted ${video.name}`, "ok");
+    advanceToNext();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
 async function labelCurrentClip() {
   if (state.busy) return;
   const video = currentVideo();
@@ -1232,10 +1286,22 @@ el.scanBtn.addEventListener("click", scanSource);
 el.fileFilter.addEventListener("input", renderFileList);
 el.undoClipBtn.addEventListener("click", undoMark);
 el.trimBtn.addEventListener("click", trimMarkedClip);
+el.deleteFileBtn?.addEventListener("click", deleteCurrentFile);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
 el.phaseClean.addEventListener("click", () => setPhase("clean"));
 el.phaseLabel.addEventListener("click", () => setPhase("label"));
 el.taskSearch.addEventListener("input", () => renderTasks());
+el.taskSearch.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    moveTaskSelection(1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    moveTaskSelection(-1);
+  }
+});
 el.addTaskBtn.addEventListener("click", addTask);
 el.newTaskInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
@@ -1304,6 +1370,10 @@ document.addEventListener("keydown", (event) => {
       event.preventDefault();
       finishCleaningFile();
     }
+    if (event.key === "Delete") {
+      event.preventDefault();
+      deleteCurrentFile();
+    }
     if (key === " ") {
       event.preventDefault();
       if (el.player.paused) el.player.play();
@@ -1312,6 +1382,16 @@ document.addEventListener("keydown", (event) => {
   }
 
   if (state.phase === "label") {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveTaskSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveTaskSelection(-1);
+      return;
+    }
     if (key === "n" || key === "enter") {
       event.preventDefault();
       labelCurrentClip();

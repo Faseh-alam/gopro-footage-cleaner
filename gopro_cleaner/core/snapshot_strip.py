@@ -42,7 +42,7 @@ def _ffmpeg_timeout() -> int:
 
 GARBAGE_RATIO = 0.10
 GARBAGE_SNAPSHOT_THRESHOLD = 4
-INTERVAL_MAX_SEC = 180.0  # hard cap: snapshots never more than 3 minutes apart
+INTERVAL_MAX_SEC = 90.0  # hard cap: snapshots never more than 90 seconds apart
 LABEL_PREVIEW_INTERVAL_SEC = 5.0
 LABEL_PREVIEW_SPAN_SEC = 40.0
 MIN_FRAMES_BEFORE_UI = 3
