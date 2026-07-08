@@ -42,6 +42,7 @@ def _ffmpeg_timeout() -> int:
 
 GARBAGE_RATIO = 0.10
 GARBAGE_SNAPSHOT_THRESHOLD = 4
+INTERVAL_MAX_SEC = 180.0  # hard cap: snapshots never more than 3 minutes apart
 LABEL_PREVIEW_INTERVAL_SEC = 5.0
 LABEL_PREVIEW_SPAN_SEC = 40.0
 MIN_FRAMES_BEFORE_UI = 3
@@ -76,7 +77,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v10-lite" if lite_mode_enabled() else "v10-full"
+    version = "v11-lite" if lite_mode_enabled() else "v11-full"
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -89,6 +90,14 @@ def _snapshot_dir(source: Path, purpose: str) -> Path:
 
 def _manifest_path(source: Path, purpose: str) -> Path:
     return _snapshot_dir(source, purpose) / "manifest.json"
+
+
+def _format_minutes(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    rest = int(seconds % 60)
+    return f"{minutes}m {rest}s" if rest else f"{minutes} min"
 
 
 def compute_snapshot_interval(duration_seconds: float) -> float:
@@ -104,6 +113,9 @@ def compute_snapshot_interval(duration_seconds: float) -> float:
     if count > max_snaps:
         interval = duration_seconds / max(max_snaps - 1, 1)
         interval = max(interval_min, interval)
+    # The 3-minute cap wins over max_snapshots — long clips get more snapshots
+    # rather than wider gaps (keyframe extraction keeps them cheap).
+    interval = min(interval, INTERVAL_MAX_SEC)
     return round(interval, 2)
 
 
@@ -150,7 +162,7 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
         max_garbage = round(duration * GARBAGE_RATIO, 1) if duration else 0
         garbage_hint = (
             f"{GARBAGE_SNAPSHOT_THRESHOLD}+ snapshots in a row without work "
-            f"≈ garbage (up to ~{int(max_garbage)}s allowed in this clip)"
+            f"≈ garbage (up to ~{_format_minutes(max_garbage)} allowed in this clip)"
         )
 
     return {

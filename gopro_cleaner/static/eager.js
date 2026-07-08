@@ -458,10 +458,17 @@ function updateFilmstripMeta() {
   const m = state.snapshots;
   const idx = state.snapshotIndex + 1;
   const total = m.frames?.length || 0;
-  el.filmstripMeta.textContent =
-    state.snapshotPurpose === "label"
-      ? `Opening preview ${idx}/${total} · use , . ±3s to scrub`
-      : `Every ${m.interval_seconds}s · snapshot ${idx}/${total} · ${m.garbage_hint || ""}`;
+  if (state.snapshotPurpose === "label") {
+    el.filmstripMeta.textContent = `Opening preview ${idx}/${total} · use , . ±3s to scrub`;
+    return;
+  }
+  const parts = [];
+  if (m.duration) parts.push(`Clip ${formatDurationShort(m.duration)}`);
+  parts.push(`snapshot every ${formatDurationShort(m.interval_seconds)} (${idx}/${total})`);
+  if (m.max_garbage_seconds > 0) {
+    parts.push(`garbage allowed ~${formatDurationShort(m.max_garbage_seconds)}`);
+  }
+  el.filmstripMeta.textContent = parts.join(" · ");
 }
 
 function attachSnapshotImage(img, video, frameIndex) {
