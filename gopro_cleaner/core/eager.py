@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .probe import probe_media
@@ -149,7 +150,12 @@ def scan_mp4_files(
             elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
                 candidates.append(path)
 
-    videos = [_video_dict(path, root) for path in sorted(candidates, key=lambda p: p.name.lower())]
+    ordered = sorted(candidates, key=lambda p: p.name.lower())
+    if not ordered:
+        return []
+    # Probe in parallel — serial ffprobe over a big folder on a USB drive is slow.
+    with ThreadPoolExecutor(max_workers=min(4, len(ordered))) as pool:
+        videos = list(pool.map(lambda path: _video_dict(path, root), ordered))
     return videos
 
 

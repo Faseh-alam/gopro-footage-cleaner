@@ -1020,7 +1020,7 @@ async function scanSource() {
   }
 }
 
-const PREFETCH_AHEAD = 1;
+const PREFETCH_AHEAD = 2;
 
 function prefetchSnapshotsBackground(fromIndex) {
   if (state.phase !== "clean" || !state.perf.prefetch) return;

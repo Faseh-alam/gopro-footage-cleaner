@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".360", ".mkv"}
 GOPRO_PREFIXES = ("GOPR", "GP", "GX", "GL", "GH")
+
+# Cache ffprobe results keyed by (path, mtime, size) — probing the same file
+# repeatedly is expensive on slow USB drives and happens on every status poll.
+_PROBE_CACHE_MAX = 512
+_probe_cache: dict[str, tuple[int, int, "MediaInfo"]] = {}
+_probe_cache_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,13 @@ def probe_media(path: Path) -> MediaInfo:
     if not path.exists():
         raise FileNotFoundError(path)
 
+    stat = path.stat()
+    cache_key = str(path)
+    with _probe_cache_lock:
+        hit = _probe_cache.get(cache_key)
+        if hit and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
+            return hit[2]
+
     payload = _run_ffprobe(path)
     streams: list[StreamInfo] = []
     video_index = None
@@ -100,13 +114,18 @@ def probe_media(path: Path) -> MediaInfo:
     duration_raw = payload.get("format", {}).get("duration")
     duration = float(duration_raw) if duration_raw is not None else None
 
-    return MediaInfo(
+    info = MediaInfo(
         path=path,
         duration=duration,
-        size_bytes=path.stat().st_size,
+        size_bytes=stat.st_size,
         streams=streams,
         video_index=video_index,
         audio_index=audio_index,
         gpmf_index=gpmf_index,
         has_gpmf=gpmf_index is not None,
     )
+    with _probe_cache_lock:
+        if len(_probe_cache) >= _PROBE_CACHE_MAX:
+            _probe_cache.pop(next(iter(_probe_cache)))
+        _probe_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, info)
+    return info

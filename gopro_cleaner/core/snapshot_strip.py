@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import platform
 import subprocess
 import threading
 import time
@@ -46,7 +45,7 @@ GARBAGE_SNAPSHOT_THRESHOLD = 4
 LABEL_PREVIEW_INTERVAL_SEC = 5.0
 LABEL_PREVIEW_SPAN_SEC = 40.0
 MIN_FRAMES_BEFORE_UI = 3
-SNAPSHOT_FFMPEG_THREADS = 1
+SNAPSHOT_FFMPEG_THREADS = 2
 PRIORITY_FOREGROUND = 10
 PRIORITY_BACKGROUND = 1
 BOOTSTRAP_FRAMES = 3
@@ -77,7 +76,7 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v9-lite" if lite_mode_enabled() else "v9-full"
+    version = "v10-lite" if lite_mode_enabled() else "v10-full"
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -185,12 +184,6 @@ def _load_manifest(source: Path, purpose: str) -> dict | None:
         return None
 
 
-def _hwaccel_args() -> list[str]:
-    if platform.system() == "Darwin":
-        return ["-hwaccel", "videotoolbox"]
-    return []
-
-
 def _snapshot_video_filter() -> str:
     return f"scale={_snapshot_width()}:-2:flags=fast_bilinear,format=yuvj420p"
 
@@ -206,17 +199,22 @@ def _frame_looks_valid(path: Path) -> bool:
 
 def _input_strategies(source: Path, timestamp: float) -> list[list[str]]:
     source_arg = str(source)
-    coarse = max(0.0, timestamp - 2.0)
-    fine = min(2.0, timestamp)
-    if lite_mode_enabled():
-        return [["-ss", f"{coarse:.3f}", "-i", source_arg, "-ss", f"{fine:.3f}"]]
-    strategies = [
-        ["-ss", f"{coarse:.3f}", "-i", source_arg, "-ss", f"{fine:.3f}"],
-        ["-ss", f"{timestamp:.3f}", "-i", source_arg],
+    # Keyframe-only decode: seek on the input side, skip all non-key frames, and
+    # decode a single keyframe. Orders of magnitude faster than accurate seeking
+    # on slow CPUs (no 4K frame-by-frame decode). Filmstrip accuracy of ~1 GOP
+    # (<1s on GoPro files) is fine — trims are keyframe-based stream copies anyway.
+    keyframe = [
+        "-skip_frame",
+        "nokey",
+        "-noaccurate_seek",
+        "-ss",
+        f"{timestamp:.3f}",
+        "-i",
+        source_arg,
     ]
-    if timestamp <= 30.0:
-        strategies.append(["-i", source_arg, "-ss", f"{timestamp:.3f}"])
-    return strategies
+    # Fallback: plain input-side accurate seek (decodes at most ~1 GOP).
+    accurate = ["-ss", f"{timestamp:.3f}", "-i", source_arg]
+    return [keyframe, accurate]
 
 
 def _run_ffmpeg(command: list[str]) -> tuple[int, str]:
@@ -261,9 +259,9 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
 
     errors: list[str] = []
     vf = _snapshot_video_filter()
-    for hwaccel in ([False] if lite_mode_enabled() else ([True, False] if _hwaccel_args() else [False])):
-        for input_args in _input_strategies(source, timestamp):
-            command = [
+    for input_args in _input_strategies(source, timestamp):
+        command = (
+            [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
@@ -272,31 +270,26 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
                 "-threads",
                 str(SNAPSHOT_FFMPEG_THREADS),
             ]
-            if hwaccel:
-                command.extend(_hwaccel_args())
-            command.extend(
-                input_args
-                + [
-                    "-frames:v",
-                    "1",
-                    "-an",
-                    "-vf",
-                    vf,
-                    "-pix_fmt",
-                    "yuvj420p",
-                    "-q:v",
-                    "10",
-                    str(dest),
-                ]
-            )
-            code, detail = _run_ffmpeg(command)
-            if code == 0 and _frame_looks_valid(dest):
-                return
-            if dest.exists():
-                dest.unlink(missing_ok=True)
-            detail = detail or "ffmpeg frame extract failed"
-            label = "hwaccel" if hwaccel else "software"
-            errors.append(f"{label}: {detail}")
+            + input_args
+            + [
+                "-frames:v",
+                "1",
+                "-an",
+                "-vf",
+                vf,
+                "-pix_fmt",
+                "yuvj420p",
+                "-q:v",
+                "10",
+                str(dest),
+            ]
+        )
+        code, detail = _run_ffmpeg(command)
+        if code == 0 and _frame_looks_valid(dest):
+            return
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        errors.append(detail or "ffmpeg frame extract failed")
 
     raise RuntimeError(errors[-1] if errors else "ffmpeg frame extract failed")
 
@@ -324,22 +317,6 @@ def _ordered_times(times: list[float]) -> list[tuple[int, float]]:
     return head + tail
 
 
-def _wait_while_trims_active(job_key: str) -> None:
-    if not lite_mode_enabled():
-        return
-    while True:
-        if _job_cancelled(job_key):
-            return
-        try:
-            from .eager_trim_queue import eager_trim_queue
-
-            if not eager_trim_queue.any_active():
-                return
-        except Exception:
-            return
-        time.sleep(1.5)
-
-
 def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
     source = source.expanduser().resolve()
     purpose = _normalize_purpose(purpose)
@@ -362,7 +339,6 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
         for index, timestamp in _ordered_times(times):
             if _job_cancelled(job_key):
                 return
-            _wait_while_trims_active(job_key)
 
             dest = out_dir / f"frame_{index:05d}.jpg"
             try:
@@ -430,8 +406,6 @@ def _remove_from_queue(key: str) -> None:
 
 def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
     global _queue_worker_started
-    if lite_mode_enabled() and priority < PRIORITY_FOREGROUND:
-        return
     key = _job_key(source, purpose)
     with _lock:
         job = _jobs.get(key)
@@ -485,22 +459,24 @@ def _queue_worker_loop() -> None:
             continue
 
         key, source, purpose = item
-        while lite_mode_enabled():
-            try:
-                from .eager_trim_queue import eager_trim_queue
-
-                if not eager_trim_queue.any_active():
-                    break
-            except Exception:
-                break
-            time.sleep(1.5)
         with _lock:
             job = _jobs.get(key)
-            if job and job.get("status") == "cancelled":
+            if job and job.get("status") in {"cancelled", "ready"}:
                 continue
-            if job and job.get("status") == "ready":
-                continue
+
+        # Probe outside the lock — ffprobe on a slow USB drive must not block
+        # status polls, and a vanished file must not kill the worker thread.
+        try:
             plan = snapshot_plan(source, purpose=purpose)
+        except Exception as exc:  # noqa: BLE001
+            with _lock:
+                _jobs[key] = {"status": "error", "error": str(exc), "progress": 0}
+            continue
+
+        with _lock:
+            job = _jobs.get(key)
+            if job and job.get("status") in {"cancelled", "ready"}:
+                continue
             priority = (job or {}).get("priority", PRIORITY_BACKGROUND)
             _jobs[key] = {
                 "status": "running",

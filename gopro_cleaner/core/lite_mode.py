@@ -73,14 +73,14 @@ def performance_config() -> dict:
         return {
             "lite_mode": True,
             "ram_gb": round(ram, 1) if ram else None,
-            "max_snapshots": 8,
-            "snapshot_width": 120,
-            "interval_min_sec": 20.0,
-            "label_preview_count": 5,
-            "prefetch": False,
-            "snapshot_poll_ms": 2500,
-            "trim_poll_ms": 2500,
-            "hint": "Lite mode — fewer snapshots, no background loading (low RAM PC)",
+            "max_snapshots": 12,
+            "snapshot_width": 160,
+            "interval_min_sec": 10.0,
+            "label_preview_count": 6,
+            "prefetch": True,
+            "snapshot_poll_ms": 1200,
+            "trim_poll_ms": 1500,
+            "hint": "Lite mode — keyframe snapshots, next files preload in background",
         }
     return {
         "lite_mode": False,
