@@ -179,15 +179,32 @@ def snapshot_times(duration_seconds: float, interval: float | None = None) -> li
     )
 
 
-def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
+def snapshot_plan(
+    source: Path,
+    *,
+    purpose: str = "clean",
+    duration_hint: float | None = None,
+) -> dict:
     source = source.expanduser().resolve()
     purpose = _normalize_purpose(purpose)
     if not source.exists():
         raise FileNotFoundError(source)
-    try:
-        duration = probe_media(source).duration or 0.0
-    except (RuntimeError, OSError):
-        duration = 0.0
+
+    duration = 0.0
+    for _ in range(2):
+        try:
+            duration = float(probe_media(source).duration or 0.0)
+        except (RuntimeError, OSError):
+            duration = 0.0
+        if duration > 0:
+            break
+    if duration <= 0 and duration_hint is not None:
+        try:
+            hint = float(duration_hint)
+        except (TypeError, ValueError):
+            hint = 0.0
+        if hint > 0:
+            duration = hint
 
     snap = _settings()
     if purpose == "label":
@@ -392,7 +409,9 @@ def _ordered_times(times: list[float]) -> list[tuple[int, float]]:
 def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
     source = source.expanduser().resolve()
     purpose = _normalize_purpose(purpose)
-    plan = snapshot_plan(source, purpose=purpose)
+    with _lock:
+        duration_hint = (_jobs.get(job_key) or {}).get("duration_hint")
+    plan = snapshot_plan(source, purpose=purpose, duration_hint=duration_hint)
     times = plan["times"]
     out_dir = _snapshot_dir(source, purpose)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -424,7 +443,18 @@ def _build_snapshots(source: Path, job_key: str, purpose: str) -> None:
             pct = min(99, int((len(frames) / total) * 100))
             _update_job_progress(job_key, plan, frames, pct)
 
-    min_required = 1 if purpose == "label" else (2 if lite_mode_enabled() else MIN_FRAMES_BEFORE_UI)
+    if _job_cancelled(job_key):
+        return
+
+    if not frames:
+        raise RuntimeError(
+            "No snapshots could be built"
+            + (f" ({failures} failed)" if failures else "")
+        )
+
+    # Never require more frames than we planned (short clips may only need 1).
+    desired = 1 if purpose == "label" else (2 if lite_mode_enabled() else MIN_FRAMES_BEFORE_UI)
+    min_required = max(1, min(desired, len(times)))
     if len(frames) < min_required:
         raise RuntimeError(
             f"Only {len(frames)}/{len(times)} snapshots could be built"
@@ -562,11 +592,13 @@ def _queue_worker_loop() -> None:
             if job and job.get("status") in {"cancelled", "ready"}:
                 continue
             priority = (job or {}).get("priority", PRIORITY_BACKGROUND)
+            duration_hint = (job or {}).get("duration_hint")
             _jobs[key] = {
                 "status": "running",
                 "progress": 0,
                 "plan": plan,
                 "priority": priority,
+                "duration_hint": duration_hint,
             }
             _active_job_key = key
 
@@ -603,6 +635,7 @@ def snapshot_status(
     start: bool = False,
     purpose: str = "clean",
     priority: str | int | None = None,
+    duration_hint: float | None = None,
 ) -> dict:
     source = source.expanduser().resolve()
     purpose = _normalize_purpose(purpose)
@@ -611,6 +644,15 @@ def snapshot_status(
 
     key = _job_key(source, purpose)
     prio = _parse_priority(priority) if start else PRIORITY_BACKGROUND
+    hint: float | None = None
+    if duration_hint is not None:
+        try:
+            parsed = float(duration_hint)
+            if parsed > 0:
+                hint = parsed
+        except (TypeError, ValueError):
+            hint = None
+
     manifest = _load_manifest(source, purpose)
     if manifest and manifest.get("ready") and manifest.get("frames"):
         if _manifest_frames_valid(source, purpose, manifest):
@@ -628,6 +670,8 @@ def snapshot_status(
         if job and job.get("status") in {"running", "queued"}:
             if start and prio >= PRIORITY_FOREGROUND:
                 job["priority"] = max(job.get("priority", PRIORITY_BACKGROUND), prio)
+            if start and hint is not None:
+                job["duration_hint"] = hint
             result = {k: v for k, v in job.items() if k not in {"process"}}
             if job.get("status") == "queued":
                 position = next(
@@ -658,12 +702,18 @@ def snapshot_status(
             _preempt_other_jobs(prio, key)
         return result
 
-    plan = snapshot_plan(source, purpose=purpose)
+    plan = snapshot_plan(source, purpose=purpose, duration_hint=hint)
     if not start:
         return {"status": "idle", "progress": 0, "plan": plan}
 
     with _lock:
-        _jobs[key] = {"status": "queued", "progress": 0, "plan": plan, "priority": prio}
+        _jobs[key] = {
+            "status": "queued",
+            "progress": 0,
+            "plan": plan,
+            "priority": prio,
+            "duration_hint": hint,
+        }
     _enqueue_snapshot(source, purpose, priority=prio)
     return {"status": "queued", "progress": 0, "plan": plan, "priority": prio}
 

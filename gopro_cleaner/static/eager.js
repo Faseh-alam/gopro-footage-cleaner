@@ -375,6 +375,10 @@ function snapshotQuery(video, { priority } = {}) {
   const purpose = state.snapshotPurpose || "clean";
   let q = `path=${encodeURIComponent(video.path)}&purpose=${purpose}`;
   if (priority) q += `&priority=${encodeURIComponent(priority)}`;
+  const duration = Number(video?.duration);
+  if (Number.isFinite(duration) && duration > 0) {
+    q += `&duration=${encodeURIComponent(String(duration))}`;
+  }
   return q;
 }
 

@@ -318,8 +318,17 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         purpose = request.args.get("purpose", "clean")
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
+        duration_hint = None
+        raw_duration = request.args.get("duration", "").strip()
+        if raw_duration:
+            try:
+                duration_hint = float(raw_duration)
+            except ValueError:
+                duration_hint = None
         try:
-            return jsonify(snapshot_plan(Path(raw_path), purpose=purpose))
+            return jsonify(
+                snapshot_plan(Path(raw_path), purpose=purpose, duration_hint=duration_hint)
+            )
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
 
@@ -331,9 +340,22 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        duration_hint = None
+        raw_duration = request.args.get("duration", "").strip()
+        if raw_duration:
+            try:
+                duration_hint = float(raw_duration)
+            except ValueError:
+                duration_hint = None
         try:
             return jsonify(
-                snapshot_status(Path(raw_path), start=start, purpose=purpose, priority=priority)
+                snapshot_status(
+                    Path(raw_path),
+                    start=start,
+                    purpose=purpose,
+                    priority=priority,
+                    duration_hint=duration_hint,
+                )
             )
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
