@@ -1897,7 +1897,7 @@ document.addEventListener("keydown", (event) => {
       event.preventDefault();
       finishCleaningFile();
     }
-    if (event.key === "Delete") {
+    if (key === "d" || event.key === "Delete") {
       event.preventDefault();
       deleteCurrentFile();
     }
