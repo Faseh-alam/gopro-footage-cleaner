@@ -28,24 +28,21 @@
             <button type="button" id="phase-clean" class="phase-tab active">1 · Clean footage</button>
             <button type="button" id="phase-label" class="phase-tab">2 · Label tasks</button>
           </div>
-          <label>
-            Footage folder
-            <div class="row folder-row">
-              <input id="source-path" type="text" readonly placeholder="Choose a folder…" />
-              <button id="browse-folder-btn" type="button" class="primary">Choose folder…</button>
-            </div>
-          </label>
-          <label id="camera-row" class="camera-row">
-            Camera folder (C####)
+          <label id="sd-card-row" class="sd-card-row">
+            SD card (C####)
             <div class="row">
-              <select id="camera-select">
-                <option value="">SD card root (MP4s directly on drive)</option>
+              <select id="sd-card-select">
+                <option value="">Detecting SD cards…</option>
               </select>
-              <button id="refresh-cameras-btn" type="button" class="secondary">Refresh</button>
+              <button id="refresh-sd-btn" type="button" class="secondary" title="Re-detect connected SD cards">Refresh</button>
             </div>
+            <p id="sd-card-hint" class="hint sd-card-hint">Cards named C1234 are listed automatically. One card → selected for you.</p>
           </label>
-          <div class="row">
+          <input id="source-path" type="hidden" value="" />
+          <select id="camera-select" class="hidden-select" aria-hidden="true"></select>
+          <div class="row folder-fallback-row">
             <button id="scan-btn" type="button" class="primary">Scan footage</button>
+            <button id="browse-folder-btn" type="button" class="secondary" title="Manual folder pick if the card is not listed">Browse…</button>
             <span id="scan-summary" class="hint"></span>
           </div>
           <div id="work-timer" class="work-timer idle" title="Counts only while mouse/keyboard is active. Pauses after 90s idle.">

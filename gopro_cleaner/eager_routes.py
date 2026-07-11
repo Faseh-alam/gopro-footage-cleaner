@@ -27,7 +27,7 @@ from .core.snapshot_strip import (
 )
 from .core.task_store import add_task, load_tasks
 from .core.work_log import append_work_session, list_work_sessions
-from .core.volumes import list_volume_roots, normalize_path
+from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
 
 
 def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blueprint:
@@ -63,6 +63,14 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
     @eager.get("/api/eager/volumes")
     def eager_volumes():
         return jsonify({"volumes": list_volume_roots()})
+
+    @eager.get("/api/eager/sd-cards")
+    def eager_sd_cards():
+        try:
+            cards = list_sd_cards()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"cards": cards, "count": len(cards)})
 
     @eager.post("/api/eager/pick-folder")
     def eager_pick_folder():

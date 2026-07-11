@@ -39,8 +39,10 @@ const el = {
   phaseLabel: document.getElementById("phase-label"),
   sourcePath: document.getElementById("source-path"),
   browseFolderBtn: document.getElementById("browse-folder-btn"),
+  sdCardSelect: document.getElementById("sd-card-select"),
+  refreshSdBtn: document.getElementById("refresh-sd-btn"),
+  sdCardHint: document.getElementById("sd-card-hint"),
   cameraSelect: document.getElementById("camera-select"),
-  refreshCamerasBtn: document.getElementById("refresh-cameras-btn"),
   scanBtn: document.getElementById("scan-btn"),
   scanSummary: document.getElementById("scan-summary"),
   fileFilter: document.getElementById("file-filter"),
@@ -337,9 +339,14 @@ function setStatus(message, kind = "") {
 }
 
 function scanTargetPath() {
-  const camera = el.cameraSelect.value.trim();
-  if (camera) return camera;
-  return el.sourcePath.value.trim();
+  const card = (el.sdCardSelect?.value || "").trim();
+  if (card) return card;
+  return (el.sourcePath?.value || "").trim();
+}
+
+function selectedSdCardLabel() {
+  const opt = el.sdCardSelect?.selectedOptions?.[0];
+  return opt?.dataset?.label || opt?.textContent?.split(" — ")[0] || "";
 }
 
 function filteredVideos() {
@@ -676,7 +683,7 @@ function updateContextHint() {
       el.contextMessage.textContent =
         remaining > 0
           ? `${remaining} unlabeled file(s) still outside task folders`
-          : "Choose folder and scan — use ← → filmstrip to identify task";
+          : "Select an SD card and scan — use ← → filmstrip to identify task";
     } else if (!selectedTask()) {
       el.contextMessage.textContent = "Press S to search a task, then Enter to move";
     } else {
@@ -686,7 +693,9 @@ function updateContextHint() {
   }
 
   if (!currentVideo()) {
-    el.contextMessage.textContent = "Choose a footage folder, then scan";
+    el.contextMessage.textContent = scanTargetPath()
+      ? "Press Scan footage to load files from the selected SD card"
+      : "Plug in an SD card (C####), then scan";
     return;
   }
 
@@ -1236,18 +1245,14 @@ async function chooseFootageFolder() {
   el.browseFolderBtn.disabled = true;
   setStatus("Choose a folder in the dialog…");
   try {
-    const initial = el.sourcePath.value.trim();
+    const initial = el.sourcePath.value.trim() || el.sdCardSelect?.value || "";
     const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
     const data = await api(`/api/eager/pick-folder${query}`, { method: "POST" });
     if (data.cancelled) {
       setStatus("Folder selection cancelled");
       return;
     }
-    el.sourcePath.value = data.path;
-    state.scanRoot = data.path;
-    state.labelRoot = data.path;
-    ensureWorkTimerRunning(data.path);
-    await loadCameras();
+    applySelectedPath(data.path, { label: "Manual folder", manual: true });
     setStatus(`Selected ${data.path}`, "ok");
     updateContextHint();
   } catch (error) {
@@ -1257,25 +1262,123 @@ async function chooseFootageFolder() {
   }
 }
 
-async function loadCameras() {
-  const path = el.sourcePath.value.trim();
-  if (!path) return;
-  try {
-    const data = await api(`/api/eager/cameras?path=${encodeURIComponent(path)}`);
-    const selected = el.cameraSelect.value;
-    el.cameraSelect.innerHTML = '<option value="">SD card root (MP4s on drive)</option>';
-    for (const camera of data.cameras || []) {
-      const option = document.createElement("option");
-      option.value = camera.path;
-      option.textContent = `${camera.name} (${camera.raw_count} raw · ${camera.clip_count} clips)`;
-      el.cameraSelect.appendChild(option);
-    }
-    if (selected && [...el.cameraSelect.options].some((opt) => opt.value === selected)) {
-      el.cameraSelect.value = selected;
-    }
-  } catch {
-    el.cameraSelect.innerHTML = '<option value="">SD card root (MP4s on drive)</option>';
+function applySelectedPath(scanPath, { label = "", manual = false } = {}) {
+  el.sourcePath.value = scanPath;
+  state.scanRoot = scanPath;
+  state.labelRoot = scanPath;
+  ensureWorkTimerRunning(scanPath);
+
+  if (!el.sdCardSelect) return;
+
+  const existing = [...el.sdCardSelect.options].find((opt) => opt.value === scanPath);
+  if (existing) {
+    el.sdCardSelect.value = scanPath;
+    return;
   }
+
+  if (manual) {
+    // Keep detected cards, add/replace a manual option at the top.
+    let manualOpt = [...el.sdCardSelect.options].find((opt) => opt.dataset.manual === "1");
+    if (!manualOpt) {
+      manualOpt = document.createElement("option");
+      manualOpt.dataset.manual = "1";
+      el.sdCardSelect.insertBefore(manualOpt, el.sdCardSelect.firstChild);
+    }
+    manualOpt.value = scanPath;
+    manualOpt.dataset.label = label || "Manual";
+    manualOpt.textContent = `${label || "Manual"} — ${scanPath}`;
+    el.sdCardSelect.value = scanPath;
+  }
+}
+
+async function refreshSdCards({ quiet = false } = {}) {
+  if (!el.sdCardSelect) return;
+  const previous = el.sdCardSelect.value;
+  el.refreshSdBtn.disabled = true;
+  if (!quiet) setStatus("Detecting SD cards…");
+  try {
+    const data = await api("/api/eager/sd-cards");
+    const cards = data.cards || [];
+    el.sdCardSelect.innerHTML = "";
+
+    if (!cards.length) {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "No C#### SD cards found";
+      el.sdCardSelect.appendChild(empty);
+      el.sourcePath.value = "";
+      if (el.sdCardHint) {
+        el.sdCardHint.textContent =
+          "No card detected. Plug in a card named C1234, then press Refresh — or use Browse…";
+      }
+      if (!quiet) setStatus("No SD cards detected", "error");
+      updateContextHint();
+      return;
+    }
+
+    for (const card of cards) {
+      const option = document.createElement("option");
+      option.value = card.scan_path || card.path;
+      option.dataset.label = card.id || card.label || "";
+      option.dataset.volume = card.path || "";
+      const goproNote =
+        card.gopro_root && card.scan_path === card.gopro_root ? " · DCIM/GoPro" : "";
+      option.textContent = `${card.id || card.label}${goproNote}`;
+      el.sdCardSelect.appendChild(option);
+    }
+
+    let chosen = "";
+    if (previous && [...el.sdCardSelect.options].some((opt) => opt.value === previous)) {
+      chosen = previous;
+    } else if (cards.length === 1) {
+      chosen = cards[0].scan_path || cards[0].path;
+    }
+
+    if (cards.length > 1 && !chosen) {
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = `Select SD card (${cards.length} found)…`;
+      el.sdCardSelect.insertBefore(placeholder, el.sdCardSelect.firstChild);
+      el.sdCardSelect.value = "";
+      el.sourcePath.value = "";
+    } else if (chosen) {
+      el.sdCardSelect.value = chosen;
+      applySelectedPath(chosen, { label: selectedSdCardLabel() });
+    }
+
+    if (el.sdCardHint) {
+      el.sdCardHint.textContent =
+        cards.length === 1
+          ? `Selected ${cards[0].id} automatically — press Scan footage`
+          : `${cards.length} SD cards found — pick one, then Scan footage`;
+    }
+    if (!quiet) {
+      setStatus(
+        cards.length === 1
+          ? `SD card ${cards[0].id} ready`
+          : `${cards.length} SD cards detected — pick one`,
+        "ok",
+      );
+    }
+    updateContextHint();
+  } catch (error) {
+    el.sdCardSelect.innerHTML = '<option value="">SD card detection failed</option>';
+    if (!quiet) setStatus(error.message, "error");
+  } finally {
+    el.refreshSdBtn.disabled = false;
+  }
+}
+
+function onSdCardChanged() {
+  const path = (el.sdCardSelect?.value || "").trim();
+  if (!path) {
+    el.sourcePath.value = "";
+    updateContextHint();
+    return;
+  }
+  applySelectedPath(path, { label: selectedSdCardLabel() });
+  setStatus(`Selected ${selectedSdCardLabel() || path}`, "ok");
+  updateContextHint();
 }
 
 async function loadTasks() {
@@ -1335,7 +1438,7 @@ async function refreshLabelProgress({ quiet = false } = {}) {
 async function scanSource() {
   const path = scanTargetPath();
   if (!path) {
-    setStatus("Choose a footage folder first", "error");
+    setStatus("Select an SD card first (or press Refresh)", "error");
     return;
   }
 
@@ -1661,10 +1764,8 @@ el.scrubTrack.addEventListener("mousedown", (event) => {
 });
 
 el.browseFolderBtn.addEventListener("click", chooseFootageFolder);
-el.refreshCamerasBtn.addEventListener("click", loadCameras);
-el.cameraSelect.addEventListener("change", () => {
-  if (el.cameraSelect.value) setStatus(`Camera folder: ${el.cameraSelect.value}`);
-});
+el.refreshSdBtn?.addEventListener("click", () => refreshSdCards());
+el.sdCardSelect?.addEventListener("change", onSdCardChanged);
 el.scanBtn.addEventListener("click", scanSource);
 el.fileFilter.addEventListener("input", renderFileList);
 el.undoClipBtn.addEventListener("click", undoMark);
@@ -1809,7 +1910,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 loadTasks()
-  .then(() => Promise.all([api("/api/health"), api("/api/eager/config")]))
+  .then(() => Promise.all([api("/api/health"), api("/api/eager/config"), refreshSdCards({ quiet: true })]))
   .then(([health, perf]) => {
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };

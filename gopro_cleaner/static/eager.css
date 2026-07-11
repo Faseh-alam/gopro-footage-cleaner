@@ -684,6 +684,34 @@ body.scrub-cursor-hidden * {
   margin-top: 0.25rem;
 }
 
+.sd-card-row {
+  margin-top: 0.25rem;
+}
+
+.sd-card-hint {
+  margin: 0.35rem 0 0;
+}
+
+.folder-fallback-row {
+  flex-wrap: wrap;
+}
+
+#sd-card-select {
+  flex: 1;
+  min-width: 0;
+  background: #0d1117;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 0.55rem 0.75rem;
+  font-weight: 600;
+}
+
+#refresh-sd-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .panel-desc {
   font-size: 0.85rem;
   line-height: 1.45;
