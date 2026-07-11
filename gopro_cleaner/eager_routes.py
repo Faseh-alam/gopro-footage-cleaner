@@ -9,6 +9,7 @@ from flask import Blueprint, jsonify, render_template, request, send_file
 
 from .core.eager import (
     assign_clip_to_task,
+    label_progress,
     list_camera_folders,
     process_reviewed_video,
     scan_mp4_files,
@@ -107,11 +108,29 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         try:
             root = normalize_path(raw_path)
             videos = scan_mp4_files(root, recursive=recursive, mode=mode)
+            progress = label_progress(root, recursive=recursive) if mode == "label" else None
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 404
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"root": str(root), "count": len(videos), "videos": videos, "mode": mode})
+        payload_out = {"root": str(root), "count": len(videos), "videos": videos, "mode": mode}
+        if progress is not None:
+            payload_out["progress"] = progress
+        return jsonify(payload_out)
+
+    @eager.get("/api/eager/label-progress")
+    def eager_label_progress():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        recursive = request.args.get("recursive", "1").strip().lower() not in {"0", "false", "no"}
+        try:
+            root = normalize_path(raw_path)
+            return jsonify(label_progress(root, recursive=recursive))
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
 
     @eager.get("/api/eager/preview/status")
     def eager_preview_status():

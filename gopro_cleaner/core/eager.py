@@ -113,6 +113,58 @@ def list_camera_folders(root: Path) -> list[dict]:
     return cameras
 
 
+def _iter_mp4_files(root: Path, *, recursive: bool = True):
+    root = root.expanduser().resolve()
+    if recursive:
+        yield from (path for path in root.rglob("*") if path.is_file())
+    else:
+        yield from (path for path in root.iterdir() if path.is_file())
+
+
+def label_progress(root: Path, *, recursive: bool = True) -> dict:
+    """Count footage still outside task folders vs already labeled."""
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Folder not found: {root}")
+
+    unlabeled = 0
+    labeled = 0
+    skipped = 0
+    unlabeled_names: list[str] = []
+
+    for path in _iter_mp4_files(root, recursive=recursive):
+        if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
+            continue
+        if any(part.lower() in SKIP_DIR_NAMES for part in path.parts):
+            skipped += 1
+            continue
+        if is_under_task_folder(path, root):
+            labeled += 1
+            continue
+        unlabeled += 1
+        if len(unlabeled_names) < 25:
+            try:
+                unlabeled_names.append(str(path.relative_to(root)))
+            except ValueError:
+                unlabeled_names.append(path.name)
+
+    complete = unlabeled == 0
+    return {
+        "root": str(root),
+        "unlabeled": unlabeled,
+        "labeled": labeled,
+        "skipped": skipped,
+        "total_mp4": unlabeled + labeled + skipped,
+        "complete": complete,
+        "unlabeled_names": unlabeled_names,
+        "message": (
+            "All footage is inside task folders"
+            if complete
+            else f"{unlabeled} file(s) still outside task folders"
+        ),
+    }
+
+
 def scan_mp4_files(
     root: Path,
     *,
@@ -125,30 +177,15 @@ def scan_mp4_files(
         raise FileNotFoundError(f"Folder not found: {root}")
 
     candidates: list[Path] = []
-    if recursive:
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if mode == "raw" and is_raw_footage(path, root=root):
-                candidates.append(path)
-            elif mode == "clips" and is_trimmed_clip(path):
-                candidates.append(path)
-            elif mode == "label" and is_labelable_footage(path, root=root):
-                candidates.append(path)
-            elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
-                candidates.append(path)
-    else:
-        for path in root.iterdir():
-            if not path.is_file():
-                continue
-            if mode == "raw" and is_raw_footage(path, root=root):
-                candidates.append(path)
-            elif mode == "clips" and is_trimmed_clip(path):
-                candidates.append(path)
-            elif mode == "label" and is_labelable_footage(path, root=root):
-                candidates.append(path)
-            elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
-                candidates.append(path)
+    for path in _iter_mp4_files(root, recursive=recursive):
+        if mode == "raw" and is_raw_footage(path, root=root):
+            candidates.append(path)
+        elif mode == "clips" and is_trimmed_clip(path):
+            candidates.append(path)
+        elif mode == "label" and is_labelable_footage(path, root=root):
+            candidates.append(path)
+        elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
+            candidates.append(path)
 
     ordered = sorted(candidates, key=lambda p: p.name.lower())
     if not ordered:

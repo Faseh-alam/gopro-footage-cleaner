@@ -135,6 +135,16 @@
 
           <div id="label-panel" class="hidden">
             <h2>Label tasks</h2>
+            <div id="label-progress" class="label-progress idle">
+              <div class="label-progress-main">
+                <span id="label-progress-count">—</span>
+                <span id="label-progress-label">Scan to check unlabeled footage</span>
+              </div>
+              <div class="label-progress-meta">
+                <span id="label-progress-detail" class="hint"></span>
+                <button id="recheck-label-btn" type="button" class="secondary">Recheck</button>
+              </div>
+            </div>
             <p class="workflow-brief">Scan the same folder. A short opening preview loads automatically — then use <kbd>,</kbd> <kbd>.</kbd> and <kbd>±3s</kbd> to scrub. Press <kbd>N</kbd> to move the file into <code>&lt;task-name&gt;/</code>.</p>
 
             <input id="task-search" type="search" placeholder="Search tasks..." />

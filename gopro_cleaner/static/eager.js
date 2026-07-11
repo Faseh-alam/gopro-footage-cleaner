@@ -22,6 +22,7 @@ const state = {
   snapshotBuildToken: 0,
   scrubTime: 0,
   snapshotPurpose: "clean",
+  labelProgress: null,
   perf: {
     lite_mode: false,
     prefetch: true,
@@ -90,6 +91,11 @@ const el = {
   addTaskBtn: document.getElementById("add-task-btn"),
   taskAddedMsg: document.getElementById("task-added-msg"),
   labelBtn: document.getElementById("label-btn"),
+  labelProgress: document.getElementById("label-progress"),
+  labelProgressCount: document.getElementById("label-progress-count"),
+  labelProgressLabel: document.getElementById("label-progress-label"),
+  labelProgressDetail: document.getElementById("label-progress-detail"),
+  recheckLabelBtn: document.getElementById("recheck-label-btn"),
   statusLine: document.getElementById("status-line"),
   footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
@@ -200,16 +206,79 @@ function setPhase(phase) {
   state.videos = [];
   state.index = -1;
   state.donePaths = new Set();
+  state.labelProgress = null;
   renderFileList();
+  renderLabelProgress();
   el.currentName.textContent = "No file loaded";
   el.currentMeta.textContent = "";
   updateContextHint();
 }
 
+function remainingUnlabeledCount() {
+  if (state.phase !== "label") return 0;
+  if (state.labelProgress && Number.isFinite(state.labelProgress.unlabeled)) {
+    return Math.max(0, state.labelProgress.unlabeled);
+  }
+  return state.videos.filter((video) => !state.donePaths.has(video.path)).length;
+}
+
+function renderLabelProgress() {
+  if (!el.labelProgress) return;
+  if (state.phase !== "label") {
+    el.labelProgress.className = "label-progress idle";
+    return;
+  }
+
+  const progress = state.labelProgress;
+  const remaining = remainingUnlabeledCount();
+  const labeled = progress?.labeled ?? 0;
+
+  if (!progress && !state.videos.length) {
+    el.labelProgress.className = "label-progress idle";
+    if (el.labelProgressCount) el.labelProgressCount.textContent = "—";
+    if (el.labelProgressLabel) el.labelProgressLabel.textContent = "Scan to check unlabeled footage";
+    if (el.labelProgressDetail) el.labelProgressDetail.textContent = "";
+    return;
+  }
+
+  if (remaining === 0) {
+    el.labelProgress.className = "label-progress ok";
+    if (el.labelProgressCount) el.labelProgressCount.textContent = "0";
+    if (el.labelProgressLabel) el.labelProgressLabel.textContent = "All footage labeled";
+    if (el.labelProgressDetail) {
+      el.labelProgressDetail.textContent =
+        labeled > 0 ? `${labeled} file(s) inside task folders` : "Nothing left outside task folders";
+    }
+    return;
+  }
+
+  el.labelProgress.className = "label-progress warn";
+  if (el.labelProgressCount) el.labelProgressCount.textContent = String(remaining);
+  if (el.labelProgressLabel) {
+    el.labelProgressLabel.textContent =
+      remaining === 1 ? "unlabeled file left" : "unlabeled files left";
+  }
+  if (el.labelProgressDetail) {
+    el.labelProgressDetail.textContent =
+      labeled > 0
+        ? `${labeled} already in task folders · keep pressing N`
+        : "Still outside task folders — label every file";
+  }
+}
+
 function renderFileList() {
   const items = filteredVideos();
   el.fileList.innerHTML = "";
-  el.listSummary.textContent = `${state.videos.length} files · ${state.donePaths.size} done`;
+  if (state.phase === "label") {
+    const remaining = remainingUnlabeledCount();
+    el.listSummary.textContent =
+      remaining === 0
+        ? `0 unlabeled · ${state.labelProgress?.labeled || 0} labeled`
+        : `${remaining} unlabeled · ${state.donePaths.size} done this session`;
+  } else {
+    el.listSummary.textContent = `${state.videos.length} files · ${state.donePaths.size} done`;
+  }
+  renderLabelProgress();
 
   for (const video of items) {
     const btn = document.createElement("button");
@@ -217,6 +286,7 @@ function renderFileList() {
     btn.className = "file-item";
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
     if (state.donePaths.has(video.path)) btn.classList.add("done");
+    else if (state.phase === "label") btn.classList.add("unlabeled");
     const typeHint =
       state.phase === "label" ? `${video.is_trimmed ? "clip" : "whole"} · ` : "";
     btn.innerHTML = `<span class="name">${video.name}</span><span class="meta">${typeHint}${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
@@ -409,11 +479,15 @@ function updateContextHint() {
 
   if (state.phase === "label") {
     if (!currentVideo()) {
-      el.contextMessage.textContent = "Choose folder and scan — use ← → filmstrip to identify task";
+      const remaining = remainingUnlabeledCount();
+      el.contextMessage.textContent =
+        remaining > 0
+          ? `${remaining} unlabeled file(s) still outside task folders`
+          : "Choose folder and scan — use ← → filmstrip to identify task";
     } else if (!selectedTask()) {
       el.contextMessage.textContent = "Use , . ±3s to scrub · ← → for opening previews";
     } else {
-      el.contextMessage.textContent = `Press N to move to "${selectedTask()}"`;
+      el.contextMessage.textContent = `Press N to move to "${selectedTask()}" · ${remainingUnlabeledCount()} unlabeled left`;
     }
     return;
   }
@@ -1010,6 +1084,24 @@ async function addTask() {
   }
 }
 
+async function refreshLabelProgress({ quiet = false } = {}) {
+  const path = state.labelRoot || state.scanRoot || scanTargetPath();
+  if (!path || state.phase !== "label") return null;
+  try {
+    const data = await api(`/api/eager/label-progress?path=${encodeURIComponent(path)}`);
+    state.labelProgress = data;
+    renderFileList();
+    updateContextHint();
+    if (!quiet) {
+      setStatus(data.message || `${data.unlabeled} unlabeled left`, data.complete ? "ok" : "");
+    }
+    return data;
+  } catch (error) {
+    if (!quiet) setStatus(error.message, "error");
+    return null;
+  }
+}
+
 async function scanSource() {
   const path = scanTargetPath();
   if (!path) {
@@ -1032,6 +1124,9 @@ async function scanSource() {
     state.videos = data.videos || [];
     state.donePaths = new Set();
     state.index = -1;
+    if (mode === "label") {
+      state.labelProgress = data.progress || null;
+    }
     renderFileList();
     const summaryLabel =
       mode === "raw" ? "raw files" : mode === "label" ? "files to label" : "files";
@@ -1042,9 +1137,25 @@ async function scanSource() {
       }
       await loadVideo(0);
       if (mode === "raw") hideLoading();
-      setStatus(`Found ${state.videos.length} files`, "ok");
+      if (mode === "label" && data.progress) {
+        setStatus(data.progress.message, data.progress.complete ? "ok" : "");
+      } else {
+        setStatus(`Found ${state.videos.length} files`, "ok");
+      }
+    } else if (mode === "label") {
+      if (!state.labelProgress) {
+        await refreshLabelProgress({ quiet: true });
+      }
+      renderFileList();
+      const complete = state.labelProgress?.complete;
+      setStatus(
+        complete
+          ? "All footage is inside task folders — nothing left to label"
+          : "No footage to label found",
+        complete ? "ok" : "error",
+      );
     } else {
-      setStatus(mode === "label" ? "No footage to label found" : `No ${mode} MP4 files found`, "error");
+      setStatus(`No ${mode} MP4 files found`, "error");
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -1240,8 +1351,24 @@ async function labelCurrentClip() {
       }),
     });
     state.donePaths.add(video.path);
-    setStatus(`Moved to ${data.task_dir}`, "ok");
+    if (state.labelProgress) {
+      const nextUnlabeled = Math.max(0, (state.labelProgress.unlabeled || 0) - 1);
+      const nextLabeled = (state.labelProgress.labeled || 0) + 1;
+      state.labelProgress = {
+        ...state.labelProgress,
+        unlabeled: nextUnlabeled,
+        labeled: nextLabeled,
+        complete: nextUnlabeled === 0,
+        message:
+          nextUnlabeled === 0
+            ? "All footage is inside task folders"
+            : `${nextUnlabeled} file(s) still outside task folders`,
+      };
+    }
+    setStatus(`Moved to ${data.task_dir} · ${remainingUnlabeledCount()} unlabeled left`, "ok");
+    renderFileList();
     advanceToNext();
+    refreshLabelProgress({ quiet: true });
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
@@ -1258,7 +1385,18 @@ function advanceToNext() {
   if (next < state.videos.length) {
     loadVideo(next);
   } else {
-    setStatus(state.phase === "clean" ? "All files cleaned" : "All clips labeled", "ok");
+    if (state.phase === "label") {
+      const remaining = remainingUnlabeledCount();
+      setStatus(
+        remaining === 0
+          ? "All clips labeled — every file is inside a task folder"
+          : `${remaining} unlabeled file(s) still outside task folders`,
+        remaining === 0 ? "ok" : "error",
+      );
+      refreshLabelProgress({ quiet: true });
+    } else {
+      setStatus("All files cleaned", "ok");
+    }
     renderFileList();
   }
 }
@@ -1310,6 +1448,7 @@ el.newTaskInput.addEventListener("keydown", (event) => {
   }
 });
 el.labelBtn.addEventListener("click", labelCurrentClip);
+el.recheckLabelBtn?.addEventListener("click", () => refreshLabelProgress());
 el.player.addEventListener("timeupdate", () => {
   if (!el.player.paused && Number.isFinite(el.player.currentTime) && el.player.currentTime > 0) {
     state.scrubTime = el.player.currentTime;
