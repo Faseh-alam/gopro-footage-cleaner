@@ -96,6 +96,12 @@ const el = {
   labelProgressLabel: document.getElementById("label-progress-label"),
   labelProgressDetail: document.getElementById("label-progress-detail"),
   recheckLabelBtn: document.getElementById("recheck-label-btn"),
+  workTimer: document.getElementById("work-timer"),
+  workTimerStatus: document.getElementById("work-timer-status"),
+  workCleanTime: document.getElementById("work-clean-time"),
+  workLabelTime: document.getElementById("work-label-time"),
+  workTotalTime: document.getElementById("work-total-time"),
+  workTimerReset: document.getElementById("work-timer-reset"),
   statusLine: document.getElementById("status-line"),
   footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
@@ -103,6 +109,183 @@ const el = {
 
 el.player.muted = true;
 el.player.pause();
+
+const WORK_IDLE_MS = 90_000;
+const workTimer = {
+  root: "",
+  cleanMs: 0,
+  labelMs: 0,
+  active: false,
+  lastActivityAt: 0,
+  lastTickAt: 0,
+  tickHandle: null,
+  saveHandle: null,
+};
+
+function formatWorkHms(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function workStorageKey(root) {
+  return `eager-work-timer:${root || "default"}`;
+}
+
+function loadWorkTimer(root) {
+  if (!root) return;
+  try {
+    const raw = localStorage.getItem(workStorageKey(root));
+    if (!raw) {
+      workTimer.root = root;
+      workTimer.cleanMs = 0;
+      workTimer.labelMs = 0;
+      return;
+    }
+    const data = JSON.parse(raw);
+    workTimer.root = root;
+    workTimer.cleanMs = Math.max(0, Number(data.cleanMs) || 0);
+    workTimer.labelMs = Math.max(0, Number(data.labelMs) || 0);
+  } catch {
+    workTimer.root = root;
+    workTimer.cleanMs = 0;
+    workTimer.labelMs = 0;
+  }
+}
+
+function persistWorkTimer() {
+  if (!workTimer.root) return;
+  try {
+    localStorage.setItem(
+      workStorageKey(workTimer.root),
+      JSON.stringify({
+        cleanMs: workTimer.cleanMs,
+        labelMs: workTimer.labelMs,
+        updatedAt: Date.now(),
+      }),
+    );
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function renderWorkTimer() {
+  if (!el.workTimer) return;
+  const working = workTimer.active;
+  el.workTimer.classList.toggle("working", working);
+  el.workTimer.classList.toggle("idle", !working);
+  if (el.workTimerStatus) {
+    el.workTimerStatus.textContent = working ? "Working" : "Paused (idle)";
+  }
+  if (el.workCleanTime) el.workCleanTime.textContent = formatWorkHms(workTimer.cleanMs);
+  if (el.workLabelTime) el.workLabelTime.textContent = formatWorkHms(workTimer.labelMs);
+  if (el.workTotalTime) {
+    el.workTotalTime.textContent = formatWorkHms(workTimer.cleanMs + workTimer.labelMs);
+  }
+}
+
+function workTimerTick() {
+  const now = Date.now();
+  if (!workTimer.lastTickAt) workTimer.lastTickAt = now;
+
+  if (workTimer.active && now - workTimer.lastActivityAt > WORK_IDLE_MS) {
+    workTimer.active = false;
+  }
+
+  if (workTimer.active) {
+    const delta = now - workTimer.lastTickAt;
+    if (state.phase === "label") workTimer.labelMs += delta;
+    else workTimer.cleanMs += delta;
+  }
+
+  workTimer.lastTickAt = now;
+  renderWorkTimer();
+}
+
+function noteWorkActivity() {
+  const now = Date.now();
+  if (!workTimer.root) return;
+  const wasActive = workTimer.active;
+  workTimer.lastActivityAt = now;
+  if (!wasActive) {
+    workTimer.active = true;
+    workTimer.lastTickAt = now;
+    renderWorkTimer();
+  }
+}
+
+function ensureWorkTimerRunning(root) {
+  if (!root) return;
+  if (workTimer.root !== root) {
+    if (workTimer.root) persistWorkTimer();
+    loadWorkTimer(root);
+  }
+  if (!workTimer.tickHandle) {
+    workTimer.lastTickAt = Date.now();
+    workTimer.tickHandle = setInterval(workTimerTick, 1000);
+  }
+  if (!workTimer.saveHandle) {
+    workTimer.saveHandle = setInterval(persistWorkTimer, 5000);
+  }
+  noteWorkActivity();
+  renderWorkTimer();
+}
+
+function resetWorkTimer({ confirmReset = true } = {}) {
+  if (confirmReset && !window.confirm("Reset work timer for this folder?")) return;
+  workTimer.cleanMs = 0;
+  workTimer.labelMs = 0;
+  workTimer.active = false;
+  workTimer.lastActivityAt = 0;
+  workTimer.lastTickAt = Date.now();
+  persistWorkTimer();
+  renderWorkTimer();
+  setStatus("Work timer reset", "ok");
+}
+
+async function saveWorkSession(eventName) {
+  const root = workTimer.root || state.scanRoot || state.labelRoot || scanTargetPath();
+  if (!root) return;
+  persistWorkTimer();
+  try {
+    await api("/api/eager/work-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        root,
+        event: eventName,
+        phase: state.phase,
+        clean_seconds: Math.floor(workTimer.cleanMs / 1000),
+        label_seconds: Math.floor(workTimer.labelMs / 1000),
+        files_total: state.videos.length,
+        files_done: state.donePaths.size,
+      }),
+    });
+  } catch {
+    /* non-blocking */
+  }
+}
+
+["mousemove", "mousedown", "keydown", "wheel", "touchstart", "scroll"].forEach((name) => {
+  document.addEventListener(name, noteWorkActivity, { passive: true });
+});
+window.addEventListener("blur", () => {
+  workTimer.active = false;
+  persistWorkTimer();
+  renderWorkTimer();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    workTimer.active = false;
+    persistWorkTimer();
+    renderWorkTimer();
+  } else {
+    noteWorkActivity();
+  }
+});
 
 async function api(url, options = {}) {
   const response = await fetch(url, options);
@@ -190,6 +373,7 @@ function scrubStepSeconds() {
 }
 
 function setPhase(phase) {
+  if (workTimer.root) persistWorkTimer();
   state.phase = phase;
   state.snapshotPurpose = phase === "clean" ? "clean" : "label";
   el.phaseClean.classList.toggle("active", phase === "clean");
@@ -212,6 +396,7 @@ function setPhase(phase) {
   el.currentName.textContent = "No file loaded";
   el.currentMeta.textContent = "";
   updateContextHint();
+  renderWorkTimer();
 }
 
 function remainingUnlabeledCount() {
@@ -1017,6 +1202,7 @@ async function chooseFootageFolder() {
     el.sourcePath.value = data.path;
     state.scanRoot = data.path;
     state.labelRoot = data.path;
+    ensureWorkTimerRunning(data.path);
     await loadCameras();
     setStatus(`Selected ${data.path}`, "ok");
     updateContextHint();
@@ -1111,6 +1297,7 @@ async function scanSource() {
 
   state.scanRoot = path;
   state.labelRoot = path;
+  ensureWorkTimerRunning(path);
   const mode = state.phase === "clean" ? "raw" : "label";
 
   setStatus("Scanning...");
@@ -1389,13 +1576,18 @@ function advanceToNext() {
       const remaining = remainingUnlabeledCount();
       setStatus(
         remaining === 0
-          ? "All clips labeled — every file is inside a task folder"
+          ? `All clips labeled — work ${formatWorkHms(workTimer.cleanMs + workTimer.labelMs)} (clean ${formatWorkHms(workTimer.cleanMs)} · label ${formatWorkHms(workTimer.labelMs)})`
           : `${remaining} unlabeled file(s) still outside task folders`,
         remaining === 0 ? "ok" : "error",
       );
       refreshLabelProgress({ quiet: true });
+      if (remaining === 0) saveWorkSession("label_complete");
     } else {
-      setStatus("All files cleaned", "ok");
+      setStatus(
+        `All files cleaned — clean time ${formatWorkHms(workTimer.cleanMs)}`,
+        "ok",
+      );
+      saveWorkSession("clean_complete");
     }
     renderFileList();
   }
@@ -1449,6 +1641,7 @@ el.newTaskInput.addEventListener("keydown", (event) => {
 });
 el.labelBtn.addEventListener("click", labelCurrentClip);
 el.recheckLabelBtn?.addEventListener("click", () => refreshLabelProgress());
+el.workTimerReset?.addEventListener("click", () => resetWorkTimer());
 el.player.addEventListener("timeupdate", () => {
   if (!el.player.paused && Number.isFinite(el.player.currentTime) && el.player.currentTime > 0) {
     state.scrubTime = el.player.currentTime;
@@ -1543,6 +1736,7 @@ loadTasks()
   .then(([health, perf]) => {
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };
+    renderWorkTimer();
     if (perf.lite_mode && perf.hint) {
       setStatus(perf.hint, "ok");
     }

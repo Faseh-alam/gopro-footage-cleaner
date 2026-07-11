@@ -9,6 +9,7 @@ recovery/
 *.zip
 *.numbers
 eager_tasks.json
+work_sessions.json
 
 # Optional local binaries (add your platform build if needed)
 bin/udtacopy

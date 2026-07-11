@@ -26,6 +26,7 @@ from .core.snapshot_strip import (
     snapshot_status,
 )
 from .core.task_store import add_task, load_tasks
+from .core.work_log import append_work_session, list_work_sessions
 from .core.volumes import list_volume_roots, normalize_path
 
 
@@ -39,6 +40,25 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
     @eager.get("/api/eager/config")
     def eager_config():
         return jsonify(snapshot_config())
+
+    @eager.get("/api/eager/work-log")
+    def eager_work_log_list():
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        return jsonify({"sessions": list_work_sessions(limit=limit)})
+
+    @eager.post("/api/eager/work-log")
+    def eager_work_log_save():
+        payload = request.get_json(silent=True) or {}
+        try:
+            row = append_work_session(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "session": row})
 
     @eager.get("/api/eager/volumes")
     def eager_volumes():

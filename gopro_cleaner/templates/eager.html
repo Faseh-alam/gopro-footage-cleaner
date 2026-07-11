@@ -48,6 +48,17 @@
             <button id="scan-btn" type="button" class="primary">Scan footage</button>
             <span id="scan-summary" class="hint"></span>
           </div>
+          <div id="work-timer" class="work-timer idle" title="Counts only while mouse/keyboard is active. Pauses after 90s idle.">
+            <div class="work-timer-head">
+              <span id="work-timer-status" class="work-timer-status">Idle</span>
+              <button id="work-timer-reset" type="button" class="secondary">Reset timer</button>
+            </div>
+            <div class="work-timer-grid">
+              <div><span class="work-timer-label">Clean</span><strong id="work-clean-time">0:00</strong></div>
+              <div><span class="work-timer-label">Label</span><strong id="work-label-time">0:00</strong></div>
+              <div><span class="work-timer-label">Total</span><strong id="work-total-time">0:00</strong></div>
+            </div>
+          </div>
         </div>
       </header>
 
