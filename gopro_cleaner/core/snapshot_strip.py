@@ -1,9 +1,10 @@
-"""Snapshot filmstrip — adaptive spacing for cleaning, fixed 5s spacing for labeling."""
+"""Snapshot filmstrip — adaptive spacing for cleaning, fixed spacing for labeling."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import threading
 import time
@@ -12,24 +13,22 @@ from pathlib import Path
 
 from .lite_mode import lite_mode_enabled, performance_config
 from .probe import probe_media
+from .snapshot_settings import load_snapshot_settings
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
+
 def _settings() -> dict:
-    return performance_config()
-
-
-def _max_snapshots() -> int:
-    return int(_settings()["max_snapshots"])
+    return load_snapshot_settings()
 
 
 def _snapshot_width() -> int:
     return int(_settings()["snapshot_width"])
 
 
-def _interval_min() -> float:
-    return float(_settings()["interval_min_sec"])
+def _jpeg_quality() -> int:
+    return int(_settings()["jpeg_quality"])
 
 
 def _label_preview_count() -> int:
@@ -40,11 +39,6 @@ def _ffmpeg_timeout() -> int:
     return 30 if lite_mode_enabled() else 45
 
 
-GARBAGE_RATIO = 0.10
-GARBAGE_SNAPSHOT_THRESHOLD = 4
-INTERVAL_MAX_SEC = 90.0  # hard cap: snapshots never more than 90 seconds apart
-LABEL_PREVIEW_INTERVAL_SEC = 5.0
-LABEL_PREVIEW_SPAN_SEC = 40.0
 MIN_FRAMES_BEFORE_UI = 3
 SNAPSHOT_FFMPEG_THREADS = 2
 PRIORITY_FOREGROUND = 10
@@ -77,7 +71,12 @@ def _cache_root() -> Path:
 def _cache_key(source: Path, purpose: str) -> str:
     purpose = _normalize_purpose(purpose)
     stat = source.stat()
-    version = "v11-lite" if lite_mode_enabled() else "v11-full"
+    snap = _settings()
+    version = (
+        f"v12-{snap['garbage_percent']}-{snap['resolution_factor']}"
+        f"-{snap['min_interval_sec']}-{snap['max_interval_sec']}"
+        f"-{'lite' if lite_mode_enabled() else 'full'}"
+    )
     digest = hashlib.sha256(
         f"{version}:{purpose}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
@@ -100,37 +99,84 @@ def _format_minutes(seconds: float) -> str:
     return f"{minutes}m {rest}s" if rest else f"{minutes} min"
 
 
-def compute_snapshot_interval(duration_seconds: float) -> float:
-    """Spacing so GARBAGE_SNAPSHOT_THRESHOLD idle frames ≈ 10% of clip length."""
-    interval_min = _interval_min()
-    max_snaps = _max_snapshots()
-    if not duration_seconds or duration_seconds <= 0:
-        return interval_min
-    max_garbage = duration_seconds * GARBAGE_RATIO
-    interval = max_garbage / GARBAGE_SNAPSHOT_THRESHOLD
-    interval = max(interval_min, interval)
-    count = int(duration_seconds / interval) + 1
-    if count > max_snaps:
-        interval = duration_seconds / max(max_snaps - 1, 1)
-        interval = max(interval_min, interval)
-    # The 3-minute cap wins over max_snapshots — long clips get more snapshots
-    # rather than wider gaps (keyframe extraction keeps them cheap).
-    interval = min(interval, INTERVAL_MAX_SEC)
-    return round(interval, 2)
+def get_snapshot_timestamps(
+    clip_duration_seconds: float,
+    garbage_percent: float = 0.10,
+    N: int = 3,
+    *,
+    min_interval: float | None = None,
+    max_interval: float | None = None,
+) -> list[float]:
+    """Return filmstrip timestamps for a clip.
+
+    1. tolerance_seconds = clip_duration_seconds * garbage_percent
+    2. raw_interval = tolerance_seconds / N
+    3. snapshot_interval = clamp(raw_interval, MIN_INTERVAL, MAX_INTERVAL)
+    4. num_snapshots = ceil(clip_duration_seconds / snapshot_interval)
+    5. timestamps = 0, interval, 2*interval, ... (num_snapshots points, clamped to duration)
+    """
+    snap = _settings()
+    min_iv = float(snap["min_interval_sec"] if min_interval is None else min_interval)
+    max_iv = float(snap["max_interval_sec"] if max_interval is None else max_interval)
+    if max_iv < min_iv:
+        max_iv = min_iv
+
+    duration = float(clip_duration_seconds or 0.0)
+    if duration <= 0:
+        return [0.0]
+
+    n = max(1, int(N))
+    tolerance_seconds = duration * float(garbage_percent)
+    raw_interval = tolerance_seconds / n
+    snapshot_interval = max(min_iv, min(max_iv, raw_interval))
+    num_snapshots = max(1, math.ceil(duration / snapshot_interval))
+
+    timestamps: list[float] = []
+    for i in range(num_snapshots):
+        t = i * snapshot_interval
+        if t > duration:
+            break
+        timestamps.append(round(min(t, duration), 3))
+
+    if not timestamps:
+        return [0.0]
+    return timestamps
+
+
+def compute_snapshot_interval(
+    duration_seconds: float,
+    *,
+    garbage_percent: float | None = None,
+    N: int | None = None,
+) -> float:
+    """Interval used by get_snapshot_timestamps (clamped)."""
+    snap = _settings()
+    gp = snap["garbage_percent"] if garbage_percent is None else float(garbage_percent)
+    n = snap["resolution_factor"] if N is None else max(1, int(N))
+    min_iv = float(snap["min_interval_sec"])
+    max_iv = float(snap["max_interval_sec"])
+    duration = float(duration_seconds or 0.0)
+    if duration <= 0:
+        return min_iv
+    raw = (duration * gp) / n
+    return round(max(min_iv, min(max_iv, raw)), 2)
 
 
 def snapshot_times(duration_seconds: float, interval: float | None = None) -> list[float]:
-    if not duration_seconds or duration_seconds <= 0:
-        return [0.0]
-    step = interval if interval is not None else compute_snapshot_interval(duration_seconds)
-    times: list[float] = []
-    t = 0.0
-    while t < duration_seconds - 0.05:
-        times.append(round(t, 3))
-        t += step
-    if not times or times[-1] < duration_seconds - step * 0.5:
-        times.append(round(min(duration_seconds - 0.04, times[-1] + step if times else 0), 3))
-    return times
+    """Compatibility wrapper — prefers the tolerance formula over a fixed interval."""
+    if interval is not None:
+        duration = float(duration_seconds or 0.0)
+        if duration <= 0:
+            return [0.0]
+        step = float(interval)
+        num = max(1, math.ceil(duration / step))
+        return [round(min(i * step, duration), 3) for i in range(num) if i * step <= duration] or [0.0]
+    snap = _settings()
+    return get_snapshot_timestamps(
+        duration_seconds,
+        garbage_percent=snap["garbage_percent"],
+        N=snap["resolution_factor"],
+    )
 
 
 def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
@@ -143,11 +189,13 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
     except (RuntimeError, OSError):
         duration = 0.0
 
+    snap = _settings()
     if purpose == "label":
-        interval = LABEL_PREVIEW_INTERVAL_SEC
+        interval = float(snap["label_preview_interval_sec"])
+        span = float(snap["label_preview_span_sec"])
         times: list[float] = []
         t = 0.0
-        while t < min(duration, LABEL_PREVIEW_SPAN_SEC) - 0.05 and len(times) < _label_preview_count():
+        while t < min(duration, span) - 0.05 and len(times) < _label_preview_count():
             times.append(round(t, 3))
             t += interval
         if not times:
@@ -156,13 +204,18 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
             f"Opening preview ({len(times)} shots) — use , . and ±3s to scrub through the clip"
         )
         max_garbage = 0
+        n_factor = 0
+        garbage_percent = 0.0
     else:
-        interval = compute_snapshot_interval(duration)
-        times = snapshot_times(duration, interval)
-        max_garbage = round(duration * GARBAGE_RATIO, 1) if duration else 0
+        garbage_percent = float(snap["garbage_percent"])
+        n_factor = int(snap["resolution_factor"])
+        interval = compute_snapshot_interval(duration, garbage_percent=garbage_percent, N=n_factor)
+        times = get_snapshot_timestamps(duration, garbage_percent=garbage_percent, N=n_factor)
+        max_garbage = round(duration * garbage_percent, 1) if duration else 0
         garbage_hint = (
-            f"{GARBAGE_SNAPSHOT_THRESHOLD}+ snapshots in a row without work "
-            f"≈ garbage (up to ~{_format_minutes(max_garbage)} allowed in this clip)"
+            f"{n_factor}+ snapshots in a row without work "
+            f"≈ garbage (up to ~{_format_minutes(max_garbage)} allowed · "
+            f"interval {interval:.0f}s)"
         )
 
     return {
@@ -171,7 +224,11 @@ def snapshot_plan(source: Path, *, purpose: str = "clean") -> dict:
         "duration": duration,
         "interval_seconds": interval,
         "snapshot_count": len(times),
-        "garbage_threshold": GARBAGE_SNAPSHOT_THRESHOLD if purpose == "clean" else 0,
+        "garbage_percent": garbage_percent,
+        "resolution_factor": n_factor,
+        "min_interval_sec": snap["min_interval_sec"],
+        "max_interval_sec": snap["max_interval_sec"],
+        "garbage_threshold": n_factor if purpose == "clean" else 0,
         "max_garbage_seconds": max_garbage,
         "garbage_hint": garbage_hint,
         "times": times,
@@ -211,10 +268,7 @@ def _frame_looks_valid(path: Path) -> bool:
 
 def _input_strategies(source: Path, timestamp: float) -> list[list[str]]:
     source_arg = str(source)
-    # Keyframe-only decode: seek on the input side, skip all non-key frames, and
-    # decode a single keyframe. Orders of magnitude faster than accurate seeking
-    # on slow CPUs (no 4K frame-by-frame decode). Filmstrip accuracy of ~1 GOP
-    # (<1s on GoPro files) is fine — trims are keyframe-based stream copies anyway.
+    # -ss before -i: fast keyframe seek (critical on i5 / 16GB machines).
     keyframe = [
         "-skip_frame",
         "nokey",
@@ -224,7 +278,6 @@ def _input_strategies(source: Path, timestamp: float) -> list[list[str]]:
         "-i",
         source_arg,
     ]
-    # Fallback: plain input-side accurate seek (decodes at most ~1 GOP).
     accurate = ["-ss", f"{timestamp:.3f}", "-i", source_arg]
     return [keyframe, accurate]
 
@@ -264,13 +317,16 @@ def _kill_active_ffmpeg() -> None:
             pass
 
 
-def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
+def extract_snapshot_jpeg(source: Path, timestamp: float, dest: Path) -> None:
+    """Extract one JPEG thumbnail at ``timestamp`` (-ss before -i, -vframes 1)."""
+    dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
 
     errors: list[str] = []
     vf = _snapshot_video_filter()
+    qv = str(_jpeg_quality())
     for input_args in _input_strategies(source, timestamp):
         command = (
             [
@@ -284,7 +340,7 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
             ]
             + input_args
             + [
-                "-frames:v",
+                "-vframes",
                 "1",
                 "-an",
                 "-vf",
@@ -292,7 +348,7 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
                 "-pix_fmt",
                 "yuvj420p",
                 "-q:v",
-                "10",
+                qv,
                 str(dest),
             ]
         )
@@ -304,6 +360,10 @@ def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
         errors.append(detail or "ffmpeg frame extract failed")
 
     raise RuntimeError(errors[-1] if errors else "ffmpeg frame extract failed")
+
+
+def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:
+    extract_snapshot_jpeg(source, timestamp, dest)
 
 
 def _job_cancelled(job_key: str) -> bool:
@@ -476,8 +536,6 @@ def _queue_worker_loop() -> None:
             if job and job.get("status") in {"cancelled", "ready"}:
                 continue
 
-        # Probe outside the lock — ffprobe on a slow USB drive must not block
-        # status polls, and a vanished file must not kill the worker thread.
         try:
             plan = snapshot_plan(source, purpose=purpose)
         except Exception as exc:  # noqa: BLE001

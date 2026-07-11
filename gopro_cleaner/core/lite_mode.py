@@ -6,6 +6,8 @@ import os
 import platform
 import subprocess
 
+from .snapshot_settings import load_snapshot_settings
+
 _LITE_RAM_GB_THRESHOLD = 10.0
 _lite_cached: bool | None = None
 
@@ -69,28 +71,26 @@ def lite_mode_enabled() -> bool:
 def performance_config() -> dict:
     lite = lite_mode_enabled()
     ram = system_ram_gb()
-    if lite:
-        return {
-            "lite_mode": True,
-            "ram_gb": round(ram, 1) if ram else None,
-            "max_snapshots": 12,
-            "snapshot_width": 160,
-            "interval_min_sec": 10.0,
-            "label_preview_count": 6,
-            "prefetch": True,
-            "snapshot_poll_ms": 1200,
-            "trim_poll_ms": 1500,
-            "hint": "Lite mode — keyframe snapshots, next files preload in background",
-        }
-    return {
-        "lite_mode": False,
+    snap = load_snapshot_settings()
+    base = {
+        "lite_mode": lite,
         "ram_gb": round(ram, 1) if ram else None,
-        "max_snapshots": 24,
-        "snapshot_width": 160,
-        "interval_min_sec": 8.0,
-        "label_preview_count": 8,
+        "garbage_percent": snap["garbage_percent"],
+        "resolution_factor": snap["resolution_factor"],
+        "min_interval_sec": snap["min_interval_sec"],
+        "max_interval_sec": snap["max_interval_sec"],
+        "interval_min_sec": snap["min_interval_sec"],
+        "interval_max_sec": snap["max_interval_sec"],
+        "snapshot_width": snap["snapshot_width"],
+        "jpeg_quality": snap["jpeg_quality"],
+        "label_preview_count": snap["label_preview_count"],
         "prefetch": True,
-        "snapshot_poll_ms": 1000,
-        "trim_poll_ms": 1200,
-        "hint": "",
+        "snapshot_poll_ms": 1200 if lite else 1000,
+        "trim_poll_ms": 1500 if lite else 1200,
+        "hint": (
+            "Lite mode — keyframe snapshots, next files preload in background"
+            if lite
+            else ""
+        ),
     }
+    return base
