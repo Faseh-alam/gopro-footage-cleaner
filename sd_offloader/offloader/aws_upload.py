@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,50 @@ _jobs: dict[str, dict] = {}
 
 def aws_cli_available() -> bool:
     return shutil.which("aws") is not None
+
+
+def test_aws_connection(s3_uri: str) -> dict:
+    """Upload a tiny empty file via AWS CLI credentials (`aws configure`).
+
+    Does not read/write app secret files — only uses the S3 URI from the UI and
+    whatever profile ``aws configure`` already set up.
+    """
+    if not aws_cli_available():
+        raise RuntimeError("AWS CLI not found. Install AWS CLI v2, then run `aws configure`.")
+
+    base = normalize_s3_uri(s3_uri)
+    # Marker under the configured prefix so it lands where footage would go
+    key = f"{base}_offloader_connection_test.txt"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "offloader_connection_test.txt"
+        local.write_text("", encoding="utf-8")
+        put = subprocess.run(
+            ["aws", "s3", "cp", str(local), key],
+            capture_output=True,
+            text=True,
+        )
+        if put.returncode != 0:
+            detail = (put.stderr or put.stdout or "aws s3 cp failed").strip()
+            raise RuntimeError(detail)
+
+        # Best-effort cleanup so the bucket isn't littered
+        delete = subprocess.run(
+            ["aws", "s3", "rm", key],
+            capture_output=True,
+            text=True,
+        )
+        cleaned = delete.returncode == 0
+
+    return {
+        "ok": True,
+        "message": (
+            f"AWS OK — uploaded and verified write to {key}"
+            + (" (test file removed)" if cleaned else " (could not delete test file; upload still worked)")
+        ),
+        "s3_key": key,
+        "cleaned": cleaned,
+    }
 
 
 def normalize_s3_uri(uri: str) -> str:

@@ -80,6 +80,23 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, "job": job})
 
+    @app.post("/api/aws/test")
+    def aws_test():
+        payload = request.get_json(silent=True) or {}
+        s3_uri = str(payload.get("s3_uri") or "").strip()
+        if not s3_uri:
+            cfg = load_config()
+            s3_uri = str(cfg.get("s3_uri") or "").strip()
+        if not s3_uri:
+            return jsonify({"error": "Paste an S3 URI first (e.g. s3://bucket/prefix/)"}), 400
+        try:
+            # Remember the URI they tested with
+            save_config({"s3_uri": s3_uri})
+            result = aws_upload.test_aws_connection(s3_uri)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify(result)
+
     return app
 
 

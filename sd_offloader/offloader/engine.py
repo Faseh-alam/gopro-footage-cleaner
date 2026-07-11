@@ -289,11 +289,36 @@ def _copy_card_worker(
     dest: Path,
     prog: dict,
 ) -> None:
-    _update_card(card_id, status="copying", message="Copying…")
+    total_bytes = inventory.total_bytes(files)
+    _update_card(card_id, status="copying", message="Copying…", bytes_done=0, files_done=0)
     started = time.time()
     done_bytes = 0
     files_done = 0
     task_names = sorted({f["task"] for f in files})
+    last_ui = 0.0
+
+    def _publish(current_file_bytes: int = 0, *, message: str | None = None) -> None:
+        nonlocal last_ui
+        now = time.time()
+        # Throttle UI updates to ~4/sec while streaming a large file
+        if message is None and now - last_ui < 0.25:
+            return
+        last_ui = now
+        live = done_bytes + max(0, current_file_bytes)
+        elapsed = max(0.1, now - started)
+        speed = (live / (1024 * 1024)) / elapsed if live > 0 else 0.0
+        remaining = max(0, total_bytes - live)
+        eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
+        payload = {
+            "status": "copying",
+            "bytes_done": live,
+            "files_done": files_done,
+            "speed_mbps": round(speed, 2),
+            "eta_seconds": eta,
+        }
+        if message is not None:
+            payload["message"] = message
+        _update_card(card_id, **payload)
 
     try:
         for item in files:
@@ -304,31 +329,19 @@ def _copy_card_worker(
             if progress.is_file_done(prog, rel, size, dest_file):
                 done_bytes += size
                 files_done += 1
-                _update_card(
-                    card_id,
-                    bytes_done=done_bytes,
-                    files_done=files_done,
-                    message=f"Skipped (done): {rel}",
-                )
+                _publish(0, message=f"Skipped (done): {rel}")
                 continue
 
-            copy_file(src, dest_file)
+            _publish(0, message=f"Copying {rel}…")
+
+            def on_progress(written: int, _rel: str = rel) -> None:
+                _publish(written, message=f"Copying {_rel}…")
+
+            copy_file(src, dest_file, on_progress=on_progress)
             progress.mark_file_done(card_root, prog, rel, size)
             done_bytes += size
             files_done += 1
-            elapsed = max(0.1, time.time() - started)
-            speed = (done_bytes / (1024 * 1024)) / elapsed
-            remaining = max(0, inventory.total_bytes(files) - done_bytes)
-            eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
-            _update_card(
-                card_id,
-                status="copying",
-                bytes_done=done_bytes,
-                files_done=files_done,
-                speed_mbps=round(speed, 2),
-                eta_seconds=eta,
-                message=f"Copied {rel}",
-            )
+            _publish(0, message=f"Copied {rel}")
 
         _update_card(card_id, status="verifying", message="Verifying…")
         for item in files:
@@ -364,7 +377,7 @@ def _copy_card_worker(
                     message=f"Ready — AWS job {job.get('id')} started",
                     speed_mbps=0,
                     eta_seconds=0,
-                    bytes_done=inventory.total_bytes(files),
+                    bytes_done=total_bytes,
                 )
             except Exception as exc:  # noqa: BLE001
                 _update_card(
@@ -380,7 +393,7 @@ def _copy_card_worker(
                 message="Ready — card ejected (SSD only)",
                 speed_mbps=0,
                 eta_seconds=0,
-                bytes_done=inventory.total_bytes(files),
+                bytes_done=total_bytes,
             )
 
         _log_line(f"{card_id}: complete → {dest}", kind="ok")

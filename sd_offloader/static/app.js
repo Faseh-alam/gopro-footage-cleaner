@@ -8,6 +8,7 @@ const el = {
   startSession: document.getElementById("start-session"),
   stopSession: document.getElementById("stop-session"),
   uploadBatch: document.getElementById("upload-batch"),
+  testAws: document.getElementById("test-aws"),
   sessionStatus: document.getElementById("session-status"),
   cards: document.getElementById("cards"),
   cardsSummary: document.getElementById("cards-summary"),
@@ -231,6 +232,23 @@ el.uploadBatch.addEventListener("click", async () => {
     await pollStatus();
   } catch (error) {
     setStatus(error.message, "error");
+  }
+});
+
+el.testAws?.addEventListener("click", async () => {
+  el.testAws.disabled = true;
+  setStatus("Testing AWS — uploading empty file…");
+  try {
+    const data = await api("/api/aws/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ s3_uri: el.s3Uri.value.trim() }),
+    });
+    setStatus(data.message || "AWS connection OK", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    el.testAws.disabled = false;
   }
 });
 

@@ -1,6 +1,6 @@
 # SD Card Offloader
 
-24/7 server tool: plug labeled GoPro SD cards → copy task folders to dual removable SSDs → optional AWS S3 sync. Multi-card parallel transfers with resume.
+24/7 server tool: plug labeled GoPro SD cards → copy task folders to dual removable SSDs → optional AWS S3 sync. Multi-card parallel transfers with live progress and resume.
 
 ## What it copies
 
@@ -48,7 +48,7 @@ chmod +x run.sh
    - **SSD + AWS** — each card uploads to S3 after it finishes copying
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
 7. Click **Start watching cards**
-8. Plug SD cards into readers — transfers start automatically (several at once)
+8. Plug SD cards into readers — transfers start in parallel with live MB/s / ETA
 9. When a card shows **completed / Ready**, it has been verified, wiped (task folders), and ejected
 
 If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** `batch 6` folder name. AWS still syncs everything into one `…/batch 6/` prefix.
@@ -94,6 +94,8 @@ In the offloader UI, only set:
 ```text
 s3://your-bucket/footage/
 ```
+
+Then click **Test AWS connection** — it uploads (and removes) an empty `_offloader_connection_test.txt` using your `aws configure` credentials. No keys go in any app config file.
 
 The app runs `aws s3 sync` into `s3://your-bucket/footage/batch 6/…`.
 

@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">Server ingest</p>
           <h1>SD Card Offloader</h1>
-          <p class="hint">SD → removable SSDs → optional AWS S3 · multi-card parallel · resume-safe</p>
+          <p class="hint">SD → removable SSDs → optional AWS S3 · multi-card parallel · live MB/s · resume-safe</p>
         </div>
         <div class="header-meta">
           <span id="aws-cli-status" class="pill">AWS CLI…</span>
@@ -51,6 +51,7 @@
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives</button>
           <button id="start-session" type="button" class="primary">Start watching cards</button>
           <button id="stop-session" type="button" class="secondary">Stop watching</button>
+          <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
           <button id="upload-batch" type="button" class="secondary">Upload batch to AWS now</button>
         </div>
         <p id="session-status" class="status"></p>
