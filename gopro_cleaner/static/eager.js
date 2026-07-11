@@ -801,10 +801,26 @@ function renderFilmstrip() {
   active?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
 }
 
-async function waitForSnapshots(video, token) {
+async function cancelSnapshotJob(path) {
+  if (!path) return;
+  try {
+    await api("/api/eager/snapshots/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function waitForSnapshots(video, token, { showOverlay = true } = {}) {
   const isLabel = state.snapshotPurpose === "label";
   await api(`/api/eager/snapshots/status?${snapshotQuery(video, { priority: "foreground" })}&start=1`);
-  let uiOpen = false;
+  let uiOpen = !showOverlay || isLabel;
+  if (!showOverlay && !isLabel) {
+    hideLoading();
+  }
   const maxPolls = isLabel ? 120 : 3600;
   for (let i = 0; i < maxPolls; i += 1) {
     if (token !== state.snapshotBuildToken) return null;
@@ -825,16 +841,16 @@ async function waitForSnapshots(video, token) {
       }
     }
 
-    if (status.status === "running" && !uiOpen && !isLabel) {
+    if (showOverlay && status.status === "running" && !uiOpen && !isLabel) {
       showLoading(
         "Building snapshots",
-        `${video.name} — ${frameCount}/${status.plan?.snapshot_count || "?"} frames`,
-        status.progress || Math.min(95, Math.round((frameCount / (status.plan?.snapshot_count || 1)) * 100)),
-        status.plan?.garbage_hint || "",
+        `${video.name} — ${frameCount}/${status.plan?.snapshot_count || status.manifest?.snapshot_count || "?"} frames`,
+        status.progress || Math.min(95, Math.round((frameCount / (status.plan?.snapshot_count || status.manifest?.snapshot_count || 1)) * 100)),
+        status.plan?.garbage_hint || status.manifest?.garbage_hint || "",
       );
     }
-    if (status.status === "queued" && !uiOpen && !isLabel) {
-      if (i >= 8) {
+    if (showOverlay && status.status === "queued" && !uiOpen && !isLabel) {
+      if (i >= 4) {
         hideLoading();
         uiOpen = true;
         setStatus(
@@ -855,15 +871,16 @@ async function waitForSnapshots(video, token) {
       hideLoading();
       return status.manifest;
     }
-    if (uiOpen && partial?.frames?.length >= minFrames && status.status === "running") {
-      // Enough frames to work — stop blocking the overlay loop.
+    if (uiOpen && partial?.frames?.length >= minFrames && (status.status === "running" || status.status === "ready")) {
       return partial;
     }
     if (status.status === "error") {
+      hideLoading();
       throw new Error(status.error || "Snapshot build failed");
     }
-    await new Promise((r) => setTimeout(r, uiOpen ? state.perf.snapshot_poll_ms : Math.min(800, state.perf.snapshot_poll_ms)));
+    await new Promise((r) => setTimeout(r, uiOpen ? state.perf.snapshot_poll_ms : Math.min(400, state.perf.snapshot_poll_ms)));
   }
+  hideLoading();
   throw new Error("Snapshot build timed out");
 }
 
@@ -874,6 +891,8 @@ async function ensureSnapshots(video, showOverlay = true) {
     showLoading("Checking snapshots", video.name, 5);
   } else if (isLabel) {
     setStatus(`Loading opening preview for ${video.name}...`);
+  } else {
+    hideLoading();
   }
   const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
   if (status.status === "ready" && status.manifest) {
@@ -887,7 +906,7 @@ async function ensureSnapshots(video, showOverlay = true) {
   if (showOverlay && !isLabel) {
     showLoading("Building snapshots", video.name, 0, status.plan?.garbage_hint || "");
   }
-  const manifest = await waitForSnapshots(video, token);
+  const manifest = await waitForSnapshots(video, token, { showOverlay });
   if (token !== state.snapshotBuildToken || !manifest) return null;
   state.snapshots = manifest;
   renderFilmstrip();
@@ -900,7 +919,7 @@ function continueSnapshotRefresh(video) {
   const token = state.snapshotBuildToken;
   const pollMs = state.perf.snapshot_poll_ms || 1000;
   (async () => {
-    for (let i = 0; i < 120; i += 1) {
+    for (let i = 0; i < 180; i += 1) {
       if (token !== state.snapshotBuildToken) return;
       if (currentVideo()?.path !== video.path) return;
       const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
@@ -913,6 +932,11 @@ function continueSnapshotRefresh(video) {
         state.snapshots = status.manifest;
         renderFilmstrip();
         updateFilmstripMeta();
+        // Only prefetch the next clip once this one is fully done — otherwise the
+        // next file sits behind leftover frames and N shows "Starting soon…".
+        if (state.phase === "clean" && state.perf.prefetch) {
+          prefetchSnapshotsBackground(state.index + 1);
+        }
         return;
       }
       if (status.status === "error") return;
@@ -1149,6 +1173,8 @@ async function loadVideo(index) {
   const previous = currentVideo();
   if (previous?.path && previous.path !== state.videos[index]?.path) {
     await cancelPreviewJob(previous.path);
+    // Free the snapshot worker so the next clip isn't stuck behind leftover frames.
+    await cancelSnapshotJob(previous.path);
   }
 
   state.index = index;
@@ -1216,12 +1242,10 @@ async function loadVideo(index) {
               ? `Ready — , . ±3s to scrub (${video.name})`
               : `Ready — use snapshot strip (${video.name})`;
           setStatus(readyMsg, "ok");
-          if (state.phase === "clean" && manifest.frames?.length >= 3 && state.perf.prefetch) {
-            prefetchSnapshotsBackground(state.index + 1);
-          }
         })
         .catch((error) => {
           if (token !== state.previewToken) return;
+          hideLoading();
           setStatus(error.message || "Snapshot build failed — use scrub bar", "error");
         });
     } else {
@@ -1609,7 +1633,6 @@ async function finishCleaningFile() {
       setStatus(`Finished ${video.name}`, "ok");
     }
     advanceToNext();
-    if (state.phase === "clean" && state.perf.prefetch) prefetchSnapshotsBackground(state.index + 1);
   } catch (error) {
     setStatus(error.message, "error");
   }

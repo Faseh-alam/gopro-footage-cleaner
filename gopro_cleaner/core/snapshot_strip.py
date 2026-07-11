@@ -453,17 +453,17 @@ def _parse_priority(raw: str | int | None) -> int:
     return PRIORITY_BACKGROUND
 
 
-def _preempt_background_for_foreground(priority: int) -> None:
+def _preempt_other_jobs(priority: int, keep_key: str) -> None:
+    """Cancel whatever the worker is building when the user focuses a different clip."""
     if priority < PRIORITY_FOREGROUND:
         return
     global _active_job_key
     with _lock:
-        if not _active_job_key:
+        if not _active_job_key or _active_job_key == keep_key:
             return
         active = _jobs.get(_active_job_key)
-        if not active or active.get("priority", PRIORITY_BACKGROUND) >= PRIORITY_FOREGROUND:
-            return
-        active["status"] = "cancelled"
+        if active:
+            active["status"] = "cancelled"
     _kill_active_ffmpeg()
 
 
@@ -476,6 +476,19 @@ def _remove_from_queue(key: str) -> None:
     _queue_keys.discard(key)
 
 
+def _promote_queued_job(key: str, source: Path, purpose: str, priority: int) -> None:
+    """Move an already-queued job to the front when it becomes foreground."""
+    with _lock:
+        job = _jobs.get(key)
+        if not job or job.get("status") != "queued":
+            return
+        job["priority"] = max(job.get("priority", PRIORITY_BACKGROUND), priority)
+        if key in _queue_keys:
+            _remove_from_queue(key)
+        _queue.appendleft((-priority, time.time(), key, source, purpose))
+        _queue_keys.add(key)
+
+
 def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
     global _queue_worker_started
     key = _job_key(source, purpose)
@@ -484,6 +497,7 @@ def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
         if job and job.get("status") == "running" and key == _active_job_key:
             if priority > job.get("priority", PRIORITY_BACKGROUND):
                 job["priority"] = priority
+            # Already building this clip — nothing to enqueue.
             return
 
         if job and job.get("status") == "ready":
@@ -512,7 +526,7 @@ def _enqueue_snapshot(source: Path, purpose: str, *, priority: int) -> None:
             ).start()
 
     if priority >= PRIORITY_FOREGROUND:
-        _preempt_background_for_foreground(priority)
+        _preempt_other_jobs(priority, key)
 
 
 def _queue_worker_loop() -> None:
@@ -596,6 +610,7 @@ def snapshot_status(
         raise FileNotFoundError(source)
 
     key = _job_key(source, purpose)
+    prio = _parse_priority(priority) if start else PRIORITY_BACKGROUND
     manifest = _load_manifest(source, purpose)
     if manifest and manifest.get("ready") and manifest.get("frames"):
         if _manifest_frames_valid(source, purpose, manifest):
@@ -611,6 +626,8 @@ def snapshot_status(
     with _lock:
         job = _jobs.get(key)
         if job and job.get("status") in {"running", "queued"}:
+            if start and prio >= PRIORITY_FOREGROUND:
+                job["priority"] = max(job.get("priority", PRIORITY_BACKGROUND), prio)
             result = {k: v for k, v in job.items() if k not in {"process"}}
             if job.get("status") == "queued":
                 position = next(
@@ -618,16 +635,33 @@ def snapshot_status(
                     None,
                 )
                 result["queue_position"] = position
-            return result
-        if job and job.get("status") == "error":
-            if not start:
-                return job
+            promote = bool(start and prio >= PRIORITY_FOREGROUND and job.get("status") == "queued")
+            running_here = bool(job.get("status") == "running" and key == _active_job_key)
+        else:
+            promote = False
+            running_here = False
+            result = None
+        if job and job.get("status") == "error" and not start:
+            return job
+
+    if result is not None:
+        if promote:
+            _promote_queued_job(key, source, purpose, prio)
+            _preempt_other_jobs(prio, key)
+            with _lock:
+                job = _jobs.get(key)
+                if job:
+                    result = {k: v for k, v in job.items() if k not in {"process"}}
+                    result["queue_position"] = 0
+        elif start and prio >= PRIORITY_FOREGROUND and not running_here:
+            # Another clip is occupying the worker — free it for this one.
+            _preempt_other_jobs(prio, key)
+        return result
 
     plan = snapshot_plan(source, purpose=purpose)
     if not start:
         return {"status": "idle", "progress": 0, "plan": plan}
 
-    prio = _parse_priority(priority)
     with _lock:
         _jobs[key] = {"status": "queued", "progress": 0, "plan": plan, "priority": prio}
     _enqueue_snapshot(source, purpose, priority=prio)
