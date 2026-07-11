@@ -1,0 +1,237 @@
+const el = {
+  batchName: document.getElementById("batch-name"),
+  mode: document.getElementById("mode"),
+  ssd1: document.getElementById("ssd1"),
+  ssd2: document.getElementById("ssd2"),
+  s3Uri: document.getElementById("s3-uri"),
+  refreshVolumes: document.getElementById("refresh-volumes"),
+  startSession: document.getElementById("start-session"),
+  stopSession: document.getElementById("stop-session"),
+  uploadBatch: document.getElementById("upload-batch"),
+  sessionStatus: document.getElementById("session-status"),
+  cards: document.getElementById("cards"),
+  cardsSummary: document.getElementById("cards-summary"),
+  awsJobs: document.getElementById("aws-jobs"),
+  log: document.getElementById("log"),
+  awsCliStatus: document.getElementById("aws-cli-status"),
+  appVersion: document.getElementById("app-version"),
+};
+
+async function api(url, options = {}) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds == null) return "—";
+  const s = Math.max(0, Math.ceil(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${r}s`;
+  return `${r}s`;
+}
+
+function setStatus(message, kind = "") {
+  el.sessionStatus.textContent = message || "";
+  el.sessionStatus.className = `status ${kind}`.trim();
+}
+
+function fillVolumeSelect(select, volumes, selected) {
+  const current = selected || select.value;
+  select.innerHTML = '<option value="">— not selected —</option>';
+  for (const vol of volumes) {
+    const option = document.createElement("option");
+    option.value = vol.path;
+    const free = formatBytes(vol.free_bytes);
+    const tag = vol.is_card_candidate ? " · SD?" : "";
+    option.textContent = `${vol.label} (${vol.path}) · ${free} free${tag}`;
+    select.appendChild(option);
+  }
+  if (current && [...select.options].some((o) => o.value === current)) {
+    select.value = current;
+  }
+}
+
+async function refreshVolumes() {
+  const data = await api("/api/volumes");
+  fillVolumeSelect(el.ssd1, data.volumes || [], el.ssd1.value);
+  fillVolumeSelect(el.ssd2, data.volumes || [], el.ssd2.value);
+  return data.volumes || [];
+}
+
+function renderCards(cards) {
+  el.cards.innerHTML = "";
+  if (!cards.length) {
+    el.cards.innerHTML = '<div class="hint">Waiting for Cxxxx cards with DCIM/100GOPRO/task folders…</div>';
+    el.cardsSummary.textContent = "No cards yet";
+    return;
+  }
+  const active = cards.filter((c) => !["completed", "error"].includes(c.status)).length;
+  const done = cards.filter((c) => c.status === "completed").length;
+  el.cardsSummary.textContent = `${cards.length} seen · ${active} active · ${done} done`;
+
+  for (const card of cards) {
+    const pct = card.bytes_total ? Math.min(100, (card.bytes_done / card.bytes_total) * 100) : 0;
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML = `
+      <div class="card-top">
+        <span class="card-id">${card.card_id || "?"}</span>
+        <span class="phase ${card.status || ""}">${card.status || ""}</span>
+      </div>
+      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="meta">
+        <span>${formatBytes(card.bytes_done || 0)} / ${formatBytes(card.bytes_total || 0)}</span>
+        <span>${Number(card.speed_mbps || 0).toFixed(1)} MB/s</span>
+        <span>ETA ${formatEta(card.eta_seconds)}</span>
+        <span>${card.files_done || 0}/${card.files_total || 0} files</span>
+      </div>
+      <div class="message">${card.message || ""}</div>
+    `;
+    el.cards.appendChild(div);
+  }
+}
+
+function renderAwsJobs(jobs) {
+  el.awsJobs.innerHTML = "";
+  if (!jobs.length) {
+    el.awsJobs.innerHTML = '<div class="hint">No AWS uploads yet</div>';
+    return;
+  }
+  for (const job of jobs.slice(0, 8)) {
+    const pct = job.bytes_total ? Math.min(100, (job.bytes_done / job.bytes_total) * 100) : 0;
+    const div = document.createElement("div");
+    div.className = "job";
+    div.innerHTML = `
+      <div class="job-top">
+        <span>${job.batch || ""}${job.card_id ? " / " + job.card_id : " (full batch)"}</span>
+        <span class="phase ${job.status || ""}">${job.status || ""}</span>
+      </div>
+      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="meta">
+        <span>${formatBytes(job.bytes_done || 0)} / ${formatBytes(job.bytes_total || 0)}</span>
+        <span>${Number(job.speed_mbps || 0).toFixed(1)} MB/s</span>
+        <span>ETA ${formatEta(job.eta_seconds)}</span>
+      </div>
+      <div class="message">${job.message || job.dest || ""}</div>
+    `;
+    el.awsJobs.appendChild(div);
+  }
+}
+
+function renderLog(lines) {
+  el.log.innerHTML = "";
+  for (const line of (lines || []).slice().reverse()) {
+    const div = document.createElement("div");
+    div.className = `log-line ${line.kind || ""}`;
+    const t = new Date((line.t || 0) * 1000).toLocaleTimeString();
+    div.textContent = `[${t}] ${line.message || ""}`;
+    el.log.appendChild(div);
+  }
+}
+
+async function pollStatus() {
+  try {
+    const data = await api("/api/status");
+    const session = data.session || {};
+    if (session.active) {
+      setStatus(
+        `Watching · batch "${session.batch}" · ${session.mode === "ssd_and_aws" ? "SSD+AWS" : "SSD only"}`,
+        "ok",
+      );
+    }
+    renderCards(data.cards || []);
+    renderAwsJobs(data.aws_jobs || []);
+    renderLog(data.log || []);
+  } catch {
+    /* ignore transient */
+  }
+}
+
+async function bootstrap() {
+  const [health, config] = await Promise.all([api("/api/health"), api("/api/config")]);
+  el.appVersion.textContent = `v${health.version || "?"}`;
+  el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
+  el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
+
+  el.batchName.value = config.last_batch || "";
+  el.mode.value = config.mode || "ssd_only";
+  el.s3Uri.value = config.s3_uri || "";
+  await refreshVolumes();
+  if (config.ssd1) el.ssd1.value = config.ssd1;
+  if (config.ssd2) el.ssd2.value = config.ssd2;
+  await pollStatus();
+  setInterval(pollStatus, 1000);
+}
+
+el.refreshVolumes.addEventListener("click", async () => {
+  try {
+    await refreshVolumes();
+    setStatus("Drive list refreshed", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.startSession.addEventListener("click", async () => {
+  try {
+    await api("/api/session/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch: el.batchName.value.trim(),
+        mode: el.mode.value,
+        ssd1: el.ssd1.value,
+        ssd2: el.ssd2.value,
+        s3_uri: el.s3Uri.value.trim(),
+      }),
+    });
+    setStatus("Session started — plug SD cards", "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.stopSession.addEventListener("click", async () => {
+  try {
+    await api("/api/session/stop", { method: "POST" });
+    setStatus("Stopped watching for new cards", "");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.uploadBatch.addEventListener("click", async () => {
+  try {
+    // Persist S3 URI first
+    await api("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ s3_uri: el.s3Uri.value.trim(), last_batch: el.batchName.value.trim() }),
+    });
+    const data = await api("/api/aws/upload-batch", { method: "POST" });
+    setStatus(`AWS upload started: ${data.job?.id || "ok"}`, "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+bootstrap().catch((error) => setStatus(error.message, "error"));

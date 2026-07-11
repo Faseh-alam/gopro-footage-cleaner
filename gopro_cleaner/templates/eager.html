@@ -156,9 +156,13 @@
                 <button id="recheck-label-btn" type="button" class="secondary">Recheck</button>
               </div>
             </div>
-            <p class="workflow-brief">Scan the same folder. A short opening preview loads automatically — then use <kbd>,</kbd> <kbd>.</kbd> and <kbd>±3s</kbd> to scrub. Press <kbd>N</kbd> to move the file into <code>&lt;task-name&gt;/</code>.</p>
+            <p class="workflow-brief">
+              Scrub to identify the task. Press <kbd>S</kbd> to search, <kbd>↑</kbd><kbd>↓</kbd> to choose, <kbd>Enter</kbd> to move.
+              Same task again? Just press <kbd>N</kbd> or <kbd>Enter</kbd> — last task stays selected.
+            </p>
 
-            <input id="task-search" type="search" placeholder="Search tasks..." />
+            <input id="task-search" type="search" placeholder="Press S to search tasks…" autocomplete="off" />
+            <p id="task-selected-hint" class="task-selected-hint">Press S to search, arrows to choose, Enter to move</p>
             <div id="task-list" class="task-list"></div>
             <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
             <div class="row">
@@ -167,7 +171,7 @@
             </div>
             <p id="task-added-msg" class="task-added"></p>
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Move to task <kbd>N</kbd></button>
+              <button id="label-btn" type="button" class="primary">Move to task <kbd>Enter</kbd>/<kbd>N</kbd></button>
             </div>
           </div>
 
@@ -176,7 +180,7 @@
       </main>
 
       <footer class="footer">
-        <span id="footer-hints"><kbd>I</kbd> <kbd>O</kbd> <kbd>T</kbd> <kbd>N</kbd> · <kbd>←</kbd> <kbd>→</kbd> <kbd>,</kbd> <kbd>.</kbd></span>
+        <span id="footer-hints"><kbd>S</kbd> search · <kbd>↑</kbd><kbd>↓</kbd> · <kbd>Enter</kbd>/<kbd>N</kbd> move · <kbd>I</kbd><kbd>O</kbd><kbd>T</kbd> clean</span>
         <span id="app-version"></span>
       </footer>
     </div>

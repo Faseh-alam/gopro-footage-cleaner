@@ -1,0 +1,120 @@
+# SD Card Offloader
+
+24/7 server tool: plug labeled GoPro SD cards → copy task folders to dual removable SSDs → optional AWS S3 sync. Multi-card parallel transfers with resume.
+
+## What it copies
+
+From each card:
+
+```text
+C1234/
+  DCIM/
+    100GOPRO/
+      <task-folder>/*.MP4
+```
+
+Onto SSD:
+
+```text
+<SSD>/Batches/batch 6/C1234/<task-folder>/*.MP4
+```
+
+Skips `.LRV`, `.THM`, and other non-MP4 junk.
+
+## Quick start
+
+### Windows
+
+1. Install Python 3.10+ and (for AWS) [AWS CLI v2](https://aws.amazon.com/cli/)
+2. Double-click `run.bat`
+3. Browser opens `http://127.0.0.1:8877`
+
+### Mac
+
+```bash
+cd sd_offloader
+chmod +x run.sh
+./run.sh
+```
+
+## Daily workflow
+
+1. Plug both removable SSDs
+2. Open the UI → **Refresh drives**
+3. Pick **SSD 1** and **SSD 2**
+4. Enter batch name, e.g. `batch 6`
+5. Choose mode:
+   - **SSD only** — free cards fast; upload to AWS later
+   - **SSD + AWS** — each card uploads to S3 after it finishes copying
+6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
+7. Click **Start watching cards**
+8. Plug SD cards into readers — transfers start automatically (several at once)
+9. When a card shows **completed / Ready**, it has been verified, wiped (task folders), and ejected
+
+If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** `batch 6` folder name. AWS still syncs everything into one `…/batch 6/` prefix.
+
+## Resume after crash / unplug
+
+A progress file is written on the SD card:
+
+`C1234/.gopro_offload_progress.json`
+
+Replug the card (same batch session) and it continues from unfinished files.
+
+## AWS login (one-time on the server)
+
+**Do not put Access Keys in this app.** Use AWS CLI:
+
+```bash
+aws configure
+```
+
+Enter:
+
+- AWS Access Key ID  
+- AWS Secret Access Key  
+- Default region  
+- Output: `json`
+
+Keys are stored by AWS CLI:
+
+| OS | Location |
+|----|----------|
+| Windows | `C:\Users\<you>\.aws\credentials` |
+| Mac | `~/.aws/credentials` |
+
+Test:
+
+```bash
+aws s3 ls s3://your-bucket/footage/
+```
+
+In the offloader UI, only set:
+
+```text
+s3://your-bucket/footage/
+```
+
+The app runs `aws s3 sync` into `s3://your-bucket/footage/batch 6/…`.
+
+### Upload later (SSD-only mode)
+
+After cards are dumped, click **Upload batch to AWS now**. It syncs `Batches/batch 6` from both SSDs into the same S3 batch folder.
+
+## IAM tip
+
+Give the IAM user at least:
+
+- `s3:ListBucket` on the bucket  
+- `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on `your-bucket/footage*`
+
+## Ports
+
+Default: `8877`  
+Override: `SD_OFFLOADER_PORT=8899`
+
+## Safety notes
+
+- Wipe/eject happens only after size verification  
+- Only transferred task folders under `DCIM/…GOPRO` are deleted on the card  
+- SSD copies are kept after AWS upload (local backup)

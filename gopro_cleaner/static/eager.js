@@ -12,6 +12,8 @@ const state = {
   trimEtaTotal: 0,
   currentHasGpmf: null,
   donePaths: new Set(),
+  labeledTasks: {},
+  lastLabelTask: "",
   busy: false,
   previewToken: 0,
   seekTimer: null,
@@ -87,6 +89,7 @@ const el = {
   taskSearch: document.getElementById("task-search"),
   taskList: document.getElementById("task-list"),
   taskSelect: document.getElementById("task-select"),
+  taskSelectedHint: document.getElementById("task-selected-hint"),
   newTaskInput: document.getElementById("new-task-input"),
   addTaskBtn: document.getElementById("add-task-btn"),
   taskAddedMsg: document.getElementById("task-added-msg"),
@@ -390,6 +393,7 @@ function setPhase(phase) {
   state.videos = [];
   state.index = -1;
   state.donePaths = new Set();
+  state.labeledTasks = {};
   state.labelProgress = null;
   renderFileList();
   renderLabelProgress();
@@ -446,8 +450,8 @@ function renderLabelProgress() {
   if (el.labelProgressDetail) {
     el.labelProgressDetail.textContent =
       labeled > 0
-        ? `${labeled} already in task folders · keep pressing N`
-        : "Still outside task folders — label every file";
+        ? `${labeled} already in task folders · S search · Enter/N move`
+        : "Still outside task folders — S to search, Enter to move";
   }
 }
 
@@ -470,11 +474,15 @@ function renderFileList() {
     btn.type = "button";
     btn.className = "file-item";
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
+    const assignedTask = state.labeledTasks[video.path];
     if (state.donePaths.has(video.path)) btn.classList.add("done");
     else if (state.phase === "label") btn.classList.add("unlabeled");
     const typeHint =
       state.phase === "label" ? `${video.is_trimmed ? "clip" : "whole"} · ` : "";
-    btn.innerHTML = `<span class="name">${video.name}</span><span class="meta">${typeHint}${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
+    const taskBadge = assignedTask
+      ? `<span class="task-badge" title="Moved to ${assignedTask}">${assignedTask}</span>`
+      : "";
+    btn.innerHTML = `<span class="name">${video.name}${taskBadge}</span><span class="meta">${typeHint}${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
     btn.addEventListener("click", () => {
       const idx = state.videos.findIndex((item) => item.path === video.path);
       if (idx >= 0) loadVideo(idx);
@@ -670,9 +678,9 @@ function updateContextHint() {
           ? `${remaining} unlabeled file(s) still outside task folders`
           : "Choose folder and scan — use ← → filmstrip to identify task";
     } else if (!selectedTask()) {
-      el.contextMessage.textContent = "Use , . ±3s to scrub · ← → for opening previews";
+      el.contextMessage.textContent = "Press S to search a task, then Enter to move";
     } else {
-      el.contextMessage.textContent = `Press N to move to "${selectedTask()}" · ${remainingUnlabeledCount()} unlabeled left`;
+      el.contextMessage.textContent = `Selected "${selectedTask()}" — Enter/N to move · S to search another`;
     }
     return;
   }
@@ -952,9 +960,10 @@ function currentScrubTime() {
 function renderTasks(preferred = "") {
   const matches = visibleTasks();
   const current = el.taskSelect.value;
+  const preferredTask = preferred || state.lastLabelTask || "";
   const selected =
-    preferred && matches.includes(preferred)
-      ? preferred
+    preferredTask && matches.includes(preferredTask)
+      ? preferredTask
       : matches.includes(current)
         ? current
         : matches[0] || "";
@@ -963,6 +972,18 @@ function renderTasks(preferred = "") {
 
   if (!state.tasks.length) {
     el.taskList.innerHTML = '<div class="hint">No tasks yet — add one below.</div>';
+    if (el.taskSelectedHint) el.taskSelectedHint.textContent = "";
+    return;
+  }
+
+  if (!matches.length) {
+    el.taskList.innerHTML = '<div class="hint">No matching tasks — keep typing or clear search.</div>';
+    if (el.taskSelectedHint) {
+      el.taskSelectedHint.textContent = state.lastLabelTask
+        ? `Last used: ${state.lastLabelTask} — clear search or press Esc, then N`
+        : "";
+    }
+    updateContextHint();
     return;
   }
 
@@ -979,6 +1000,7 @@ function renderTasks(preferred = "") {
     if (task === selected) btn.classList.add("active");
     btn.addEventListener("click", () => {
       el.taskSelect.value = task;
+      state.lastLabelTask = task;
       renderTasks(task);
     });
     el.taskList.appendChild(btn);
@@ -988,6 +1010,12 @@ function renderTasks(preferred = "") {
     el.taskSelect.value = selected;
   } else if (el.taskSelect.options.length) {
     el.taskSelect.selectedIndex = 0;
+  }
+  if (el.taskSelectedHint) {
+    const active = selectedTask();
+    el.taskSelectedHint.textContent = active
+      ? `Selected: ${active} — Enter / N moves current file`
+      : "Press S to search, arrows to choose, Enter to move";
   }
   updateContextHint();
 }
@@ -1000,10 +1028,26 @@ function moveTaskSelection(delta) {
   const next = Math.max(0, Math.min(options.length - 1, idx + delta));
   const chosen = options[next];
   el.taskSelect.value = chosen;
+  state.lastLabelTask = chosen;
   renderTasks(chosen);
   const active = el.taskList.querySelector(".task-item.active");
   active?.scrollIntoView({ block: "nearest" });
   return true;
+}
+
+function focusTaskSearch() {
+  if (!el.taskSearch || state.phase !== "label") return;
+  el.taskSearch.focus();
+  el.taskSearch.select();
+  setStatus("Search a task — ↑↓ to choose, Enter to move", "ok");
+}
+
+function leaveTaskSearch({ clear = false } = {}) {
+  if (clear) el.taskSearch.value = "";
+  const keep = selectedTask() || state.lastLabelTask;
+  renderTasks(keep);
+  el.taskSearch.blur();
+  el.playerWrap?.focus?.();
 }
 
 function updateScrubUi() {
@@ -1310,6 +1354,7 @@ async function scanSource() {
     });
     state.videos = data.videos || [];
     state.donePaths = new Set();
+    state.labeledTasks = {};
     state.index = -1;
     if (mode === "label") {
       state.labelProgress = data.progress || null;
@@ -1538,6 +1583,11 @@ async function labelCurrentClip() {
       }),
     });
     state.donePaths.add(video.path);
+    state.labeledTasks[video.path] = task;
+    state.lastLabelTask = task;
+    el.taskSearch.value = "";
+    renderTasks(task);
+    el.taskSearch.blur();
     if (state.labelProgress) {
       const nextUnlabeled = Math.max(0, (state.labelProgress.unlabeled || 0) - 1);
       const nextLabeled = (state.labelProgress.labeled || 0) + 1;
@@ -1552,7 +1602,10 @@ async function labelCurrentClip() {
             : `${nextUnlabeled} file(s) still outside task folders`,
       };
     }
-    setStatus(`Moved to ${data.task_dir} · ${remainingUnlabeledCount()} unlabeled left`, "ok");
+    setStatus(
+      `Moved to ${task} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
+      "ok",
+    );
     renderFileList();
     advanceToNext();
     refreshLabelProgress({ quiet: true });
@@ -1630,6 +1683,20 @@ el.taskSearch.addEventListener("keydown", (event) => {
   if (event.key === "ArrowUp") {
     event.preventDefault();
     moveTaskSelection(-1);
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (!selectedTask() && state.lastLabelTask) {
+      renderTasks(state.lastLabelTask);
+    }
+    leaveTaskSearch({ clear: true });
+    labelCurrentClip();
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    leaveTaskSearch({ clear: true });
   }
 });
 el.addTaskBtn.addEventListener("click", addTask);
@@ -1714,6 +1781,16 @@ document.addEventListener("keydown", (event) => {
   }
 
   if (state.phase === "label") {
+    if (key === "s") {
+      event.preventDefault();
+      focusTaskSearch();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      leaveTaskSearch({ clear: true });
+      return;
+    }
     if (event.key === "ArrowDown") {
       event.preventDefault();
       moveTaskSelection(1);

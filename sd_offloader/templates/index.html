@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SD Card Offloader</title>
+    <link rel="stylesheet" href="/static/style.css?v={{ version }}" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div>
+          <p class="eyebrow">Server ingest</p>
+          <h1>SD Card Offloader</h1>
+          <p class="hint">SD → removable SSDs → optional AWS S3 · multi-card parallel · resume-safe</p>
+        </div>
+        <div class="header-meta">
+          <span id="aws-cli-status" class="pill">AWS CLI…</span>
+          <span id="app-version" class="pill">v{{ version }}</span>
+        </div>
+      </header>
+
+      <section class="panel setup">
+        <h2>Session</h2>
+        <div class="grid-2">
+          <label>
+            Batch name
+            <input id="batch-name" type="text" placeholder="batch 6" />
+          </label>
+          <label>
+            Mode
+            <select id="mode">
+              <option value="ssd_only">SSD only (no AWS yet)</option>
+              <option value="ssd_and_aws">SSD + AWS (upload as each card finishes)</option>
+            </select>
+          </label>
+          <label>
+            SSD 1
+            <select id="ssd1"></select>
+          </label>
+          <label>
+            SSD 2
+            <select id="ssd2"></select>
+          </label>
+          <label class="full">
+            AWS S3 destination (folder URI — keys stay in `aws configure`)
+            <input id="s3-uri" type="text" placeholder="s3://your-bucket/footage/" />
+          </label>
+        </div>
+        <div class="row actions">
+          <button id="refresh-volumes" type="button" class="secondary">Refresh drives</button>
+          <button id="start-session" type="button" class="primary">Start watching cards</button>
+          <button id="stop-session" type="button" class="secondary">Stop watching</button>
+          <button id="upload-batch" type="button" class="secondary">Upload batch to AWS now</button>
+        </div>
+        <p id="session-status" class="status"></p>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Active cards</h2>
+          <span id="cards-summary" class="hint">No cards yet</span>
+        </div>
+        <div id="cards" class="cards"></div>
+      </section>
+
+      <section class="panel grid-2-panels">
+        <div>
+          <h2>AWS jobs</h2>
+          <div id="aws-jobs" class="jobs"></div>
+        </div>
+        <div>
+          <h2>Log</h2>
+          <div id="log" class="log"></div>
+        </div>
+      </section>
+    </div>
+    <script src="/static/app.js?v={{ version }}"></script>
+  </body>
+</html>
