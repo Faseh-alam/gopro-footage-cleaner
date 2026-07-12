@@ -18,15 +18,15 @@
     </div>
     <div class="eager-app">
       <header class="eager-header">
-        <div>
+        <div class="header-brand">
           <p class="eyebrow"><a href="/">← Bulk trimmer</a></p>
           <h1>Eager Review Station</h1>
-          <p class="hint">Phase 1: clean footage · Phase 2: label all footage into task folders</p>
+          <p class="hint">Clean + label in one pass · Enter labels · I/O/T then N trims in background</p>
         </div>
         <div class="eager-setup">
-          <div class="phase-tabs">
-            <button type="button" id="phase-clean" class="phase-tab active">1 · Clean footage</button>
-            <button type="button" id="phase-label" class="phase-tab">2 · Label tasks</button>
+          <div class="card-tabs" id="card-tabs">
+            <div id="card-tab-list" class="card-tab-list"></div>
+            <button type="button" id="add-card-tab" class="card-tab-add" title="Open another SD card">+</button>
           </div>
           <label id="sd-card-row" class="sd-card-row">
             SD card (C####)
@@ -35,27 +35,14 @@
                 <option value="">Detecting SD cards…</option>
               </select>
               <button id="refresh-sd-btn" type="button" class="secondary" title="Re-detect connected SD cards">Refresh</button>
+              <button id="scan-btn" type="button" class="primary">Scan</button>
+              <button id="browse-folder-btn" type="button" class="secondary" title="Manual folder pick">Browse…</button>
             </div>
-            <p id="sd-card-hint" class="hint sd-card-hint">Cards named C1234 are listed automatically. One card → selected for you.</p>
+            <p id="sd-card-hint" class="hint sd-card-hint">One card → selected for you. Use + for a second card while the first trims.</p>
           </label>
           <input id="source-path" type="hidden" value="" />
           <select id="camera-select" class="hidden-select" aria-hidden="true"></select>
-          <div class="row folder-fallback-row">
-            <button id="scan-btn" type="button" class="primary">Scan footage</button>
-            <button id="browse-folder-btn" type="button" class="secondary" title="Manual folder pick if the card is not listed">Browse…</button>
-            <span id="scan-summary" class="hint"></span>
-          </div>
-          <div id="work-timer" class="work-timer idle" title="Counts only while mouse/keyboard is active. Pauses after 90s idle.">
-            <div class="work-timer-head">
-              <span id="work-timer-status" class="work-timer-status">Idle</span>
-              <button id="work-timer-reset" type="button" class="secondary">Reset timer</button>
-            </div>
-            <div class="work-timer-grid">
-              <div><span class="work-timer-label">Clean</span><strong id="work-clean-time">0:00</strong></div>
-              <div><span class="work-timer-label">Label</span><strong id="work-label-time">0:00</strong></div>
-              <div><span class="work-timer-label">Total</span><strong id="work-total-time">0:00</strong></div>
-            </div>
-          </div>
+          <span id="scan-summary" class="hint scan-summary-inline"></span>
         </div>
       </header>
 
@@ -65,8 +52,16 @@
             <h2 id="list-title">Footage</h2>
             <span id="list-summary" class="hint">0 files</span>
           </div>
-          <input id="file-filter" type="search" placeholder="Filter by filename..." />
           <div id="file-list" class="file-list"></div>
+          <div id="trim-progress-panel" class="trim-progress-panel hidden">
+            <div class="trim-progress-head">
+              <span>Background trims</span>
+              <span id="trim-active-count">0</span> ·
+              <span id="trim-eta-total">~0s</span>
+            </div>
+            <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
+            <div id="trim-progress-list" class="trim-progress-list"></div>
+          </div>
         </aside>
 
         <section class="eager-player panel">
@@ -113,59 +108,27 @@
               <button id="mark-start-btn" type="button" class="secondary mark-btn" title="Shortcut: I">Start <kbd>I</kbd></button>
               <button id="mark-end-btn" type="button" class="secondary mark-btn" title="Shortcut: O">End <kbd>O</kbd></button>
               <button id="undo-clip-btn" type="button" class="secondary">Undo</button>
+              <button id="trim-btn" type="button" class="secondary">Trim <kbd>T</kbd></button>
             </div>
             <p id="pending-in" class="pending-status">Load a file to begin</p>
-          </div>
-          <div id="trim-progress-panel" class="trim-progress-panel hidden">
-            <div class="trim-progress-head">
-              <span>Background trims</span>
-              <span id="trim-active-count">0</span> active ·
-              <span id="trim-eta-total">~0s</span> left
-            </div>
-            <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
-            <div id="trim-progress-list" class="trim-progress-list"></div>
           </div>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
 
         <aside class="eager-side panel">
           <div id="clean-panel">
-            <h2>Clean footage</h2>
+            <h2>Task label</h2>
             <p class="workflow-brief">
-              <strong>Garbage in clip:</strong> mark each useful part (<kbd>I</kbd> → <kbd>O</kbd> → <kbd>T</kbd>), then <kbd>N</kbd>. Trims run in the background; raw file is removed when done.<br />
-              <strong>No garbage:</strong> press <kbd>N</kbd> — raw file is left untouched.
+              <strong>Clean file:</strong> type task · <kbd>↑</kbd><kbd>↓</kbd> · <kbd>Enter</kbd> to move &amp; next.<br />
+              <strong>Garbage:</strong> <kbd>I</kbd> → <kbd>O</kbd> → <kbd>T</kbd> for each part, then <kbd>N</kbd>. Clips appear when trim finishes — label them with Enter.<br />
+              <strong>Delete:</strong> <kbd>D</kbd> removes the whole file.
             </p>
-            <div class="action-stack">
-              <button id="trim-btn" type="button" class="secondary">Trim <kbd>T</kbd></button>
-              <button id="delete-file-btn" type="button" class="secondary" title="Shortcut: D">Delete whole file <kbd>D</kbd></button>
-              <button id="next-clean-btn" type="button" class="primary">Next file <kbd>N</kbd></button>
-            </div>
-          </div>
-
-          <div id="label-panel" class="hidden">
-            <h2>Label tasks</h2>
             <div id="label-trim-banner" class="label-trim-banner hidden">
               <strong>Trims still running</strong>
               <span id="label-trim-banner-text">—</span>
-              <span class="hint">Those files stay out of this list until each trim finishes.</span>
             </div>
-            <div id="label-progress" class="label-progress idle">
-              <div class="label-progress-main">
-                <span id="label-progress-count">—</span>
-                <span id="label-progress-label">Scan to check unlabeled footage</span>
-              </div>
-              <div class="label-progress-meta">
-                <span id="label-progress-detail" class="hint"></span>
-                <button id="recheck-label-btn" type="button" class="secondary">Recheck</button>
-              </div>
-            </div>
-            <p class="workflow-brief">
-              Scrub to identify the task. Press <kbd>S</kbd> to search, <kbd>↑</kbd><kbd>↓</kbd> to choose, <kbd>Enter</kbd> to move.
-              Same task again? Just press <kbd>N</kbd> or <kbd>Enter</kbd> — last task stays selected.
-            </p>
-
-            <input id="task-search" type="search" placeholder="Press S to search tasks…" autocomplete="off" />
-            <p id="task-selected-hint" class="task-selected-hint">Press S to search, arrows to choose, Enter to move</p>
+            <input id="task-search" type="search" placeholder="Type a task name…" autocomplete="off" autofocus />
+            <p id="task-selected-hint" class="task-selected-hint">↑↓ choose · Enter label &amp; next</p>
             <div id="task-list" class="task-list"></div>
             <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
             <div class="row">
@@ -174,7 +137,22 @@
             </div>
             <p id="task-added-msg" class="task-added"></p>
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Move to task <kbd>Enter</kbd>/<kbd>N</kbd></button>
+              <button id="label-btn" type="button" class="primary">Label &amp; next <kbd>Enter</kbd></button>
+              <button id="next-clean-btn" type="button" class="secondary">Finish trims / Next <kbd>N</kbd></button>
+              <button id="delete-file-btn" type="button" class="secondary danger-btn" title="Shortcut: D">Delete file <kbd>D</kbd></button>
+            </div>
+          </div>
+
+          <div id="label-panel" class="hidden" aria-hidden="true">
+            <div id="label-progress" class="label-progress idle hidden">
+              <div class="label-progress-main">
+                <span id="label-progress-count">—</span>
+                <span id="label-progress-label"></span>
+              </div>
+              <div class="label-progress-meta">
+                <span id="label-progress-detail" class="hint"></span>
+                <button id="recheck-label-btn" type="button" class="secondary hidden">Recheck</button>
+              </div>
             </div>
           </div>
 
@@ -183,10 +161,21 @@
       </main>
 
       <footer class="footer">
-        <span id="footer-hints"><kbd>S</kbd> search · <kbd>↑</kbd><kbd>↓</kbd> · <kbd>Enter</kbd>/<kbd>N</kbd> move · <kbd>I</kbd><kbd>O</kbd><kbd>T</kbd> clean · <kbd>D</kbd> delete</span>
+        <span id="footer-hints"><kbd>Enter</kbd> label · <kbd>I</kbd><kbd>O</kbd><kbd>T</kbd> trim · <kbd>N</kbd> next · <kbd>D</kbd> delete · <kbd>+</kbd> another card</span>
         <span id="app-version"></span>
       </footer>
     </div>
+    <!-- Keep phase hooks for legacy JS; unified flow always uses review mode -->
+    <button type="button" id="phase-clean" class="hidden" aria-hidden="true"></button>
+    <button type="button" id="phase-label" class="hidden" aria-hidden="true"></button>
+    <div id="work-timer" class="hidden" aria-hidden="true">
+      <span id="work-timer-status"></span>
+      <span id="work-clean-time"></span>
+      <span id="work-label-time"></span>
+      <span id="work-total-time"></span>
+      <button id="work-timer-reset" type="button"></button>
+    </div>
+    <input id="file-filter" type="hidden" value="" />
     <script src="/static/eager.js?v={{ version }}"></script>
   </body>
 </html>

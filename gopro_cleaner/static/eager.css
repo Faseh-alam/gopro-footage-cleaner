@@ -7,13 +7,23 @@
 }
 
 .eager-header {
-  padding: 1rem 1.25rem;
+  padding: 0.65rem 1rem;
   border-bottom: 1px solid var(--panel-border);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
-  gap: 1rem;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 0.75rem;
   align-items: start;
   min-width: 0;
+}
+
+.header-brand h1 {
+  font-size: 1.15rem;
+  margin: 0.1rem 0;
+}
+
+.header-brand .hint {
+  font-size: 0.78rem;
+  margin: 0;
 }
 
 .eyebrow {
@@ -131,12 +141,13 @@
 
 .eager-main {
   display: grid;
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(240px, 300px);
-  gap: 1rem;
-  padding: 1rem;
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr) minmax(220px, 280px);
+  gap: 0.75rem;
+  padding: 0.75rem;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
+  height: calc(100vh - 7.5rem);
 }
 
 .eager-list,
@@ -238,11 +249,11 @@
   width: 100%;
   max-width: 100%;
   aspect-ratio: 16 / 9;
-  max-height: min(38vh, 400px);
-  border-radius: 14px;
+  max-height: min(62vh, 720px);
+  border-radius: 10px;
   overflow: hidden;
   background: #000;
-  margin: 0.75rem 0;
+  margin: 0.4rem 0;
   outline: none;
   cursor: default;
   flex-shrink: 0;
@@ -664,6 +675,78 @@ body.scrub-cursor-hidden * {
   margin-bottom: 0.25rem;
 }
 
+.card-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.35rem;
+}
+
+.card-tab-list {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.card-tab,
+.card-tab-add {
+  border: 1px solid var(--panel-border);
+  background: #111820;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 0.4rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.card-tab.active {
+  border-color: var(--accent);
+  background: rgba(62, 166, 255, 0.15);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.card-tab-add {
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1;
+  min-width: 2.1rem;
+  padding: 0.35rem 0.55rem;
+  color: var(--accent);
+  border-color: rgba(62, 166, 255, 0.45);
+}
+
+.card-tab-add:hover {
+  background: rgba(62, 166, 255, 0.12);
+}
+
+.scan-summary-inline {
+  display: block;
+  margin-top: 0.15rem;
+}
+
+.file-item.trimming {
+  opacity: 0.85;
+  border-color: rgba(210, 153, 34, 0.55);
+}
+
+.file-item.trimming .name::after {
+  content: "trimming";
+  margin-left: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--warning);
+}
+
+.danger-btn {
+  border-color: rgba(248, 81, 73, 0.45) !important;
+  color: #ff7b72 !important;
+}
+
 .phase-tab {
   flex: 1;
   background: #111820;
@@ -1059,6 +1142,6 @@ body.scrub-cursor-hidden * {
   }
 
   #player-wrap {
-    max-height: min(50vw, 360px);
+    max-height: min(55vh, 520px);
   }
 }

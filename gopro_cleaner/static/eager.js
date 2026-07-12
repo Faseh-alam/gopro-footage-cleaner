@@ -1,5 +1,5 @@
 const state = {
-  phase: "clean",
+  phase: "clean", // unified review: trim marks + label in one pass
   videos: [],
   index: -1,
   tasks: [],
@@ -18,6 +18,7 @@ const state = {
   currentHasGpmf: null,
   donePaths: new Set(),
   labeledTasks: {},
+  trimmingPaths: new Set(),
   lastLabelTask: "",
   busy: false,
   previewToken: 0,
@@ -30,6 +31,8 @@ const state = {
   scrubTime: 0,
   snapshotPurpose: "clean",
   labelProgress: null,
+  workspaces: [],
+  activeWorkspaceId: null,
   perf: {
     lite_mode: false,
     prefetch: true,
@@ -118,6 +121,8 @@ const el = {
   statusLine: document.getElementById("status-line"),
   footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
+  cardTabList: document.getElementById("card-tab-list"),
+  addCardTab: document.getElementById("add-card-tab"),
 };
 
 el.player.muted = true;
@@ -358,9 +363,7 @@ function selectedSdCardLabel() {
 }
 
 function filteredVideos() {
-  const q = el.fileFilter.value.trim().toLowerCase();
-  if (!q) return state.videos;
-  return state.videos.filter((video) => video.name.toLowerCase().includes(q));
+  return state.videos;
 }
 
 function currentVideo() {
@@ -394,53 +397,131 @@ function scrubStepSeconds() {
   return state.phase === "label" ? 3 : 1;
 }
 
-function setPhase(phase) {
-  if (workTimer.root) persistWorkTimer();
-  const previousPhase = state.phase;
-  state.phase = phase;
-  state.snapshotPurpose = phase === "clean" ? "clean" : "label";
-  el.phaseClean.classList.toggle("active", phase === "clean");
-  el.phaseLabel.classList.toggle("active", phase === "label");
-  el.cleanPanel.classList.toggle("hidden", phase !== "clean");
-  el.labelPanel.classList.toggle("hidden", phase !== "label");
-  el.listTitle.textContent = phase === "clean" ? "Raw footage" : "Footage to label";
-  el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan footage";
-  if (el.markSection) el.markSection.classList.toggle("hidden", phase !== "clean");
-  if (el.clipList) el.clipList.classList.toggle("hidden", phase !== "clean");
-  // Keep shared folder + global trim panel across clean ↔ label.
-  state.snapshots = null;
-  state.snapshotIndex = 0;
-  state.videos = [];
-  state.index = -1;
-  state.donePaths = new Set();
-  state.labeledTasks = {};
-  state.labelProgress = null;
+function setPhase(_phase) {
+  // Unified clean+label flow — marking tools stay available; labeling always on.
+  state.phase = "clean";
+  state.snapshotPurpose = "clean";
+  if (el.phaseClean) el.phaseClean.classList.add("active");
+  if (el.phaseLabel) el.phaseLabel.classList.remove("active");
+  if (el.cleanPanel) el.cleanPanel.classList.remove("hidden");
+  if (el.labelPanel) el.labelPanel.classList.add("hidden");
+  if (el.listTitle) el.listTitle.textContent = "Footage";
+  if (el.scanBtn) el.scanBtn.textContent = "Scan";
+  if (el.markSection) el.markSection.classList.remove("hidden");
+  if (el.clipList) el.clipList.classList.remove("hidden");
+  updateContextHint();
+}
+
+function createWorkspace(title) {
+  const n = state.workspaces.length + 1;
+  return {
+    id: `ws-${Date.now()}-${n}`,
+    title: title || `Card ${n}`,
+    scanRoot: "",
+    labelRoot: "",
+    videos: [],
+    index: -1,
+    donePaths: [],
+    labeledTasks: {},
+    trimmingPaths: [],
+    lastLabelTask: "",
+    labelProgress: null,
+  };
+}
+
+function snapshotWorkspace() {
+  return {
+    scanRoot: state.scanRoot,
+    labelRoot: state.labelRoot,
+    videos: state.videos,
+    index: state.index,
+    donePaths: [...state.donePaths],
+    labeledTasks: { ...state.labeledTasks },
+    trimmingPaths: [...state.trimmingPaths],
+    lastLabelTask: state.lastLabelTask,
+    labelProgress: state.labelProgress,
+  };
+}
+
+function applyWorkspace(ws) {
+  state.activeWorkspaceId = ws.id;
+  state.scanRoot = ws.scanRoot || "";
+  state.labelRoot = ws.labelRoot || ws.scanRoot || "";
+  state.videos = ws.videos || [];
+  state.index = Number.isFinite(ws.index) ? ws.index : -1;
+  state.donePaths = new Set(ws.donePaths || []);
+  state.labeledTasks = { ...(ws.labeledTasks || {}) };
+  state.trimmingPaths = new Set(ws.trimmingPaths || []);
+  state.lastLabelTask = ws.lastLabelTask || "";
+  state.labelProgress = ws.labelProgress || null;
   state.pendingIn = null;
   state.pendingClip = null;
   state.savedClips = [];
-  stopTrimPolling();
-  renderFileList();
-  renderLabelProgress();
-  renderClips();
-  el.currentName.textContent = "No file loaded";
-  el.currentMeta.textContent = "";
-  updateContextHint();
-  renderWorkTimer();
-  applyGlobalTrimUi({
-    active: state.globalTrimActive,
-    eta_total_seconds: state.trimEtaTotal,
-    jobs: state.globalTrimJobs,
-  });
-
-  const sharedRoot = state.scanRoot || state.labelRoot || scanTargetPath();
-  if (sharedRoot) {
-    el.sourcePath.value = sharedRoot;
-    state.scanRoot = sharedRoot;
-    state.labelRoot = sharedRoot;
-    if (previousPhase !== phase) {
-      scanSource();
-    }
+  state.snapshots = null;
+  el.sourcePath.value = state.scanRoot || "";
+  if (state.scanRoot && el.sdCardSelect) {
+    const opt = [...el.sdCardSelect.options].find((o) => o.value === state.scanRoot);
+    if (opt) el.sdCardSelect.value = state.scanRoot;
   }
+  renderCardTabs();
+  renderFileList();
+  renderTasks(state.lastLabelTask || undefined);
+  if (state.index >= 0 && state.index < state.videos.length) {
+    loadVideo(state.index);
+  } else {
+    el.currentName.textContent = "No file loaded";
+    el.currentMeta.textContent = "";
+    el.player.removeAttribute("src");
+    updateContextHint();
+  }
+}
+
+function saveActiveWorkspace() {
+  const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+  if (!ws) return;
+  Object.assign(ws, snapshotWorkspace());
+  if (state.scanRoot) {
+    const label = selectedSdCardLabel() || state.scanRoot.split(/[/\\]/).filter(Boolean).pop();
+    if (label) ws.title = label;
+  }
+}
+
+function renderCardTabs() {
+  if (!el.cardTabList) return;
+  el.cardTabList.innerHTML = "";
+  for (const ws of state.workspaces) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "card-tab" + (ws.id === state.activeWorkspaceId ? " active" : "");
+    btn.textContent = ws.title;
+    btn.title = ws.scanRoot || "No folder scanned yet";
+    btn.addEventListener("click", () => switchWorkspace(ws.id));
+    el.cardTabList.appendChild(btn);
+  }
+}
+
+function switchWorkspace(id) {
+  if (id === state.activeWorkspaceId) return;
+  saveActiveWorkspace();
+  const ws = state.workspaces.find((w) => w.id === id);
+  if (!ws) return;
+  applyWorkspace(ws);
+  setStatus(`Switched to ${ws.title}`, "ok");
+}
+
+function addWorkspaceTab() {
+  saveActiveWorkspace();
+  const ws = createWorkspace();
+  state.workspaces.push(ws);
+  applyWorkspace(ws);
+  setStatus("New card tab — pick an SD card and Scan", "ok");
+}
+
+function ensureWorkspaces() {
+  if (state.workspaces.length) return;
+  const ws = createWorkspace("Card 1");
+  state.workspaces.push(ws);
+  state.activeWorkspaceId = ws.id;
 }
 
 function remainingUnlabeledCount() {
@@ -498,16 +579,9 @@ function renderLabelProgress() {
 function renderFileList() {
   const items = filteredVideos();
   el.fileList.innerHTML = "";
-  if (state.phase === "label") {
-    const remaining = remainingUnlabeledCount();
-    el.listSummary.textContent =
-      remaining === 0
-        ? `0 unlabeled · ${state.labelProgress?.labeled || 0} labeled`
-        : `${remaining} unlabeled · ${state.donePaths.size} done this session`;
-  } else {
-    el.listSummary.textContent = `${state.videos.length} files · ${state.donePaths.size} done`;
-  }
-  renderLabelProgress();
+  const doneCount = state.donePaths.size;
+  const trimCount = state.trimmingPaths.size;
+  el.listSummary.textContent = `${state.videos.length} left · ${doneCount} done · ${trimCount} trimming`;
 
   for (const video of items) {
     const btn = document.createElement("button");
@@ -516,9 +590,9 @@ function renderFileList() {
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
     const assignedTask = state.labeledTasks[video.path];
     if (state.donePaths.has(video.path)) btn.classList.add("done");
-    else if (state.phase === "label") btn.classList.add("unlabeled");
-    const typeHint =
-      state.phase === "label" ? `${video.is_trimmed ? "clip" : "whole"} · ` : "";
+    else if (state.trimmingPaths.has(video.path)) btn.classList.add("trimming");
+    else btn.classList.add("unlabeled");
+    const typeHint = `${video.is_trimmed ? "clip" : "whole"} · `;
     const taskBadge = assignedTask
       ? `<span class="task-badge" title="Moved to ${assignedTask}">${assignedTask}</span>`
       : "";
@@ -612,11 +686,11 @@ function applyGlobalTrimUi(data) {
   state.trimEtaTotal = Number(data?.eta_total_seconds || 0);
 
   if (el.labelTrimBanner) {
-    el.labelTrimBanner.classList.toggle("hidden", active === 0 || state.phase !== "label");
+    el.labelTrimBanner.classList.toggle("hidden", active === 0);
     if (el.labelTrimBannerText && active > 0) {
       el.labelTrimBannerText.textContent =
         `${active} clip(s) still trimming · ~${formatDurationShort(state.trimEtaTotal)} left. ` +
-        "They stay out of this list until each trim finishes.";
+        "Use + to open another card while you wait.";
     }
   }
 
@@ -665,7 +739,6 @@ function applyGlobalTrimUi(data) {
 }
 
 function scheduleLabelListRefresh() {
-  if (state.phase !== "label") return;
   if (state.labelRefreshTimer) clearTimeout(state.labelRefreshTimer);
   state.labelRefreshTimer = setTimeout(() => {
     state.labelRefreshTimer = null;
@@ -674,7 +747,7 @@ function scheduleLabelListRefresh() {
 }
 
 async function softRefreshLabelScan() {
-  if (state.phase !== "label" || state.busy) return;
+  if (state.busy) return;
   const path = state.labelRoot || state.scanRoot || scanTargetPath();
   if (!path) return;
   const currentPath = currentVideo()?.path || "";
@@ -686,23 +759,24 @@ async function softRefreshLabelScan() {
       body: JSON.stringify({ path, recursive: true, mode: "label" }),
     });
     if (token !== state.labelScanToken) return;
-    if (state.phase !== "label" || state.busy) return;
-    // Drop anything already labeled this session so a slow scan can't resurrect them.
+    if (state.busy) return;
     const fresh = (data.videos || []).filter((video) => !state.donePaths.has(video.path));
+    // Drop trimming markers for sources that are no longer busy / gone from disk.
+    const freshPaths = new Set(fresh.map((v) => v.path));
+    for (const p of [...state.trimmingPaths]) {
+      if (!freshPaths.has(p)) state.trimmingPaths.delete(p);
+    }
     state.videos = fresh;
     state.labelProgress = data.progress || state.labelProgress;
-    el.scanSummary.textContent = `${fresh.length} files to label`;
-    renderLabelProgress();
+    el.scanSummary.textContent = `${fresh.length} files`;
+    saveActiveWorkspace();
     const idx = currentPath ? state.videos.findIndex((v) => v.path === currentPath) : -1;
     if (idx >= 0) {
       state.index = idx;
       renderFileList();
       updateContextHint();
     } else if (state.videos.length) {
-      const fallback = Math.min(
-        Math.max(0, state.index),
-        state.videos.length - 1,
-      );
+      const fallback = Math.min(Math.max(0, state.index), state.videos.length - 1);
       await loadVideo(fallback);
     } else {
       state.index = -1;
@@ -773,7 +847,7 @@ async function pollGlobalTrims() {
       updateContextHint();
     }
 
-    if (state.phase === "label" && prevActive > 0 && (data.active || 0) < prevActive) {
+    if (prevActive > 0 && (data.active || 0) < prevActive) {
       scheduleLabelListRefresh();
     }
   } catch {
@@ -829,31 +903,22 @@ function activeTrimCount() {
 function updateContextHint() {
   if (!el.contextMessage) return;
 
-  if (state.phase === "label") {
-    if (state.globalTrimActive > 0) {
-      const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
-      el.contextMessage.textContent =
-        `${state.globalTrimActive} trim(s) still running${eta} — finished clips appear in this list`;
-      return;
-    }
-    if (!currentVideo()) {
-      const remaining = remainingUnlabeledCount();
-      el.contextMessage.textContent =
-        remaining > 0
-          ? `${remaining} unlabeled file(s) still outside task folders`
-          : "Select an SD card and scan — use ← → filmstrip to identify task";
-    } else if (!selectedTask()) {
-      el.contextMessage.textContent = "Press S to search a task, then Enter to move";
-    } else {
-      el.contextMessage.textContent = `Selected "${selectedTask()}" — Enter/N to move · S to search another`;
-    }
-    return;
+  if (state.globalTrimActive > 0) {
+    const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
+    el.contextMessage.textContent =
+      `${state.globalTrimActive} trim(s) running${eta} — finished clips show up for labeling · + for another card`;
+    if (!currentVideo()) return;
   }
 
   if (!currentVideo()) {
     el.contextMessage.textContent = scanTargetPath()
-      ? "Press Scan footage to load files from the selected SD card"
-      : "Plug in an SD card (C####), then scan";
+      ? "Press Scan to load files — clean files: Enter to label · garbage: I→O→T then N"
+      : "Plug in a C#### SD card, then Scan · use + for a second card";
+    return;
+  }
+
+  if (state.trimmingPaths.has(currentVideo().path)) {
+    el.contextMessage.textContent = "This file is still trimming — pick another, or wait for clips to appear";
     return;
   }
 
@@ -864,7 +929,7 @@ function updateContextHint() {
 
   if (activeTrimCount() > 0) {
     const eta = state.trimEtaTotal > 0 ? ` (~${formatDurationShort(state.trimEtaTotal)} left)` : "";
-    el.contextMessage.textContent = `Trims running in background${eta} — press N when done to move on`;
+    el.contextMessage.textContent = `Trims queued for this file${eta} — press N when done marking`;
     return;
   }
 
@@ -873,12 +938,18 @@ function updateContextHint() {
     return;
   }
 
-  if (state.savedClips.some((j) => j.status === "completed" || j.output)) {
-    el.contextMessage.textContent = "More useful parts? Keep marking. Otherwise press N";
+  if (state.savedClips.some((j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running")) {
+    el.contextMessage.textContent = "More parts? Keep marking. Ready? Press N — then label the new clips when they appear";
     return;
   }
 
-  el.contextMessage.textContent = "Garbage? I → O → T for each part. All useful? Press N";
+  if (currentVideo().is_trimmed) {
+    el.contextMessage.textContent = "Trimmed clip — type a task and press Enter to label";
+    return;
+  }
+
+  el.contextMessage.textContent =
+    "Clean? Type task + Enter. Garbage? I → O → T for each part, then N";
 }
 
 function showLoading(title, detail, pct = 0, hint = "") {
@@ -1449,6 +1520,13 @@ function applySelectedPath(scanPath, { label = "", manual = false } = {}) {
   state.scanRoot = scanPath;
   state.labelRoot = scanPath;
   ensureWorkTimerRunning(scanPath);
+  const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+  if (ws) {
+    ws.scanRoot = scanPath;
+    ws.labelRoot = scanPath;
+    ws.title = label || selectedSdCardLabel() || ws.title;
+    renderCardTabs();
+  }
 
   if (!el.sdCardSelect) return;
 
@@ -1601,7 +1679,7 @@ async function addTask() {
 
 async function refreshLabelProgress({ quiet = false } = {}) {
   const path = state.labelRoot || state.scanRoot || scanTargetPath();
-  if (!path || state.phase !== "label") return null;
+  if (!path) return null;
   try {
     const data = await api(`/api/eager/label-progress?path=${encodeURIComponent(path)}`);
     state.labelProgress = data;
@@ -1627,7 +1705,8 @@ async function scanSource() {
   state.scanRoot = path;
   state.labelRoot = path;
   ensureWorkTimerRunning(path);
-  const mode = state.phase === "clean" ? "raw" : "label";
+  // Unified list: raw wholes + finished trimmed clips (busy outputs excluded server-side).
+  const mode = "label";
 
   setStatus("Scanning...");
   el.scanBtn.disabled = true;
@@ -1637,42 +1716,31 @@ async function scanSource() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, recursive: true, mode }),
     });
-    state.videos = data.videos || [];
-    state.donePaths = new Set();
-    state.labeledTasks = {};
+    const keepDone = state.donePaths;
+    const keepTrim = state.trimmingPaths;
+    const keepLabeled = state.labeledTasks;
+    state.videos = (data.videos || []).filter((v) => !keepDone.has(v.path));
+    state.donePaths = keepDone;
+    state.trimmingPaths = keepTrim;
+    state.labeledTasks = keepLabeled;
     state.index = -1;
-    if (mode === "label") {
-      state.labelProgress = data.progress || null;
-    }
+    state.labelProgress = data.progress || null;
+    saveActiveWorkspace();
+    renderCardTabs();
     renderFileList();
-    const summaryLabel =
-      mode === "raw" ? "raw files" : mode === "label" ? "files to label" : "files";
-    el.scanSummary.textContent = `${data.count} ${summaryLabel}`;
+    el.scanSummary.textContent = `${state.videos.length} files`;
     if (state.videos.length) {
-      if (mode === "raw") {
-        showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
-      }
+      showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
       await loadVideo(0);
-      if (mode === "raw") hideLoading();
-      if (mode === "label" && data.progress) {
-        setStatus(data.progress.message, data.progress.complete ? "ok" : "");
-      } else {
-        setStatus(`Found ${state.videos.length} files`, "ok");
-      }
-    } else if (mode === "label") {
-      if (!state.labelProgress) {
-        await refreshLabelProgress({ quiet: true });
-      }
-      renderFileList();
-      const complete = state.labelProgress?.complete;
-      setStatus(
-        complete
-          ? "All footage is inside task folders — nothing left to label"
-          : "No footage to label found",
-        complete ? "ok" : "error",
-      );
+      hideLoading();
+      setStatus(`Found ${state.videos.length} files — Enter to label · I/O/T then N to trim`, "ok");
     } else {
-      setStatus(`No ${mode} MP4 files found`, "error");
+      setStatus(
+        state.labelProgress?.complete
+          ? "All footage is inside task folders"
+          : "No footage found",
+        state.labelProgress?.complete ? "ok" : "error",
+      );
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -1762,16 +1830,18 @@ async function finishCleaningFile() {
     setStatus("Press T to queue the marked clip first", "error");
     return;
   }
+  if (state.pendingIn !== null) {
+    setStatus("Finish the mark (O then T) or Undo before Next", "error");
+    return;
+  }
 
   const hasClips = state.savedClips.some(
     (j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running",
   );
 
   if (!hasClips) {
-    setStatus("Raw file kept — next file", "ok");
-    state.donePaths.add(video.path);
-    stopTrimPolling();
-    advanceToNext();
+    setStatus("No trims queued — type a task and press Enter to label this clean file", "error");
+    focusTaskSearch();
     return;
   }
 
@@ -1781,15 +1851,20 @@ async function finishCleaningFile() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: video.path }),
     });
-    state.donePaths.add(video.path);
+    state.trimmingPaths.add(video.path);
     stopTrimPolling();
+    saveActiveWorkspace();
     if (data.scheduled) {
-      setStatus(`Next file — ${data.active} trim(s) still finishing, raw will be removed when done`, "ok");
+      setStatus(
+        `Trimming in background (${data.active}) — label those clips when they appear · + for another card`,
+        "ok",
+      );
     } else if (data.deleted_source) {
-      setStatus(`Finished ${video.name} — raw file removed`, "ok");
+      setStatus(`Finished ${video.name} — raw removed; label new clips when listed`, "ok");
     } else {
       setStatus(`Finished ${video.name}`, "ok");
     }
+    renderFileList();
     advanceToNext();
   } catch (error) {
     setStatus(error.message, "error");
@@ -1829,9 +1904,27 @@ async function labelCurrentClip() {
   const video = currentVideo();
   if (!video) return;
 
+  if (state.trimmingPaths.has(video.path)) {
+    setStatus("This file is still trimming — wait for clips, then label those", "error");
+    return;
+  }
+  if (state.pendingIn !== null || state.pendingClip) {
+    setStatus("Finish or undo the current mark before labeling", "error");
+    return;
+  }
+  if (activeTrimCount() > 0 || state.savedClips.some((j) => j.status === "queued" || j.status === "running")) {
+    setStatus("Press N to finish trims first — label the new clips when they appear", "error");
+    return;
+  }
+  if (!video.is_trimmed && state.savedClips.some((j) => j.status === "completed" || j.output)) {
+    setStatus("Press N to finish this file — then label the trimmed clips", "error");
+    return;
+  }
+
   let task = selectedTask();
   if (!task) {
-    setStatus("Choose or add a task first", "error");
+    setStatus("Type or choose a task first", "error");
+    focusTaskSearch();
     return;
   }
 
@@ -1872,6 +1965,7 @@ async function labelCurrentClip() {
     state.labeledTasks[video.path] = task;
     state.lastLabelTask = task;
     state.videos = state.videos.filter((item) => item.path !== video.path);
+    saveActiveWorkspace();
     el.taskSearch.value = "";
     renderTasks(task);
     el.taskSearch.blur();
@@ -1929,29 +2023,36 @@ async function labelCurrentClip() {
 
 function advanceToNext() {
   let next = state.index + 1;
-  while (next < state.videos.length && state.donePaths.has(state.videos[next].path)) {
+  while (
+    next < state.videos.length
+    && (state.donePaths.has(state.videos[next].path) || state.trimmingPaths.has(state.videos[next].path))
+  ) {
     next += 1;
   }
   if (next < state.videos.length) {
     loadVideo(next);
   } else {
-    if (state.phase === "label") {
-      const remaining = remainingUnlabeledCount();
-      setStatus(
-        remaining === 0
-          ? `All clips labeled — work ${formatWorkHms(workTimer.cleanMs + workTimer.labelMs)} (clean ${formatWorkHms(workTimer.cleanMs)} · label ${formatWorkHms(workTimer.labelMs)})`
-          : `${remaining} unlabeled file(s) still outside task folders`,
-        remaining === 0 ? "ok" : "error",
+    if (state.videos.some((v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path))) {
+      // wrap to first unfinished
+      const first = state.videos.findIndex(
+        (v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path),
       );
-      refreshLabelProgress({ quiet: true });
-      if (remaining === 0) saveWorkSession("label_complete");
-    } else {
-      setStatus(
-        `All files cleaned — clean time ${formatWorkHms(workTimer.cleanMs)}`,
-        "ok",
-      );
-      saveWorkSession("clean_complete");
+      if (first >= 0) {
+        loadVideo(first);
+        return;
+      }
     }
+    const remaining = state.videos.filter(
+      (v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path),
+    ).length;
+    setStatus(
+      remaining === 0
+        ? state.trimmingPaths.size
+          ? `All files handled — ${state.trimmingPaths.size} still trimming in background`
+          : "All files done"
+        : `${remaining} file(s) left`,
+      remaining === 0 ? "ok" : "",
+    );
     renderFileList();
   }
 }
@@ -1974,13 +2075,11 @@ el.browseFolderBtn.addEventListener("click", chooseFootageFolder);
 el.refreshSdBtn?.addEventListener("click", () => refreshSdCards());
 el.sdCardSelect?.addEventListener("change", onSdCardChanged);
 el.scanBtn.addEventListener("click", scanSource);
-el.fileFilter.addEventListener("input", renderFileList);
 el.undoClipBtn.addEventListener("click", undoMark);
 el.trimBtn.addEventListener("click", trimMarkedClip);
 el.deleteFileBtn?.addEventListener("click", deleteCurrentFile);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
-el.phaseClean.addEventListener("click", () => setPhase("clean"));
-el.phaseLabel.addEventListener("click", () => setPhase("label"));
+el.addCardTab?.addEventListener("click", addWorkspaceTab);
 el.taskSearch.addEventListener("input", () => renderTasks());
 el.taskSearch.addEventListener("keydown", (event) => {
   if (event.key === "ArrowDown") {
@@ -2016,7 +2115,6 @@ el.newTaskInput.addEventListener("keydown", (event) => {
 });
 el.labelBtn.addEventListener("click", labelCurrentClip);
 el.recheckLabelBtn?.addEventListener("click", () => refreshLabelProgress());
-el.workTimerReset?.addEventListener("click", () => resetWorkTimer());
 el.player.addEventListener("timeupdate", () => {
   if (!el.player.paused && Number.isFinite(el.player.currentTime) && el.player.currentTime > 0) {
     state.scrubTime = el.player.currentTime;
@@ -2029,90 +2127,63 @@ document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;
   const key = event.key.toLowerCase();
 
-  if (state.phase === "clean" || state.phase === "label") {
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      if (state.phase === "label" && !state.snapshots?.frames?.length) {
-        fineTune(-scrubStepSeconds());
-      } else {
-        goToSnapshot(-1);
-      }
-      return;
-    }
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      if (state.phase === "label" && !state.snapshots?.frames?.length) {
-        fineTune(scrubStepSeconds());
-      } else {
-        goToSnapshot(1);
-      }
-      return;
-    }
-    if (event.key === ",") {
-      event.preventDefault();
-      fineTune(-scrubStepSeconds());
-      return;
-    }
-    if (event.key === ".") {
-      event.preventDefault();
-      fineTune(scrubStepSeconds());
-      return;
-    }
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    goToSnapshot(-1);
+    return;
+  }
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    goToSnapshot(1);
+    return;
+  }
+  if (event.key === ",") {
+    event.preventDefault();
+    fineTune(-scrubStepSeconds());
+    return;
+  }
+  if (event.key === ".") {
+    event.preventDefault();
+    fineTune(scrubStepSeconds());
+    return;
   }
 
-  if (state.phase === "clean") {
-    if (key === "i") {
-      event.preventDefault();
-      markStart();
-    }
-    if (key === "o") {
-      event.preventDefault();
-      markEnd();
-    }
-    if (key === "t") {
-      event.preventDefault();
-      trimMarkedClip();
-    }
-    if (key === "n") {
-      event.preventDefault();
-      finishCleaningFile();
-    }
-    if (key === "d" || event.key === "Delete") {
-      event.preventDefault();
-      deleteCurrentFile();
-    }
-    if (key === " ") {
-      event.preventDefault();
-      if (el.player.paused) el.player.play();
-      else el.player.pause();
-    }
+  if (key === "i") {
+    event.preventDefault();
+    markStart();
   }
-
-  if (state.phase === "label") {
-    if (key === "s") {
-      event.preventDefault();
-      focusTaskSearch();
-      return;
+  if (key === "o") {
+    event.preventDefault();
+    markEnd();
+  }
+  if (key === "t") {
+    event.preventDefault();
+    trimMarkedClip();
+  }
+  if (key === "n") {
+    event.preventDefault();
+    finishCleaningFile();
+  }
+  if (key === "d" || event.key === "Delete") {
+    event.preventDefault();
+    deleteCurrentFile();
+  }
+  if (key === " ") {
+    event.preventDefault();
+    if (el.player.paused) el.player.play();
+    else el.player.pause();
+  }
+  if (key === "s") {
+    event.preventDefault();
+    focusTaskSearch();
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (!selectedTask() && state.lastLabelTask) {
+      renderTasks(state.lastLabelTask);
     }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      leaveTaskSearch({ clear: true });
-      return;
-    }
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      moveTaskSelection(1);
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      moveTaskSelection(-1);
-      return;
-    }
-    if (key === "n" || key === "enter") {
-      event.preventDefault();
-      labelCurrentClip();
-    }
+    labelCurrentClip();
   }
 });
 
@@ -2121,7 +2192,9 @@ loadTasks()
   .then(([health, perf]) => {
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };
-    renderWorkTimer();
+    ensureWorkspaces();
+    renderCardTabs();
+    setPhase("clean");
     startGlobalTrimPolling();
     if (health.ffmpeg_ok === false) {
       setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
