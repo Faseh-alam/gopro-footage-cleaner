@@ -1942,7 +1942,9 @@ loadTasks()
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };
     renderWorkTimer();
-    if (perf.lite_mode && perf.hint) {
+    if (health.ffmpeg_ok === false) {
+      setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
+    } else if (perf.lite_mode && perf.hint) {
       setStatus(perf.hint, "ok");
     }
   })

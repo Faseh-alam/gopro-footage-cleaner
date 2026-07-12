@@ -22,6 +22,12 @@ _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 _COPY_SUFFIX_RE = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
 
 
+def _ffmpeg_exe() -> str:
+    from .ffmpeg_tools import ffmpeg_bin
+
+    return ffmpeg_bin()
+
+
 def clip_base_stem(path: Path | str) -> str:
     """Base name for trimmed clips, e.g. 'GH012332 copy' -> 'GH012332'."""
     stem = path.stem if isinstance(path, Path) else Path(str(path)).stem
@@ -102,7 +108,7 @@ def build_ffmpeg_command(
         raise RuntimeError("Clip duration must be greater than zero")
 
     command = [
-        "ffmpeg",
+        _ffmpeg_exe(),
         "-hide_banner",
         "-loglevel",
         "warning",
@@ -158,14 +164,21 @@ def _run_udtacopy(source: Path, target: Path) -> None:
 
 
 def _run_ffmpeg(command: list[str], duration_seconds: float, job_id: str) -> None:
-    process = subprocess.Popen(
-        command,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        from .ffmpeg_tools import FFmpegNotFoundError
+
+        raise FFmpegNotFoundError(
+            "FFmpeg is not installed or not on PATH. Install FFmpeg and restart. Test: ffmpeg -version"
+        ) from exc
     assert process.stderr is not None
     stderr_lines: list[str] = []
     for line in process.stderr:

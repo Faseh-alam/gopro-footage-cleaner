@@ -19,6 +19,9 @@ echo "Installing dependencies..."
 
 export PYTHONPATH="${ROOT}"
 
+echo "Ensuring FFmpeg (system install, or download via static-ffmpeg)..."
+"${VENV_PY}" -c "from gopro_cleaner.core.ffmpeg_tools import ensure_ffmpeg; s=ensure_ffmpeg(); raise SystemExit(0 if s.get('ok') else 1)"
+
 stop_existing() {
   local pids
   pids="$(lsof -ti :"${PORT}" 2>/dev/null || true)"

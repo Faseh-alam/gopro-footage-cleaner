@@ -50,21 +50,33 @@ def looks_like_gopro(path: Path) -> bool:
 
 
 def _run_ffprobe(path: Path) -> dict:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    from .ffmpeg_tools import FFmpegNotFoundError, ffprobe_bin
+
+    try:
+        binary = ffprobe_bin()
+    except FFmpegNotFoundError:
+        raise
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegNotFoundError(
+            "FFmpeg is not installed or not on PATH. "
+            "Install FFmpeg, add it to PATH, restart the app. Test: ffmpeg -version"
+        ) from exc
     if result.returncode != 0:
         stderr = result.stderr.strip() or "ffprobe failed"
         raise RuntimeError(f"Could not inspect {path.name}: {stderr}")

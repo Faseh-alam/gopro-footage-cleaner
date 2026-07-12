@@ -42,6 +42,17 @@ set "PYTHONPATH=%CD%"
 set "GOPRO_LITE_MODE=1"
 rem Lite mode auto-enables on PCs with 8GB RAM or less (fewer snapshots, less CPU/RAM).
 
+echo Ensuring FFmpeg (uses system install, or downloads via static-ffmpeg)...
+"%VENV_PY%" -c "from gopro_cleaner.core.ffmpeg_tools import ensure_ffmpeg; s=ensure_ffmpeg(); raise SystemExit(0 if s.get('ok') else 1)"
+if errorlevel 1 (
+  echo.
+  echo ERROR: Could not install FFmpeg. Check your internet connection and re-run run.bat.
+  echo Or install manually: https://www.gyan.dev/ffmpeg/builds/
+  echo.
+  pause
+  exit /b 1
+)
+
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT% ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
 
 echo Starting GoPro Footage Cleaner on port %PORT%...

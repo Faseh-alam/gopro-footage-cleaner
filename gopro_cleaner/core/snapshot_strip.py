@@ -344,10 +344,14 @@ def extract_snapshot_jpeg(source: Path, timestamp: float, dest: Path) -> None:
     errors: list[str] = []
     vf = _snapshot_video_filter()
     qv = str(_jpeg_quality())
+    try:
+        ffmpeg = _ffmpeg_exe()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(str(exc)) from exc
     for input_args in _input_strategies(source, timestamp):
         command = (
             [
-                "ffmpeg",
+                ffmpeg,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -369,7 +373,12 @@ def extract_snapshot_jpeg(source: Path, timestamp: float, dest: Path) -> None:
                 str(dest),
             ]
         )
-        code, detail = _run_ffmpeg(command)
+        try:
+            code, detail = _run_ffmpeg(command)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "FFmpeg is not installed or not on PATH. Install FFmpeg and restart. Test: ffmpeg -version"
+            ) from exc
         if code == 0 and _frame_looks_valid(dest):
             return
         if dest.exists():
@@ -377,6 +386,12 @@ def extract_snapshot_jpeg(source: Path, timestamp: float, dest: Path) -> None:
         errors.append(detail or "ffmpeg frame extract failed")
 
     raise RuntimeError(errors[-1] if errors else "ffmpeg frame extract failed")
+
+
+def _ffmpeg_exe() -> str:
+    from .ffmpeg_tools import ffmpeg_bin
+
+    return ffmpeg_bin()
 
 
 def _extract_frame(source: Path, timestamp: float, dest: Path) -> None:

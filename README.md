@@ -10,11 +10,11 @@ Two-phase workflow for Windows and Mac — review in the browser at `http://127.
 
 ### Windows — one command
 
-1. Install [Python 3.10+](https://www.python.org/downloads/) and [ffmpeg](https://ffmpeg.org/download.html) (add both to PATH)
-2. Clone or download this repo
+1. Install [Python 3.10+](https://www.python.org/downloads/) (add to PATH)
+2. Clone or pull this repo
 3. Double-click **`run.bat`** (or run it from Command Prompt)
 
-The script creates a virtual environment, installs dependencies, starts the server, and opens the review page in your browser.
+The script creates a virtual environment, installs Python deps (including **static-ffmpeg**), downloads FFmpeg binaries on first run if needed, starts the server, and opens the review page. You do **not** need a separate system FFmpeg install.
 
 ### macOS
 
@@ -101,7 +101,7 @@ Use `7:45` rather than `745` for seven minutes forty-five seconds.
 
 - Windows 10/11 or macOS
 - Python 3.10+
-- [ffmpeg](https://ffmpeg.org/) on your `PATH`
+- FFmpeg — **auto-installed** by `run.bat` / `run.sh` via the `static-ffmpeg` pip package (system FFmpeg on PATH is also fine)
 
 Optional but recommended for best metadata compatibility:
 
@@ -163,7 +163,7 @@ Because trimming is stream copy, it is fast and does not re-encode video.
 ## Troubleshooting
 
 - **"No GPMF metadata track detected"**: the source file may not contain IMU data, or it uses an unusual stream layout.
-- **Trim fails**: confirm `ffmpeg` is installed (`ffmpeg -version`).
+- **Trim fails / `?` durations / WinError 2**: re-run `run.bat` / `run.sh` so it can install `static-ffmpeg` and download binaries. Or install system FFmpeg and restart (`ffmpeg -version`).
 - **Metadata still missing in downstream tools**: place `udtacopy` in `bin/udtacopy` and retry.
 
 ## Safety

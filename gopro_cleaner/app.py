@@ -18,7 +18,7 @@ from .core.volumes import list_volume_roots
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
-APP_VERSION = "2.13.3"
+APP_VERSION = "2.13.5"
 
 
 def create_app() -> Flask:
@@ -36,7 +36,19 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "version": APP_VERSION})
+        from .core.ffmpeg_tools import ffmpeg_available
+
+        tools = ffmpeg_available()
+        return jsonify(
+            {
+                "ok": True,
+                "version": APP_VERSION,
+                "ffmpeg_ok": tools["ok"],
+                "ffmpeg": tools.get("ffmpeg"),
+                "ffprobe": tools.get("ffprobe"),
+                "ffmpeg_hint": tools.get("hint") or "",
+            }
+        )
 
     @app.get("/api/volumes")
     def volumes():
@@ -331,6 +343,11 @@ def main() -> None:
     host = os.environ.get("GOPRO_CLEANER_HOST", "127.0.0.1")
     port = int(os.environ.get("GOPRO_CLEANER_PORT", "8765"))
     debug = os.environ.get("GOPRO_CLEANER_DEBUG", "0") == "1"
+    from .core.ffmpeg_tools import ensure_ffmpeg
+
+    tools = ensure_ffmpeg(quiet=True)
+    if not tools.get("ok"):
+        print(tools.get("hint") or "FFmpeg missing")
     app = create_app()
     print(f"GoPro Footage Cleaner running at http://{host}:{port}")
     app.run(host=host, port=port, debug=debug, threaded=True)

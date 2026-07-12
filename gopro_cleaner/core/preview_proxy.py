@@ -53,8 +53,10 @@ def _hwaccel_input_args() -> list[str]:
 
 
 def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list) -> None:
+    from .ffmpeg_tools import ffmpeg_bin
+
     command = [
-        "ffmpeg",
+        ffmpeg_bin(),
         "-hide_banner",
         "-loglevel",
         "error",

@@ -49,7 +49,12 @@ def _footage_blocked(path: Path, root: Path | None = None) -> bool:
 def _probe_duration(path: Path) -> float | None:
     try:
         return probe_media(path).duration
-    except (RuntimeError, OSError):
+    except Exception as exc:  # noqa: BLE001
+        # Surface missing ffmpeg clearly once; otherwise skip duration.
+        from .ffmpeg_tools import FFmpegNotFoundError
+
+        if isinstance(exc, FFmpegNotFoundError):
+            raise
         return None
 
 
@@ -172,6 +177,12 @@ def scan_mp4_files(
     mode: str = "all",
 ) -> list[dict]:
     """mode: all | raw | clips | label"""
+    from .ffmpeg_tools import FFmpegNotFoundError, ffmpeg_available
+
+    tools = ffmpeg_available()
+    if not tools["ok"]:
+        raise FFmpegNotFoundError(tools["hint"] or "FFmpeg / ffprobe not found on PATH")
+
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
