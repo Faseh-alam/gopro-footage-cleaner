@@ -12,6 +12,21 @@
   color: #f2f2f2;
 }
 
+.header-left {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.pipeline-hint {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #b0b0b0;
+  line-height: 1.35;
+  max-width: 42rem;
+}
+
 .wc-header {
   padding: 0.55rem 0.9rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
@@ -66,13 +81,35 @@
   font-size: 0.8rem;
 }
 
-.scan-summary-inline {
+.trim-progress-by-card {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.4rem 0 0.5rem;
+}
+
+.trim-card-block {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.trim-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
   font-size: 0.75rem;
-  color: #8a8a8a;
-  max-width: 10rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  color: #b8b8b8;
+}
+
+.trim-card-head strong {
+  color: #f2f2f2;
+  font-size: 0.8rem;
+}
+
+.card-tab {
+  min-width: 3.4rem;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 
 .eager-header {
@@ -1189,6 +1226,26 @@ body.scrub-cursor-hidden * {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: min(100%, 40vw);
+}
+
+.player-time {
+  display: grid;
+  gap: 0.25rem;
+  justify-items: end;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.allowed-garbage {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #f0c674;
+  background: rgba(240, 198, 116, 0.12);
+  border: 1px solid rgba(240, 198, 116, 0.35);
+  border-radius: 6px;
+  padding: 0.2rem 0.45rem;
+  white-space: nowrap;
 }
 
 .mark-toolbar {

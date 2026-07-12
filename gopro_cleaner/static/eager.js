@@ -83,6 +83,7 @@ const el = {
   currentName: document.getElementById("current-name"),
   currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
+  allowedGarbage: document.getElementById("allowed-garbage"),
   undoClipBtn: document.getElementById("undo-clip-btn"),
   pendingIn: document.getElementById("pending-in"),
   gpmfStatus: document.getElementById("gpmf-status"),
@@ -91,6 +92,7 @@ const el = {
   trimEtaTotal: document.getElementById("trim-eta-total"),
   trimProgressFill: document.getElementById("trim-progress-fill"),
   trimProgressList: document.getElementById("trim-progress-list"),
+  trimProgressByCard: document.getElementById("trim-progress-by-card"),
   labelTrimBanner: document.getElementById("label-trim-banner"),
   labelTrimBannerText: document.getElementById("label-trim-banner-text"),
   clipList: document.getElementById("clip-list"),
@@ -346,6 +348,43 @@ function formatDurationShort(seconds) {
   return `${s}s`;
 }
 
+/** Matches snapshot_settings.json garbage_percent (default 10% of clip). */
+const DEFAULT_GARBAGE_PERCENT = 0.1;
+
+function allowedGarbageSeconds(duration) {
+  const fromSnap = state.snapshots?.max_garbage_seconds;
+  if (Number.isFinite(fromSnap) && fromSnap > 0) return fromSnap;
+  const pct = Number(state.snapshots?.garbage_percent);
+  const usePct = Number.isFinite(pct) && pct > 0 ? pct : DEFAULT_GARBAGE_PERCENT;
+  if (!Number.isFinite(duration) || duration <= 0) return 0;
+  return duration * usePct;
+}
+
+function updateAllowedGarbage() {
+  if (!el.allowedGarbage) return;
+  const video = currentVideo();
+  const duration =
+    state.snapshots?.duration
+    || video?.duration
+    || el.player?.duration
+    || 0;
+  const allowed = allowedGarbageSeconds(duration);
+  if (!allowed) {
+    el.allowedGarbage.classList.add("hidden");
+    el.allowedGarbage.textContent = "";
+    return;
+  }
+  const pct = Math.round(
+    (Number(state.snapshots?.garbage_percent) > 0
+      ? Number(state.snapshots.garbage_percent)
+      : DEFAULT_GARBAGE_PERCENT) * 100,
+  );
+  el.allowedGarbage.classList.remove("hidden");
+  el.allowedGarbage.textContent = `Allowed garbage time ${formatDurationShort(allowed)} (${pct}%)`;
+  el.allowedGarbage.title =
+    `${pct}% of this clip may be non-work. Filmstrip spacing is based on that budget.`;
+}
+
 function setStatus(message, kind = "") {
   el.statusLine.textContent = message || "";
   el.statusLine.className = `status-line ${kind}`.trim();
@@ -482,7 +521,7 @@ function saveActiveWorkspace() {
   Object.assign(ws, snapshotWorkspace());
   if (state.scanRoot) {
     const label = selectedSdCardLabel() || state.scanRoot.split(/[/\\]/).filter(Boolean).pop();
-    if (label) ws.title = label;
+    if (label) ws.title = shortCardTitle(label);
   }
 }
 
@@ -493,8 +532,8 @@ function renderCardTabs() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "card-tab" + (ws.id === state.activeWorkspaceId ? " active" : "");
-    btn.textContent = ws.title;
-    btn.title = ws.scanRoot || "No folder scanned yet";
+    btn.textContent = shortCardTitle(ws.title);
+    btn.title = ws.scanRoot || "No card yet";
     btn.addEventListener("click", () => switchWorkspace(ws.id));
     el.cardTabList.appendChild(btn);
   }
@@ -649,37 +688,49 @@ function renderClips() {
     }
     el.clipList.appendChild(item);
   }
+  if (state.pendingIn !== null && !state.pendingClip) {
+    const item = document.createElement("li");
+    item.className = "pending";
+    item.textContent = `Start ${formatTime(state.pendingIn)} — press O for end, then T`;
+    el.clipList.appendChild(item);
+  }
   if (state.pendingClip) {
     const item = document.createElement("li");
     item.className = "pending";
-    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T to queue`;
+    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T`;
     el.clipList.appendChild(item);
   }
-  const activeTrims = state.savedClips.filter((j) => j.status === "queued" || j.status === "running").length;
-  if (state.pendingIn !== null) {
-    el.pendingIn.textContent = `Start locked at ${formatTime(state.pendingIn)} — step forward, then Mark end`;
-    el.pendingIn.className = "pending-status active";
-  } else if (state.pendingClip) {
-    el.pendingIn.textContent = "Press T to queue trim — you can mark the next clip immediately after";
-    el.pendingIn.className = "pending-status warn";
-  } else if (activeTrims > 0) {
-    const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
-    el.pendingIn.textContent = `${activeTrims} trim(s) in background${eta} — keep marking or press N when done`;
-    el.pendingIn.className = "pending-status active";
-  } else if (state.savedClips.some((j) => j.status === "completed" || j.output)) {
-    const done = state.savedClips.filter((j) => j.status === "completed" || j.output).length;
-    el.pendingIn.textContent = `${done} clip(s) saved — mark more or press N for next file`;
-    el.pendingIn.className = "pending-status active";
-  } else {
-    el.pendingIn.textContent = "At useful footage? Press I or Mark start";
-    el.pendingIn.className = "pending-status";
+  if (el.pendingIn) {
+    el.pendingIn.textContent = "";
+    el.pendingIn.className = "hidden";
   }
-  updateContextHint();
 }
 
 function basenamePath(path) {
   if (!path) return "";
   return String(path).split(/[/\\]/).pop() || "";
+}
+
+function cardLabelFromPath(path) {
+  const parts = String(path || "").split(/[/\\]/).filter(Boolean);
+  for (const part of parts) {
+    if (/^C\d{4}$/i.test(part)) return part.toUpperCase();
+  }
+  for (const ws of state.workspaces) {
+    const root = ws.scanRoot || ws.labelRoot || "";
+    if (root && String(path || "").startsWith(root)) {
+      return shortCardTitle(ws.title || "Card");
+    }
+  }
+  return shortCardTitle(selectedSdCardLabel() || "Card");
+}
+
+function shortCardTitle(title) {
+  const raw = String(title || "Card").trim();
+  const match = raw.match(/C\d{4}/i);
+  if (match) return match[0].toUpperCase();
+  // Drop long path suffixes — keep first token only.
+  return raw.split(/[\s·—-]/)[0] || "Card";
 }
 
 function applyGlobalTrimUi(data) {
@@ -693,8 +744,7 @@ function applyGlobalTrimUi(data) {
     el.labelTrimBanner.classList.toggle("hidden", active === 0);
     if (el.labelTrimBannerText && active > 0) {
       el.labelTrimBannerText.textContent =
-        `${active} clip(s) still trimming · ~${formatDurationShort(state.trimEtaTotal)} left. ` +
-        "Use + to open another card while you wait.";
+        `${active} clip(s) trimming · ~${formatDurationShort(state.trimEtaTotal)} left`;
     }
   }
 
@@ -705,6 +755,7 @@ function applyGlobalTrimUi(data) {
     el.trimProgressPanel.classList.add("hidden");
     if (el.trimProgressFill) el.trimProgressFill.style.width = "0%";
     if (el.trimProgressList) el.trimProgressList.innerHTML = "";
+    if (el.trimProgressByCard) el.trimProgressByCard.innerHTML = "";
     return;
   }
 
@@ -714,28 +765,66 @@ function applyGlobalTrimUi(data) {
     el.trimEtaTotal.textContent = `~${formatDurationShort(state.trimEtaTotal)}`;
   }
 
-  const runningJobs = activeJobs.filter((j) => j.status === "running");
-  let overallPct = 0;
-  if (runningJobs.length) {
-    // Bar tracks active ffmpeg work (queued jobs made the old bar look stuck at ~0).
-    overallPct =
-      runningJobs.reduce((sum, j) => sum + (j.progress || 0), 0) / runningJobs.length;
-  }
+  // Combined overall progress across every active trim.
+  const totalDuration = activeJobs.reduce(
+    (sum, j) => sum + (j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0),
+    0,
+  );
+  const doneDuration = activeJobs.reduce((sum, j) => {
+    const dur = j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0;
+    if (j.status === "running") return sum + (dur * (j.progress || 0)) / 100;
+    if (j.status === "queued") return sum;
+    return sum + dur;
+  }, 0);
+  const overallPct = totalDuration > 0 ? (doneDuration / totalDuration) * 100 : 0;
   if (el.trimProgressFill) {
-    el.trimProgressFill.style.width = `${Math.min(100, overallPct)}%`;
+    el.trimProgressFill.style.width = `${Math.min(100, Math.max(2, overallPct))}%`;
+  }
+
+  // Per-card combined bars.
+  if (el.trimProgressByCard) {
+    el.trimProgressByCard.innerHTML = "";
+    const byCard = new Map();
+    for (const job of activeJobs) {
+      const card = cardLabelFromPath(job.source_path);
+      if (!byCard.has(card)) byCard.set(card, []);
+      byCard.get(card).push(job);
+    }
+    for (const [card, cardJobs] of byCard) {
+      const block = document.createElement("div");
+      block.className = "trim-card-block";
+      const tot = cardJobs.reduce(
+        (sum, j) => sum + (j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0),
+        0,
+      );
+      const done = cardJobs.reduce((sum, j) => {
+        const dur = j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0;
+        if (j.status === "running") return sum + (dur * (j.progress || 0)) / 100;
+        return sum;
+      }, 0);
+      const pct = tot > 0 ? Math.min(100, (done / tot) * 100) : 0;
+      const running = cardJobs.filter((j) => j.status === "running").length;
+      const queued = cardJobs.filter((j) => j.status === "queued").length;
+      block.innerHTML = `
+        <div class="trim-card-head"><strong>${card}</strong><span>${Math.round(pct)}% · ${running} run · ${queued} queued</span></div>
+        <div class="trim-progress-bar"><div class="trim-progress-fill" style="width:${pct}%"></div></div>
+      `;
+      el.trimProgressByCard.appendChild(block);
+    }
   }
 
   if (el.trimProgressList) {
     el.trimProgressList.innerHTML = "";
-    for (const job of activeJobs.slice(0, 12)) {
+    for (const job of activeJobs.slice(0, 16)) {
       const row = document.createElement("div");
       const outName = basenamePath(job.output);
       const sourceName = job.source_name || basenamePath(job.source_path) || "clip";
+      const card = cardLabelFromPath(job.source_path);
       if (job.status === "queued") {
-        row.textContent = `Queued · ${sourceName} (${formatTime(job.start_seconds)} → ${formatTime(job.end_seconds)})`;
+        row.textContent = `${card} · Queued · ${sourceName}`;
       } else {
         const pct = Math.round(job.progress || 0);
-        row.textContent = `Trimming ${pct}% · ${outName || sourceName}`;
+        row.textContent = `${card} · ${pct}% · ${outName || sourceName}`;
       }
       el.trimProgressList.appendChild(row);
     }
@@ -859,23 +948,10 @@ async function pollGlobalTrims() {
   }
 }
 
-async function loadMediaProbe(path) {
-  if (!el.gpmfStatus) return;
-  try {
-    const info = await api(`/api/probe?path=${encodeURIComponent(path)}`);
-    state.currentHasGpmf = info.has_gpmf;
-    el.gpmfStatus.classList.remove("hidden");
-    if (info.has_gpmf) {
-      el.gpmfStatus.textContent = "IMU / GPMF detected — copied with clip timestamps on trim";
-      el.gpmfStatus.className = "gpmf-badge ok";
-    } else {
-      el.gpmfStatus.textContent = "No IMU track on this file";
-      el.gpmfStatus.className = "gpmf-badge warn";
-    }
-  } catch {
-    state.currentHasGpmf = null;
-    el.gpmfStatus.classList.add("hidden");
-  }
+async function loadMediaProbe(_path) {
+  // IMU/GPMF badge intentionally hidden — keep probe optional/off for a clean UI.
+  if (el.gpmfStatus) el.gpmfStatus.classList.add("hidden");
+  state.currentHasGpmf = null;
 }
 
 function startTrimPolling() {
@@ -905,55 +981,7 @@ function activeTrimCount() {
 }
 
 function updateContextHint() {
-  if (!el.contextMessage) return;
-
-  if (state.globalTrimActive > 0) {
-    const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
-    el.contextMessage.textContent =
-      `${state.globalTrimActive} trim(s) running${eta} — finished clips show up for labeling · + for another card`;
-    if (!currentVideo()) return;
-  }
-
-  if (!currentVideo()) {
-    el.contextMessage.textContent = scanTargetPath()
-      ? "Press Scan to load files — clean files: Enter to label · garbage: I→O→T then N"
-      : "Plug in a C#### SD card, then Scan · use + for a second card";
-    return;
-  }
-
-  if (state.trimmingPaths.has(currentVideo().path)) {
-    el.contextMessage.textContent = "This file is still trimming — pick another, or wait for clips to appear";
-    return;
-  }
-
-  if (state.pendingClip) {
-    el.contextMessage.textContent = "Press T to queue trim, then mark the next useful section";
-    return;
-  }
-
-  if (activeTrimCount() > 0) {
-    const eta = state.trimEtaTotal > 0 ? ` (~${formatDurationShort(state.trimEtaTotal)} left)` : "";
-    el.contextMessage.textContent = `Trims queued for this file${eta} — press N when done marking`;
-    return;
-  }
-
-  if (state.pendingIn !== null) {
-    el.contextMessage.textContent = "Find the end of useful footage, then press O";
-    return;
-  }
-
-  if (state.savedClips.some((j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running")) {
-    el.contextMessage.textContent = "More parts? Keep marking. Ready? Press N — then label the new clips when they appear";
-    return;
-  }
-
-  if (currentVideo().is_trimmed) {
-    el.contextMessage.textContent = "Trimmed clip — type a task and press Enter to label";
-    return;
-  }
-
-  el.contextMessage.textContent =
-    "Clean? Type task + Enter. Garbage? I → O → T for each part, then N";
+  // Pipeline hint stays fixed in the header. Status goes to the status line only.
 }
 
 function showLoading(title, detail, pct = 0, hint = "") {
@@ -974,15 +1002,16 @@ function updateFilmstripMeta() {
   const m = state.snapshots;
   const idx = state.snapshotIndex + 1;
   const total = m.frames?.length || 0;
+  updateAllowedGarbage();
   if (state.snapshotPurpose === "label") {
     el.filmstripMeta.textContent = `Opening preview ${idx}/${total} · use , . ±3s to scrub`;
     return;
   }
   const parts = [];
   if (m.duration) parts.push(`Clip ${formatDurationShort(m.duration)}`);
-  parts.push(`snapshot every ${formatDurationShort(m.interval_seconds)} (${idx}/${total})`);
+  parts.push(`every ${formatDurationShort(m.interval_seconds)} (${idx}/${total})`);
   if (m.max_garbage_seconds > 0) {
-    parts.push(`garbage allowed ~${formatDurationShort(m.max_garbage_seconds)}`);
+    parts.push(`Allowed garbage time ${formatDurationShort(m.max_garbage_seconds)}`);
   }
   el.filmstripMeta.textContent = parts.join(" · ");
 }
@@ -1431,6 +1460,7 @@ async function loadVideo(index) {
 
   el.currentName.textContent = video.name;
   el.currentMeta.textContent = `${video.relative || video.path} · ${video.duration_label || "?"}`;
+  updateAllowedGarbage();
   el.previewStatus.textContent = "";
   el.playerWrap.classList.add("loading");
   setStatus(`Loading ${video.name}...`);
@@ -1529,7 +1559,7 @@ function applySelectedPath(scanPath, { label = "", manual = false } = {}) {
   if (ws) {
     ws.scanRoot = scanPath;
     ws.labelRoot = scanPath;
-    ws.title = label || selectedSdCardLabel() || ws.title;
+    ws.title = shortCardTitle(label || selectedSdCardLabel() || ws.title);
     renderCardTabs();
   }
 
@@ -2103,7 +2133,10 @@ el.player.addEventListener("timeupdate", () => {
     updateScrubUi();
   }
 });
-el.player.addEventListener("loadedmetadata", updateScrubUi);
+  el.player.addEventListener("loadedmetadata", () => {
+    updateScrubUi();
+    updateAllowedGarbage();
+  });
 
 document.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea, select")) return;

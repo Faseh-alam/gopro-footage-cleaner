@@ -22,18 +22,23 @@
 
     <div class="eager-app">
       <header class="eager-header wc-header">
-        <a class="wc-brand" href="https://worldcontext.org/" target="_blank" rel="noopener">
-          <span class="wc-mark" aria-hidden="true"></span>
-          <span class="wc-name">World Context</span>
-        </a>
+        <div class="header-left">
+          <a class="wc-brand" href="https://worldcontext.org/" target="_blank" rel="noopener">
+            <span class="wc-mark" aria-hidden="true"></span>
+            <span class="wc-name">World Context</span>
+          </a>
+          <p class="pipeline-hint" id="context-message">
+            Clean? Type task + Enter. Garbage? I → O → T for each part, then N.
+          </p>
+        </div>
         <div class="header-tools">
           <div class="card-tabs" id="card-tabs">
             <div id="card-tab-list" class="card-tab-list"></div>
             <button type="button" id="add-card-tab" class="card-tab-add" title="Another SD card">+</button>
           </div>
-          <select id="sd-card-select" class="card-select" title="SD card"></select>
-          <span id="scan-summary" class="hint scan-summary-inline"></span>
         </div>
+        <select id="sd-card-select" class="hidden" aria-hidden="true"></select>
+        <span id="scan-summary" class="hidden" aria-hidden="true"></span>
         <input id="source-path" type="hidden" value="" />
         <select id="camera-select" class="hidden-select" aria-hidden="true"></select>
         <button id="scan-btn" type="button" class="hidden" aria-hidden="true">Scan</button>
@@ -51,10 +56,11 @@
           <div id="file-list" class="file-list"></div>
           <div id="trim-progress-panel" class="trim-progress-panel hidden">
             <div class="trim-progress-head">
-              <span>Trimming</span>
+              <span>Background trims</span>
               <span id="trim-active-count">0</span> ·
               <span id="trim-eta-total">~0s</span>
             </div>
+            <div id="trim-progress-by-card" class="trim-progress-by-card"></div>
             <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
             <div id="trim-progress-list" class="trim-progress-list"></div>
           </div>
@@ -65,9 +71,10 @@
             <div>
               <h2 id="current-name">No file loaded</h2>
               <p id="current-meta" class="hint"></p>
-              <span id="gpmf-status" class="gpmf-badge hidden"></span>
+              <span id="gpmf-status" class="gpmf-badge hidden" aria-hidden="true"></span>
             </div>
             <div class="player-time">
+              <span id="allowed-garbage" class="allowed-garbage hidden"></span>
               <span id="time-display">00:00:00 / 00:00:00</span>
             </div>
           </div>
@@ -88,10 +95,8 @@
             </div>
             <div id="filmstrip" class="filmstrip" tabindex="0"></div>
           </div>
-          <div id="context-banner" class="context-banner">
-            <span id="context-message">Connecting…</span>
-          </div>
-          <p id="pending-in" class="pending-status">Load a file to begin</p>
+          <div id="context-banner" class="hidden" aria-hidden="true"></div>
+          <p id="pending-in" class="hidden" aria-hidden="true"></p>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
 
