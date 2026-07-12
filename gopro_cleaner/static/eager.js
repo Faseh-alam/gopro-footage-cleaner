@@ -14,6 +14,7 @@ const state = {
   globalTrimJobs: [],
   trimEtaTotal: 0,
   labelRefreshTimer: null,
+  labelScanToken: 0,
   currentHasGpmf: null,
   donePaths: new Set(),
   labeledTasks: {},
@@ -635,16 +636,13 @@ function applyGlobalTrimUi(data) {
     el.trimEtaTotal.textContent = `~${formatDurationShort(state.trimEtaTotal)}`;
   }
 
-  const totalDuration = activeJobs.reduce(
-    (sum, j) => sum + (j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0),
-    0,
-  );
-  const doneDuration = activeJobs.reduce((sum, j) => {
-    const dur = j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0;
-    if (j.status === "running") return sum + (dur * (j.progress || 0)) / 100;
-    return sum;
-  }, 0);
-  const overallPct = totalDuration > 0 ? (doneDuration / totalDuration) * 100 : 0;
+  const runningJobs = activeJobs.filter((j) => j.status === "running");
+  let overallPct = 0;
+  if (runningJobs.length) {
+    // Bar tracks active ffmpeg work (queued jobs made the old bar look stuck at ~0).
+    overallPct =
+      runningJobs.reduce((sum, j) => sum + (j.progress || 0), 0) / runningJobs.length;
+  }
   if (el.trimProgressFill) {
     el.trimProgressFill.style.width = `${Math.min(100, overallPct)}%`;
   }
@@ -680,16 +678,20 @@ async function softRefreshLabelScan() {
   const path = state.labelRoot || state.scanRoot || scanTargetPath();
   if (!path) return;
   const currentPath = currentVideo()?.path || "";
+  const token = ++state.labelScanToken;
   try {
     const data = await api("/api/eager/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, recursive: true, mode: "label" }),
     });
-    if (state.phase !== "label") return;
-    state.videos = data.videos || [];
+    if (token !== state.labelScanToken) return;
+    if (state.phase !== "label" || state.busy) return;
+    // Drop anything already labeled this session so a slow scan can't resurrect them.
+    const fresh = (data.videos || []).filter((video) => !state.donePaths.has(video.path));
+    state.videos = fresh;
     state.labelProgress = data.progress || state.labelProgress;
-    el.scanSummary.textContent = `${data.count} files to label`;
+    el.scanSummary.textContent = `${fresh.length} files to label`;
     renderLabelProgress();
     const idx = currentPath ? state.videos.findIndex((v) => v.path === currentPath) : -1;
     if (idx >= 0) {
@@ -697,7 +699,11 @@ async function softRefreshLabelScan() {
       renderFileList();
       updateContextHint();
     } else if (state.videos.length) {
-      await loadVideo(Math.min(state.index >= 0 ? state.index : 0, state.videos.length - 1));
+      const fallback = Math.min(
+        Math.max(0, state.index),
+        state.videos.length - 1,
+      );
+      await loadVideo(fallback);
     } else {
       state.index = -1;
       el.currentName.textContent = "No file loaded";
@@ -1860,9 +1866,12 @@ async function labelCurrentClip() {
         task,
       }),
     });
+    // Invalidate any in-flight soft refresh that could put this path back.
+    state.labelScanToken += 1;
     state.donePaths.add(video.path);
     state.labeledTasks[video.path] = task;
     state.lastLabelTask = task;
+    state.videos = state.videos.filter((item) => item.path !== video.path);
     el.taskSearch.value = "";
     renderTasks(task);
     el.taskSearch.blur();
@@ -1880,12 +1889,35 @@ async function labelCurrentClip() {
             : `${nextUnlabeled} file(s) still outside task folders`,
       };
     }
+    const already = data.already_there
+      ? `Already in ${task} — removed leftover copy`
+      : `Moved to ${task}`;
     setStatus(
-      `Moved to ${task} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
+      `${already} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
       "ok",
     );
+    // Remove from list now; the same index becomes the next unlabeled clip.
+    const nextIndex = state.index;
+    state.videos = state.videos.filter((item) => item.path !== video.path);
     renderFileList();
-    advanceToNext();
+    if (nextIndex < state.videos.length) {
+      await loadVideo(nextIndex);
+    } else if (state.videos.length) {
+      await loadVideo(state.videos.length - 1);
+    } else {
+      state.index = -1;
+      el.currentName.textContent = "No file loaded";
+      el.currentMeta.textContent = "";
+      updateContextHint();
+      const remaining = remainingUnlabeledCount();
+      if (remaining === 0) {
+        setStatus(
+          `All clips labeled — work ${formatWorkHms(workTimer.cleanMs + workTimer.labelMs)}`,
+          "ok",
+        );
+        saveWorkSession("label_complete");
+      }
+    }
     refreshLabelProgress({ quiet: true });
   } catch (error) {
     setStatus(error.message, "error");

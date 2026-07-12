@@ -16,7 +16,16 @@ from .trimmer import TrimJob, _execute_trim, build_output_path, clip_base_stem, 
 LABELED_FOLDER = "Labeled"  # legacy folder name — no longer created for new labels
 TRIMMED_SUFFIX_RE = re.compile(r"-\d+$", re.IGNORECASE)
 CAMERA_FOLDER_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
+GOPRO_MEDIA_DIR_RE = re.compile(r"^\d{3}GOPRO$", re.IGNORECASE)
 SKIP_DIR_NAMES = {LABELED_FOLDER.lower(), "labeled", "tasks", ".trash"}
+NON_TASK_DIR_NAMES = SKIP_DIR_NAMES | {
+    "dcim",
+    "misc",
+    "private",
+    "system volume information",
+    "gopro",
+    ".trash",
+}
 
 
 def task_directory(label_root: Path, task_name: str) -> Path:
@@ -24,10 +33,23 @@ def task_directory(label_root: Path, task_name: str) -> Path:
     return label_root.expanduser().resolve() / task_folder_name(task_name)
 
 
+def _looks_like_task_dir_name(name: str) -> bool:
+    """True for folders that hold labeled clips (not DCIM / ###GOPRO / camera ids)."""
+    if not name or name.startswith("."):
+        return False
+    lower = name.lower()
+    if lower in NON_TASK_DIR_NAMES:
+        return False
+    if CAMERA_FOLDER_RE.match(name) or GOPRO_MEDIA_DIR_RE.match(name):
+        return False
+    return True
+
+
 def is_under_task_folder(path: Path, root: Path) -> bool:
     root = root.expanduser().resolve()
     try:
-        rel = path.parent.relative_to(root)
+        resolved = path.expanduser().resolve()
+        rel = resolved.parent.relative_to(root)
     except ValueError:
         return False
     if not rel.parts:
@@ -35,8 +57,11 @@ def is_under_task_folder(path: Path, root: Path) -> bool:
     task_slugs = {task_folder_name(task) for task in load_tasks()}
     first = rel.parts[0]
     if CAMERA_FOLDER_RE.match(first):
-        return len(rel.parts) > 1 and rel.parts[1] in task_slugs
-    return first in task_slugs
+        if len(rel.parts) < 2:
+            return False
+        second = rel.parts[1]
+        return second in task_slugs or _looks_like_task_dir_name(second)
+    return first in task_slugs or _looks_like_task_dir_name(first)
 
 
 def _footage_blocked(path: Path, root: Path | None = None) -> bool:
@@ -151,7 +176,7 @@ def label_progress(root: Path, *, recursive: bool = True) -> dict:
     unlabeled_names: list[str] = []
 
     for path in _iter_mp4_files(root, recursive=recursive):
-        if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
+        if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
             continue
         if any(part.lower() in SKIP_DIR_NAMES for part in path.parts):
             skipped += 1
@@ -246,16 +271,74 @@ def scan_mp4_files(
     return videos
 
 
-def _next_clip_number(source: Path) -> int:
-    parent = source.parent
-    base = clip_base_stem(source)
-    existing = 0
-    for path in parent.iterdir():
+def _clip_number_from_stem(stem: str, base: str) -> int | None:
+    prefix = f"{base}-"
+    if not stem.startswith(prefix):
+        return None
+    tail = stem[len(prefix) :]
+    if tail.isdigit():
+        return int(tail)
+    return None
+
+
+def _collect_used_clip_numbers(folder: Path, base: str, used: set[int]) -> None:
+    if not folder.is_dir():
+        return
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return
+    for path in entries:
         if not path.is_file() or path.suffix.upper() != ".MP4":
             continue
-        if path.stem.startswith(f"{base}-") and path.stem[len(base) + 1 :].isdigit():
-            existing = max(existing, int(path.stem.rsplit("-", 1)[-1]))
-    return existing + 1
+        if is_hidden_or_temp_mp4(path):
+            continue
+        number = _clip_number_from_stem(path.stem, base)
+        if number is not None:
+            used.add(number)
+
+
+def _next_clip_number(source: Path, reserved: set[int] | None = None) -> int:
+    """Next -N for this stem. Includes sibling task folders so labeled clips keep their numbers."""
+    parent = source.parent
+    base = clip_base_stem(source)
+    used: set[int] = set(reserved or ())
+
+    _collect_used_clip_numbers(parent, base, used)
+
+    # Also scan nearby task folders (beside DCIM / under camera / card root).
+    # Stay shallow — never walk into the system temp / drive root junk.
+    ancestors: list[Path] = []
+    cursor = parent
+    for _ in range(3):
+        ancestors.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+
+    task_slugs = {task_folder_name(t) for t in load_tasks()}
+    for ancestor in ancestors:
+        try:
+            siblings = list(ancestor.iterdir())
+        except OSError:
+            continue
+        for sibling in siblings:
+            if not sibling.is_dir():
+                continue
+            try:
+                if sibling.resolve() == parent.resolve():
+                    continue
+            except OSError:
+                continue
+            name = sibling.name
+            if not (_looks_like_task_dir_name(name) or name in task_slugs):
+                continue
+            _collect_used_clip_numbers(sibling, base, used)
+
+    next_number = 1
+    while next_number in used:
+        next_number += 1
+    return next_number
 
 
 def trim_single_clip(source: Path, start_seconds: float, end_seconds: float) -> dict:
@@ -327,6 +410,19 @@ def finish_cleaning_file(source: Path, *, delete_source: bool = True) -> dict:
     return _finish_source_after_trims(source, delete_source=delete_source)
 
 
+def _unique_label_dest(task_dir: Path, filename: str) -> Path:
+    dest = task_dir / filename
+    if not dest.exists():
+        return dest
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".MP4"
+    for index in range(2, 1000):
+        candidate = task_dir / f"{stem}__{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Already exists: {dest}")
+
+
 def assign_clip_to_task(clip_path: Path, label_root: Path, task_name: str) -> dict:
     """Move footage into <task>/ directly under the footage folder."""
     clip_path = clip_path.expanduser().resolve()
@@ -339,15 +435,46 @@ def assign_clip_to_task(clip_path: Path, label_root: Path, task_name: str) -> di
     task_dir = task_directory(label_root, task_name)
     task_dir.mkdir(parents=True, exist_ok=True)
     dest = task_dir / clip_path.name
+
     if dest.exists():
-        raise FileExistsError(f"Already exists: {dest}")
+        try:
+            same_size = dest.stat().st_size == clip_path.stat().st_size
+        except OSError:
+            same_size = False
+        if same_size:
+            # Prior label left a duplicate in DCIM (or cross-device copy remnant).
+            try:
+                clip_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Already in {task_name}, but could not remove leftover source: {exc}"
+                ) from exc
+            return {
+                "task": task_name,
+                "task_dir": str(task_dir),
+                "output": str(dest),
+                "moved": False,
+                "already_there": True,
+            }
+        dest = _unique_label_dest(task_dir, clip_path.name)
 
     shutil.move(str(clip_path), str(dest))
+    if clip_path.exists():
+        # Cross-device move sometimes leaves the source; force-remove if dest is good.
+        try:
+            if dest.is_file() and dest.stat().st_size > 0:
+                clip_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Moved to {task_name}, but leftover source remains: {exc}"
+            ) from exc
+
     return {
         "task": task_name,
         "task_dir": str(task_dir),
         "output": str(dest),
         "moved": True,
+        "already_there": False,
     }
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .eager import _finish_source_after_trims, _next_clip_number
 from .probe import probe_media
-from .trimmer import TrimJob, _execute_trim, build_output_path, job_store
+from .trimmer import TrimJob, _execute_trim, build_output_path, clip_base_stem, job_store
 
 
 @dataclass
@@ -24,6 +24,7 @@ class EagerTrimRecord:
     output: str | None = None
     error: str | None = None
     trim_job_id: str | None = None
+    clip_number: int | None = None
     source_has_gpmf: bool | None = None
     output_has_gpmf: bool | None = None
     created_at: float = field(default_factory=time.time)
@@ -53,18 +54,51 @@ class EagerTrimQueue:
             source_has_gpmf = None
 
         job_id = str(uuid.uuid4())
-        record = EagerTrimRecord(
-            job_id=job_id,
-            source_path=str(source),
-            start_seconds=start_seconds,
-            end_seconds=end_seconds,
-            source_has_gpmf=source_has_gpmf,
-        )
         with self._condition:
+            reserved = self._reserved_clip_numbers_locked(source)
+            clip_number = _next_clip_number(source, reserved=reserved)
+            output_path = build_output_path(source, clip_number, source.parent)
+            # Avoid colliding with a file already on disk while another job is mid-flight.
+            while output_path.exists() or clip_number in reserved:
+                reserved.add(clip_number)
+                clip_number = _next_clip_number(source, reserved=reserved)
+                output_path = build_output_path(source, clip_number, source.parent)
+
+            record = EagerTrimRecord(
+                job_id=job_id,
+                source_path=str(source),
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                source_has_gpmf=source_has_gpmf,
+                clip_number=clip_number,
+                output=str(output_path),
+            )
             self._records[job_id] = record
             self._pending.append(job_id)
             self._condition.notify()
         return record
+
+    def _reserved_clip_numbers_locked(self, source: Path) -> set[int]:
+        """Clip numbers already claimed by queued/running/completed jobs for this stem."""
+        base = clip_base_stem(source)
+        parent = str(source.parent)
+        reserved: set[int] = set()
+        for record in self._records.values():
+            if record.status == "failed":
+                continue
+            other = Path(record.source_path)
+            if str(other.parent) != parent:
+                continue
+            if clip_base_stem(other) != base:
+                continue
+            if record.clip_number is not None:
+                reserved.add(int(record.clip_number))
+            elif record.output:
+                stem = Path(record.output).stem
+                prefix = f"{base}-"
+                if stem.startswith(prefix) and stem[len(prefix) :].isdigit():
+                    reserved.add(int(stem[len(prefix) :]))
+        return reserved
 
     def get(self, job_id: str) -> EagerTrimRecord | None:
         with self._lock:
@@ -280,10 +314,24 @@ class EagerTrimQueue:
 
             source = Path(record.source_path)
             try:
-                clip_number = _next_clip_number(source)
-                output_path = build_output_path(source, clip_number, source.parent)
+                clip_number = record.clip_number
+                if clip_number is None:
+                    with self._lock:
+                        reserved = self._reserved_clip_numbers_locked(source)
+                    clip_number = _next_clip_number(source, reserved=reserved)
+                    record.clip_number = clip_number
+                output_path = Path(record.output) if record.output else build_output_path(
+                    source, clip_number, source.parent
+                )
                 if output_path.exists():
-                    raise FileExistsError(f"Output already exists: {output_path.name}")
+                    # Rare race with a leftover file — pick a free number instead of failing.
+                    with self._lock:
+                        reserved = self._reserved_clip_numbers_locked(source)
+                        reserved.add(clip_number)
+                    clip_number = _next_clip_number(source, reserved=reserved)
+                    output_path = build_output_path(source, clip_number, source.parent)
+                    record.clip_number = clip_number
+                    record.output = str(output_path)
 
                 trim_job = TrimJob(
                     job_id=str(uuid.uuid4()),
