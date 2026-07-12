@@ -780,6 +780,32 @@ body.scrub-cursor-hidden * {
   transition: width 0.4s ease;
 }
 
+.trim-progress-list {
+  margin-top: 0.45rem;
+  max-height: 7rem;
+  overflow: auto;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.trim-progress-list div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin: 0.15rem 0;
+}
+
+.label-trim-banner {
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  background: rgba(88, 166, 255, 0.1);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+  font-size: 0.85rem;
+  display: grid;
+  gap: 0.2rem;
+}
+
 .clip-progress {
   height: 4px;
   margin-top: 0.35rem;

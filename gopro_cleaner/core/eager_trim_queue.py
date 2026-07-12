@@ -90,6 +90,75 @@ class EagerTrimQueue:
         with self._lock:
             return any(r.status in {"queued", "running"} for r in self._records.values())
 
+    def active_path_sets(self) -> tuple[set[str], set[str]]:
+        """Return (busy_source_paths, busy_output_paths) for in-flight trims."""
+        sources: set[str] = set()
+        outputs: set[str] = set()
+        with self._lock:
+            for record in self._records.values():
+                if record.status not in {"queued", "running"}:
+                    continue
+                sources.add(record.source_path)
+                if record.output:
+                    outputs.add(record.output)
+                elif record.trim_job_id:
+                    trim_job = job_store.get(record.trim_job_id)
+                    if trim_job and getattr(trim_job, "output_path", None):
+                        outputs.add(str(trim_job.output_path))
+        return sources, outputs
+
+    def status_all(self) -> dict:
+        """Lightweight global trim progress for clean + label UIs."""
+        with self._lock:
+            records = list(self._records.values())
+        jobs_out: list[dict] = []
+        eta_total = 0.0
+        active = 0
+        for record in sorted(records, key=lambda r: r.created_at, reverse=True):
+            if record.status not in {"queued", "running", "completed", "failed"}:
+                continue
+            if record.status in {"queued", "running"}:
+                active += 1
+            duration = max(0.0, record.end_seconds - record.start_seconds)
+            progress = 0.0
+            remaining = 0.0
+            message = ""
+            if record.status == "queued":
+                remaining = duration
+                eta_total += duration
+            elif record.status == "running":
+                if record.trim_job_id:
+                    trim_job = job_store.get(record.trim_job_id)
+                    if trim_job:
+                        progress = float(trim_job.progress or 0)
+                        message = trim_job.message or ""
+                remaining = duration * max(0.0, 1.0 - progress / 100.0)
+                eta_total += remaining
+            source_name = Path(record.source_path).name
+            jobs_out.append(
+                {
+                    "job_id": record.job_id,
+                    "source_path": record.source_path,
+                    "source_name": source_name,
+                    "status": record.status,
+                    "start_seconds": record.start_seconds,
+                    "end_seconds": record.end_seconds,
+                    "duration_seconds": duration,
+                    "progress": round(progress, 1),
+                    "remaining_seconds": round(remaining, 1),
+                    "message": message,
+                    "output": record.output,
+                    "error": record.error,
+                }
+            )
+            if len(jobs_out) >= 40:
+                break
+        return {
+            "active": active,
+            "eta_total_seconds": round(eta_total, 1),
+            "jobs": jobs_out,
+        }
+
     def schedule_source_finish(self, source: Path) -> dict:
         """Delete raw file after queued trims finish; returns immediately if trims still running."""
         source = source.expanduser().resolve()
@@ -225,6 +294,7 @@ class EagerTrimQueue:
                     clip_number=clip_number,
                 )
                 record.trim_job_id = trim_job.job_id
+                record.output = str(output_path)
                 job_store.create(trim_job)
                 _execute_trim(trim_job)
                 finished = job_store.get(trim_job.job_id)

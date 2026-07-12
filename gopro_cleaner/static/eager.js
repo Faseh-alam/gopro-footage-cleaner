@@ -9,7 +9,11 @@ const state = {
   pendingClip: null,
   savedClips: [],
   trimPollTimer: null,
+  globalTrimPollTimer: null,
+  globalTrimActive: 0,
+  globalTrimJobs: [],
   trimEtaTotal: 0,
+  labelRefreshTimer: null,
   currentHasGpmf: null,
   donePaths: new Set(),
   labeledTasks: {},
@@ -82,6 +86,9 @@ const el = {
   trimActiveCount: document.getElementById("trim-active-count"),
   trimEtaTotal: document.getElementById("trim-eta-total"),
   trimProgressFill: document.getElementById("trim-progress-fill"),
+  trimProgressList: document.getElementById("trim-progress-list"),
+  labelTrimBanner: document.getElementById("label-trim-banner"),
+  labelTrimBannerText: document.getElementById("label-trim-banner-text"),
   clipList: document.getElementById("clip-list"),
   cleanPanel: document.getElementById("clean-panel"),
   labelPanel: document.getElementById("label-panel"),
@@ -388,6 +395,7 @@ function scrubStepSeconds() {
 
 function setPhase(phase) {
   if (workTimer.root) persistWorkTimer();
+  const previousPhase = state.phase;
   state.phase = phase;
   state.snapshotPurpose = phase === "clean" ? "clean" : "label";
   el.phaseClean.classList.toggle("active", phase === "clean");
@@ -398,7 +406,7 @@ function setPhase(phase) {
   el.scanBtn.textContent = phase === "clean" ? "Scan raw footage" : "Scan footage";
   if (el.markSection) el.markSection.classList.toggle("hidden", phase !== "clean");
   if (el.clipList) el.clipList.classList.toggle("hidden", phase !== "clean");
-  if (el.trimProgressPanel && phase !== "clean") el.trimProgressPanel.classList.add("hidden");
+  // Keep shared folder + global trim panel across clean ↔ label.
   state.snapshots = null;
   state.snapshotIndex = 0;
   state.videos = [];
@@ -406,12 +414,32 @@ function setPhase(phase) {
   state.donePaths = new Set();
   state.labeledTasks = {};
   state.labelProgress = null;
+  state.pendingIn = null;
+  state.pendingClip = null;
+  state.savedClips = [];
+  stopTrimPolling();
   renderFileList();
   renderLabelProgress();
+  renderClips();
   el.currentName.textContent = "No file loaded";
   el.currentMeta.textContent = "";
   updateContextHint();
   renderWorkTimer();
+  applyGlobalTrimUi({
+    active: state.globalTrimActive,
+    eta_total_seconds: state.trimEtaTotal,
+    jobs: state.globalTrimJobs,
+  });
+
+  const sharedRoot = state.scanRoot || state.labelRoot || scanTargetPath();
+  if (sharedRoot) {
+    el.sourcePath.value = sharedRoot;
+    state.scanRoot = sharedRoot;
+    state.labelRoot = sharedRoot;
+    if (previousPhase !== phase) {
+      scanSource();
+    }
+  }
 }
 
 function remainingUnlabeledCount() {
@@ -570,14 +598,34 @@ function renderClips() {
   updateContextHint();
 }
 
-function updateTrimEtaPanel(data) {
-  state.trimEtaTotal = data?.eta_total_seconds || 0;
-  const active = activeTrimCount();
+function basenamePath(path) {
+  if (!path) return "";
+  return String(path).split(/[/\\]/).pop() || "";
+}
+
+function applyGlobalTrimUi(data) {
+  const active = Number(data?.active || 0);
+  const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+  state.globalTrimActive = active;
+  state.globalTrimJobs = jobs;
+  state.trimEtaTotal = Number(data?.eta_total_seconds || 0);
+
+  if (el.labelTrimBanner) {
+    el.labelTrimBanner.classList.toggle("hidden", active === 0 || state.phase !== "label");
+    if (el.labelTrimBannerText && active > 0) {
+      el.labelTrimBannerText.textContent =
+        `${active} clip(s) still trimming · ~${formatDurationShort(state.trimEtaTotal)} left. ` +
+        "They stay out of this list until each trim finishes.";
+    }
+  }
+
   if (!el.trimProgressPanel) return;
 
-  if (active === 0) {
+  const activeJobs = jobs.filter((j) => j.status === "queued" || j.status === "running");
+  if (active === 0 || activeJobs.length === 0) {
     el.trimProgressPanel.classList.add("hidden");
     if (el.trimProgressFill) el.trimProgressFill.style.width = "0%";
+    if (el.trimProgressList) el.trimProgressList.innerHTML = "";
     return;
   }
 
@@ -587,16 +635,78 @@ function updateTrimEtaPanel(data) {
     el.trimEtaTotal.textContent = `~${formatDurationShort(state.trimEtaTotal)}`;
   }
 
-  const jobs = state.savedClips.filter((j) => j.status === "queued" || j.status === "running");
-  const totalDuration = jobs.reduce((sum, j) => sum + (j.duration_seconds || j.end - j.start || 0), 0);
-  const doneDuration = jobs.reduce((sum, j) => {
-    const dur = j.duration_seconds || j.end - j.start || 0;
-    if (j.status === "running") return sum + dur * (j.progress || 0) / 100;
+  const totalDuration = activeJobs.reduce(
+    (sum, j) => sum + (j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0),
+    0,
+  );
+  const doneDuration = activeJobs.reduce((sum, j) => {
+    const dur = j.duration_seconds || Math.max(0, (j.end_seconds || 0) - (j.start_seconds || 0)) || 0;
+    if (j.status === "running") return sum + (dur * (j.progress || 0)) / 100;
     return sum;
   }, 0);
   const overallPct = totalDuration > 0 ? (doneDuration / totalDuration) * 100 : 0;
   if (el.trimProgressFill) {
     el.trimProgressFill.style.width = `${Math.min(100, overallPct)}%`;
+  }
+
+  if (el.trimProgressList) {
+    el.trimProgressList.innerHTML = "";
+    for (const job of activeJobs.slice(0, 12)) {
+      const row = document.createElement("div");
+      const outName = basenamePath(job.output);
+      const sourceName = job.source_name || basenamePath(job.source_path) || "clip";
+      if (job.status === "queued") {
+        row.textContent = `Queued · ${sourceName} (${formatTime(job.start_seconds)} → ${formatTime(job.end_seconds)})`;
+      } else {
+        const pct = Math.round(job.progress || 0);
+        row.textContent = `Trimming ${pct}% · ${outName || sourceName}`;
+      }
+      el.trimProgressList.appendChild(row);
+    }
+  }
+}
+
+function scheduleLabelListRefresh() {
+  if (state.phase !== "label") return;
+  if (state.labelRefreshTimer) clearTimeout(state.labelRefreshTimer);
+  state.labelRefreshTimer = setTimeout(() => {
+    state.labelRefreshTimer = null;
+    softRefreshLabelScan();
+  }, 900);
+}
+
+async function softRefreshLabelScan() {
+  if (state.phase !== "label" || state.busy) return;
+  const path = state.labelRoot || state.scanRoot || scanTargetPath();
+  if (!path) return;
+  const currentPath = currentVideo()?.path || "";
+  try {
+    const data = await api("/api/eager/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, recursive: true, mode: "label" }),
+    });
+    if (state.phase !== "label") return;
+    state.videos = data.videos || [];
+    state.labelProgress = data.progress || state.labelProgress;
+    el.scanSummary.textContent = `${data.count} files to label`;
+    renderLabelProgress();
+    const idx = currentPath ? state.videos.findIndex((v) => v.path === currentPath) : -1;
+    if (idx >= 0) {
+      state.index = idx;
+      renderFileList();
+      updateContextHint();
+    } else if (state.videos.length) {
+      await loadVideo(Math.min(state.index >= 0 ? state.index : 0, state.videos.length - 1));
+    } else {
+      state.index = -1;
+      el.currentName.textContent = "No file loaded";
+      el.currentMeta.textContent = "";
+      renderFileList();
+      updateContextHint();
+    }
+  } catch {
+    /* ignore background refresh */
   }
 }
 
@@ -606,7 +716,7 @@ function syncTrimJobsFromServer(jobs) {
     const existing = byId.get(job.job_id);
     if (existing) {
       Object.assign(existing, job);
-      if (job.output) existing.name = job.output.split(/[/\\]/).pop();
+      if (job.output) existing.name = basenamePath(job.output);
       existing.start = job.start_seconds;
       existing.end = job.end_seconds;
     } else {
@@ -619,7 +729,7 @@ function syncTrimJobsFromServer(jobs) {
         progress: job.progress,
         remaining_seconds: job.remaining_seconds,
         output: job.output,
-        name: job.output ? job.output.split(/[/\\]/).pop() : null,
+        name: job.output ? basenamePath(job.output) : null,
         error: job.error,
         source_has_gpmf: job.source_has_gpmf,
         output_has_gpmf: job.output_has_gpmf,
@@ -636,7 +746,30 @@ async function pollTrimStatus() {
   try {
     const data = await api(`/api/eager/trim/status?path=${encodeURIComponent(video.path)}`);
     syncTrimJobsFromServer(data.jobs);
-    updateTrimEtaPanel(data);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function pollGlobalTrims() {
+  try {
+    const data = await api("/api/eager/trim/active");
+    const prevActive = state.globalTrimActive;
+    applyGlobalTrimUi(data);
+
+    const video = currentVideo();
+    if (video && state.phase === "clean") {
+      const forSource = (data.jobs || []).filter((j) => j.source_path === video.path);
+      if (forSource.length) syncTrimJobsFromServer(forSource);
+    }
+
+    if (prevActive !== (data.active || 0)) {
+      updateContextHint();
+    }
+
+    if (state.phase === "label" && prevActive > 0 && (data.active || 0) < prevActive) {
+      scheduleLabelListRefresh();
+    }
   } catch {
     /* ignore */
   }
@@ -674,6 +807,15 @@ function stopTrimPolling() {
   }
 }
 
+function startGlobalTrimPolling() {
+  if (state.globalTrimPollTimer) return;
+  pollGlobalTrims();
+  state.globalTrimPollTimer = setInterval(
+    pollGlobalTrims,
+    Math.max(1500, state.perf.trim_poll_ms || 1200),
+  );
+}
+
 function activeTrimCount() {
   return state.savedClips.filter((j) => j.status === "queued" || j.status === "running").length;
 }
@@ -682,6 +824,12 @@ function updateContextHint() {
   if (!el.contextMessage) return;
 
   if (state.phase === "label") {
+    if (state.globalTrimActive > 0) {
+      const eta = state.trimEtaTotal > 0 ? ` · ~${formatDurationShort(state.trimEtaTotal)} left` : "";
+      el.contextMessage.textContent =
+        `${state.globalTrimActive} trim(s) still running${eta} — finished clips appear in this list`;
+      return;
+    }
     if (!currentVideo()) {
       const remaining = remainingUnlabeledCount();
       el.contextMessage.textContent =
@@ -1942,6 +2090,7 @@ loadTasks()
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };
     renderWorkTimer();
+    startGlobalTrimPolling();
     if (health.ffmpeg_ok === false) {
       setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
     } else if (perf.lite_mode && perf.hint) {

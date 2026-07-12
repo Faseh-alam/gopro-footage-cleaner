@@ -245,6 +245,11 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": "path is required"}), 400
         return jsonify(eager_trim_queue.status_for_source(Path(raw_path)))
 
+    @eager.get("/api/eager/trim/active")
+    def eager_trim_active():
+        """Global trim queue snapshot (survives clean↔label switch and reload)."""
+        return jsonify(eager_trim_queue.status_all())
+
     @eager.post("/api/eager/clean")
     def eager_clean():
         payload = request.get_json(silent=True) or {}

@@ -230,8 +230,8 @@ def _execute_trim(job: TrimJob) -> None:
             )
 
         temp_fd, temp_name = tempfile.mkstemp(
-            suffix=job.output_path.suffix or ".MP4",
-            prefix=f".{job.output_path.stem}_",
+            suffix=f"{job.output_path.suffix or '.MP4'}.partial",
+            prefix=f"{job.output_path.stem}_",
             dir=output_dir,
         )
         os.close(temp_fd)
@@ -308,6 +308,11 @@ def _execute_trim(job: TrimJob) -> None:
 
         trimmed = probe_media(job.output_path)
         if media.has_gpmf and not trimmed.has_gpmf:
+            # Don't leave a lookalike finalized clip that label mode would pick up.
+            try:
+                job.output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise RuntimeError(
                 "Trim completed but the output file is missing the GoPro IMU/GPMF track."
             )

@@ -123,6 +123,7 @@
               <span id="trim-eta-total">~0s</span> left
             </div>
             <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
+            <div id="trim-progress-list" class="trim-progress-list"></div>
           </div>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
@@ -143,6 +144,11 @@
 
           <div id="label-panel" class="hidden">
             <h2>Label tasks</h2>
+            <div id="label-trim-banner" class="label-trim-banner hidden">
+              <strong>Trims still running</strong>
+              <span id="label-trim-banner-text">—</span>
+              <span class="hint">Those files stay out of this list until each trim finishes.</span>
+            </div>
             <div id="label-progress" class="label-progress idle">
               <div class="label-progress-main">
                 <span id="label-progress-count">—</span>

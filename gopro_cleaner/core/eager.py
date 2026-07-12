@@ -58,19 +58,32 @@ def _probe_duration(path: Path) -> float | None:
         return None
 
 
+def is_hidden_or_temp_mp4(path: Path) -> bool:
+    """True for Finder junk, in-progress trim temps (.name… / *.partial)."""
+    name = path.name
+    if name.startswith("."):
+        return True
+    lower = name.lower()
+    return lower.endswith(".partial") or ".partial." in lower
+
+
 def is_trimmed_clip(path: Path) -> bool:
-    return path.suffix.upper() == ".MP4" and bool(TRIMMED_SUFFIX_RE.search(path.stem))
+    return (
+        path.suffix.upper() == ".MP4"
+        and not is_hidden_or_temp_mp4(path)
+        and bool(TRIMMED_SUFFIX_RE.search(path.stem))
+    )
 
 
 def is_labelable_footage(path: Path, *, root: Path | None = None) -> bool:
-    """Trimmed clips and whole files in the scan folder (not already in a task folder)."""
-    if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
+    """Candidate for the label list (temps excluded; active trims filtered at scan)."""
+    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
         return False
     return not _footage_blocked(path, root)
 
 
 def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
-    if path.suffix.upper() != ".MP4" or path.name.startswith("._"):
+    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
         return False
     if is_trimmed_clip(path):
         return False
@@ -195,8 +208,34 @@ def scan_mp4_files(
             candidates.append(path)
         elif mode == "label" and is_labelable_footage(path, root=root):
             candidates.append(path)
-        elif mode == "all" and path.suffix.upper() == ".MP4" and not path.name.startswith("._"):
+        elif (
+            mode == "all"
+            and path.suffix.upper() == ".MP4"
+            and not is_hidden_or_temp_mp4(path)
+        ):
             candidates.append(path)
+
+    if mode == "label" and candidates:
+        # Only finalized clips / wholes — hide sources still being trimmed and
+        # any output path that is still a running/queued job target.
+        try:
+            from .eager_trim_queue import eager_trim_queue
+
+            busy_sources, busy_outputs = eager_trim_queue.active_path_sets()
+        except Exception:  # noqa: BLE001
+            busy_sources, busy_outputs = set(), set()
+
+        filtered: list[Path] = []
+        for path in candidates:
+            key = str(path.resolve())
+            if key in busy_outputs:
+                continue
+            if key in busy_sources:
+                continue
+            # Prefer finalized trimmed clips; also allow whole files kept after clean.
+            if is_trimmed_clip(path) or is_raw_footage(path, root=root):
+                filtered.append(path)
+        candidates = filtered
 
     ordered = sorted(candidates, key=lambda p: p.name.lower())
     if not ordered:
