@@ -446,7 +446,9 @@ function setPhase(_phase) {
   if (el.labelPanel) el.labelPanel.classList.add("hidden");
   if (el.listTitle) el.listTitle.textContent = "Footage";
   if (el.scanBtn) el.scanBtn.textContent = "Scan";
-  if (el.markSection) el.markSection.classList.remove("hidden");
+  // Mark buttons stay hidden — keyboard (I/O/T) drives them; empty buttons
+  // were showing as white pills on Windows when this class was removed.
+  if (el.markSection) el.markSection.classList.add("hidden");
   if (el.clipList) el.clipList.classList.remove("hidden");
   updateContextHint();
 }
@@ -911,6 +913,7 @@ function syncTrimJobsFromServer(jobs) {
   }
   state.savedClips.sort((a, b) => (a.start || 0) - (b.start || 0));
   renderClips();
+  renderFilmstrip();
 }
 
 async function pollTrimStatus() {
@@ -1041,12 +1044,18 @@ function renderFilmstrip() {
   }
   const video = currentVideo();
   if (!video) return;
+  const ranges = keptClipRanges();
 
   state.snapshots.frames.forEach((frame) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "filmstrip-item";
     if (frame.index === state.snapshotIndex) btn.classList.add("active");
+    const tint = filmstripTintForTime(frame.t, ranges);
+    if (tint) btn.classList.add(tint);
+    if (state.pendingIn !== null && Math.abs(frame.t - state.pendingIn) < (state.snapshots.interval_seconds || 1) / 2) {
+      btn.classList.add("mark-start");
+    }
     const img = document.createElement("img");
     img.loading = "lazy";
     img.alt = formatTime(frame.t);
@@ -1059,8 +1068,44 @@ function renderFilmstrip() {
     el.filmstrip.appendChild(btn);
   });
   updateFilmstripMeta();
+  updateScrubRangeTints(ranges);
   const active = el.filmstrip.querySelector(".filmstrip-item.active");
   active?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+}
+
+function updateScrubRangeTints(ranges) {
+  const track = el.scrubTrack;
+  if (!track) return;
+  track.querySelectorAll(".scrub-range").forEach((node) => node.remove());
+  const duration = el.player.duration || currentVideo()?.duration || state.snapshots?.duration || 0;
+  if (!duration || !ranges.length) return;
+
+  // Leading garbage
+  if (ranges[0].start > 0.25) {
+    const gap = document.createElement("div");
+    gap.className = "scrub-range garbage";
+    gap.style.left = "0%";
+    gap.style.width = `${(ranges[0].start / duration) * 100}%`;
+    track.appendChild(gap);
+  }
+  for (let i = 0; i < ranges.length; i += 1) {
+    const r = ranges[i];
+    const kept = document.createElement("div");
+    kept.className = "scrub-range kept";
+    kept.style.left = `${(r.start / duration) * 100}%`;
+    kept.style.width = `${((r.end - r.start) / duration) * 100}%`;
+    track.appendChild(kept);
+    if (i < ranges.length - 1) {
+      const next = ranges[i + 1];
+      if (next.start > r.end) {
+        const gap = document.createElement("div");
+        gap.className = "scrub-range garbage";
+        gap.style.left = `${(r.end / duration) * 100}%`;
+        gap.style.width = `${((next.start - r.end) / duration) * 100}%`;
+        track.appendChild(gap);
+      }
+    }
+  }
 }
 
 async function cancelSnapshotJob(path) {
@@ -1387,23 +1432,32 @@ function markStart() {
   state.pendingClip = null;
   setStatus(`Start marked at ${formatTime(state.pendingIn)}`, "ok");
   renderClips();
+  renderFilmstrip();
 }
 
 function markEnd() {
   if (!currentVideo()) return;
-  if (state.pendingIn === null) {
-    setStatus("Mark start first", "error");
-    return;
-  }
   const end = currentScrubTime();
-  if (end <= state.pendingIn + 0.05) {
-    setStatus("End must be after start — step forward first", "error");
+  // O alone = useful from the beginning of the file to here (no need to arrow back to 0).
+  let start = state.pendingIn;
+  if (start === null) {
+    start = 0;
+  }
+  if (end <= start + 0.05) {
+    setStatus("End must be after start — step forward a little, then O", "error");
     return;
   }
-  state.pendingClip = { start: state.pendingIn, end };
+  state.pendingClip = { start, end };
   state.pendingIn = null;
-  setStatus(`Marked ${formatTime(state.pendingClip.start)} → ${formatTime(end)}`, "ok");
+  const autoFromZero = start === 0;
+  setStatus(
+    autoFromZero
+      ? `Marked 0:00 → ${formatTime(end)} (from start) — press T to trim`
+      : `Marked ${formatTime(start)} → ${formatTime(end)} — press T`,
+    "ok",
+  );
   renderClips();
+  renderFilmstrip();
 }
 
 function undoMark() {
@@ -1415,6 +1469,46 @@ function undoMark() {
     state.savedClips.pop();
   }
   renderClips();
+  renderFilmstrip();
+}
+
+function jumpToClipStart() {
+  if (!currentVideo()) return;
+  scheduleSeek(0, true);
+  if (state.snapshots?.frames?.length) {
+    goToSnapshotIndex(0);
+  }
+  setStatus("At start of clip (0:00)", "ok");
+}
+
+/** Kept ranges from queued/done trims + the pending mark. */
+function keptClipRanges() {
+  const ranges = [];
+  for (const job of state.savedClips) {
+    if (job.status === "failed") continue;
+    const start = Number(job.start);
+    const end = Number(job.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      ranges.push({ start, end });
+    }
+  }
+  if (state.pendingClip) {
+    ranges.push({ start: state.pendingClip.start, end: state.pendingClip.end });
+  }
+  ranges.sort((a, b) => a.start - b.start);
+  return ranges;
+}
+
+function filmstripTintForTime(t, ranges) {
+  if (!ranges.length) return "";
+  for (const r of ranges) {
+    if (t >= r.start - 0.05 && t <= r.end + 0.05) return "kept";
+  }
+  if (t < ranges[0].start - 0.05) return "garbage"; // leading unused
+  for (let i = 0; i < ranges.length - 1; i += 1) {
+    if (t > ranges[i].end + 0.05 && t < ranges[i + 1].start - 0.05) return "garbage";
+  }
+  return ""; // after last kept — still reviewing
 }
 
 async function cancelPreviewJob(path) {
@@ -1824,9 +1918,10 @@ async function trimMarkedClip() {
     });
     renderClips();
     startTrimPolling();
+    renderFilmstrip();
     const imuNote =
       data.source_has_gpmf === true ? " (IMU will be verified)" : "";
-    setStatus(`Queued trim ${formatTime(clip.start)} → ${formatTime(clip.end)}${imuNote} — mark next clip`, "ok");
+    setStatus(`Queued trim ${formatTime(clip.start)} → ${formatTime(clip.end)}${imuNote} — mark next with I/O or O-from-here`, "ok");
   } catch (error) {
     state.pendingClip = clip;
     renderClips();
@@ -2174,6 +2269,10 @@ document.addEventListener("keydown", (event) => {
   if (key === "t") {
     event.preventDefault();
     trimMarkedClip();
+  }
+  if (key === "home" || event.key === "Home") {
+    event.preventDefault();
+    jumpToClipStart();
   }
   if (key === "n") {
     event.preventDefault();

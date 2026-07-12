@@ -28,7 +28,7 @@
             <span class="wc-name">World Context</span>
           </a>
           <p class="pipeline-hint" id="context-message">
-            Clean? Type task + Enter. Garbage? I → O → T for each part, then N.
+            Clean? Type task + Enter. Garbage from the start? Jump to where work ends → O → T (start is 0:00). Later parts: I → O → T.
           </p>
         </div>
         <div class="header-tools">
@@ -123,9 +123,10 @@
                 <li><kbd>S</kbd> Focus task search</li>
                 <li><kbd>↑</kbd> <kbd>↓</kbd> Choose task</li>
                 <li><kbd>Enter</kbd> Label &amp; next</li>
-                <li><kbd>I</kbd> Mark start</li>
-                <li><kbd>O</kbd> Mark end</li>
+                <li><kbd>O</kbd> End mark (start = 0:00 if I not set)</li>
+                <li><kbd>I</kbd> Mark start (later useful parts)</li>
                 <li><kbd>T</kbd> Queue trim</li>
+                <li><kbd>Home</kbd> Jump to 0:00</li>
                 <li><kbd>N</kbd> Finish trims / next</li>
                 <li><kbd>D</kbd> Delete file</li>
                 <li><kbd>←</kbd> <kbd>→</kbd> Filmstrip step</li>
@@ -165,25 +166,25 @@
       </footer>
     </div>
 
-    <!-- Hidden controls kept for keyboard/JS hooks -->
-    <button type="button" id="phase-clean" class="hidden" aria-hidden="true"></button>
-    <button type="button" id="phase-label" class="hidden" aria-hidden="true"></button>
-    <div id="mark-section" class="hidden" aria-hidden="true">
-      <button id="mark-start-btn" type="button"></button>
-      <button id="mark-end-btn" type="button"></button>
-      <button id="undo-clip-btn" type="button"></button>
-      <button id="trim-btn" type="button"></button>
-      <button id="snap-prev-btn" type="button"></button>
-      <button id="snap-next-btn" type="button"></button>
-      <button id="fine-back-btn" type="button"></button>
-      <button id="fine-fwd-btn" type="button"></button>
+    <!-- Hook-only nodes for JS/keyboard — never shown (see .js-hook-hidden) -->
+    <button type="button" id="phase-clean" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
+    <button type="button" id="phase-label" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
+    <div id="mark-section" class="js-hook-hidden" aria-hidden="true">
+      <button id="mark-start-btn" type="button" tabindex="-1"></button>
+      <button id="mark-end-btn" type="button" tabindex="-1"></button>
+      <button id="undo-clip-btn" type="button" tabindex="-1"></button>
+      <button id="trim-btn" type="button" tabindex="-1"></button>
+      <button id="snap-prev-btn" type="button" tabindex="-1"></button>
+      <button id="snap-next-btn" type="button" tabindex="-1"></button>
+      <button id="fine-back-btn" type="button" tabindex="-1"></button>
+      <button id="fine-fwd-btn" type="button" tabindex="-1"></button>
     </div>
-    <div id="work-timer" class="hidden" aria-hidden="true">
+    <div id="work-timer" class="js-hook-hidden" aria-hidden="true">
       <span id="work-timer-status"></span>
       <span id="work-clean-time"></span>
       <span id="work-label-time"></span>
       <span id="work-total-time"></span>
-      <button id="work-timer-reset" type="button"></button>
+      <button id="work-timer-reset" type="button" tabindex="-1"></button>
     </div>
     <input id="file-filter" type="hidden" value="" />
     <script src="/static/eager.js?v={{ version }}"></script>
