@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+PROGRESS_EVERY = 1 * 1024 * 1024  # report to UI at least every 1 MB
 ProgressCallback = Callable[[int], None]  # bytes written so far for this file
 
 
@@ -30,10 +31,8 @@ def copy_file(
 
     system = platform.system()
     if system == "Windows":
-        # robocopy is directory-oriented; for single files use buffered copy
         _buffered_copy(src, tmp, on_progress=on_progress)
     elif system == "Darwin" and shutil.which("rsync") and on_progress is None:
-        # rsync single file with partial (no mid-file callback)
         result = subprocess.run(
             ["rsync", "-a", "--partial", str(src), str(tmp)],
             capture_output=True,
@@ -65,7 +64,6 @@ def _finalize_partial(tmp: Path, dest: Path) -> None:
         except OSError as exc:
             last_error = exc
             winerr = getattr(exc, "winerror", None)
-            # 32 = sharing violation, 5 = access denied; also Errno 13 Permission denied
             if winerr not in {32, 5} and exc.errno not in {13, 11, 16}:
                 raise
             time.sleep(min(2.0, 0.25 * (attempt + 1)))
@@ -82,23 +80,23 @@ def _buffered_copy(
     on_progress: ProgressCallback | None = None,
 ) -> None:
     written = 0
-    last_report = 0.0
+    last_reported = 0
+    # Smaller reads when UI needs live progress (slow SD cards can sit on a 16MB read).
+    read_size = (1 * 1024 * 1024) if on_progress else BUFFER_SIZE
     with src.open("rb") as reader, dest.open("wb") as writer:
+        if on_progress:
+            on_progress(0)
         while True:
-            chunk = reader.read(BUFFER_SIZE)
+            chunk = reader.read(read_size)
             if not chunk:
                 break
             writer.write(chunk)
             written += len(chunk)
-            now = time.time()
-            # Report every ~16MB chunk, but at least every 0.5s for UI smoothness
-            if on_progress and (now - last_report >= 0.5 or len(chunk) < BUFFER_SIZE):
+            if on_progress and (
+                written - last_reported >= PROGRESS_EVERY or len(chunk) < read_size
+            ):
                 on_progress(written)
-                last_report = now
+                last_reported = written
         writer.flush()
-        try:
-            writer.flush()
-        except OSError:
-            pass
     if on_progress:
         on_progress(written)

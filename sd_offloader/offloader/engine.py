@@ -349,8 +349,9 @@ def _start_card_job(
 
 def _update_card(card_id: str, **kwargs) -> None:
     with _lock:
-        if card_id in _cards:
-            _cards[card_id].update(kwargs)
+        if card_id not in _cards:
+            _cards[card_id] = {"card_id": card_id}
+        _cards[card_id].update(kwargs)
     _save_snapshot(force=False)
 
 
@@ -365,29 +366,51 @@ def _copy_card_worker(
     prog: dict,
 ) -> None:
     total_bytes = inventory.total_bytes(files)
-    _update_card(card_id, status="copying", message="Copying…", bytes_done=0, files_done=0)
+    _update_card(
+        card_id,
+        status="copying",
+        message="Copying…",
+        bytes_done=0,
+        bytes_total=total_bytes,
+        files_done=0,
+        files_total=len(files),
+        speed_mbps=0.0,
+        eta_seconds=None,
+    )
     started = time.time()
     done_bytes = 0
     files_done = 0
     task_names = sorted({f["task"] for f in files})
     last_ui = 0.0
+    last_live = 0
+    last_speed_at = started
 
-    def _publish(current_file_bytes: int = 0, *, message: str | None = None) -> None:
-        nonlocal last_ui
+    def _publish(current_file_bytes: int = 0, *, message: str | None = None, force: bool = False) -> None:
+        nonlocal last_ui, last_live, last_speed_at
         now = time.time()
-        # Throttle UI updates to ~4/sec while streaming a large file
-        if message is None and now - last_ui < 0.25:
+        live = done_bytes + max(0, current_file_bytes)
+        # Throttle UI to ~5/sec unless forced or message changed meaningfully
+        if not force and message is None and now - last_ui < 0.2:
             return
         last_ui = now
-        live = done_bytes + max(0, current_file_bytes)
         elapsed = max(0.1, now - started)
-        speed = (live / (1024 * 1024)) / elapsed if live > 0 else 0.0
+        # Prefer recent window speed so bar doesn't look stuck at 0 on slow starts
+        window = max(0.1, now - last_speed_at)
+        delta = max(0, live - last_live)
+        if delta > 0 and window >= 0.2:
+            speed = (delta / (1024 * 1024)) / window
+            last_live = live
+            last_speed_at = now
+        else:
+            speed = (live / (1024 * 1024)) / elapsed if live > 0 else 0.0
         remaining = max(0, total_bytes - live)
         eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
         payload = {
             "status": "copying",
             "bytes_done": live,
+            "bytes_total": total_bytes,
             "files_done": files_done,
+            "files_total": len(files),
             "speed_mbps": round(speed, 2),
             "eta_seconds": eta,
         }
@@ -404,10 +427,10 @@ def _copy_card_worker(
             if progress.is_file_done(prog, rel, size, dest_file):
                 done_bytes += size
                 files_done += 1
-                _publish(0, message=f"Skipped (done): {rel}")
+                _publish(0, message=f"Skipped (done): {rel}", force=True)
                 continue
 
-            _publish(0, message=f"Copying {rel}…")
+            _publish(0, message=f"Copying {rel}…", force=True)
 
             def on_progress(written: int, _rel: str = rel) -> None:
                 _publish(written, message=f"Copying {_rel}…")
@@ -416,7 +439,7 @@ def _copy_card_worker(
             progress.mark_file_done(card_root, prog, rel, size)
             done_bytes += size
             files_done += 1
-            _publish(0, message=f"Copied {rel}")
+            _publish(0, message=f"Copied {rel}", force=True)
 
         _update_card(card_id, status="verifying", message="Verifying…")
         for item in files:

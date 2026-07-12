@@ -34,10 +34,7 @@ _COMPLETED_RE = re.compile(
     r"Completed\s+([\d.]+)\s*(MiB|MB|GiB|GB|KiB|KB|B)(?:\s*/\s*([\d.]+)\s*(MiB|MB|GiB|GB|KiB|KB|B))?",
     re.IGNORECASE,
 )
-_UPLOAD_RE = re.compile(
-    r"^(?:upload|copy|download):\s+(.+?)\s+to\s+s3://",
-    re.IGNORECASE,
-)
+_FILES_REMAINING_RE = re.compile(r"with\s+(\d+)\s+file\(s\)\s+remaining", re.IGNORECASE)
 _BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\\"'\s/]+)", re.IGNORECASE)
 _SYNC_ARGS_RE = re.compile(
     r"s3\s+sync\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
@@ -827,6 +824,8 @@ def _poll_s3_progress_for_jobs() -> None:
             if not dest.startswith("s3://"):
                 continue
             log_path = str(job.get("log_path") or "")
+            if job.get("using_completed_meter"):
+                continue
             log_quiet = (not log_path) or int(job.get("bytes_done") or 0) == 0
             if not log_quiet and not job.get("progress_via_s3") and not job.get("aws_pid"):
                 continue
@@ -870,6 +869,8 @@ def _poll_s3_progress_for_jobs() -> None:
             job = _jobs.get(job_id)
             if not job or job.get("status") != "running":
                 continue
+            if job.get("using_completed_meter"):
+                continue
             if bytes_total and not job.get("bytes_total"):
                 job["bytes_total"] = bytes_total
             total = int(job.get("bytes_total") or bytes_total or 0)
@@ -891,8 +892,8 @@ def _poll_s3_progress_for_jobs() -> None:
                 job["eta_seconds"] = 0
             pct = int((job["bytes_done"] / total) * 100) if total else 0
             job["message"] = (
-                f"Uploading via CMD — {pct}% on S3 "
-                f"({job['bytes_done']}/{total or '?'} bytes, {s3_objects} objects)"
+                f"Batch on S3: {pct}% · {job['bytes_done']}/{total or '?'} bytes "
+                f"({s3_objects} objects). CMD may also show mid-file Completed X/Y."
             )
         _persist_jobs()
 
@@ -959,13 +960,21 @@ def _ingest_log_progress(job_id: str) -> bool:
                 job["speed_mbps"] = speed
 
             done = _parse_completed_bytes(line)
+            total_from_cmd = _parse_completed_total(line)
             if done is not None:
                 using_completed = True
                 transferred = max(transferred, done)
-                total = job.get("bytes_total") or 0
-                job["bytes_done"] = min(total, transferred) if total else transferred
                 job["using_completed_meter"] = True
                 job["transferred"] = transferred
+                # Match CMD Completed X/Y — don't cap against full local batch size
+                job["bytes_done"] = done
+                if total_from_cmd and total_from_cmd > 0:
+                    job["bytes_total"] = total_from_cmd
+                    job["cmd_total"] = total_from_cmd
+
+            remain = _FILES_REMAINING_RE.search(line)
+            if remain:
+                job["files_remaining"] = int(remain.group(1))
 
             uploaded = _parse_upload_rel(line)
             if uploaded:
@@ -1078,6 +1087,13 @@ def _parse_completed_bytes(line: str) -> int | None:
     if not match:
         return None
     return _to_bytes(float(match.group(1)), match.group(2))
+
+
+def _parse_completed_total(line: str) -> int | None:
+    match = _COMPLETED_RE.search(line)
+    if not match or not match.group(3) or not match.group(4):
+        return None
+    return _to_bytes(float(match.group(3)), match.group(4))
 
 
 def list_external_jobs() -> list[dict]:

@@ -210,7 +210,11 @@ function renderAwsJobs(jobs) {
         <span>${formatBytes(job.bytes_done || 0)} / ${formatBytes(job.bytes_total || 0)}</span>
         <span>${Number(job.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(job.eta_seconds)}</span>
-        <span>${job.files_done || 0} file(s) sent</span>
+        <span>${
+          job.files_remaining != null
+            ? `${job.files_remaining} file(s) remaining`
+            : `${job.files_done || 0} file(s) sent`
+        }</span>
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${job.message || job.dest || ""}</div>
