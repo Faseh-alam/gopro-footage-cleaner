@@ -62,6 +62,30 @@ def is_file_done(data: dict | None, rel: str, size: int, dest_file: Path) -> boo
         return False
 
 
+def dest_looks_complete(data: dict | None, dest_root: Path) -> bool:
+    """True only if progress 'complete' and marked files actually exist on the SSD."""
+    if not data or not dest_root.is_dir():
+        return False
+    files = data.get("files") or {}
+    if not files:
+        # No per-file records — require at least one MP4 under dest
+        try:
+            return any(p.is_file() and p.suffix.upper() == ".MP4" for p in dest_root.rglob("*.MP4"))
+        except OSError:
+            return False
+    ok = 0
+    for rel, entry in files.items():
+        if not isinstance(entry, dict) or entry.get("status") != "done":
+            continue
+        path = dest_root / rel
+        try:
+            if path.is_file() and path.stat().st_size == int(entry.get("size") or 0):
+                ok += 1
+        except OSError:
+            continue
+    return ok > 0
+
+
 def _mirror_local(data: dict) -> None:
     ensure_dirs()
     card_id = str(data.get("card_id") or "unknown")

@@ -23,10 +23,19 @@ _session: dict = {
     "started_at": None,
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
+_copy_threads: dict[str, threading.Thread] = {}
 _watcher_started = False
 _log: list[dict] = []
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
 _last_snapshot_at = 0.0
+ACTIVE_COPY_STATUSES = {
+    "queued",
+    "copying",
+    "verifying",
+    "wiping",
+    "ejecting",
+    "uploading",
+}
 
 
 def _log_line(message: str, *, kind: str = "info") -> None:
@@ -215,42 +224,74 @@ def _scan_for_cards() -> None:
 
     cards = find_card_volumes(exclude_paths=exclude)
     for vol in cards:
-        card_id = (vol.get("card_id") or Path(vol["path"]).name).upper()
+        card_id = _resolve_card_id(vol)
+        if not card_id:
+            _log_line(
+                f"Skipping volume {vol.get('path')}: no C#### card id "
+                "(rename volume label to C1234 or add a C1234 folder)",
+                kind="error",
+            )
+            continue
         card_root = Path(vol["path"])
         with _lock:
             existing = _cards.get(card_id)
-            if existing and existing.get("status") in {
-                "queued",
-                "copying",
-                "verifying",
-                "wiping",
-                "ejecting",
-                "uploading",
-                "completed",
-            }:
-                # Allow resume if previously error / interrupted and card remounted
-                if existing.get("status") == "completed":
+            thread = _copy_threads.get(card_id)
+            thread_alive = bool(thread and thread.is_alive())
+            if existing and existing.get("status") in ACTIVE_COPY_STATUSES and thread_alive:
+                # Real in-flight worker — do not restart
+                if existing.get("mount") == str(card_root):
                     continue
-                if existing.get("status") != "error" and existing.get("mount") == str(card_root):
-                    continue
+            if existing and existing.get("status") == "completed" and thread_alive:
+                continue
+            # Stale UI "copying" with dead thread must be restarted
+            if existing and existing.get("status") in ACTIVE_COPY_STATUSES and not thread_alive:
+                existing["status"] = "interrupted"
+                existing["message"] = "Copy worker stopped — restarting transfer…"
+                _log_line(f"{card_id}: stale {existing.get('status')} state — restarting", kind="error")
 
         prog = progress.load_progress(card_root)
         if prog and prog.get("status") == "complete" and prog.get("batch") == batch:
-            with _lock:
-                _cards[card_id] = {
-                    "card_id": card_id,
-                    "mount": str(card_root),
-                    "status": "completed",
-                    "message": "Already completed earlier (progress file)",
-                    "bytes_done": prog.get("bytes_total") or 0,
-                    "bytes_total": prog.get("bytes_total") or 0,
-                    "speed_mbps": 0,
-                    "eta_seconds": 0,
-                    "started_at": time.time(),
-                }
-            continue
+            dest_hint = Path(str(prog.get("dest") or ""))
+            if dest_hint.is_dir() and progress.dest_looks_complete(prog, dest_hint):
+                with _lock:
+                    _cards[card_id] = {
+                        "card_id": card_id,
+                        "mount": str(card_root),
+                        "status": "completed",
+                        "message": f"Already on SSD: {dest_hint}",
+                        "dest": str(dest_hint),
+                        "bytes_done": prog.get("bytes_total") or 0,
+                        "bytes_total": prog.get("bytes_total") or 0,
+                        "speed_mbps": 0,
+                        "eta_seconds": 0,
+                        "started_at": time.time(),
+                    }
+                continue
+            _log_line(
+                f"{card_id}: progress file says complete but SSD folder empty/incomplete — re-copying",
+                kind="error",
+            )
+            progress.clear_progress(card_root)
+            prog = None
 
         _start_card_job(card_root, card_id, batch, mode, ssd1, ssd2, s3_uri, prog)
+
+
+def _resolve_card_id(vol: dict) -> str:
+    raw = (vol.get("card_id") or "").strip().upper()
+    if raw:
+        return raw
+    path = Path(str(vol.get("path") or ""))
+    # Windows drive root has empty .name — never use that as card id
+    name = path.name.strip().upper()
+    if name and name not in {path.anchor.strip("\\/").upper(), ""}:
+        if len(name) >= 2:
+            return name
+    # Last resort: drive letter
+    anchor = path.anchor.replace("\\", "").replace(":", "").replace("/", "").upper()
+    if anchor:
+        return f"DRIVE-{anchor}"
+    return ""
 
 
 def _start_card_job(
@@ -309,6 +350,7 @@ def _start_card_job(
         "status": "in_progress",
         "bytes_total": total,
     }
+    # Always re-bind dest to the SSD we just picked (avoid stale progress path)
     prog.update(
         {
             "batch": batch,
@@ -337,13 +379,15 @@ def _start_card_job(
             "started_at": time.time(),
         }
 
-    _log_line(f"{card_id}: starting copy to {dest}")
+    _log_line(f"{card_id}: starting copy → {dest} ({len(files)} files, {total} bytes)")
     thread = threading.Thread(
         target=_copy_card_worker,
         args=(card_root, card_id, batch, mode, s3_uri, files, dest, prog),
         daemon=True,
         name=f"copy-{card_id}",
     )
+    with _lock:
+        _copy_threads[card_id] = thread
     thread.start()
 
 
@@ -369,7 +413,8 @@ def _copy_card_worker(
     _update_card(
         card_id,
         status="copying",
-        message="Copying…",
+        message=f"Copying → {dest}",
+        dest=str(dest),
         bytes_done=0,
         bytes_total=total_bytes,
         files_done=0,
@@ -384,17 +429,16 @@ def _copy_card_worker(
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
+    saw_disk_write = False
 
     def _publish(current_file_bytes: int = 0, *, message: str | None = None, force: bool = False) -> None:
         nonlocal last_ui, last_live, last_speed_at
         now = time.time()
         live = done_bytes + max(0, current_file_bytes)
-        # Throttle UI to ~5/sec unless forced or message changed meaningfully
         if not force and message is None and now - last_ui < 0.2:
             return
         last_ui = now
         elapsed = max(0.1, now - started)
-        # Prefer recent window speed so bar doesn't look stuck at 0 on slow starts
         window = max(0.1, now - last_speed_at)
         delta = max(0, live - last_live)
         if delta > 0 and window >= 0.2:
@@ -407,6 +451,7 @@ def _copy_card_worker(
         eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
         payload = {
             "status": "copying",
+            "dest": str(dest),
             "bytes_done": live,
             "bytes_total": total_bytes,
             "files_done": files_done,
@@ -427,25 +472,43 @@ def _copy_card_worker(
             if progress.is_file_done(prog, rel, size, dest_file):
                 done_bytes += size
                 files_done += 1
+                saw_disk_write = True
                 _publish(0, message=f"Skipped (done): {rel}", force=True)
                 continue
 
-            _publish(0, message=f"Copying {rel}…", force=True)
+            if not src.is_file():
+                raise RuntimeError(f"Source missing on card: {src}")
 
-            def on_progress(written: int, _rel: str = rel) -> None:
+            _publish(0, message=f"Copying {rel} → {dest_file}", force=True)
+
+            def on_progress(written: int, _rel: str = rel, _dest_file: Path = dest_file) -> None:
+                nonlocal saw_disk_write
+                partial = _dest_file.with_suffix(_dest_file.suffix + ".partial")
+                if written > 0 and (partial.exists() or _dest_file.exists()):
+                    saw_disk_write = True
                 _publish(written, message=f"Copying {_rel}…")
 
             copy_file(src, dest_file, on_progress=on_progress)
+            if not dest_file.is_file() or dest_file.stat().st_size != size:
+                raise RuntimeError(
+                    f"Copy did not land on SSD: expected {dest_file} ({size} bytes)"
+                )
+            saw_disk_write = True
             progress.mark_file_done(card_root, prog, rel, size)
             done_bytes += size
             files_done += 1
             _publish(0, message=f"Copied {rel}", force=True)
 
-        _update_card(card_id, status="verifying", message="Verifying…")
+        if not saw_disk_write and files:
+            raise RuntimeError(
+                f"No files were written under {dest} — check SSD path and card folders"
+            )
+
+        _update_card(card_id, status="verifying", message=f"Verifying {dest}…", dest=str(dest))
         for item in files:
             dest_file = dest / item["rel"]
             if not dest_file.exists() or dest_file.stat().st_size != int(item["size"]):
-                raise RuntimeError(f"Verify failed: {item['rel']}")
+                raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
 
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
@@ -497,8 +560,11 @@ def _copy_card_worker(
 
         _log_line(f"{card_id}: complete → {dest}", kind="ok")
     except Exception as exc:  # noqa: BLE001
-        _update_card(card_id, status="error", message=str(exc))
+        _update_card(card_id, status="error", message=str(exc), dest=str(dest))
         _log_line(f"{card_id}: error — {exc}", kind="error")
+    finally:
+        with _lock:
+            _copy_threads.pop(card_id, None)
 
 
 def log_message(message: str, *, kind: str = "info") -> None:

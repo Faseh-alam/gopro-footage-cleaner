@@ -175,6 +175,7 @@ function renderCards(cards) {
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${card.message || ""}</div>
+      ${card.dest ? `<div class="hint">SSD dest: ${card.dest}</div>` : ""}
     `;
     el.cards.appendChild(div);
   }
