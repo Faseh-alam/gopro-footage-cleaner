@@ -111,9 +111,11 @@ async function refreshBatches(preferred) {
     const option = document.createElement("option");
     option.value = batch.name;
     const cards = batch.cards ? `${batch.cards} card(s)` : "empty";
-    const size = formatBytes(batch.bytes || 0);
-    option.textContent = `${batch.name} · ${cards} · ${size}`;
-    option.dataset.detail = `${batch.name}: ${cards}, ${size} on SSD — continue SD copy or upload to AWS`;
+    const size = batch.bytes ? ` · ${formatBytes(batch.bytes)}` : "";
+    option.textContent = `${batch.name} · ${cards}${size}`;
+    option.dataset.detail = `${batch.name}: ${cards}${
+      batch.bytes ? `, ${formatBytes(batch.bytes)} on SSD` : ""
+    } — continue SD copy or upload to AWS`;
     el.batchSelect.appendChild(option);
   }
 

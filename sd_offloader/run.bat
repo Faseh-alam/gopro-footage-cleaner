@@ -38,7 +38,7 @@ set "PYTHONPATH=%CD%"
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT% ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
 
 echo Starting SD Card Offloader on port %PORT%...
-start /MIN cmd /c "ping -n 3 127.0.0.1 >nul && start http://127.0.0.1:%PORT%/"
+start /MIN cmd /c "ping -n 2 127.0.0.1 >nul && start http://127.0.0.1:%PORT%/"
 
 "%VENV_PY%" -m offloader
 if errorlevel 1 (

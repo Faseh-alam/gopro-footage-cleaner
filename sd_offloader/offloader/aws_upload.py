@@ -599,7 +599,8 @@ def _discover_live_aws_processes() -> None:
         if "s3" not in cmd.lower() or "sync" not in cmd.lower():
             continue
         src, dest, batch = _parse_sync_cmdline(cmd)
-        bytes_total = _dir_bytes(Path(src)) if src else 0
+        # Never walk multi-TB trees here — that blocked server startup for minutes.
+        bytes_total = 0
 
         with _lock:
             # Prefer an existing job for same batch / dest / pid (revive interrupted).

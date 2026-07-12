@@ -11,8 +11,8 @@ from .detect import volume_free_bytes
 def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
     """Return batches found under ``Batches/`` on either SSD.
 
-    Each entry:
-      name, cards, card_ids, bytes, paths (ssd roots that contain it)
+    Fast path: only lists card folders (no full-tree size scan — that blocked
+    the UI for minutes on multi‑TB drives).
     """
     found: dict[str, dict] = {}
 
@@ -32,20 +32,16 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
                 continue
             name = entry.name
             card_ids: list[str] = []
-            total_bytes = 0
             try:
                 for child in entry.iterdir():
                     if not child.is_dir() or child.name.startswith("."):
                         continue
                     # Card folders look like C1234
-                    if len(child.name) >= 2 and child.name[0].upper() == "C":
-                        card_ids.append(child.name.upper())
-                    for path in child.rglob("*"):
-                        if path.is_file():
-                            try:
-                                total_bytes += path.stat().st_size
-                            except OSError:
-                                pass
+                    child_name = child.name.upper()
+                    if len(child_name) >= 5 and child_name[0] == "C" and child_name[1:5].isdigit():
+                        card_ids.append(child_name)
+                    elif child_name.startswith("C") and child_name[1:].isdigit():
+                        card_ids.append(child_name)
             except OSError:
                 continue
 
@@ -62,7 +58,6 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
             merged = sorted(set(row["card_ids"]) | set(card_ids))
             row["card_ids"] = merged
             row["cards"] = len(merged)
-            row["bytes"] = int(row["bytes"]) + int(total_bytes)
 
     rows = sorted(found.values(), key=lambda r: r["name"].lower())
     return rows

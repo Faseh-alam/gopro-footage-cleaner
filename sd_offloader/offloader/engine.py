@@ -122,7 +122,7 @@ def get_status() -> dict:
             "cards": sorted(cards, key=lambda c: c.get("started_at") or 0, reverse=True),
             "log": list(_log[-80:]),
             "aws_jobs": aws_upload.list_jobs()[:20],
-            "volumes": list_volumes(),
+            # volumes are heavy on Windows — UI loads them via /api/volumes
         }
     _save_snapshot(force=False)
     return status

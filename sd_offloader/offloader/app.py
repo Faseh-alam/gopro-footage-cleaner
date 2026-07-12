@@ -147,13 +147,24 @@ def create_app() -> Flask:
 
 def main() -> None:
     import os
+    import threading
 
     from .config import ensure_dirs, load_config
 
     ensure_dirs()
-    engine.restore_ui_state()
     cfg = load_config()
     port = int(os.environ.get("SD_OFFLOADER_PORT", cfg.get("port") or 8877))
     app = create_app()
+
+    def _boot() -> None:
+        try:
+            print("Restoring previous session / AWS jobs in background…")
+            engine.restore_ui_state()
+            print("Restore complete.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Restore warning: {exc}")
+
+    threading.Thread(target=_boot, daemon=True, name="offloader-restore").start()
     print(f"SD Card Offloader v{__version__} → http://127.0.0.1:{port}")
+    print("(Page should open immediately; heavy SSD scans run in the background.)")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
