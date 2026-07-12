@@ -31,6 +31,7 @@ def create_app() -> Flask:
                 "ok": True,
                 "version": __version__,
                 "aws_cli": aws_upload.aws_cli_available(),
+                "ready": True,
             }
         )
 

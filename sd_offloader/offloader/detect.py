@@ -22,6 +22,7 @@ SKIP_VOLUME_NAMES = {
 def _windows_drives() -> list[dict]:
     import ctypes
     import shutil
+    import threading
 
     volumes: list[dict] = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
@@ -31,25 +32,56 @@ def _windows_drives() -> list[dict]:
             continue
         bitmask >>= 1
         root = Path(f"{letter}:/")
-        drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(root))
+        try:
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(root))
+        except Exception:  # noqa: BLE001
+            continue
         # 2 = removable, 3 = fixed (USB SSDs sometimes report fixed)
         if drive_type not in {2, 3}:
             continue
-        try:
-            usage = shutil.disk_usage(root)
-        except OSError:
+
+        # disk_usage can hang for minutes on empty card readers / flaky USB —
+        # never block the web UI on that.
+        usage_box: dict = {}
+
+        def _usage(path: Path = root, box: dict = usage_box) -> None:
+            try:
+                box["usage"] = shutil.disk_usage(path)
+            except OSError as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=_usage, daemon=True)
+        thread.start()
+        thread.join(2.0)
+        if thread.is_alive() or "usage" not in usage_box:
             continue
-        label = _windows_volume_label(letter) or letter
+        usage = usage_box["usage"]
+        try:
+            label = _windows_volume_label(letter) or letter
+        except Exception:  # noqa: BLE001
+            label = letter
+        try:
+            gopro = _find_gopro_root(root)
+        except Exception:  # noqa: BLE001
+            gopro = None
+        try:
+            is_card = _looks_like_sd_card(root, label) if gopro else False
+        except Exception:  # noqa: BLE001
+            is_card = False
+        try:
+            card_id = _card_id_for(root, label)
+        except Exception:  # noqa: BLE001
+            card_id = None
         volumes.append(
             {
-                "path": str(root.resolve()),
+                "path": str(root.resolve()) if root.exists() else f"{letter}:\\",
                 "label": label,
                 "free_bytes": usage.free,
                 "total_bytes": usage.total,
                 "drive_type": "removable" if drive_type == 2 else "fixed",
-                "is_card_candidate": _looks_like_sd_card(root, label),
-                "card_id": _card_id_for(root, label),
-                "gopro_root": str(_find_gopro_root(root)) if _find_gopro_root(root) else None,
+                "is_card_candidate": is_card,
+                "card_id": card_id,
+                "gopro_root": str(gopro) if gopro else None,
             }
         )
     return volumes

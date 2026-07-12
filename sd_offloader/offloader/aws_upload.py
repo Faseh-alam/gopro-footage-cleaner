@@ -389,10 +389,19 @@ def restore_jobs_from_disk() -> None:
                     _jobs[job["id"]] = job
 
     _discover_orphan_logs()
-    _discover_live_aws_processes()
-    _finalize_checking_jobs()
     _persist_jobs()
     _ensure_monitor()
+
+    def _later_discover() -> None:
+        try:
+            _discover_live_aws_processes()
+            _finalize_checking_jobs()
+            _persist_jobs()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # PowerShell WMI process scan can hang — never do it on the request/startup path.
+    threading.Thread(target=_later_discover, daemon=True, name="aws-discover").start()
 
 
 def _finalize_checking_jobs() -> None:

@@ -283,24 +283,45 @@ function sessionPayload() {
 }
 
 async function bootstrap() {
-  const [health, config] = await Promise.all([api("/api/health"), api("/api/config")]);
-  el.appVersion.textContent = `v${health.version || "?"}`;
-  el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
-  el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
-
-  el.mode.value = config.mode || "ssd_only";
-  el.s3Uri.value = config.s3_uri || "";
-  await refreshVolumes();
-  if (config.ssd1) el.ssd1.value = config.ssd1;
-  if (config.ssd2) el.ssd2.value = config.ssd2;
-  await refreshBatches(config.last_batch || "");
-  if (config.last_batch && ![...el.batchSelect.options].some((o) => o.value === config.last_batch)) {
-    el.batchSelect.value = "__new__";
-    el.batchName.value = config.last_batch;
-    onBatchSelectChange();
+  setStatus("Connecting to offloader…");
+  try {
+    const health = await api("/api/health");
+    el.appVersion.textContent = `v${health.version || "?"}`;
+    el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
+    el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
+    setStatus(`Connected · v${health.version || "?"}`, "ok");
+  } catch (error) {
+    setStatus(`Cannot reach server: ${error.message}`, "error");
+    return;
   }
-  await pollStatus();
-  setInterval(pollStatus, 1000);
+
+  let config = {};
+  try {
+    config = await api("/api/config");
+    el.mode.value = config.mode || "ssd_only";
+    el.s3Uri.value = config.s3_uri || "";
+  } catch (error) {
+    setStatus(`Config load failed: ${error.message}`, "error");
+  }
+
+  setStatus("Loading drives (skipping hung card readers)…");
+  try {
+    await refreshVolumes();
+    if (config.ssd1) el.ssd1.value = config.ssd1;
+    if (config.ssd2) el.ssd2.value = config.ssd2;
+    await refreshBatches(config.last_batch || "");
+    if (config.last_batch && ![...el.batchSelect.options].some((o) => o.value === config.last_batch)) {
+      el.batchSelect.value = "__new__";
+      el.batchName.value = config.last_batch;
+      onBatchSelectChange();
+    }
+    setStatus("Ready", "ok");
+  } catch (error) {
+    setStatus(`Drive list failed: ${error.message} — click Refresh drives`, "error");
+  }
+
+  pollStatus().catch(() => {});
+  setInterval(() => pollStatus().catch(() => {}), 1000);
 }
 
 el.refreshVolumes.addEventListener("click", async () => {
