@@ -514,7 +514,8 @@ function addWorkspaceTab() {
   const ws = createWorkspace();
   state.workspaces.push(ws);
   applyWorkspace(ws);
-  setStatus("New card tab — pick an SD card and Scan", "ok");
+  setStatus("New card tab — pick a card (auto-scans)", "ok");
+  refreshSdCards({ quiet: false, autoScan: true });
 }
 
 function ensureWorkspaces() {
@@ -581,7 +582,10 @@ function renderFileList() {
   el.fileList.innerHTML = "";
   const doneCount = state.donePaths.size;
   const trimCount = state.trimmingPaths.size;
-  el.listSummary.textContent = `${state.videos.length} left · ${doneCount} done · ${trimCount} trimming`;
+  const bits = [];
+  if (doneCount) bits.push(`${doneCount} done`);
+  if (trimCount) bits.push(`${trimCount} trimming`);
+  el.listSummary.textContent = bits.join(" · ");
 
   for (const video of items) {
     const btn = document.createElement("button");
@@ -768,7 +772,7 @@ async function softRefreshLabelScan() {
     }
     state.videos = fresh;
     state.labelProgress = data.progress || state.labelProgress;
-    el.scanSummary.textContent = `${fresh.length} files`;
+    el.scanSummary.textContent = selectedSdCardLabel() || "";
     saveActiveWorkspace();
     const idx = currentPath ? state.videos.findIndex((v) => v.path === currentPath) : -1;
     if (idx >= 0) {
@@ -1298,10 +1302,11 @@ function moveTaskSelection(delta) {
 }
 
 function focusTaskSearch() {
-  if (!el.taskSearch || state.phase !== "label") return;
+  if (!el.taskSearch) return;
   el.taskSearch.focus();
   el.taskSearch.select();
-  setStatus("Search a task — ↑↓ to choose, Enter to move", "ok");
+  renderTasks(selectedTask() || state.lastLabelTask || undefined);
+  setStatus("Search a task — ↑↓ to choose, Enter to label", "ok");
 }
 
 function leaveTaskSearch({ clear = false } = {}) {
@@ -1551,10 +1556,10 @@ function applySelectedPath(scanPath, { label = "", manual = false } = {}) {
   }
 }
 
-async function refreshSdCards({ quiet = false } = {}) {
+async function refreshSdCards({ quiet = false, autoScan = false } = {}) {
   if (!el.sdCardSelect) return;
   const previous = el.sdCardSelect.value;
-  el.refreshSdBtn.disabled = true;
+  if (el.refreshSdBtn) el.refreshSdBtn.disabled = true;
   if (!quiet) setStatus("Detecting SD cards…");
   try {
     const data = await api("/api/eager/sd-cards");
@@ -1564,14 +1569,10 @@ async function refreshSdCards({ quiet = false } = {}) {
     if (!cards.length) {
       const empty = document.createElement("option");
       empty.value = "";
-      empty.textContent = "No C#### SD cards found";
+      empty.textContent = "No card";
       el.sdCardSelect.appendChild(empty);
       el.sourcePath.value = "";
-      if (el.sdCardHint) {
-        el.sdCardHint.textContent =
-          "No card detected. Plug in a card named C1234, then press Refresh — or use Browse…";
-      }
-      if (!quiet) setStatus("No SD cards detected", "error");
+      if (!quiet) setStatus("No SD card detected", "error");
       updateContextHint();
       return;
     }
@@ -1581,9 +1582,7 @@ async function refreshSdCards({ quiet = false } = {}) {
       option.value = card.scan_path || card.path;
       option.dataset.label = card.id || card.label || "";
       option.dataset.volume = card.path || "";
-      const goproNote =
-        card.gopro_root && card.scan_path === card.gopro_root ? " · DCIM/GoPro" : "";
-      option.textContent = `${card.id || card.label}${goproNote}`;
+      option.textContent = card.id || card.label || "Card";
       el.sdCardSelect.appendChild(option);
     }
 
@@ -1592,53 +1591,36 @@ async function refreshSdCards({ quiet = false } = {}) {
       chosen = previous;
     } else if (cards.length === 1) {
       chosen = cards[0].scan_path || cards[0].path;
+    } else {
+      chosen = cards[0].scan_path || cards[0].path;
     }
 
-    if (cards.length > 1 && !chosen) {
-      const placeholder = document.createElement("option");
-      placeholder.value = "";
-      placeholder.textContent = `Select SD card (${cards.length} found)…`;
-      el.sdCardSelect.insertBefore(placeholder, el.sdCardSelect.firstChild);
-      el.sdCardSelect.value = "";
-      el.sourcePath.value = "";
-    } else if (chosen) {
+    if (chosen) {
       el.sdCardSelect.value = chosen;
       applySelectedPath(chosen, { label: selectedSdCardLabel() });
     }
 
-    if (el.sdCardHint) {
-      el.sdCardHint.textContent =
-        cards.length === 1
-          ? `Selected ${cards[0].id} automatically — press Scan footage`
-          : `${cards.length} SD cards found — pick one, then Scan footage`;
-    }
     if (!quiet) {
-      setStatus(
-        cards.length === 1
-          ? `SD card ${cards[0].id} ready`
-          : `${cards.length} SD cards detected — pick one`,
-        "ok",
-      );
+      setStatus(chosen ? `${selectedSdCardLabel() || "Card"} ready` : "Pick an SD card", "ok");
     }
     updateContextHint();
+
+    if (autoScan && chosen) {
+      await scanSource();
+    }
   } catch (error) {
-    el.sdCardSelect.innerHTML = '<option value="">SD card detection failed</option>';
+    el.sdCardSelect.innerHTML = '<option value="">Detection failed</option>';
     if (!quiet) setStatus(error.message, "error");
   } finally {
-    el.refreshSdBtn.disabled = false;
+    if (el.refreshSdBtn) el.refreshSdBtn.disabled = false;
   }
 }
 
 function onSdCardChanged() {
   const path = (el.sdCardSelect?.value || "").trim();
-  if (!path) {
-    el.sourcePath.value = "";
-    updateContextHint();
-    return;
-  }
+  if (!path) return;
   applySelectedPath(path, { label: selectedSdCardLabel() });
-  setStatus(`Selected ${selectedSdCardLabel() || path}`, "ok");
-  updateContextHint();
+  scanSource();
 }
 
 async function loadTasks() {
@@ -1728,7 +1710,7 @@ async function scanSource() {
     saveActiveWorkspace();
     renderCardTabs();
     renderFileList();
-    el.scanSummary.textContent = `${state.videos.length} files`;
+    el.scanSummary.textContent = selectedSdCardLabel() || "";
     if (state.videos.length) {
       showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
       await loadVideo(0);
@@ -2061,8 +2043,8 @@ el.snapPrevBtn?.addEventListener("click", () => goToSnapshot(-1));
 el.snapNextBtn?.addEventListener("click", () => goToSnapshot(1));
 el.fineBackBtn?.addEventListener("click", () => fineTune(-3));
 el.fineFwdBtn?.addEventListener("click", () => fineTune(3));
-el.markStartBtn.addEventListener("click", markStart);
-el.markEndBtn.addEventListener("click", markEnd);
+el.markStartBtn?.addEventListener("click", markStart);
+el.markEndBtn?.addEventListener("click", markEnd);
 
 el.scrubTrack.addEventListener("mousedown", (event) => {
   if (!currentVideo()) return;
@@ -2071,12 +2053,12 @@ el.scrubTrack.addEventListener("mousedown", (event) => {
   seekToFraction((event.clientX - rect.left) / rect.width);
 });
 
-el.browseFolderBtn.addEventListener("click", chooseFootageFolder);
-el.refreshSdBtn?.addEventListener("click", () => refreshSdCards());
+el.browseFolderBtn?.addEventListener("click", chooseFootageFolder);
+el.refreshSdBtn?.addEventListener("click", () => refreshSdCards({ autoScan: true }));
 el.sdCardSelect?.addEventListener("change", onSdCardChanged);
-el.scanBtn.addEventListener("click", scanSource);
-el.undoClipBtn.addEventListener("click", undoMark);
-el.trimBtn.addEventListener("click", trimMarkedClip);
+el.scanBtn?.addEventListener("click", scanSource);
+el.undoClipBtn?.addEventListener("click", undoMark);
+el.trimBtn?.addEventListener("click", trimMarkedClip);
 el.deleteFileBtn?.addEventListener("click", deleteCurrentFile);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
 el.addCardTab?.addEventListener("click", addWorkspaceTab);
@@ -2188,18 +2170,22 @@ document.addEventListener("keydown", (event) => {
 });
 
 loadTasks()
-  .then(() => Promise.all([api("/api/health"), api("/api/eager/config"), refreshSdCards({ quiet: true })]))
-  .then(([health, perf]) => {
-    if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
-    state.perf = { ...state.perf, ...perf };
+  .then(() => {
     ensureWorkspaces();
     renderCardTabs();
     setPhase("clean");
+    return Promise.all([
+      api("/api/health"),
+      api("/api/eager/config"),
+      refreshSdCards({ quiet: true, autoScan: true }),
+    ]);
+  })
+  .then(([health, perf]) => {
+    if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
+    state.perf = { ...state.perf, ...perf };
     startGlobalTrimPolling();
     if (health.ffmpeg_ok === false) {
       setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
-    } else if (perf.lite_mode && perf.hint) {
-      setStatus(perf.hint, "ok");
     }
   })
   .catch((error) => setStatus(error.message, "error"));
