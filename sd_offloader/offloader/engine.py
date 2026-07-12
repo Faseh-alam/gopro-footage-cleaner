@@ -246,8 +246,22 @@ def _scan_for_cards() -> None:
                 # Real in-flight worker — do not restart
                 if existing.get("mount") == str(card_root):
                     continue
-            if existing and existing.get("status") == "completed" and thread_alive:
-                continue
+            # Finished (or finishing) this session. After wipe the volume may still be
+            # mounted empty — never re-queue that as ERROR. Only re-offload when the
+            # card is "completed" and new labeled MP4s appear.
+            if existing and existing.get("status") in {
+                "completed",
+                "wiping",
+                "ejecting",
+                "uploading",
+            }:
+                if not inventory.list_transfer_files(card_root):
+                    if existing.get("status") != "completed" and not thread_alive:
+                        existing["status"] = "completed"
+                        existing["message"] = "Ready — card finished"
+                    continue
+                if existing.get("status") != "completed":
+                    continue
             # Stale UI "copying" with dead thread must be restarted
             if existing and existing.get("status") in ACTIVE_COPY_STATUSES and not thread_alive:
                 existing["status"] = "interrupted"
@@ -312,6 +326,11 @@ def _start_card_job(
     files = inventory.list_transfer_files(card_root)
     total = inventory.total_bytes(files)
     if not files:
+        with _lock:
+            existing = _cards.get(card_id)
+            if existing and existing.get("status") == "completed":
+                # Empty after wipe/eject — keep DONE, never downgrade to ERROR.
+                return
         _log_line(f"{card_id}: no task MP4 folders under DCIM/…GOPRO", kind="error")
         with _lock:
             _cards[card_id] = {
@@ -518,11 +537,29 @@ def _copy_card_worker(
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
-        _update_card(card_id, status="wiping", message="Wiping transferred folders on card…")
-        eject.wipe_transferred_tasks(card_root, task_names)
+        # Mark DONE before wipe/eject so a mid-wipe watcher pass cannot flip us to ERROR.
+        _update_card(
+            card_id,
+            status="completed",
+            message="Copy verified — wiping & ejecting…",
+            dest=str(dest),
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
 
-        _update_card(card_id, status="ejecting", message="Ejecting card…")
-        eject.eject_volume(card_root)
+        try:
+            _update_card(card_id, status="wiping", message="Wiping transferred folders on card…")
+            # Keep completed semantics if wipe/eject races the watcher.
+            eject.wipe_transferred_tasks(card_root, task_names)
+        except Exception as wipe_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
+
+        try:
+            _update_card(card_id, status="ejecting", message="Ejecting card…")
+            eject.eject_volume(card_root)
+        except Exception as eject_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
 
         if mode == "ssd_and_aws" and s3_uri:
             _update_card(card_id, status="uploading", message="Queued for AWS upload…")

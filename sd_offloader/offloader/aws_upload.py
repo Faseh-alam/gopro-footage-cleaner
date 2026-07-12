@@ -35,6 +35,10 @@ _COMPLETED_RE = re.compile(
     re.IGNORECASE,
 )
 _FILES_REMAINING_RE = re.compile(r"with\s+(\d+)\s+file\(s\)\s+remaining", re.IGNORECASE)
+_UPLOAD_RE = re.compile(
+    r"^(?:upload|copy|download):\s+(.+?)\s+to\s+s3://",
+    re.IGNORECASE,
+)
 _BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\\"'\s/]+)", re.IGNORECASE)
 _SYNC_ARGS_RE = re.compile(
     r"s3\s+sync\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
@@ -736,19 +740,25 @@ def _ensure_monitor() -> None:
 def _monitor_loop() -> None:
     ticks = 0
     while True:
+        ticks += 1
+        # Keep each step isolated — a log-parse bug must not block S3 progress.
         try:
-            ticks += 1
             _poll_all_jobs()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             _poll_s3_progress_for_jobs()
-            if platform.system() == "Windows":
+        except Exception:  # noqa: BLE001
+            pass
+        if platform.system() == "Windows":
+            try:
                 _refresh_process_only_jobs()
-                # Re-scan often so interrupted/checking jobs revive while CMD still runs.
                 if ticks % 5 == 0:
                     _discover_live_aws_processes()
                     _finalize_checking_jobs()
                     _persist_jobs()
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                pass
         time.sleep(1.0)
 
 
