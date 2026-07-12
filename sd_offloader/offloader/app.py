@@ -148,24 +148,69 @@ def create_app() -> Flask:
 
 def main() -> None:
     import os
+    import sys
     import threading
+    import time
+    import urllib.error
+    import urllib.request
+    import webbrowser
 
     from .config import ensure_dirs, load_config
+
+    # Unbuffered-ish logs so the CMD window shows progress immediately
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
 
     ensure_dirs()
     cfg = load_config()
     port = int(os.environ.get("SD_OFFLOADER_PORT", cfg.get("port") or 8877))
+    host = os.environ.get("SD_OFFLOADER_HOST", "127.0.0.1")
+    open_browser = os.environ.get("SD_OFFLOADER_OPEN_BROWSER", "1") != "0"
+    url = f"http://{host}:{port}/"
+    health_url = f"http://{host}:{port}/api/health"
+
+    print(f"Creating app (v{__version__})…", flush=True)
     app = create_app()
+    print("App created.", flush=True)
 
     def _boot() -> None:
+        # Give Flask a moment to bind before any disk/WMI work.
+        time.sleep(2.0)
         try:
-            print("Restoring previous session / AWS jobs in background…")
+            print("Background: restoring session / AWS job list…", flush=True)
             engine.restore_ui_state()
-            print("Restore complete.")
+            print("Background: restore finished.", flush=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"Restore warning: {exc}")
+            print(f"Background restore warning: {exc}", flush=True)
+
+    def _open_when_ready() -> None:
+        if not open_browser:
+            return
+        for attempt in range(60):
+            try:
+                with urllib.request.urlopen(health_url, timeout=2) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        print(f"Ready — opening browser: {url}", flush=True)
+                        webbrowser.open(url)
+                        return
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+            time.sleep(0.5)
+        print(
+            f"Server health check did not succeed. Open manually: {url}",
+            flush=True,
+        )
 
     threading.Thread(target=_boot, daemon=True, name="offloader-restore").start()
-    print(f"SD Card Offloader v{__version__} → http://127.0.0.1:{port}")
-    print("(Page should open immediately; heavy SSD scans run in the background.)")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    threading.Thread(target=_open_when_ready, daemon=True, name="offloader-browser").start()
+
+    print(f"SD Card Offloader v{__version__} listening on {url}", flush=True)
+    print("If the browser does not open, paste that URL into Chrome.", flush=True)
+    try:
+        app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+    except OSError as exc:
+        print(f"ERROR: could not bind {host}:{port} — {exc}", flush=True)
+        print("Another program may still be using the port. Close it and retry.", flush=True)
+        raise
