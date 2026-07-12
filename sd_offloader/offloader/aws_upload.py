@@ -38,7 +38,13 @@ _UPLOAD_RE = re.compile(
     r"^(?:upload|copy|download):\s+(.+?)\s+to\s+s3://",
     re.IGNORECASE,
 )
-_BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\/]+)[\\/]", re.IGNORECASE)
+_BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\\"'\s/]+)", re.IGNORECASE)
+_SYNC_ARGS_RE = re.compile(
+    r"s3\s+sync\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
+    re.IGNORECASE,
+)
+_TOTAL_SIZE_RE = re.compile(r"Total Size:\s*(\d+)", re.IGNORECASE)
+_TOTAL_OBJECTS_RE = re.compile(r"Total Objects:\s*(\d+)", re.IGNORECASE)
 
 
 def aws_cli_available() -> bool:
@@ -459,6 +465,52 @@ def _discover_orphan_logs() -> None:
             }
 
 
+def _parse_sync_cmdline(cmd: str) -> tuple[str | None, str | None, str | None]:
+    """Return (local_source, s3_dest, batch_name) from an aws s3 sync command line."""
+    match = _SYNC_ARGS_RE.search(cmd or "")
+    if not match:
+        return None, None, None
+    src = (match.group(1) or match.group(2) or "").strip().rstrip("\\/")
+    dest = (match.group(3) or match.group(4) or "").strip()
+    if dest and not dest.endswith("/"):
+        dest += "/"
+    batch = None
+    if src:
+        bm = _BATCH_IN_PATH_RE.search(src)
+        if bm:
+            batch = bm.group(1).strip()
+    if not batch and dest:
+        parts = [p for p in dest.rstrip("/").split("/") if p]
+        if parts:
+            batch = parts[-1]
+    return src or None, dest or None, batch
+
+
+def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
+    """Return (total_bytes, total_objects) already on S3 under dest, or None."""
+    if not dest.startswith("s3://"):
+        return None
+    try:
+        result = subprocess.run(
+            ["aws", "s3", "ls", dest, "--recursive", "--summarize"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    size_m = _TOTAL_SIZE_RE.search(text)
+    obj_m = _TOTAL_OBJECTS_RE.search(text)
+    if not size_m:
+        return None
+    size = int(size_m.group(1))
+    objects = int(obj_m.group(1)) if obj_m else 0
+    return size, objects
+
+
 def _discover_live_aws_processes() -> None:
     """Detect aws s3 sync still running in CMD (including pre-log older uploads)."""
     if platform.system() != "Windows":
@@ -492,30 +544,46 @@ def _discover_live_aws_processes() -> None:
         pid = row.get("ProcessId")
         if "s3" not in cmd.lower() or "sync" not in cmd.lower():
             continue
-        batch = None
-        match = _BATCH_IN_PATH_RE.search(cmd)
-        if match:
-            batch = match.group(1)
-        # Skip if we already track a running job for this batch with a log.
+        src, dest, batch = _parse_sync_cmdline(cmd)
+        bytes_total = _dir_bytes(Path(src)) if src else 0
+
         with _lock:
-            already = any(
-                j.get("status") == "running"
-                and (
-                    (batch and j.get("batch") == batch)
-                    or (j.get("log_path") and Path(str(j["log_path"])).is_file())
-                )
-                for j in _jobs.values()
-            )
-        if already and batch:
-            # Prefer log-backed jobs; still record pid hint on matching batch.
-            with _lock:
-                for j in _jobs.values():
-                    if j.get("status") == "running" and j.get("batch") == batch:
-                        j["aws_pid"] = pid
-                        j["message"] = j.get("message") or "CMD aws s3 sync running"
-            continue
-        job_id = f"aws:proc:{pid}"
-        with _lock:
+            # Prefer an existing running job for same batch / dest / pid.
+            existing_id = None
+            for jid, j in _jobs.items():
+                if j.get("status") != "running":
+                    continue
+                if j.get("aws_pid") == pid:
+                    existing_id = jid
+                    break
+                if dest and j.get("dest") == dest:
+                    existing_id = jid
+                    break
+                if batch and j.get("batch") == batch and j.get("log_path"):
+                    existing_id = jid
+                    break
+            if existing_id:
+                job = _jobs[existing_id]
+                job["aws_pid"] = pid
+                if src and not job.get("sources"):
+                    job["sources"] = [src]
+                if dest and not job.get("dest"):
+                    job["dest"] = dest
+                if batch and (
+                    not job.get("batch")
+                    or "s3:" in str(job.get("batch"))
+                    or str(job.get("batch")).startswith("pid-")
+                ):
+                    job["batch"] = batch
+                if bytes_total and not job.get("bytes_total"):
+                    job["bytes_total"] = bytes_total
+                if not job.get("log_path"):
+                    job["message"] = (
+                        f"Live CMD upload (PID {pid}) — progress from S3 size vs local"
+                    )
+                continue
+
+            job_id = f"aws:proc:{pid}"
             if job_id in _jobs:
                 continue
             _jobs[job_id] = {
@@ -523,28 +591,30 @@ def _discover_live_aws_processes() -> None:
                 "status": "running",
                 "batch": batch or f"pid-{pid}",
                 "card_id": None,
-                "dest": "",
+                "dest": dest or "",
                 "bytes_done": 0,
-                "bytes_total": 0,
+                "bytes_total": bytes_total,
                 "files_done": 0,
                 "speed_mbps": 0.0,
                 "eta_seconds": None,
                 "message": (
-                    "Detected live aws s3 sync in CMD "
-                    f"(PID {pid}"
-                    + (f", batch {batch}" if batch else "")
-                    + "). Leave that window open — "
-                    "byte-level progress needs a log-backed upload (new uploads)."
+                    f"Live CMD upload (PID {pid}"
+                    + (f", {batch}" if batch else "")
+                    + ") — measuring progress via S3 (safe to leave CMD open)"
                 ),
-                "log": [cmd[:300]],
+                "log": [cmd[:400]],
                 "started_at": time.time(),
                 "external": True,
                 "console": True,
                 "aws_pid": pid,
+                "sources": [src] if src else [],
                 "log_path": "",
                 "log_offset": 0,
                 "using_completed_meter": False,
                 "transferred": 0,
+                "progress_via_s3": True,
+                "last_s3_poll": 0.0,
+                "last_s3_bytes": 0,
             }
 
 
@@ -575,8 +645,12 @@ def _monitor_loop() -> None:
     while True:
         try:
             _poll_all_jobs()
+            _poll_s3_progress_for_jobs()
             if platform.system() == "Windows":
                 _refresh_process_only_jobs()
+                # Re-scan occasionally so a late-started CMD still gets picked up.
+                if int(time.time()) % 20 == 0:
+                    _discover_live_aws_processes()
         except Exception:  # noqa: BLE001
             pass
         time.sleep(1.0)
@@ -590,6 +664,108 @@ def _poll_all_jobs() -> None:
         if _ingest_log_progress(snapshot["id"]):
             dirty = True
     if dirty:
+        _persist_jobs()
+
+
+def _poll_s3_progress_for_jobs() -> None:
+    """For CMD uploads (especially without logs), compare S3 size vs local folder size."""
+    now = time.time()
+    with _lock:
+        targets = []
+        for jid, job in _jobs.items():
+            if job.get("status") != "running":
+                continue
+            dest = str(job.get("dest") or "")
+            # Enrich from stored cmdline if needed.
+            if not dest and job.get("log"):
+                src, parsed_dest, batch = _parse_sync_cmdline(str(job["log"][0]))
+                if parsed_dest:
+                    job["dest"] = parsed_dest
+                    dest = parsed_dest
+                if src and not job.get("sources"):
+                    job["sources"] = [src]
+                if batch and (
+                    not job.get("batch")
+                    or "s3:" in str(job.get("batch"))
+                    or str(job.get("batch")).startswith("pid-")
+                ):
+                    job["batch"] = batch
+            sources = list(job.get("sources") or [])
+            if not int(job.get("bytes_total") or 0) and sources:
+                # Defer heavy scan outside lock via marker.
+                job["_need_total"] = sources[0]
+            if not dest.startswith("s3://"):
+                continue
+            # Always use S3 meter when there is no log, or log has not moved yet.
+            log_path = str(job.get("log_path") or "")
+            log_quiet = (not log_path) or int(job.get("bytes_done") or 0) == 0
+            if not log_quiet and not job.get("progress_via_s3") and not job.get("aws_pid"):
+                continue
+            last = float(job.get("last_s3_poll") or 0)
+            if now - last < 12:
+                continue
+            job["last_s3_poll"] = now
+            targets.append(
+                (
+                    jid,
+                    dest,
+                    int(job.get("bytes_total") or 0),
+                    sources,
+                    float(job.get("last_s3_bytes") or 0),
+                    float(job.get("last_s3_poll_at") or job.get("started_at") or now),
+                    str(job.get("_need_total") or ""),
+                )
+            )
+            job.pop("_need_total", None)
+
+    for job_id, dest, bytes_total, sources, prev_bytes, prev_at, need_total in targets:
+        if bytes_total <= 0:
+            root = need_total or (sources[0] if sources else "")
+            if root:
+                bytes_total = _dir_bytes(Path(root))
+                with _lock:
+                    if job_id in _jobs and bytes_total:
+                        _jobs[job_id]["bytes_total"] = bytes_total
+        summary = _s3_prefix_summary(dest)
+        if summary is None:
+            with _lock:
+                job = _jobs.get(job_id)
+                if job and job.get("status") == "running":
+                    job["message"] = f"Uploading — querying S3 size for {dest}…"
+            continue
+        s3_bytes, s3_objects = summary
+        elapsed = max(0.1, now - prev_at)
+        delta = max(0, s3_bytes - prev_bytes)
+        speed = (delta / (1024 * 1024)) / elapsed if delta > 0 else 0.0
+        with _lock:
+            job = _jobs.get(job_id)
+            if not job or job.get("status") != "running":
+                continue
+            if bytes_total and not job.get("bytes_total"):
+                job["bytes_total"] = bytes_total
+            total = int(job.get("bytes_total") or bytes_total or 0)
+            # Prefer max(log bytes, s3 bytes) so we never go backwards oddly.
+            job["bytes_done"] = min(total, s3_bytes) if total else s3_bytes
+            job["files_done"] = max(int(job.get("files_done") or 0), s3_objects)
+            job["last_s3_bytes"] = s3_bytes
+            job["last_s3_poll_at"] = now
+            job["progress_via_s3"] = True
+            if speed > 0:
+                job["speed_mbps"] = speed
+            elif job["bytes_done"] > 0:
+                since = max(0.1, now - float(job.get("started_at") or now))
+                job["speed_mbps"] = (job["bytes_done"] / (1024 * 1024)) / since
+            remaining = max(0, total - int(job["bytes_done"]))
+            mib_s = float(job.get("speed_mbps") or 0)
+            if mib_s > 0 and remaining > 0:
+                job["eta_seconds"] = int(remaining / (mib_s * 1024 * 1024))
+            elif total and job["bytes_done"] >= total:
+                job["eta_seconds"] = 0
+            pct = int((job["bytes_done"] / total) * 100) if total else 0
+            job["message"] = (
+                f"Uploading via CMD — {pct}% on S3 "
+                f"({job['bytes_done']}/{total or '?'} bytes, {s3_objects} objects)"
+            )
         _persist_jobs()
 
 
