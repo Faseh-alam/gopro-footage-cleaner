@@ -117,9 +117,9 @@ def create_app() -> Flask:
                     ssd1=ssd1,
                     ssd2=ssd2,
                     card_id=None,
-                    external_window=True,
+                    show_console=True,
                 )
-                engine.log_message(f"AWS upload window opened for batch {batch}")
+                engine.log_message(f"AWS CMD upload started for batch {batch} (survives restart; UI tracks log)")
             else:
                 job = engine.upload_batch_now(external_window=True)
         except Exception as exc:  # noqa: BLE001
@@ -151,6 +151,7 @@ def main() -> None:
     from .config import ensure_dirs, load_config
 
     ensure_dirs()
+    engine.restore_ui_state()
     cfg = load_config()
     port = int(os.environ.get("SD_OFFLOADER_PORT", cfg.get("port") or 8877))
     app = create_app()

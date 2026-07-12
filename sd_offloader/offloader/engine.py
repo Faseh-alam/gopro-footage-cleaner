@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
 
 from . import aws_upload, eject, inventory, progress, space
-from .config import load_config, save_config
+from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
 
@@ -24,6 +25,8 @@ _session: dict = {
 _cards: dict[str, dict] = {}  # card_id -> job state
 _watcher_started = False
 _log: list[dict] = []
+SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
+_last_snapshot_at = 0.0
 
 
 def _log_line(message: str, *, kind: str = "info") -> None:
@@ -31,18 +34,89 @@ def _log_line(message: str, *, kind: str = "info") -> None:
         _log.append({"t": time.time(), "kind": kind, "message": message})
         if len(_log) > 300:
             del _log[:-300]
+    _save_snapshot(force=False)
+
+
+def _save_snapshot(*, force: bool = False) -> None:
+    """Persist session/cards/log so reopening the UI still shows live transfers."""
+    global _last_snapshot_at
+    now = time.time()
+    if not force and now - _last_snapshot_at < 1.0:
+        return
+    _last_snapshot_at = now
+    ensure_dirs()
+    with _lock:
+        payload = {
+            "session": dict(_session),
+            "cards": [dict(c) for c in _cards.values()],
+            "log": list(_log[-120:]),
+            "saved_at": now,
+        }
+    try:
+        SNAPSHOT_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def restore_ui_state() -> None:
+    """Load last SD→SSD snapshot and AWS jobs after server start / browser reopen."""
+    aws_upload.restore_jobs_from_disk()
+    if not SNAPSHOT_FILE.exists():
+        return
+    try:
+        data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict):
+        return
+    with _lock:
+        session = data.get("session")
+        if isinstance(session, dict):
+            _session.update(session)
+            # Watcher must be re-armed after process restart.
+            if _session.get("active"):
+                _session["active"] = True
+        cards = data.get("cards")
+        if isinstance(cards, list):
+            for row in cards:
+                if not isinstance(row, dict):
+                    continue
+                card_id = str(row.get("card_id") or "").upper()
+                if not card_id:
+                    continue
+                status = row.get("status") or ""
+                if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
+                    # In-flight copy threads died with the old process.
+                    if status in {"copying", "verifying"}:
+                        row = dict(row)
+                        row["status"] = "interrupted"
+                        row["message"] = (
+                            "Server restarted mid-copy — re-insert card or Start session "
+                            "to resume (completed files are skipped)"
+                        )
+                        row["speed_mbps"] = 0.0
+                _cards[card_id] = dict(row)
+        lines = data.get("log")
+        if isinstance(lines, list):
+            _log.clear()
+            _log.extend(line for line in lines if isinstance(line, dict))
+    if _session.get("active"):
+        _ensure_watcher()
+        _log_line("Restored session — watching for SD cards again", kind="ok")
 
 
 def get_status() -> dict:
     with _lock:
         cards = [dict(c) for c in _cards.values()]
-        return {
+        status = {
             "session": dict(_session),
             "cards": sorted(cards, key=lambda c: c.get("started_at") or 0, reverse=True),
             "log": list(_log[-80:]),
             "aws_jobs": aws_upload.list_jobs()[:20],
             "volumes": list_volumes(),
         }
+    _save_snapshot(force=False)
+    return status
 
 
 def start_session(
@@ -277,6 +351,7 @@ def _update_card(card_id: str, **kwargs) -> None:
     with _lock:
         if card_id in _cards:
             _cards[card_id].update(kwargs)
+    _save_snapshot(force=False)
 
 
 def _copy_card_worker(
@@ -370,12 +445,12 @@ def _copy_card_worker(
                     ssd1=ssd1,
                     ssd2=ssd2,
                     card_id=card_id,
-                    external_window=True,
+                    show_console=True,
                 )
                 _update_card(
                     card_id,
                     status="completed",
-                    message=f"Ready — AWS job {job.get('id')} started",
+                    message=f"Ready — AWS upload live in UI ({job.get('id')})",
                     speed_mbps=0,
                     eta_seconds=0,
                     bytes_done=total_bytes,
@@ -457,7 +532,7 @@ def upload_batch_now(*, external_window: bool = True) -> dict:
         ssd1=ssd1,
         ssd2=ssd2,
         card_id=None,
-        external_window=external_window,
+        show_console=external_window,
     )
-    _log_line(f"AWS upload window opened for batch {batch} → {job.get('dest')}")
+    _log_line(f"AWS upload started for batch {batch} → {job.get('dest')} (live progress in UI)")
     return job

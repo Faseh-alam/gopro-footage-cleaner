@@ -149,7 +149,11 @@ function renderCards(cards) {
     el.cardsSummary.textContent = "No cards yet";
     return;
   }
-  const active = cards.filter((c) => !["completed", "error"].includes(c.status)).length;
+  const active = cards.filter((c) =>
+    ["copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"].includes(
+      c.status,
+    ),
+  ).length;
   const done = cards.filter((c) => c.status === "completed").length;
   el.cardsSummary.textContent = `${cards.length} seen · ${active} active · ${done} done`;
 
@@ -168,6 +172,7 @@ function renderCards(cards) {
         <span>${Number(card.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(card.eta_seconds)}</span>
         <span>${card.files_done || 0}/${card.files_total || 0} files</span>
+        <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${card.message || ""}</div>
     `;
@@ -178,34 +183,55 @@ function renderCards(cards) {
 function renderAwsJobs(jobs) {
   el.awsJobs.innerHTML = "";
   if (!jobs.length) {
-    el.awsJobs.innerHTML = '<div class="hint">No AWS uploads yet — use “Upload this batch to AWS (CMD)”</div>';
+    el.awsJobs.innerHTML =
+      '<div class="hint">No AWS uploads yet — use “Upload this batch to AWS (CMD)” or SSD+AWS mode</div>';
     return;
   }
-  for (const job of jobs.slice(0, 8)) {
-    const external = job.external || job.status === "external";
+  for (const job of jobs.slice(0, 12)) {
     const pct = job.bytes_total ? Math.min(100, (job.bytes_done / job.bytes_total) * 100) : 0;
+    const statusLabel =
+      job.status === "running"
+        ? job.console
+          ? "live + console"
+          : "uploading"
+        : job.status || "";
+    const recent = (job.log || []).slice(-4);
     const div = document.createElement("div");
     div.className = "job";
     div.innerHTML = `
       <div class="job-top">
-        <span>${job.batch || ""}${job.card_id ? " / " + job.card_id : " (full batch)"}</span>
-        <span class="phase ${job.status || ""}">${external ? "CMD window" : job.status || ""}</span>
+        <span><strong>${job.batch || "?"}</strong>${
+          job.card_id ? " / " + job.card_id : " · full batch"
+        }</span>
+        <span class="phase ${job.status || ""}">${statusLabel}</span>
       </div>
-      ${
-        external
-          ? ""
-          : `<div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="meta">
         <span>${formatBytes(job.bytes_done || 0)} / ${formatBytes(job.bytes_total || 0)}</span>
         <span>${Number(job.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(job.eta_seconds)}</span>
-      </div>`
-      }
+        <span>${job.files_done || 0} file(s) sent</span>
+        <span>${pct.toFixed(0)}%</span>
+      </div>
       <div class="message">${job.message || job.dest || ""}</div>
-      ${job.script ? `<div class="hint">Script: ${job.script}</div>` : ""}
+      ${
+        recent.length
+          ? `<div class="job-console">${recent
+              .map((line) => `<div>${escapeHtml(String(line))}</div>`)
+              .join("")}</div>`
+          : ""
+      }
     `;
     el.awsJobs.appendChild(div);
   }
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function renderLog(lines) {
@@ -226,7 +252,7 @@ async function pollStatus() {
     if (session.active) {
       setStatus(
         `Watching · batch "${session.batch}" · ${
-          session.mode === "ssd_and_aws" ? "SSD+AWS (CMD)" : "SSD only"
+          session.mode === "ssd_and_aws" ? "SSD+AWS (CMD survives restart)" : "SSD only"
         }`,
         "ok",
       );
@@ -331,7 +357,7 @@ el.uploadBatch.addEventListener("click", async () => {
     });
     setStatus(
       data.job?.message ||
-        `AWS CMD opened for ${payload.batch} — watch the Command Prompt window (resume-safe)`,
+        `AWS upload started for ${payload.batch} — watch progress here and in the console`,
       "ok",
     );
     await pollStatus();

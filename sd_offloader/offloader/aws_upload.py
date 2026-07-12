@@ -1,13 +1,16 @@
 """AWS S3 sync using the AWS CLI (credentials from `aws configure`).
 
-Large batch uploads open a **local Command Prompt / Terminal window** so progress
-keeps running even if the browser is closed. ``aws s3 sync`` is resume-safe —
-re-run the same script and it skips files already on S3.
+Uploads run in an **external Command Prompt / Terminal** so a server restart
+does **not** stop them. Output is tee'd to a log file under ``state/aws_logs/``.
+The offloader watches those logs and shows size / speed / ETA in the UI.
+On startup it re-attaches to any still-running uploads (open CMD + log).
+``aws s3 sync`` is resume-safe if you ever need to start the same batch again.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import shutil
@@ -21,7 +24,21 @@ from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
-EXTERNAL_JOBS_FILE = STATE_DIR / "aws_external_jobs.json"
+_monitor_started = False
+JOBS_FILE = STATE_DIR / "aws_jobs.json"
+LOG_DIR = STATE_DIR / "aws_logs"
+EXIT_MARKER = "OFFLOADER_EXIT:"
+
+_SPEED_RE = re.compile(r"([\d.]+)\s*(MiB|MB|GiB|GB)/s", re.IGNORECASE)
+_COMPLETED_RE = re.compile(
+    r"Completed\s+([\d.]+)\s*(MiB|MB|GiB|GB|KiB|KB|B)(?:\s*/\s*([\d.]+)\s*(MiB|MB|GiB|GB|KiB|KB|B))?",
+    re.IGNORECASE,
+)
+_UPLOAD_RE = re.compile(
+    r"^(?:upload|copy|download):\s+(.+?)\s+to\s+s3://",
+    re.IGNORECASE,
+)
+_BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\/]+)[\\/]", re.IGNORECASE)
 
 
 def aws_cli_available() -> bool:
@@ -29,16 +46,11 @@ def aws_cli_available() -> bool:
 
 
 def test_aws_connection(s3_uri: str) -> dict:
-    """Upload a tiny empty file via AWS CLI credentials (`aws configure`).
-
-    Does not read/write app secret files — only uses the S3 URI from the UI and
-    whatever profile ``aws configure`` already set up.
-    """
+    """Upload a tiny empty file via AWS CLI credentials (`aws configure`)."""
     if not aws_cli_available():
         raise RuntimeError("AWS CLI not found. Install AWS CLI v2, then run `aws configure`.")
 
     base = normalize_s3_uri(s3_uri)
-    # Marker under the configured prefix so it lands where footage would go
     key = f"{base}_offloader_connection_test.txt"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -53,7 +65,6 @@ def test_aws_connection(s3_uri: str) -> dict:
             detail = (put.stderr or put.stdout or "aws s3 cp failed").strip()
             raise RuntimeError(detail)
 
-        # Best-effort cleanup so the bucket isn't littered
         delete = subprocess.run(
             ["aws", "s3", "rm", key],
             capture_output=True,
@@ -95,6 +106,20 @@ def list_local_batch_roots(ssd1: str, ssd2: str, batch_name: str) -> list[Path]:
     return roots
 
 
+def _dir_bytes(root: Path) -> int:
+    total = 0
+    try:
+        for path in root.rglob("*"):
+            if path.is_file():
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
 def start_batch_upload(
     *,
     s3_uri: str,
@@ -103,8 +128,10 @@ def start_batch_upload(
     ssd2: str,
     card_id: str | None = None,
     external_window: bool = True,
+    show_console: bool | None = None,
 ) -> dict:
-    """Start an S3 sync. Prefer a visible local console for long TB-scale uploads."""
+    """Start aws s3 sync in an external console (survives server restart)."""
+    del show_console  # always external + logged
     if not aws_cli_available():
         raise RuntimeError("AWS CLI not found. Install AWS CLI v2 and run `aws configure`.")
 
@@ -126,15 +153,30 @@ def start_batch_upload(
         sources = roots
         dest = prefix
 
-    if external_window:
-        return start_external_sync(
-            batch_name=batch_name,
-            sources=sources,
-            dest=dest,
-            card_id=card_id,
-        )
+    total_bytes = sum(_dir_bytes(src) for src in sources)
+    stamp = int(time.time())
+    label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
+    job_id = f"aws:{label}"
+    safe = re.sub(r"[^\w.-]+", "_", label)
 
-    job_id = f"{batch_name}:{card_id or 'ALL'}:{int(time.time())}"
+    ensure_dirs()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{safe}.log"
+    script_path = LOG_DIR / f"{safe}{'.bat' if platform.system() == 'Windows' else '.sh'}"
+
+    header = (
+        f"AWS S3 upload  {batch_name}"
+        + (f" / {card_id}" if card_id else "")
+        + f"\nDestination: {dest}\n"
+        f"Local size: {total_bytes} bytes\n"
+        "This CMD window keeps uploading even if you restart the offloader.\n"
+        "============================================\n"
+    )
+    log_path.write_text(header, encoding="utf-8")
+
+    _write_external_script(script_path, sources=sources, dest=dest, log_path=log_path, title=f"AWS — {batch_name}")
+    _launch_external_script(script_path, title=f"AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""))
+
     with _lock:
         _jobs[job_id] = {
             "id": job_id,
@@ -143,97 +185,99 @@ def start_batch_upload(
             "card_id": card_id,
             "dest": dest,
             "bytes_done": 0,
-            "bytes_total": 0,
+            "bytes_total": total_bytes,
+            "files_done": 0,
             "speed_mbps": 0.0,
             "eta_seconds": None,
-            "message": "Starting aws s3 sync…",
-            "log": [],
+            "message": f"CMD upload started → {dest} (survives server restart)",
+            "log": [f"Local size {total_bytes} bytes", f"Script {script_path}"],
             "started_at": time.time(),
-            "external": False,
+            "external": True,
+            "console": True,
+            "log_path": str(log_path),
+            "script": str(script_path),
+            "sources": [str(s) for s in sources],
+            "log_offset": 0,
+            "using_completed_meter": False,
+            "transferred": 0,
         }
-
-    thread = threading.Thread(
-        target=_run_sync_job,
-        args=(job_id, sources, dest),
-        daemon=True,
-        name=f"aws-{job_id}",
-    )
-    thread.start()
+    _persist_jobs()
+    _ensure_monitor()
     return get_job(job_id) or {"id": job_id, "status": "running"}
 
 
-def start_external_sync(
+def _write_external_script(
+    script_path: Path,
     *,
-    batch_name: str,
     sources: list[Path],
     dest: str,
-    card_id: str | None = None,
-) -> dict:
-    """Write a sync script and open it in a new Command Prompt / Terminal window."""
-    ensure_dirs()
-    stamp = int(time.time())
-    label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
-    safe = re.sub(r"[^\w.-]+", "_", label)
-    system = platform.system()
-
-    if system == "Windows":
-        script = STATE_DIR / f"aws_upload_{safe}.bat"
+    log_path: Path,
+    title: str,
+) -> None:
+    """Write a console script that runs sync and tees output into log_path."""
+    if platform.system() == "Windows":
+        # PowerShell Tee-Object → console + log; EXIT marker for the UI monitor.
         lines = [
             "@echo off",
             "setlocal",
-            f"title AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""),
+            f"title {title}",
             "echo ============================================",
-            f"echo   AWS S3 upload  {batch_name}"
-            + (f" / {card_id}" if card_id else ""),
+            f"echo   {title}",
             f"echo   Destination: {dest}",
-            "echo   aws s3 sync is resume-safe — re-run this window if interrupted.",
+            "echo   Progress also appears in the offloader web UI.",
+            "echo   Closing this window STOPS the upload.",
+            "echo   Restarting the offloader does NOT stop this window.",
             "echo ============================================",
             "echo.",
         ]
+        log_ps = str(log_path).replace("'", "''")
         for src in sources:
+            src_ps = str(src).replace("'", "''")
+            dest_ps = dest.replace("'", "''")
             lines.append(f'echo Syncing "{src}"')
-            lines.append(f'echo   -^> {dest}')
-            # /Y not needed; sync skips existing matching files
-            lines.append(f'aws s3 sync "{src}" "{dest}"')
-            lines.append("if errorlevel 1 (")
+            # Tee live output to the log file the server watches.
+            lines.append(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"& {{ aws s3 sync '{src_ps}' '{dest_ps}' 2>&1 | "
+                f"Tee-Object -FilePath '{log_ps}' -Append ; "
+                f"if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }} else {{ exit 0 }} }}\""
+            )
+            lines.append("set SYNC_ERR=%ERRORLEVEL%")
+            lines.append("if %SYNC_ERR% neq 0 (")
+            lines.append(f"  echo {EXIT_MARKER}%SYNC_ERR%>> \"{log_path}\"")
             lines.append("  echo.")
-            lines.append("  echo ERROR: aws s3 sync failed. Fix network/credentials and re-run this script.")
+            lines.append("  echo ERROR: aws s3 sync failed. Fix network/credentials and re-run.")
             lines.append("  pause")
-            lines.append("  exit /b 1")
+            lines.append("  exit /b %SYNC_ERR%")
             lines.append(")")
             lines.append("echo.")
-        lines.extend(
-            [
-                "echo ============================================",
-                "echo   Upload finished OK",
-                "echo ============================================",
-                "pause",
-            ]
-        )
-        script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-        # New visible console that survives browser close
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", f"AWS upload — {batch_name}", "cmd.exe", "/k", str(script)],
-            cwd=str(STATE_DIR),
-        )
+        lines.append(f"echo {EXIT_MARKER}0>> \"{log_path}\"")
+        lines.append("echo ============================================")
+        lines.append("echo   Upload finished OK")
+        lines.append("echo ============================================")
+        lines.append("pause")
+        script_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
     else:
-        script = STATE_DIR / f"aws_upload_{safe}.sh"
         lines = [
             "#!/bin/bash",
             "set -e",
             f'echo "============================================"',
-            f'echo "  AWS S3 upload  {batch_name}'
-            + (f" / {card_id}" if card_id else "")
-            + '"',
+            f'echo "  {title}"',
             f'echo "  Destination: {dest}"',
-            'echo "  aws s3 sync is resume-safe — re-run if interrupted."',
+            'echo "  Progress also appears in the offloader web UI."',
             'echo "============================================"',
             "echo",
         ]
         for src in sources:
             lines.append(f'echo "Syncing {src}"')
-            lines.append(f'aws s3 sync "{src}" "{dest}"')
+            lines.append(
+                f'aws s3 sync "{src}" "{dest}" 2>&1 | tee -a "{log_path}"'
+            )
+            lines.append("ec=${PIPESTATUS[0]}")
+            lines.append(f'echo "{EXIT_MARKER}${{ec}}" >> "{log_path}"')
+            lines.append('if [[ "$ec" -ne 0 ]]; then echo "ERROR: sync failed"; read -r; exit "$ec"; fi')
             lines.append("echo")
+        lines.append(f'echo "{EXIT_MARKER}0" >> "{log_path}"')
         lines.extend(
             [
                 'echo "============================================"',
@@ -242,74 +286,31 @@ def start_external_sync(
                 'read -r -p "Press Enter to close…" _',
             ]
         )
-        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        script.chmod(0o755)
-        if system == "Darwin":
-            subprocess.Popen(
-                [
-                    "osascript",
-                    "-e",
-                    f'tell application "Terminal" to do script "bash \\"{script}\\""',
-                ]
-            )
-        else:
-            # Linux: try a common terminal
-            for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
-                if shutil.which(term):
-                    subprocess.Popen([term, "-e", f"bash {script}"])
-                    break
-            else:
-                raise RuntimeError("No terminal found to show AWS progress")
-
-    job_id = f"external:{label}"
-    job = {
-        "id": job_id,
-        "status": "external",
-        "batch": batch_name,
-        "card_id": card_id,
-        "dest": dest,
-        "bytes_done": 0,
-        "bytes_total": 0,
-        "speed_mbps": 0.0,
-        "eta_seconds": None,
-        "message": f"Opened local console — syncing to {dest} (resume-safe)",
-        "log": [f"Script: {script}"],
-        "started_at": time.time(),
-        "external": True,
-        "script": str(script),
-    }
-    with _lock:
-        _jobs[job_id] = job
-    _remember_external_job(job)
-    return dict(job)
+        script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        script_path.chmod(0o755)
 
 
-def _remember_external_job(job: dict) -> None:
-    ensure_dirs()
-    rows: list[dict] = []
-    if EXTERNAL_JOBS_FILE.exists():
-        try:
-            rows = json.loads(EXTERNAL_JOBS_FILE.read_text(encoding="utf-8"))
-            if not isinstance(rows, list):
-                rows = []
-        except (json.JSONDecodeError, OSError):
-            rows = []
-    rows.insert(0, job)
-    rows = rows[:40]
-    try:
-        EXTERNAL_JOBS_FILE.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def list_external_jobs() -> list[dict]:
-    if not EXTERNAL_JOBS_FILE.exists():
-        return []
-    try:
-        rows = json.loads(EXTERNAL_JOBS_FILE.read_text(encoding="utf-8"))
-        return rows if isinstance(rows, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
+def _launch_external_script(script_path: Path, *, title: str) -> None:
+    system = platform.system()
+    if system == "Windows":
+        # Detached visible console — survives when Flask/python exits.
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", title, "cmd.exe", "/k", str(script_path)],
+            cwd=str(STATE_DIR),
+            close_fds=True,
+        )
+        return
+    if system == "Darwin":
+        escaped = str(script_path).replace('"', '\\"')
+        subprocess.Popen(
+            ["osascript", "-e", f'tell application "Terminal" to do script "bash \\"{escaped}\\""']
+        )
+        return
+    for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
+        if shutil.which(term):
+            subprocess.Popen([term, "-e", f"bash {script_path}"])
+            return
+    raise RuntimeError("No terminal found to show AWS progress")
 
 
 def get_job(job_id: str) -> dict | None:
@@ -320,88 +321,452 @@ def get_job(job_id: str) -> dict | None:
 
 def list_jobs() -> list[dict]:
     with _lock:
-        live = [dict(j) for j in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)]
-    # Merge recent external jobs from disk (survive app restart in the UI list)
-    seen = {j["id"] for j in live}
-    for row in list_external_jobs():
-        jid = row.get("id")
-        if jid and jid not in seen:
-            live.append(row)
-            seen.add(jid)
-    live.sort(key=lambda x: x.get("started_at", 0), reverse=True)
-    return live
+        return [
+            dict(j)
+            for j in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)
+        ]
 
 
-def _run_sync_job(job_id: str, sources: list[Path], dest: str) -> None:
-    total_bytes = 0
-    for src in sources:
-        for path in src.rglob("*"):
-            if path.is_file():
-                try:
-                    total_bytes += path.stat().st_size
-                except OSError:
-                    pass
+def restore_jobs_from_disk() -> None:
+    """Reload jobs and keep monitoring any CMD uploads that are still running."""
+    ensure_dirs()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if JOBS_FILE.exists():
+        try:
+            rows = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            rows = []
+        if isinstance(rows, list):
+            with _lock:
+                for row in rows[:40]:
+                    if not isinstance(row, dict) or not row.get("id"):
+                        continue
+                    job = dict(row)
+                    log_path = Path(str(job.get("log_path") or ""))
+                    still = _log_still_active(log_path)
+                    if job.get("status") in {"running", "interrupted"} and still:
+                        job["status"] = "running"
+                        job["message"] = (
+                            "Re-attached after server restart — CMD upload still running"
+                        )
+                        job["console"] = True
+                        job["external"] = True
+                    elif job.get("status") == "running" and not still:
+                        # Finished while we were down, or log ended cleanly.
+                        if log_path.is_file() and _log_has_exit(log_path):
+                            code = _log_exit_code(log_path)
+                            if code == 0:
+                                job["status"] = "completed"
+                                job["bytes_done"] = job.get("bytes_total") or job.get("bytes_done") or 0
+                                job["message"] = f"Uploaded to {job.get('dest') or 'S3'}"
+                            else:
+                                job["status"] = "error"
+                                job["message"] = f"aws s3 sync failed (exit {code})"
+                        else:
+                            job["status"] = "interrupted"
+                            job["message"] = (
+                                "Upload may have stopped — check CMD window or click Upload to resume"
+                            )
+                        job["speed_mbps"] = 0.0
+                        job["eta_seconds"] = None
+                    _jobs[job["id"]] = job
 
+    _discover_orphan_logs()
+    _discover_live_aws_processes()
+    _persist_jobs()
+    _ensure_monitor()
+
+
+def _log_has_exit(log_path: Path) -> bool:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return EXIT_MARKER in text
+
+
+def _log_exit_code(log_path: Path) -> int:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 1
+    code = 1
+    for line in text.splitlines():
+        if line.startswith(EXIT_MARKER):
+            try:
+                code = int(line.split(":", 1)[1].strip() or "1")
+            except ValueError:
+                code = 1
+    return code
+
+
+def _log_still_active(log_path: Path) -> bool:
+    if not log_path or not log_path.is_file():
+        return False
+    if _log_has_exit(log_path):
+        return False
+    try:
+        age = time.time() - log_path.stat().st_mtime
+    except OSError:
+        return False
+    # Still writing, or CMD open mid-file with a quiet stretch — keep watching for a while.
+    return age < 6 * 3600
+
+
+def _discover_orphan_logs() -> None:
+    """Pick up log files from CMD uploads if jobs.json was lost."""
+    if not LOG_DIR.is_dir():
+        return
     with _lock:
-        if job_id in _jobs:
-            _jobs[job_id]["bytes_total"] = total_bytes
-
-    transferred = 0
-    started = time.time()
-
-    for src in sources:
-        cmd = ["aws", "s3", "sync", str(src), dest]
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip()
-            if not line:
+        known_logs = {str(Path(j.get("log_path") or "")) for j in _jobs.values()}
+    for log_path in sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if str(log_path) in known_logs:
+            continue
+        if not _log_still_active(log_path):
+            continue
+        batch = "unknown"
+        try:
+            first = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[:3]
+            for line in first:
+                if line.startswith("AWS S3 upload"):
+                    batch = line.replace("AWS S3 upload", "").strip() or batch
+        except OSError:
+            pass
+        job_id = f"aws:reattach:{log_path.stem}"
+        with _lock:
+            if job_id in _jobs:
                 continue
-            with _lock:
-                job = _jobs.get(job_id)
-                if not job:
-                    continue
-                job["log"] = (job.get("log") or [])[-80:] + [line]
-                job["message"] = line[:200]
-                speed = _parse_speed(line)
-                if speed is not None:
-                    job["speed_mbps"] = speed
-                done = _parse_completed_bytes(line)
-                if done is not None:
-                    transferred = max(transferred, done)
-                    job["bytes_done"] = min(total_bytes, transferred)
-                    elapsed = max(0.1, time.time() - started)
-                    if job["speed_mbps"] <= 0 and transferred > 0:
-                        job["speed_mbps"] = (transferred / (1024 * 1024)) / elapsed
-                    remaining = max(0, total_bytes - job["bytes_done"])
-                    mib_s = job["speed_mbps"]
-                    if mib_s > 0:
-                        job["eta_seconds"] = int(remaining / (mib_s * 1024 * 1024))
+            _jobs[job_id] = {
+                "id": job_id,
+                "status": "running",
+                "batch": batch,
+                "card_id": None,
+                "dest": "",
+                "bytes_done": 0,
+                "bytes_total": 0,
+                "files_done": 0,
+                "speed_mbps": 0.0,
+                "eta_seconds": None,
+                "message": "Re-attached to existing CMD upload log",
+                "log": [],
+                "started_at": log_path.stat().st_mtime,
+                "external": True,
+                "console": True,
+                "log_path": str(log_path),
+                "log_offset": 0,
+                "using_completed_meter": False,
+                "transferred": 0,
+            }
 
-        code = process.wait()
-        if code != 0:
-            with _lock:
-                if job_id in _jobs:
-                    _jobs[job_id]["status"] = "error"
-                    _jobs[job_id]["message"] = f"aws s3 sync failed (exit {code})"
-            return
 
+def _discover_live_aws_processes() -> None:
+    """Detect aws s3 sync still running in CMD (including pre-log older uploads)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        ps = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name='aws.exe'\" | "
+                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return
+    try:
+        data = json.loads(ps.stdout)
+    except json.JSONDecodeError:
+        return
+    rows = data if isinstance(data, list) else [data]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cmd = str(row.get("CommandLine") or "")
+        pid = row.get("ProcessId")
+        if "s3" not in cmd.lower() or "sync" not in cmd.lower():
+            continue
+        batch = None
+        match = _BATCH_IN_PATH_RE.search(cmd)
+        if match:
+            batch = match.group(1)
+        # Skip if we already track a running job for this batch with a log.
+        with _lock:
+            already = any(
+                j.get("status") == "running"
+                and (
+                    (batch and j.get("batch") == batch)
+                    or (j.get("log_path") and Path(str(j["log_path"])).is_file())
+                )
+                for j in _jobs.values()
+            )
+        if already and batch:
+            # Prefer log-backed jobs; still record pid hint on matching batch.
+            with _lock:
+                for j in _jobs.values():
+                    if j.get("status") == "running" and j.get("batch") == batch:
+                        j["aws_pid"] = pid
+                        j["message"] = j.get("message") or "CMD aws s3 sync running"
+            continue
+        job_id = f"aws:proc:{pid}"
+        with _lock:
+            if job_id in _jobs:
+                continue
+            _jobs[job_id] = {
+                "id": job_id,
+                "status": "running",
+                "batch": batch or f"pid-{pid}",
+                "card_id": None,
+                "dest": "",
+                "bytes_done": 0,
+                "bytes_total": 0,
+                "files_done": 0,
+                "speed_mbps": 0.0,
+                "eta_seconds": None,
+                "message": (
+                    "Detected live aws s3 sync in CMD "
+                    f"(PID {pid}"
+                    + (f", batch {batch}" if batch else "")
+                    + "). Leave that window open — "
+                    "byte-level progress needs a log-backed upload (new uploads)."
+                ),
+                "log": [cmd[:300]],
+                "started_at": time.time(),
+                "external": True,
+                "console": True,
+                "aws_pid": pid,
+                "log_path": "",
+                "log_offset": 0,
+                "using_completed_meter": False,
+                "transferred": 0,
+            }
+
+
+def _persist_jobs() -> None:
+    ensure_dirs()
     with _lock:
-        if job_id in _jobs:
-            _jobs[job_id]["status"] = "completed"
-            _jobs[job_id]["bytes_done"] = total_bytes
-            _jobs[job_id]["message"] = f"Uploaded to {dest}"
-            _jobs[job_id]["eta_seconds"] = 0
+        rows = []
+        for job in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)[:40]:
+            row = {k: v for k, v in job.items() if k not in {"sources"}}
+            row["log"] = list(row.get("log") or [])[-40:]
+            rows.append(row)
+    try:
+        JOBS_FILE.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
-_SPEED_RE = re.compile(r"([\d.]+)\s*(MiB|MB|GiB|GB)/s", re.IGNORECASE)
-_COMPLETED_RE = re.compile(r"Completed\s+([\d.]+)\s*(MiB|MB|GiB|GB|KiB|KB|B)", re.IGNORECASE)
+def _ensure_monitor() -> None:
+    global _monitor_started
+    with _lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+    threading.Thread(target=_monitor_loop, daemon=True, name="aws-log-monitor").start()
+
+
+def _monitor_loop() -> None:
+    while True:
+        try:
+            _poll_all_jobs()
+            if platform.system() == "Windows":
+                _refresh_process_only_jobs()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1.0)
+
+
+def _poll_all_jobs() -> None:
+    with _lock:
+        jobs = [dict(j) for j in _jobs.values() if j.get("status") == "running"]
+    dirty = False
+    for snapshot in jobs:
+        if _ingest_log_progress(snapshot["id"]):
+            dirty = True
+    if dirty:
+        _persist_jobs()
+
+
+def _ingest_log_progress(job_id: str) -> bool:
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job or job.get("status") != "running":
+            return False
+        log_path = Path(str(job.get("log_path") or ""))
+        offset = int(job.get("log_offset") or 0)
+        started = float(job.get("started_at") or time.time())
+        using_completed = bool(job.get("using_completed_meter"))
+        transferred = int(job.get("transferred") or job.get("bytes_done") or 0)
+        files_done = int(job.get("files_done") or 0)
+        sources = [Path(p) for p in (job.get("sources") or []) if p]
+
+    if not log_path.is_file():
+        return False
+
+    try:
+        data = log_path.read_bytes()
+    except OSError:
+        return False
+    if offset > len(data):
+        offset = 0
+    chunk = data[offset:].decode("utf-8", errors="replace")
+    new_offset = len(data)
+    if not chunk and not _log_has_exit(log_path):
+        return False
+
+    changed = False
+    src_hint = sources[0] if sources else None
+    for line in chunk.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        changed = True
+        with _lock:
+            job = _jobs.get(job_id)
+            if not job:
+                return False
+            job["log"] = (job.get("log") or [])[-100:] + [line]
+            if line.startswith(EXIT_MARKER):
+                try:
+                    code = int(line.split(":", 1)[1].strip() or "1")
+                except ValueError:
+                    code = 1
+                if code == 0:
+                    job["status"] = "completed"
+                    job["bytes_done"] = job.get("bytes_total") or job.get("bytes_done") or 0
+                    job["message"] = f"Uploaded to {job.get('dest') or 'S3'}"
+                    job["eta_seconds"] = 0
+                else:
+                    job["status"] = "error"
+                    job["message"] = f"aws s3 sync failed (exit {code})"
+                job["speed_mbps"] = 0.0
+                job["log_offset"] = new_offset
+                return True
+            job["message"] = line[:220]
+
+            speed = _parse_speed(line)
+            if speed is not None:
+                job["speed_mbps"] = speed
+
+            done = _parse_completed_bytes(line)
+            if done is not None:
+                using_completed = True
+                transferred = max(transferred, done)
+                total = job.get("bytes_total") or 0
+                job["bytes_done"] = min(total, transferred) if total else transferred
+                job["using_completed_meter"] = True
+                job["transferred"] = transferred
+
+            uploaded = _parse_upload_rel(line)
+            if uploaded:
+                files_done += 1
+                job["files_done"] = files_done
+                if not using_completed and src_hint is not None:
+                    size = _resolve_upload_size(src_hint, uploaded)
+                    if size <= 0:
+                        for src in sources:
+                            size = _resolve_upload_size(src, uploaded)
+                            if size > 0:
+                                break
+                    if size > 0:
+                        transferred += size
+                        total = job.get("bytes_total") or 0
+                        job["bytes_done"] = min(total, transferred) if total else transferred
+                        job["transferred"] = transferred
+
+            elapsed = max(0.1, time.time() - started)
+            if job["bytes_done"] > 0 and float(job.get("speed_mbps") or 0) <= 0:
+                job["speed_mbps"] = (job["bytes_done"] / (1024 * 1024)) / elapsed
+            remaining = max(0, (job.get("bytes_total") or 0) - job["bytes_done"])
+            mib_s = float(job.get("speed_mbps") or 0)
+            if mib_s > 0 and remaining > 0:
+                job["eta_seconds"] = int(remaining / (mib_s * 1024 * 1024))
+            elif remaining <= 0 and (job.get("bytes_total") or 0) > 0:
+                job["eta_seconds"] = 0
+            job["log_offset"] = new_offset
+
+    if changed:
+        with _lock:
+            if job_id in _jobs:
+                _jobs[job_id]["log_offset"] = new_offset
+                _jobs[job_id]["using_completed_meter"] = using_completed
+                _jobs[job_id]["transferred"] = transferred
+                _jobs[job_id]["files_done"] = files_done
+    return changed
+
+
+def _refresh_process_only_jobs() -> None:
+    """Mark process-detected jobs completed when aws.exe PID disappears."""
+    with _lock:
+        proc_jobs = [
+            (jid, j.get("aws_pid"))
+            for jid, j in _jobs.items()
+            if j.get("status") == "running" and j.get("aws_pid") and not j.get("log_path")
+        ]
+    for job_id, pid in proc_jobs:
+        if pid is None:
+            continue
+        if _pid_alive(int(pid)):
+            continue
+        with _lock:
+            job = _jobs.get(job_id)
+            if not job:
+                continue
+            job["status"] = "completed"
+            job["message"] = "aws s3 sync process ended (check CMD window for success/errors)"
+            job["speed_mbps"] = 0.0
+            job["eta_seconds"] = 0
+        _persist_jobs()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        ps = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"Get-Process -Id {pid} -ErrorAction SilentlyContinue | "
+                "Select-Object -ExpandProperty Id",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        return bool(ps.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _resolve_upload_size(src_root: Path, rel: str) -> int:
+    cleaned = rel.strip().strip('"').replace("/", os.sep).replace("\\", os.sep)
+    candidates = [
+        src_root / cleaned,
+        Path(cleaned),
+        src_root / Path(cleaned).name,
+    ]
+    if cleaned.startswith("." + os.sep):
+        candidates.insert(0, src_root / cleaned[2:])
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.stat().st_size
+        except OSError:
+            continue
+    return 0
+
+
+def _parse_upload_rel(line: str) -> str | None:
+    match = _UPLOAD_RE.search(line.strip())
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
 def _to_bytes(value: float, unit: str) -> int:
@@ -425,7 +790,7 @@ def _parse_speed(line: str) -> float | None:
     unit = match.group(2).upper()
     if unit.startswith("G"):
         return value * 1024
-    return value  # MiB/s
+    return value
 
 
 def _parse_completed_bytes(line: str) -> int | None:
@@ -433,3 +798,7 @@ def _parse_completed_bytes(line: str) -> int | None:
     if not match:
         return None
     return _to_bytes(float(match.group(1)), match.group(2))
+
+
+def list_external_jobs() -> list[dict]:
+    return list_jobs()

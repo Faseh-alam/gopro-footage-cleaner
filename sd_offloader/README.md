@@ -45,17 +45,17 @@ chmod +x run.sh
 4. **Batch on SSDs** — select an existing batch already on the drives (e.g. `batch 3` from home), or **+ Create new batch…**
 5. Choose mode:
    - **SSD only** — free cards fast; upload to AWS later from the office
-   - **SSD + AWS** — when each card finishes, a **Command Prompt** window runs `aws s3 sync` (resume-safe)
+   - **SSD + AWS** — when each card finishes, a **Command Prompt** runs `aws s3 sync` (keeps going if you restart the offloader). The web UI re-attaches and shows size / speed / ETA from the upload log
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
-7. **Start SD → SSD for this batch** — continues dumping cards into that batch
-8. **Upload this batch to AWS (CMD)** — opens a local Command Prompt that syncs the whole batch from both SSDs. Safe for multi‑TB / overnight; if interrupted, run the same script again and it **skips files already on S3**
+7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
+8. **Upload this batch to AWS (CMD)** — opens CMD (upload survives server restart) **and** shows live progress in the UI. If interrupted, run again and sync **skips files already on S3**
 9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, task folders wiped, ejected
 
 ### Office resume example (batch 3 dumped at home, no internet)
 
 1. On the server: pick SSDs → select **batch 3** from the list  
 2. Start SD → SSD if more cards still need dumping  
-3. Click **Upload this batch to AWS (CMD)** — watches progress in the Command Prompt, not the browser  
+3. Click **Upload this batch to AWS (CMD)** — watch progress on the page; you can restart the offloader and it will re-attach to open CMD uploads  
 
 If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** batch folder name. AWS still syncs everything into one `…/batch 6/` prefix.
 

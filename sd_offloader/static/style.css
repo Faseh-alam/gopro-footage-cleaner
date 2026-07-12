@@ -244,6 +244,35 @@ button.secondary {
   word-break: break-word;
 }
 
+.job-console {
+  margin-top: 0.45rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  background: #080b10;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+  max-height: 5.5rem;
+  overflow: auto;
+}
+
+.job-console div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.phase.running,
+.phase.uploading,
+.phase.copying {
+  color: var(--accent);
+}
+
+.phase.interrupted {
+  color: var(--warn);
+}
+
 .log {
   max-height: 280px;
   overflow: auto;
