@@ -8,6 +8,8 @@ const state = {
   pendingIn: null,
   pendingClip: null,
   savedClips: [],
+  /** Per-source mark/trim state so filmstrip tints survive navigation. */
+  clipsByPath: {},
   trimPollTimer: null,
   globalTrimPollTimer: null,
   globalTrimActive: 0,
@@ -567,11 +569,82 @@ function ensureWorkspaces() {
 }
 
 function remainingUnlabeledCount() {
-  if (state.phase !== "label") return 0;
   if (state.labelProgress && Number.isFinite(state.labelProgress.unlabeled)) {
     return Math.max(0, state.labelProgress.unlabeled);
   }
-  return state.videos.filter((video) => !state.donePaths.has(video.path)).length;
+  return state.videos.filter(
+    (video) =>
+      !state.donePaths.has(video.path)
+      && !state.labeledTasks[video.path]
+      && !state.trimmingPaths.has(video.path),
+  ).length;
+}
+
+function isHandledPath(path) {
+  return (
+    state.donePaths.has(path)
+    || Boolean(state.labeledTasks[path])
+    || state.trimmingPaths.has(path)
+  );
+}
+
+function stashClipState(path) {
+  if (!path) return;
+  state.clipsByPath[path] = {
+    savedClips: state.savedClips.map((job) => ({ ...job })),
+    pendingIn: state.pendingIn,
+    pendingClip: state.pendingClip ? { ...state.pendingClip } : null,
+  };
+}
+
+function restoreClipState(path) {
+  const cached = path ? state.clipsByPath[path] : null;
+  if (cached) {
+    state.savedClips = (cached.savedClips || []).map((job) => ({ ...job }));
+    state.pendingIn = cached.pendingIn ?? null;
+    state.pendingClip = cached.pendingClip ? { ...cached.pendingClip } : null;
+  } else {
+    state.savedClips = [];
+    state.pendingIn = null;
+    state.pendingClip = null;
+  }
+}
+
+function migrateClipState(oldPath, newPath) {
+  if (!oldPath || !newPath || oldPath === newPath) return;
+  if (state.clipsByPath[oldPath]) {
+    state.clipsByPath[newPath] = state.clipsByPath[oldPath];
+    delete state.clipsByPath[oldPath];
+  }
+}
+
+/** Keep labeled / deleted / mid-trim rows when a scan returns only unlabeled files. */
+function mergeScanVideos(fresh) {
+  const freshByPath = new Map((fresh || []).map((v) => [v.path, v]));
+  const merged = [];
+  const seen = new Set();
+
+  for (const video of state.videos) {
+    if (freshByPath.has(video.path)) {
+      merged.push(freshByPath.get(video.path));
+      seen.add(video.path);
+      continue;
+    }
+    if (
+      state.labeledTasks[video.path]
+      || state.donePaths.has(video.path)
+    ) {
+      merged.push(video);
+      seen.add(video.path);
+    }
+  }
+  for (const video of fresh || []) {
+    if (seen.has(video.path)) continue;
+    if (state.donePaths.has(video.path)) continue;
+    merged.push(video);
+    seen.add(video.path);
+  }
+  return merged;
 }
 
 function renderLabelProgress() {
@@ -621,10 +694,12 @@ function renderLabelProgress() {
 function renderFileList() {
   const items = filteredVideos();
   el.fileList.innerHTML = "";
-  const doneCount = state.donePaths.size;
+  const labeledCount = Object.keys(state.labeledTasks).length;
+  const deletedCount = [...state.donePaths].filter((p) => !state.labeledTasks[p]).length;
   const trimCount = state.trimmingPaths.size;
   const bits = [];
-  if (doneCount) bits.push(`${doneCount} done`);
+  if (labeledCount) bits.push(`${labeledCount} labeled`);
+  if (deletedCount) bits.push(`${deletedCount} deleted`);
   if (trimCount) bits.push(`${trimCount} trimming`);
   el.listSummary.textContent = bits.join(" · ");
 
@@ -634,9 +709,15 @@ function renderFileList() {
     btn.className = "file-item";
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
     const assignedTask = state.labeledTasks[video.path];
-    if (state.donePaths.has(video.path)) btn.classList.add("done");
-    else if (state.trimmingPaths.has(video.path)) btn.classList.add("trimming");
-    else btn.classList.add("unlabeled");
+    if (assignedTask) {
+      btn.classList.add("labeled");
+    } else if (state.donePaths.has(video.path)) {
+      btn.classList.add("done");
+    } else if (state.trimmingPaths.has(video.path)) {
+      btn.classList.add("trimming");
+    } else {
+      btn.classList.add("unlabeled");
+    }
     const typeHint = `${video.is_trimmed ? "clip" : "whole"} · `;
     const taskBadge = assignedTask
       ? `<span class="task-badge" title="Moved to ${assignedTask}">${assignedTask}</span>`
@@ -753,7 +834,7 @@ function applyGlobalTrimUi(data) {
   if (!el.trimProgressPanel) return;
 
   const activeJobs = jobs.filter((j) => j.status === "queued" || j.status === "running");
-  if (active === 0 || activeJobs.length === 0) {
+  if (active === 0) {
     el.trimProgressPanel.classList.add("hidden");
     if (el.trimProgressFill) el.trimProgressFill.style.width = "0%";
     if (el.trimProgressList) el.trimProgressList.innerHTML = "";
@@ -765,6 +846,18 @@ function applyGlobalTrimUi(data) {
   if (el.trimActiveCount) el.trimActiveCount.textContent = String(active);
   if (el.trimEtaTotal) {
     el.trimEtaTotal.textContent = `~${formatDurationShort(state.trimEtaTotal)}`;
+  }
+
+  if (!activeJobs.length) {
+    // Counts say busy but job payloads missing — keep panel visible with a hint.
+    if (el.trimProgressByCard) el.trimProgressByCard.innerHTML = "";
+    if (el.trimProgressList) {
+      el.trimProgressList.innerHTML = "";
+      const row = document.createElement("div");
+      row.textContent = `${active} trim(s) running — refreshing…`;
+      el.trimProgressList.appendChild(row);
+    }
+    return;
   }
 
   // Combined overall progress across every active trim.
@@ -855,13 +948,13 @@ async function softRefreshLabelScan() {
     });
     if (token !== state.labelScanToken) return;
     if (state.busy) return;
-    const fresh = (data.videos || []).filter((video) => !state.donePaths.has(video.path));
+    const fresh = data.videos || [];
     // Drop trimming markers for sources that are no longer busy / gone from disk.
     const freshPaths = new Set(fresh.map((v) => v.path));
     for (const p of [...state.trimmingPaths]) {
       if (!freshPaths.has(p)) state.trimmingPaths.delete(p);
     }
-    state.videos = fresh;
+    state.videos = mergeScanVideos(fresh);
     state.labelProgress = data.progress || state.labelProgress;
     el.scanSummary.textContent = selectedSdCardLabel() || "";
     saveActiveWorkspace();
@@ -912,6 +1005,8 @@ function syncTrimJobsFromServer(jobs) {
     }
   }
   state.savedClips.sort((a, b) => (a.start || 0) - (b.start || 0));
+  const path = currentVideo()?.path;
+  if (path) stashClipState(path);
   renderClips();
   renderFilmstrip();
 }
@@ -1430,6 +1525,7 @@ function markStart() {
   if (!currentVideo()) return;
   state.pendingIn = currentScrubTime();
   state.pendingClip = null;
+  stashClipState(currentVideo().path);
   setStatus(`Start marked at ${formatTime(state.pendingIn)}`, "ok");
   renderClips();
   renderFilmstrip();
@@ -1444,11 +1540,15 @@ function markEnd() {
     start = 0;
   }
   if (end <= start + 0.05) {
-    setStatus("End must be after start — step forward a little, then O", "error");
+    setStatus(
+      "You're still at the start — jump to where work ends, then press O (start is auto 0:00)",
+      "error",
+    );
     return;
   }
   state.pendingClip = { start, end };
   state.pendingIn = null;
+  stashClipState(currentVideo().path);
   const autoFromZero = start === 0;
   setStatus(
     autoFromZero
@@ -1468,6 +1568,7 @@ function undoMark() {
   } else {
     state.savedClips.pop();
   }
+  stashClipState(currentVideo()?.path);
   renderClips();
   renderFilmstrip();
 }
@@ -1529,15 +1630,14 @@ async function loadVideo(index) {
 
   const previous = currentVideo();
   if (previous?.path && previous.path !== state.videos[index]?.path) {
+    stashClipState(previous.path);
     await cancelPreviewJob(previous.path);
     // Free the snapshot worker so the next clip isn't stuck behind leftover frames.
     await cancelSnapshotJob(previous.path);
   }
 
   state.index = index;
-  state.pendingIn = null;
-  state.pendingClip = null;
-  state.savedClips = [];
+  restoreClipState(state.videos[index]?.path);
   stopTrimPolling();
   state.pendingSeek = null;
   state.snapshots = null;
@@ -1566,6 +1666,7 @@ async function loadVideo(index) {
 
   renderFileList();
   renderClips();
+  renderFilmstrip();
 
   el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
   el.player.load();
@@ -1825,10 +1926,12 @@ async function scanSource() {
     const keepDone = state.donePaths;
     const keepTrim = state.trimmingPaths;
     const keepLabeled = state.labeledTasks;
-    state.videos = (data.videos || []).filter((v) => !keepDone.has(v.path));
+    const incoming = (data.videos || []).filter((v) => !keepDone.has(v.path));
     state.donePaths = keepDone;
     state.trimmingPaths = keepTrim;
     state.labeledTasks = keepLabeled;
+    // Keep prior labeled/trimming rows that the label-mode scan omits.
+    state.videos = mergeScanVideos(incoming);
     state.index = -1;
     state.labelProgress = data.progress || null;
     saveActiveWorkspace();
@@ -1916,6 +2019,7 @@ async function trimMarkedClip() {
       name: null,
       source_has_gpmf: data.source_has_gpmf,
     });
+    stashClipState(video.path);
     renderClips();
     startTrimPolling();
     renderFilmstrip();
@@ -1924,6 +2028,7 @@ async function trimMarkedClip() {
     setStatus(`Queued trim ${formatTime(clip.start)} → ${formatTime(clip.end)}${imuNote} — mark next with I/O or O-from-here`, "ok");
   } catch (error) {
     state.pendingClip = clip;
+    stashClipState(video.path);
     renderClips();
     setStatus(error.message, "error");
   }
@@ -1959,6 +2064,7 @@ async function finishCleaningFile() {
       body: JSON.stringify({ path: video.path }),
     });
     state.trimmingPaths.add(video.path);
+    stashClipState(video.path);
     stopTrimPolling();
     saveActiveWorkspace();
     if (data.scheduled) {
@@ -2068,10 +2174,24 @@ async function labelCurrentClip() {
     });
     // Invalidate any in-flight soft refresh that could put this path back.
     state.labelScanToken += 1;
-    state.donePaths.add(video.path);
-    state.labeledTasks[video.path] = task;
+    const oldPath = video.path;
+    const newPath = data.output || oldPath;
+    // Stay in the list with a green "labeled" badge (do not remove / grey as deleted).
+    if (newPath !== oldPath) {
+      video.path = newPath;
+      video.name = basenamePath(newPath) || video.name;
+      if (data.task_dir) {
+        video.relative = `${basenamePath(data.task_dir)}/${video.name}`;
+      }
+      migrateClipState(oldPath, newPath);
+      if (state.trimmingPaths.has(oldPath)) {
+        state.trimmingPaths.delete(oldPath);
+        state.trimmingPaths.add(newPath);
+      }
+    }
+    delete state.labeledTasks[oldPath];
+    state.labeledTasks[newPath] = task;
     state.lastLabelTask = task;
-    state.videos = state.videos.filter((item) => item.path !== video.path);
     saveActiveWorkspace();
     el.taskSearch.value = "";
     renderTasks(task);
@@ -2097,28 +2217,8 @@ async function labelCurrentClip() {
       `${already} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
       "ok",
     );
-    // Remove from list now; the same index becomes the next unlabeled clip.
-    const nextIndex = state.index;
-    state.videos = state.videos.filter((item) => item.path !== video.path);
     renderFileList();
-    if (nextIndex < state.videos.length) {
-      await loadVideo(nextIndex);
-    } else if (state.videos.length) {
-      await loadVideo(state.videos.length - 1);
-    } else {
-      state.index = -1;
-      el.currentName.textContent = "No file loaded";
-      el.currentMeta.textContent = "";
-      updateContextHint();
-      const remaining = remainingUnlabeledCount();
-      if (remaining === 0) {
-        setStatus(
-          `All clips labeled — work ${formatWorkHms(workTimer.cleanMs + workTimer.labelMs)}`,
-          "ok",
-        );
-        saveWorkSession("label_complete");
-      }
-    }
+    advanceToNext();
     refreshLabelProgress({ quiet: true });
   } catch (error) {
     setStatus(error.message, "error");
@@ -2130,38 +2230,30 @@ async function labelCurrentClip() {
 
 function advanceToNext() {
   let next = state.index + 1;
-  while (
-    next < state.videos.length
-    && (state.donePaths.has(state.videos[next].path) || state.trimmingPaths.has(state.videos[next].path))
-  ) {
+  while (next < state.videos.length && isHandledPath(state.videos[next].path)) {
     next += 1;
   }
   if (next < state.videos.length) {
     loadVideo(next);
-  } else {
-    if (state.videos.some((v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path))) {
-      // wrap to first unfinished
-      const first = state.videos.findIndex(
-        (v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path),
-      );
-      if (first >= 0) {
-        loadVideo(first);
-        return;
-      }
-    }
-    const remaining = state.videos.filter(
-      (v) => !state.donePaths.has(v.path) && !state.trimmingPaths.has(v.path),
-    ).length;
-    setStatus(
-      remaining === 0
-        ? state.trimmingPaths.size
-          ? `All files handled — ${state.trimmingPaths.size} still trimming in background`
-          : "All files done"
-        : `${remaining} file(s) left`,
-      remaining === 0 ? "ok" : "",
-    );
-    renderFileList();
+    return;
   }
+  if (state.videos.some((v) => !isHandledPath(v.path))) {
+    const first = state.videos.findIndex((v) => !isHandledPath(v.path));
+    if (first >= 0) {
+      loadVideo(first);
+      return;
+    }
+  }
+  const remaining = state.videos.filter((v) => !isHandledPath(v.path)).length;
+  setStatus(
+    remaining === 0
+      ? state.trimmingPaths.size
+        ? `All files handled — ${state.trimmingPaths.size} still trimming in background`
+        : "All files done"
+      : `${remaining} file(s) left`,
+    remaining === 0 ? "ok" : "",
+  );
+  renderFileList();
 }
 
 el.snapPrevBtn?.addEventListener("click", () => goToSnapshot(-1));

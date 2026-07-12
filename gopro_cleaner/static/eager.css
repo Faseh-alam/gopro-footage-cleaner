@@ -370,6 +370,25 @@
   opacity: 0.55;
 }
 
+.file-item.labeled {
+  opacity: 0.92;
+  border-color: rgba(46, 160, 67, 0.45);
+}
+
+.file-item.labeled .name::after {
+  content: "labeled";
+  margin-left: 0;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--success);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  border: 1px solid rgba(46, 160, 67, 0.4);
+  background: rgba(46, 160, 67, 0.14);
+}
+
 .file-item .name {
   display: flex;
   flex-wrap: wrap;

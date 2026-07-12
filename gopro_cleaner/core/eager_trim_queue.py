@@ -145,21 +145,19 @@ class EagerTrimQueue:
         """Lightweight global trim progress for clean + label UIs."""
         with self._lock:
             records = list(self._records.values())
+        active_records = [r for r in records if r.status in {"queued", "running"}]
+        other_records = [r for r in records if r.status in {"completed", "failed"}]
         jobs_out: list[dict] = []
         eta_total = 0.0
-        active = 0
-        for record in sorted(records, key=lambda r: r.created_at, reverse=True):
-            if record.status not in {"queued", "running", "completed", "failed"}:
-                continue
-            if record.status in {"queued", "running"}:
-                active += 1
+        active = len(active_records)
+
+        def _job_payload(record) -> dict:
             duration = max(0.0, record.end_seconds - record.start_seconds)
             progress = 0.0
             remaining = 0.0
             message = ""
             if record.status == "queued":
                 remaining = duration
-                eta_total += duration
             elif record.status == "running":
                 if record.trim_job_id:
                     trim_job = job_store.get(record.trim_job_id)
@@ -167,26 +165,32 @@ class EagerTrimQueue:
                         progress = float(trim_job.progress or 0)
                         message = trim_job.message or ""
                 remaining = duration * max(0.0, 1.0 - progress / 100.0)
-                eta_total += remaining
-            source_name = Path(record.source_path).name
-            jobs_out.append(
-                {
-                    "job_id": record.job_id,
-                    "source_path": record.source_path,
-                    "source_name": source_name,
-                    "status": record.status,
-                    "start_seconds": record.start_seconds,
-                    "end_seconds": record.end_seconds,
-                    "duration_seconds": duration,
-                    "progress": round(progress, 1),
-                    "remaining_seconds": round(remaining, 1),
-                    "message": message,
-                    "output": record.output,
-                    "error": record.error,
-                }
-            )
+            return {
+                "job_id": record.job_id,
+                "source_path": record.source_path,
+                "source_name": Path(record.source_path).name,
+                "status": record.status,
+                "start_seconds": record.start_seconds,
+                "end_seconds": record.end_seconds,
+                "duration_seconds": duration,
+                "progress": round(progress, 1),
+                "remaining_seconds": round(remaining, 1),
+                "message": message,
+                "output": record.output,
+                "error": record.error,
+            }
+
+        # Always include every active job first (never drop them behind a 40-cap).
+        for record in sorted(active_records, key=lambda r: r.created_at):
+            payload = _job_payload(record)
+            eta_total += float(payload["remaining_seconds"] or 0)
+            jobs_out.append(payload)
+
+        for record in sorted(other_records, key=lambda r: r.created_at, reverse=True):
             if len(jobs_out) >= 40:
                 break
+            jobs_out.append(_job_payload(record))
+
         return {
             "active": active,
             "eta_total_seconds": round(eta_total, 1),
