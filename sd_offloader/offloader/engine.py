@@ -110,8 +110,13 @@ def restore_ui_state() -> None:
             _log.clear()
             _log.extend(line for line in lines if isinstance(line, dict))
     if _session.get("active"):
-        _ensure_watcher()
-        _log_line("Restored session — watching for SD cards again", kind="ok")
+        # Do NOT auto-resume the SD watcher on startup — scanning drives during
+        # boot was freezing the web UI on hung card readers. User clicks Start.
+        _session["active"] = False
+        _log_line(
+            "Previous session was active — click Start SD → SSD to resume watching",
+            kind="ok",
+        )
 
 
 def get_status() -> dict:

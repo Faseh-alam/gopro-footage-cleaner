@@ -24,8 +24,24 @@ def create_app() -> Flask:
     def index():
         return render_template("index.html", version=__version__)
 
+    @app.get("/api/ping")
+    def ping():
+        """Tiny liveness check — no disk / AWS / WMI work."""
+        return jsonify({"ok": True, "version": __version__})
+
     @app.get("/api/health")
     def health():
+        return jsonify(
+            {
+                "ok": True,
+                "version": __version__,
+                "aws_cli": False,  # filled lazily; never block page load on PATH scan
+                "ready": True,
+            }
+        )
+
+    @app.get("/api/health/full")
+    def health_full():
         return jsonify(
             {
                 "ok": True,
@@ -169,7 +185,7 @@ def main() -> None:
     host = os.environ.get("SD_OFFLOADER_HOST", "127.0.0.1")
     open_browser = os.environ.get("SD_OFFLOADER_OPEN_BROWSER", "1") != "0"
     url = f"http://{host}:{port}/"
-    health_url = f"http://{host}:{port}/api/health"
+    health_url = f"http://{host}:{port}/api/ping"
 
     print(f"Creating app (v{__version__})…", flush=True)
     app = create_app()
@@ -209,7 +225,14 @@ def main() -> None:
     print(f"SD Card Offloader v{__version__} listening on {url}", flush=True)
     print("If the browser does not open, paste that URL into Chrome.", flush=True)
     try:
-        app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+        try:
+            from waitress import serve
+
+            print("Using waitress server (multi-thread).", flush=True)
+            serve(app, host=host, port=port, threads=16, channel_timeout=30)
+        except ImportError:
+            print("waitress not installed — falling back to Flask server.", flush=True)
+            app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
     except OSError as exc:
         print(f"ERROR: could not bind {host}:{port} — {exc}", flush=True)
         print("Another program may still be using the port. Close it and retry.", flush=True)

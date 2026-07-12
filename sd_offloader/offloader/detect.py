@@ -5,7 +5,7 @@ from __future__ import annotations
 import platform
 import re
 import string
-import subprocess
+import threading
 from pathlib import Path
 
 CARD_LABEL_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
@@ -18,72 +18,75 @@ SKIP_VOLUME_NAMES = {
     "EFI",
 }
 
+# Empty card readers / flaky USB can block forever on Win32 APIs.
+DRIVE_PROBE_TIMEOUT_SEC = 1.5
+
+
+def _run_with_timeout(fn, timeout: float = DRIVE_PROBE_TIMEOUT_SEC):
+    """Run fn() in a daemon thread; return result or None on timeout/error."""
+    box: dict = {}
+
+    def worker() -> None:
+        try:
+            box["value"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive() or "error" in box or "value" not in box:
+        return None
+    return box["value"]
+
 
 def _windows_drives() -> list[dict]:
     import ctypes
-    import shutil
-    import threading
 
     volumes: list[dict] = []
-    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    try:
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:  # noqa: BLE001
+        return []
+
     for letter in string.ascii_uppercase:
         if not bitmask & 1:
             bitmask >>= 1
             continue
         bitmask >>= 1
-        root = Path(f"{letter}:/")
-        try:
-            drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(root))
-        except Exception:  # noqa: BLE001
-            continue
-        # 2 = removable, 3 = fixed (USB SSDs sometimes report fixed)
-        if drive_type not in {2, 3}:
-            continue
 
-        # disk_usage can hang for minutes on empty card readers / flaky USB —
-        # never block the web UI on that.
-        usage_box: dict = {}
+        def probe(letter: str = letter) -> dict | None:
+            import shutil
 
-        def _usage(path: Path = root, box: dict = usage_box) -> None:
-            try:
-                box["usage"] = shutil.disk_usage(path)
-            except OSError as exc:
-                box["error"] = exc
-
-        thread = threading.Thread(target=_usage, daemon=True)
-        thread.start()
-        thread.join(2.0)
-        if thread.is_alive() or "usage" not in usage_box:
-            continue
-        usage = usage_box["usage"]
-        try:
+            root = Path(f"{letter}:/")
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\")
+            # 2 = removable, 3 = fixed (USB SSDs sometimes report fixed)
+            if drive_type not in {2, 3}:
+                return None
+            usage = shutil.disk_usage(f"{letter}:\\")
             label = _windows_volume_label(letter) or letter
-        except Exception:  # noqa: BLE001
-            label = letter
-        try:
             gopro = _find_gopro_root(root)
-        except Exception:  # noqa: BLE001
-            gopro = None
-        try:
             is_card = _looks_like_sd_card(root, label) if gopro else False
-        except Exception:  # noqa: BLE001
-            is_card = False
-        try:
             card_id = _card_id_for(root, label)
-        except Exception:  # noqa: BLE001
-            card_id = None
-        volumes.append(
-            {
-                "path": str(root.resolve()) if root.exists() else f"{letter}:\\",
+            path = f"{letter}:\\"
+            try:
+                path = str(root.resolve())
+            except OSError:
+                pass
+            return {
+                "path": path,
                 "label": label,
                 "free_bytes": usage.free,
                 "total_bytes": usage.total,
                 "drive_type": "removable" if drive_type == 2 else "fixed",
-                "is_card_candidate": is_card,
+                "is_card_candidate": bool(is_card),
                 "card_id": card_id,
                 "gopro_root": str(gopro) if gopro else None,
             }
-        )
+
+        row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
+        if row:
+            volumes.append(row)
     return volumes
 
 
@@ -116,24 +119,26 @@ def _mac_volumes() -> list[dict]:
             continue
         if entry.name.startswith("."):
             continue
-        try:
-            usage = shutil.disk_usage(entry)
-            resolved = entry.resolve()
-        except OSError:
-            continue
-        label = entry.name
-        volumes.append(
-            {
+
+        def probe(path: Path = entry) -> dict | None:
+            usage = shutil.disk_usage(path)
+            resolved = path.resolve()
+            label = path.name
+            gopro = _find_gopro_root(resolved)
+            return {
                 "path": str(resolved),
                 "label": label,
                 "free_bytes": usage.free,
                 "total_bytes": usage.total,
                 "drive_type": "removable",
-                "is_card_candidate": _looks_like_sd_card(resolved, label),
+                "is_card_candidate": _looks_like_sd_card(resolved, label) if gopro else False,
                 "card_id": _card_id_for(resolved, label),
-                "gopro_root": str(_find_gopro_root(resolved)) if _find_gopro_root(resolved) else None,
+                "gopro_root": str(gopro) if gopro else None,
             }
-        )
+
+        row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
+        if row:
+            volumes.append(row)
     return volumes
 
 
@@ -143,7 +148,7 @@ def list_volumes() -> list[dict]:
         return _windows_drives()
     if system == "Darwin":
         return _mac_volumes()
-    # Linux fallback
+    # Linux fallback — keep lightweight
     import shutil
 
     volumes: list[dict] = []
@@ -155,23 +160,25 @@ def list_volumes() -> list[dict]:
             for entry in user_dir.iterdir():
                 if not entry.is_dir():
                     continue
-                try:
-                    usage = shutil.disk_usage(entry)
-                except OSError:
-                    continue
-                label = entry.name
-                volumes.append(
-                    {
-                        "path": str(entry.resolve()),
+
+                def probe(path: Path = entry) -> dict | None:
+                    usage = shutil.disk_usage(path)
+                    label = path.name
+                    gopro = _find_gopro_root(path)
+                    return {
+                        "path": str(path),
                         "label": label,
                         "free_bytes": usage.free,
                         "total_bytes": usage.total,
                         "drive_type": "removable",
-                        "is_card_candidate": _looks_like_sd_card(entry, label),
-                        "card_id": _card_id_for(entry, label),
-                        "gopro_root": str(_find_gopro_root(entry)) if _find_gopro_root(entry) else None,
+                        "is_card_candidate": _looks_like_sd_card(path, label) if gopro else False,
+                        "card_id": _card_id_for(path, label),
+                        "gopro_root": str(gopro) if gopro else None,
                     }
-                )
+
+                row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
+                if row:
+                    volumes.append(row)
     return volumes
 
 
@@ -188,7 +195,6 @@ def _find_gopro_root(root: Path) -> Path | None:
         return None
     if not candidates:
         return None
-    # Prefer 100GOPRO, else first sorted
     preferred = [p for p in candidates if p.name.upper() == "100GOPRO"]
     return preferred[0] if preferred else sorted(candidates, key=lambda p: p.name)[0]
 
@@ -196,7 +202,6 @@ def _find_gopro_root(root: Path) -> Path | None:
 def _card_id_for(root: Path, label: str) -> str | None:
     if CARD_LABEL_RE.match(label.strip()):
         return label.strip().upper()
-    # Sometimes label is different but a C#### folder exists at root
     try:
         for child in root.iterdir():
             if child.is_dir() and CARD_LABEL_RE.match(child.name):
@@ -209,10 +214,8 @@ def _card_id_for(root: Path, label: str) -> str | None:
 def _looks_like_sd_card(root: Path, label: str) -> bool:
     if not _find_gopro_root(root):
         return False
-    # Strong signal: C#### label
     if CARD_LABEL_RE.match(label.strip()):
         return True
-    # Or has task-like folders under GOPRO with MP4s
     gopro = _find_gopro_root(root)
     if gopro is None:
         return False
@@ -232,7 +235,10 @@ def find_card_volumes(*, exclude_paths: set[str] | None = None) -> list[dict]:
     exclude = {str(Path(p).resolve()) for p in (exclude_paths or set()) if p}
     cards = []
     for vol in list_volumes():
-        path = str(Path(vol["path"]).resolve())
+        try:
+            path = str(Path(vol["path"]).resolve())
+        except OSError:
+            path = str(vol.get("path") or "")
         if path in exclude:
             continue
         if vol.get("is_card_candidate"):
@@ -243,4 +249,7 @@ def find_card_volumes(*, exclude_paths: set[str] | None = None) -> list[dict]:
 def volume_free_bytes(path: str | Path) -> int:
     import shutil
 
-    return shutil.disk_usage(Path(path)).free
+    result = _run_with_timeout(lambda: shutil.disk_usage(Path(path)).free, 2.0)
+    if result is None:
+        raise OSError(f"Timed out reading free space for {path}")
+    return int(result)

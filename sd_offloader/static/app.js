@@ -22,10 +22,22 @@ const el = {
 };
 
 async function api(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
-  return data;
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...fetchOptions, signal: ctrl.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    return data;
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`Timed out talking to server (${url})`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function formatBytes(bytes) {
@@ -136,7 +148,7 @@ async function refreshBatches(preferred) {
 }
 
 async function refreshVolumes() {
-  const data = await api("/api/volumes");
+  const data = await api("/api/volumes", { timeoutMs: 45000 });
   fillVolumeSelect(el.ssd1, data.volumes || [], el.ssd1.value);
   fillVolumeSelect(el.ssd2, data.volumes || [], el.ssd2.value);
   await refreshBatches();
@@ -285,26 +297,35 @@ function sessionPayload() {
 async function bootstrap() {
   setStatus("Connecting to offloader…");
   try {
-    const health = await api("/api/health");
+    const health = await api("/api/ping", { timeoutMs: 5000 });
     el.appVersion.textContent = `v${health.version || "?"}`;
-    el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
-    el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
     setStatus(`Connected · v${health.version || "?"}`, "ok");
   } catch (error) {
     setStatus(`Cannot reach server: ${error.message}`, "error");
     return;
   }
 
+  // Non-blocking AWS CLI check
+  api("/api/health/full", { timeoutMs: 8000 })
+    .then((health) => {
+      el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
+      el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
+    })
+    .catch(() => {
+      el.awsCliStatus.textContent = "AWS CLI ?";
+      el.awsCliStatus.className = "pill warn";
+    });
+
   let config = {};
   try {
-    config = await api("/api/config");
+    config = await api("/api/config", { timeoutMs: 5000 });
     el.mode.value = config.mode || "ssd_only";
     el.s3Uri.value = config.s3_uri || "";
   } catch (error) {
     setStatus(`Config load failed: ${error.message}`, "error");
   }
 
-  setStatus("Loading drives (skipping hung card readers)…");
+  setStatus("Loading drives…");
   try {
     await refreshVolumes();
     if (config.ssd1) el.ssd1.value = config.ssd1;
@@ -315,7 +336,7 @@ async function bootstrap() {
       el.batchName.value = config.last_batch;
       onBatchSelectChange();
     }
-    setStatus("Ready", "ok");
+    setStatus("Ready — click Start SD → SSD when you want to watch cards", "ok");
   } catch (error) {
     setStatus(`Drive list failed: ${error.message} — click Refresh drives`, "error");
   }
