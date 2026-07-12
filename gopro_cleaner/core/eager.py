@@ -59,12 +59,12 @@ def _probe_duration(path: Path) -> float | None:
 
 
 def is_hidden_or_temp_mp4(path: Path) -> bool:
-    """True for Finder junk, in-progress trim temps (.name… / *.partial)."""
+    """True for Finder junk and in-progress trim temps (*.partial.MP4 / *.MP4.partial)."""
     name = path.name
     if name.startswith("."):
         return True
     lower = name.lower()
-    return lower.endswith(".partial") or ".partial." in lower
+    return ".partial" in lower
 
 
 def is_trimmed_clip(path: Path) -> bool:

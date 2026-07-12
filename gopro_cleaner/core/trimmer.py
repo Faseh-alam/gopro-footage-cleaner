@@ -229,8 +229,11 @@ def _execute_trim(job: TrimJob) -> None:
                 ),
             )
 
+        # Keep a real media extension last — ffmpeg picks the muxer from the
+        # suffix, so ".MP4.partial" fails with "Unable to choose an output format".
+        ext = job.output_path.suffix or ".MP4"
         temp_fd, temp_name = tempfile.mkstemp(
-            suffix=f"{job.output_path.suffix or '.MP4'}.partial",
+            suffix=f".partial{ext}",
             prefix=f"{job.output_path.stem}_",
             dir=output_dir,
         )
