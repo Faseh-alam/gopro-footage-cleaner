@@ -343,23 +343,37 @@ def restore_jobs_from_disk() -> None:
         except (json.JSONDecodeError, OSError):
             rows = []
         if isinstance(rows, list):
+            pending: list[dict] = []
+            for row in rows[:40]:
+                if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                pending.append(dict(row))
+            # Resolve PIDs outside the lock (can be slow).
+            pid_live_map = {}
+            for job in pending:
+                pid = job.get("aws_pid")
+                if pid is not None:
+                    try:
+                        pid_live_map[int(pid)] = _pid_alive(int(pid))
+                    except (TypeError, ValueError):
+                        pass
             with _lock:
-                for row in rows[:40]:
-                    if not isinstance(row, dict) or not row.get("id"):
-                        continue
-                    job = dict(row)
+                for job in pending:
                     log_path = Path(str(job.get("log_path") or ""))
-                    still = _log_still_active(log_path)
-                    if job.get("status") in {"running", "interrupted"} and still:
-                        job["status"] = "running"
-                        job["message"] = (
-                            "Re-attached after server restart — CMD upload still running"
-                        )
-                        job["console"] = True
-                        job["external"] = True
-                    elif job.get("status") == "running" and not still:
-                        # Finished while we were down, or log ended cleanly.
-                        if log_path.is_file() and _log_has_exit(log_path):
+                    still_log = _log_still_active(log_path)
+                    pid = job.get("aws_pid")
+                    pid_live = bool(pid) and pid_live_map.get(int(pid), False)
+
+                    if job.get("status") in {"running", "interrupted", "checking"}:
+                        if still_log or pid_live:
+                            job["status"] = "running"
+                            job["message"] = (
+                                "Re-attached after server restart — CMD upload still running"
+                            )
+                            job["console"] = True
+                            job["external"] = True
+                            job["progress_via_s3"] = True
+                        elif log_path.is_file() and _log_has_exit(log_path):
                             code = _log_exit_code(log_path)
                             if code == 0:
                                 job["status"] = "completed"
@@ -368,20 +382,63 @@ def restore_jobs_from_disk() -> None:
                             else:
                                 job["status"] = "error"
                                 job["message"] = f"aws s3 sync failed (exit {code})"
+                            job["speed_mbps"] = 0.0
+                            job["eta_seconds"] = None
                         else:
-                            job["status"] = "interrupted"
-                            job["message"] = (
-                                "Upload may have stopped — check CMD window or click Upload to resume"
-                            )
-                        job["speed_mbps"] = 0.0
-                        job["eta_seconds"] = None
+                            # May still be uploading in CMD — confirm via process scan next.
+                            job["status"] = "checking"
+                            job["message"] = "Checking whether CMD upload is still running…"
+                            job["speed_mbps"] = 0.0
                     _jobs[job["id"]] = job
 
     _discover_orphan_logs()
     _discover_live_aws_processes()
+    _finalize_checking_jobs()
     _persist_jobs()
     _ensure_monitor()
 
+
+def _finalize_checking_jobs() -> None:
+    """After process discovery, mark truly-dead jobs interrupted."""
+    with _lock:
+        snapshots = [
+            (jid, dict(job))
+            for jid, job in _jobs.items()
+            if job.get("status") == "checking"
+        ]
+    for job_id, snap in snapshots:
+        pid = snap.get("aws_pid")
+        if pid and _pid_alive(int(pid)):
+            with _lock:
+                job = _jobs.get(job_id)
+                if job:
+                    job["status"] = "running"
+                    job["message"] = "CMD upload still running — tracking progress via S3"
+            continue
+        batch = snap.get("batch")
+        dest = snap.get("dest")
+        with _lock:
+            job = _jobs.get(job_id)
+            if not job or job.get("status") != "checking":
+                continue
+            covered = any(
+                other.get("status") == "running"
+                and other is not job
+                and (
+                    (dest and other.get("dest") == dest)
+                    or (batch and other.get("batch") == batch)
+                )
+                for other in _jobs.values()
+            )
+            if covered:
+                job["status"] = "completed"
+                job["message"] = "Superseded by live CMD upload tracker"
+                continue
+            job["status"] = "interrupted"
+            job["message"] = (
+                "No live aws s3 sync found — if CMD is still uploading, wait a few seconds "
+                "or click Upload to resume (sync skips files already on S3)"
+            )
 
 def _log_has_exit(log_path: Path) -> bool:
     try:
@@ -548,10 +605,10 @@ def _discover_live_aws_processes() -> None:
         bytes_total = _dir_bytes(Path(src)) if src else 0
 
         with _lock:
-            # Prefer an existing running job for same batch / dest / pid.
+            # Prefer an existing job for same batch / dest / pid (revive interrupted).
             existing_id = None
             for jid, j in _jobs.items():
-                if j.get("status") != "running":
+                if j.get("status") not in {"running", "interrupted", "checking"}:
                     continue
                 if j.get("aws_pid") == pid:
                     existing_id = jid
@@ -559,15 +616,19 @@ def _discover_live_aws_processes() -> None:
                 if dest and j.get("dest") == dest:
                     existing_id = jid
                     break
-                if batch and j.get("batch") == batch and j.get("log_path"):
+                if batch and j.get("batch") == batch:
                     existing_id = jid
                     break
             if existing_id:
                 job = _jobs[existing_id]
+                job["status"] = "running"
                 job["aws_pid"] = pid
+                job["console"] = True
+                job["external"] = True
+                job["progress_via_s3"] = True
                 if src and not job.get("sources"):
                     job["sources"] = [src]
-                if dest and not job.get("dest"):
+                if dest:
                     job["dest"] = dest
                 if batch and (
                     not job.get("batch")
@@ -577,14 +638,38 @@ def _discover_live_aws_processes() -> None:
                     job["batch"] = batch
                 if bytes_total and not job.get("bytes_total"):
                     job["bytes_total"] = bytes_total
-                if not job.get("log_path"):
-                    job["message"] = (
-                        f"Live CMD upload (PID {pid}) — progress from S3 size vs local"
-                    )
+                job["message"] = (
+                    f"Live CMD upload (PID {pid}"
+                    + (f", {batch}" if batch else "")
+                    + ") — tracking progress via S3"
+                )
+                if cmd and not job.get("log"):
+                    job["log"] = [cmd[:400]]
                 continue
 
             job_id = f"aws:proc:{pid}"
             if job_id in _jobs:
+                job = _jobs[job_id]
+                job["status"] = "running"
+                job["aws_pid"] = pid
+                job["console"] = True
+                job["external"] = True
+                job["progress_via_s3"] = True
+                if src:
+                    job["sources"] = [src]
+                if dest:
+                    job["dest"] = dest
+                if batch:
+                    job["batch"] = batch
+                if bytes_total:
+                    job["bytes_total"] = bytes_total
+                job["message"] = (
+                    f"Live CMD upload (PID {pid}"
+                    + (f", {batch}" if batch else "")
+                    + ") — tracking progress via S3"
+                )
+                if cmd:
+                    job["log"] = [cmd[:400]] + list(job.get("log") or [])[:20]
                 continue
             _jobs[job_id] = {
                 "id": job_id,
@@ -642,18 +727,64 @@ def _ensure_monitor() -> None:
 
 
 def _monitor_loop() -> None:
+    ticks = 0
     while True:
         try:
+            ticks += 1
             _poll_all_jobs()
             _poll_s3_progress_for_jobs()
             if platform.system() == "Windows":
                 _refresh_process_only_jobs()
-                # Re-scan occasionally so a late-started CMD still gets picked up.
-                if int(time.time()) % 20 == 0:
+                # Re-scan often so interrupted/checking jobs revive while CMD still runs.
+                if ticks % 5 == 0:
                     _discover_live_aws_processes()
+                    _finalize_checking_jobs()
+                    _persist_jobs()
         except Exception:  # noqa: BLE001
             pass
         time.sleep(1.0)
+
+
+def _refresh_process_only_jobs() -> None:
+    """If stored PID died, re-scan before declaring the upload finished."""
+    with _lock:
+        proc_jobs = [
+            (jid, j.get("aws_pid"), j.get("dest"), j.get("batch"))
+            for jid, j in _jobs.items()
+            if j.get("status") == "running" and j.get("aws_pid") and not j.get("log_path")
+        ]
+    for job_id, pid, dest, batch in proc_jobs:
+        if pid is None:
+            continue
+        if _pid_alive(int(pid)):
+            continue
+        # PID gone — maybe aws respawned under a new PID; discover before closing.
+        _discover_live_aws_processes()
+        with _lock:
+            job = _jobs.get(job_id)
+            if not job or job.get("status") != "running":
+                continue
+            # Still same job with dead pid and no replacement attached?
+            if job.get("aws_pid") == pid and not _pid_alive(int(pid)):
+                # Another running tracker for same dest/batch means we're fine.
+                covered = any(
+                    other.get("status") == "running"
+                    and other is not job
+                    and (
+                        (dest and other.get("dest") == dest)
+                        or (batch and other.get("batch") == batch)
+                    )
+                    for other in _jobs.values()
+                )
+                if covered:
+                    job["status"] = "completed"
+                    job["message"] = "Tracked by another live CMD upload"
+                else:
+                    # Keep as checking for a bit — sync may still be running under new PID.
+                    job["status"] = "checking"
+                    job["message"] = "aws PID changed — rechecking live sync…"
+                    job["aws_pid"] = None
+        _persist_jobs()
 
 
 def _poll_all_jobs() -> None:
@@ -692,11 +823,9 @@ def _poll_s3_progress_for_jobs() -> None:
                     job["batch"] = batch
             sources = list(job.get("sources") or [])
             if not int(job.get("bytes_total") or 0) and sources:
-                # Defer heavy scan outside lock via marker.
                 job["_need_total"] = sources[0]
             if not dest.startswith("s3://"):
                 continue
-            # Always use S3 meter when there is no log, or log has not moved yet.
             log_path = str(job.get("log_path") or "")
             log_quiet = (not log_path) or int(job.get("bytes_done") or 0) == 0
             if not log_quiet and not job.get("progress_via_s3") and not job.get("aws_pid"):
@@ -744,7 +873,6 @@ def _poll_s3_progress_for_jobs() -> None:
             if bytes_total and not job.get("bytes_total"):
                 job["bytes_total"] = bytes_total
             total = int(job.get("bytes_total") or bytes_total or 0)
-            # Prefer max(log bytes, s3 bytes) so we never go backwards oddly.
             job["bytes_done"] = min(total, s3_bytes) if total else s3_bytes
             job["files_done"] = max(int(job.get("files_done") or 0), s3_objects)
             job["last_s3_bytes"] = s3_bytes
@@ -875,30 +1003,6 @@ def _ingest_log_progress(job_id: str) -> bool:
                 _jobs[job_id]["transferred"] = transferred
                 _jobs[job_id]["files_done"] = files_done
     return changed
-
-
-def _refresh_process_only_jobs() -> None:
-    """Mark process-detected jobs completed when aws.exe PID disappears."""
-    with _lock:
-        proc_jobs = [
-            (jid, j.get("aws_pid"))
-            for jid, j in _jobs.items()
-            if j.get("status") == "running" and j.get("aws_pid") and not j.get("log_path")
-        ]
-    for job_id, pid in proc_jobs:
-        if pid is None:
-            continue
-        if _pid_alive(int(pid)):
-            continue
-        with _lock:
-            job = _jobs.get(job_id)
-            if not job:
-                continue
-            job["status"] = "completed"
-            job["message"] = "aws s3 sync process ended (check CMD window for success/errors)"
-            job["speed_mbps"] = 0.0
-            job["eta_seconds"] = 0
-        _persist_jobs()
 
 
 def _pid_alive(pid: int) -> bool:

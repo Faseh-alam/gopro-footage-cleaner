@@ -273,6 +273,10 @@ button.secondary {
   color: var(--warn);
 }
 
+.phase.checking {
+  color: var(--warn);
+}
+
 .log {
   max-height: 280px;
   overflow: auto;
