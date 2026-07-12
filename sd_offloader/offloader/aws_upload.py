@@ -1,7 +1,14 @@
-"""AWS S3 sync using the AWS CLI (credentials from `aws configure`)."""
+"""AWS S3 sync using the AWS CLI (credentials from `aws configure`).
+
+Large batch uploads open a **local Command Prompt / Terminal window** so progress
+keeps running even if the browser is closed. ``aws s3 sync`` is resume-safe —
+re-run the same script and it skips files already on S3.
+"""
 
 from __future__ import annotations
 
+import json
+import platform
 import re
 import shutil
 import subprocess
@@ -10,10 +17,11 @@ import threading
 import time
 from pathlib import Path
 
-from .config import BATCHES_SUBDIR
+from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+EXTERNAL_JOBS_FILE = STATE_DIR / "aws_external_jobs.json"
 
 
 def aws_cli_available() -> bool:
@@ -94,14 +102,16 @@ def start_batch_upload(
     ssd1: str,
     ssd2: str,
     card_id: str | None = None,
+    external_window: bool = True,
 ) -> dict:
+    """Start an S3 sync. Prefer a visible local console for long TB-scale uploads."""
     if not aws_cli_available():
         raise RuntimeError("AWS CLI not found. Install AWS CLI v2 and run `aws configure`.")
 
     prefix = batch_s3_prefix(s3_uri, batch_name)
     roots = list_local_batch_roots(ssd1, ssd2, batch_name)
     if not roots:
-        raise RuntimeError(f"No local batch folder found for {batch_name}")
+        raise RuntimeError(f"No local batch folder found for {batch_name} on the selected SSDs")
 
     sources: list[Path] = []
     if card_id:
@@ -111,11 +121,18 @@ def start_batch_upload(
                 sources.append(card_path)
         if not sources:
             raise RuntimeError(f"Card folder {card_id} not found under batch {batch_name}")
-        # Sync card folder into prefix/Cxxxx/
         dest = f"{prefix}{card_id.upper()}/"
     else:
         sources = roots
         dest = prefix
+
+    if external_window:
+        return start_external_sync(
+            batch_name=batch_name,
+            sources=sources,
+            dest=dest,
+            card_id=card_id,
+        )
 
     job_id = f"{batch_name}:{card_id or 'ALL'}:{int(time.time())}"
     with _lock:
@@ -132,16 +149,167 @@ def start_batch_upload(
             "message": "Starting aws s3 sync…",
             "log": [],
             "started_at": time.time(),
+            "external": False,
         }
 
     thread = threading.Thread(
         target=_run_sync_job,
-        args=(job_id, sources, dest, card_id is not None),
+        args=(job_id, sources, dest),
         daemon=True,
         name=f"aws-{job_id}",
     )
     thread.start()
     return get_job(job_id) or {"id": job_id, "status": "running"}
+
+
+def start_external_sync(
+    *,
+    batch_name: str,
+    sources: list[Path],
+    dest: str,
+    card_id: str | None = None,
+) -> dict:
+    """Write a sync script and open it in a new Command Prompt / Terminal window."""
+    ensure_dirs()
+    stamp = int(time.time())
+    label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
+    safe = re.sub(r"[^\w.-]+", "_", label)
+    system = platform.system()
+
+    if system == "Windows":
+        script = STATE_DIR / f"aws_upload_{safe}.bat"
+        lines = [
+            "@echo off",
+            "setlocal",
+            f"title AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""),
+            "echo ============================================",
+            f"echo   AWS S3 upload  {batch_name}"
+            + (f" / {card_id}" if card_id else ""),
+            f"echo   Destination: {dest}",
+            "echo   aws s3 sync is resume-safe — re-run this window if interrupted.",
+            "echo ============================================",
+            "echo.",
+        ]
+        for src in sources:
+            lines.append(f'echo Syncing "{src}"')
+            lines.append(f'echo   -^> {dest}')
+            # /Y not needed; sync skips existing matching files
+            lines.append(f'aws s3 sync "{src}" "{dest}"')
+            lines.append("if errorlevel 1 (")
+            lines.append("  echo.")
+            lines.append("  echo ERROR: aws s3 sync failed. Fix network/credentials and re-run this script.")
+            lines.append("  pause")
+            lines.append("  exit /b 1")
+            lines.append(")")
+            lines.append("echo.")
+        lines.extend(
+            [
+                "echo ============================================",
+                "echo   Upload finished OK",
+                "echo ============================================",
+                "pause",
+            ]
+        )
+        script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        # New visible console that survives browser close
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", f"AWS upload — {batch_name}", "cmd.exe", "/k", str(script)],
+            cwd=str(STATE_DIR),
+        )
+    else:
+        script = STATE_DIR / f"aws_upload_{safe}.sh"
+        lines = [
+            "#!/bin/bash",
+            "set -e",
+            f'echo "============================================"',
+            f'echo "  AWS S3 upload  {batch_name}'
+            + (f" / {card_id}" if card_id else "")
+            + '"',
+            f'echo "  Destination: {dest}"',
+            'echo "  aws s3 sync is resume-safe — re-run if interrupted."',
+            'echo "============================================"',
+            "echo",
+        ]
+        for src in sources:
+            lines.append(f'echo "Syncing {src}"')
+            lines.append(f'aws s3 sync "{src}" "{dest}"')
+            lines.append("echo")
+        lines.extend(
+            [
+                'echo "============================================"',
+                'echo "  Upload finished OK"',
+                'echo "============================================"',
+                'read -r -p "Press Enter to close…" _',
+            ]
+        )
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        script.chmod(0o755)
+        if system == "Darwin":
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "Terminal" to do script "bash \\"{script}\\""',
+                ]
+            )
+        else:
+            # Linux: try a common terminal
+            for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
+                if shutil.which(term):
+                    subprocess.Popen([term, "-e", f"bash {script}"])
+                    break
+            else:
+                raise RuntimeError("No terminal found to show AWS progress")
+
+    job_id = f"external:{label}"
+    job = {
+        "id": job_id,
+        "status": "external",
+        "batch": batch_name,
+        "card_id": card_id,
+        "dest": dest,
+        "bytes_done": 0,
+        "bytes_total": 0,
+        "speed_mbps": 0.0,
+        "eta_seconds": None,
+        "message": f"Opened local console — syncing to {dest} (resume-safe)",
+        "log": [f"Script: {script}"],
+        "started_at": time.time(),
+        "external": True,
+        "script": str(script),
+    }
+    with _lock:
+        _jobs[job_id] = job
+    _remember_external_job(job)
+    return dict(job)
+
+
+def _remember_external_job(job: dict) -> None:
+    ensure_dirs()
+    rows: list[dict] = []
+    if EXTERNAL_JOBS_FILE.exists():
+        try:
+            rows = json.loads(EXTERNAL_JOBS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(rows, list):
+                rows = []
+        except (json.JSONDecodeError, OSError):
+            rows = []
+    rows.insert(0, job)
+    rows = rows[:40]
+    try:
+        EXTERNAL_JOBS_FILE.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def list_external_jobs() -> list[dict]:
+    if not EXTERNAL_JOBS_FILE.exists():
+        return []
+    try:
+        rows = json.loads(EXTERNAL_JOBS_FILE.read_text(encoding="utf-8"))
+        return rows if isinstance(rows, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 def get_job(job_id: str) -> dict | None:
@@ -152,10 +320,19 @@ def get_job(job_id: str) -> dict | None:
 
 def list_jobs() -> list[dict]:
     with _lock:
-        return [dict(j) for j in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)]
+        live = [dict(j) for j in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)]
+    # Merge recent external jobs from disk (survive app restart in the UI list)
+    seen = {j["id"] for j in live}
+    for row in list_external_jobs():
+        jid = row.get("id")
+        if jid and jid not in seen:
+            live.append(row)
+            seen.add(jid)
+    live.sort(key=lambda x: x.get("started_at", 0), reverse=True)
+    return live
 
 
-def _run_sync_job(job_id: str, sources: list[Path], dest: str, single_card: bool) -> None:
+def _run_sync_job(job_id: str, sources: list[Path], dest: str) -> None:
     total_bytes = 0
     for src in sources:
         for path in src.rglob("*"):
@@ -173,20 +350,7 @@ def _run_sync_job(job_id: str, sources: list[Path], dest: str, single_card: bool
     started = time.time()
 
     for src in sources:
-        # If syncing whole batch root, dest is batch prefix; content includes Cxxxx folders.
-        # If single card folder, dest is batch/Cxxxx/
-        cmd = [
-            "aws",
-            "s3",
-            "sync",
-            str(src),
-            dest if single_card else dest,
-            "--only-show-errors",
-            "--no-progress",
-        ]
-        # Better: use default progress on stderr for parsing — enable progress
         cmd = ["aws", "s3", "sync", str(src), dest]
-
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -205,7 +369,6 @@ def _run_sync_job(job_id: str, sources: list[Path], dest: str, single_card: bool
                     continue
                 job["log"] = (job.get("log") or [])[-80:] + [line]
                 job["message"] = line[:200]
-                # Parse Completed X.Y MiB/s ... when available
                 speed = _parse_speed(line)
                 if speed is not None:
                     job["speed_mbps"] = speed

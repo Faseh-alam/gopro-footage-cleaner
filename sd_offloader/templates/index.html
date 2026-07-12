@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">Server ingest</p>
           <h1>SD Card Offloader</h1>
-          <p class="hint">SD → removable SSDs → optional AWS S3 · multi-card parallel · live MB/s · resume-safe</p>
+          <p class="hint">Pick an existing batch on the SSDs or create a new one · SD→SSD parallel · AWS in a local CMD window (resume-safe)</p>
         </div>
         <div class="header-meta">
           <span id="aws-cli-status" class="pill">AWS CLI…</span>
@@ -24,17 +24,6 @@
         <h2>Session</h2>
         <div class="grid-2">
           <label>
-            Batch name
-            <input id="batch-name" type="text" placeholder="batch 6" />
-          </label>
-          <label>
-            Mode
-            <select id="mode">
-              <option value="ssd_only">SSD only (no AWS yet)</option>
-              <option value="ssd_and_aws">SSD + AWS (upload as each card finishes)</option>
-            </select>
-          </label>
-          <label>
             SSD 1
             <select id="ssd1"></select>
           </label>
@@ -42,17 +31,35 @@
             SSD 2
             <select id="ssd2"></select>
           </label>
+          <label>
+            Batch on SSDs
+            <select id="batch-select">
+              <option value="">Refresh drives to list batches…</option>
+            </select>
+          </label>
+          <label id="new-batch-row" class="hidden">
+            New batch name
+            <input id="batch-name" type="text" placeholder="batch 6" />
+          </label>
+          <label>
+            Mode
+            <select id="mode">
+              <option value="ssd_only">SSD only (upload to AWS later)</option>
+              <option value="ssd_and_aws">SSD + AWS (CMD window as each card finishes)</option>
+            </select>
+          </label>
           <label class="full">
             AWS S3 destination (folder URI — keys stay in `aws configure`)
             <input id="s3-uri" type="text" placeholder="s3://your-bucket/footage/" />
           </label>
         </div>
+        <p id="batch-hint" class="hint">Existing batches appear after you pick SSD 1 / SSD 2.</p>
         <div class="row actions">
-          <button id="refresh-volumes" type="button" class="secondary">Refresh drives</button>
-          <button id="start-session" type="button" class="primary">Start watching cards</button>
+          <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
+          <button id="start-session" type="button" class="primary">Start SD → SSD for this batch</button>
           <button id="stop-session" type="button" class="secondary">Stop watching</button>
+          <button id="upload-batch" type="button" class="primary" title="Opens a local Command Prompt — survives browser close; aws s3 sync resumes">Upload this batch to AWS (CMD)</button>
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
-          <button id="upload-batch" type="button" class="secondary">Upload batch to AWS now</button>
         </div>
         <p id="session-status" class="status"></p>
       </section>
@@ -68,6 +75,7 @@
       <section class="panel grid-2-panels">
         <div>
           <h2>AWS jobs</h2>
+          <p class="hint">Long uploads run in a separate Command Prompt. Re-run the same script if interrupted — sync skips files already on S3.</p>
           <div id="aws-jobs" class="jobs"></div>
         </div>
         <div>

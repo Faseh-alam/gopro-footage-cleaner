@@ -370,6 +370,7 @@ def _copy_card_worker(
                     ssd1=ssd1,
                     ssd2=ssd2,
                     card_id=card_id,
+                    external_window=True,
                 )
                 _update_card(
                     card_id,
@@ -402,7 +403,42 @@ def _copy_card_worker(
         _log_line(f"{card_id}: error — {exc}", kind="error")
 
 
-def upload_batch_now() -> dict:
+def log_message(message: str, *, kind: str = "info") -> None:
+    _log_line(message, kind=kind)
+
+
+def bind_batch_context(
+    *,
+    batch: str,
+    ssd1: str = "",
+    ssd2: str = "",
+    s3_uri: str = "",
+) -> None:
+    """Remember batch/SSD/S3 without starting the SD watcher (for AWS-only uploads)."""
+    batch = batch.strip()
+    if not batch:
+        raise ValueError("Batch name is required")
+    ssd1_path = str(Path(ssd1).resolve()) if ssd1 else ""
+    ssd2_path = str(Path(ssd2).resolve()) if ssd2 else ""
+    with _lock:
+        _session["batch"] = batch
+        if ssd1_path:
+            _session["ssd1"] = ssd1_path
+        if ssd2_path:
+            _session["ssd2"] = ssd2_path
+        if s3_uri.strip():
+            _session["s3_uri"] = s3_uri.strip()
+    save_config(
+        {
+            "last_batch": batch,
+            "ssd1": _session.get("ssd1") or ssd1_path,
+            "ssd2": _session.get("ssd2") or ssd2_path,
+            "s3_uri": _session.get("s3_uri") or s3_uri.strip(),
+        }
+    )
+
+
+def upload_batch_now(*, external_window: bool = True) -> dict:
     cfg = load_config()
     with _lock:
         batch = _session.get("batch") or cfg.get("last_batch") or ""
@@ -410,15 +446,18 @@ def upload_batch_now() -> dict:
         ssd2 = _session.get("ssd2") or cfg.get("ssd2") or ""
         s3_uri = _session.get("s3_uri") or cfg.get("s3_uri") or ""
     if not batch:
-        raise ValueError("No active/last batch name")
+        raise ValueError("No batch selected — pick an existing batch or create a new one")
     if not s3_uri:
         raise ValueError("Set S3 URI first")
+    if not ssd1 and not ssd2:
+        raise ValueError("Pick SSD 1 / SSD 2 so we know where the batch lives")
     job = aws_upload.start_batch_upload(
         s3_uri=s3_uri,
         batch_name=batch,
         ssd1=ssd1,
         ssd2=ssd2,
         card_id=None,
+        external_window=external_window,
     )
-    _log_line(f"Manual AWS upload started for {batch}")
+    _log_line(f"AWS upload window opened for batch {batch} → {job.get('dest')}")
     return job
