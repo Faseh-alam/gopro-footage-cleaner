@@ -45,7 +45,7 @@ chmod +x run.sh
 4. **Batch on SSDs** — select an existing batch already on the drives (e.g. `batch 3` from home), or **+ Create new batch…**
 5. Choose mode:
    - **SSD only** — free cards fast; upload to AWS later from the office
-   - **SSD + AWS** — when each card finishes, a **Command Prompt** runs **s5cmd** (or `aws s3 sync` fallback) with auto-retries. The web UI re-attaches and shows size / speed / ETA
+   - **SSD + AWS** — when each card finishes, CMD runs **s5cmd** (plain sync first; `--numworkers 20` on failure). UI shows progress and re-attaches after restarts.
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
 7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
 8. **Upload this batch to AWS (CMD)** — opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
