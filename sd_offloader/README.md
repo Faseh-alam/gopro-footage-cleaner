@@ -25,7 +25,7 @@ Skips `.LRV`, `.THM`, and other non-MP4 junk.
 
 ### Windows
 
-1. Install Python 3.10+ and (for AWS) [AWS CLI v2](https://aws.amazon.com/cli/)
+1. Install Python 3.10+ and for AWS preferably **[s5cmd](https://github.com/peak/s5cmd)** (fast) plus [AWS CLI v2](https://aws.amazon.com/cli/) credentials via `aws configure`
 2. Double-click `run.bat`
 3. Browser opens `http://127.0.0.1:8877`
 
@@ -45,17 +45,17 @@ chmod +x run.sh
 4. **Batch on SSDs** — select an existing batch already on the drives (e.g. `batch 3` from home), or **+ Create new batch…**
 5. Choose mode:
    - **SSD only** — free cards fast; upload to AWS later from the office
-   - **SSD + AWS** — when each card finishes, a **Command Prompt** runs `aws s3 sync` (keeps going if you restart the offloader). The web UI re-attaches and shows size / speed / ETA from the upload log
+   - **SSD + AWS** — when each card finishes, a **Command Prompt** runs **s5cmd** (or `aws s3 sync` fallback) with auto-retries. The web UI re-attaches and shows size / speed / ETA
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
 7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
-8. **Upload this batch to AWS (CMD)** — opens CMD (upload survives server restart) **and** shows live progress in the UI. If interrupted, run again and sync **skips files already on S3**
+8. **Upload this batch to AWS (CMD)** — opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
 9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, task folders wiped, ejected
 
 ### Office resume example (batch 3 dumped at home, no internet)
 
 1. On the server: pick SSDs → select **batch 3** from the list  
 2. Start SD → SSD if more cards still need dumping  
-3. Click **Upload this batch to AWS (CMD)** — watch progress on the page; you can restart the offloader and it will re-attach to open CMD uploads  
+3. Click **Upload this batch to AWS (CMD)** — watch progress on the page; **Restart** resumes missing files (skips what’s already on S3)  
 
 If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** batch folder name. AWS still syncs everything into one `…/batch 6/` prefix.
 
@@ -125,4 +125,5 @@ Override: `SD_OFFLOADER_PORT=8899`
 
 - Wipe/eject happens only after size verification  
 - Only transferred task folders under `DCIM/…GOPRO` are deleted on the card  
-- SSD copies are kept after AWS upload (local backup)
+- After upload the UI compares local vs S3 sizes; **Delete local** is optional and only enabled when verified
+- Config: `s5cmd_numworkers` (default 20 — used only after plain sync fails), `aws_upload_retries` (default 5) in `config.json`

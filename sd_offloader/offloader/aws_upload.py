@@ -1,10 +1,14 @@
-"""AWS S3 sync using the AWS CLI (credentials from `aws configure`).
+"""AWS S3 sync via s5cmd (preferred) or AWS CLI.
 
 Uploads run in an **external Command Prompt / Terminal** so a server restart
 does **not** stop them. Output is tee'd to a log file under ``state/aws_logs/``.
 The offloader watches those logs and shows size / speed / ETA in the UI.
 On startup it re-attaches to any still-running uploads (open CMD + log).
-``aws s3 sync`` is resume-safe if you ever need to start the same batch again.
+
+Prefers ``s5cmd sync`` first (default workers — usually faster), then retries with
+``s5cmd --numworkers N`` if that fails. Falls back to ``aws s3 sync``. Failed
+syncs auto-retry in the CMD script; the UI also has Restart + size-verify
+(local vs S3) before optional local delete.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs
+from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs, load_config
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
@@ -28,6 +32,7 @@ _monitor_started = False
 JOBS_FILE = STATE_DIR / "aws_jobs.json"
 LOG_DIR = STATE_DIR / "aws_logs"
 EXIT_MARKER = "OFFLOADER_EXIT:"
+VERIFY_MARKER = "OFFLOADER_VERIFY:"
 
 _SPEED_RE = re.compile(r"([\d.]+)\s*(MiB|MB|GiB|GB)/s", re.IGNORECASE)
 _COMPLETED_RE = re.compile(
@@ -39,50 +44,111 @@ _UPLOAD_RE = re.compile(
     r"^(?:upload|copy|download):\s+(.+?)\s+to\s+s3://",
     re.IGNORECASE,
 )
+# s5cmd: cp local s3://...
+_S5CMD_CP_RE = re.compile(
+    r"^(?:cp|mv)\s+(.+?)\s+s3://",
+    re.IGNORECASE,
+)
 _BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\\"'\s/]+)", re.IGNORECASE)
 _SYNC_ARGS_RE = re.compile(
-    r"s3\s+sync\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
+    r"(?:s3\s+sync|sync)\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
     re.IGNORECASE,
 )
 _TOTAL_SIZE_RE = re.compile(r"Total Size:\s*(\d+)", re.IGNORECASE)
 _TOTAL_OBJECTS_RE = re.compile(r"Total Objects:\s*(\d+)", re.IGNORECASE)
+_S5CMD_DU_RE = re.compile(
+    r"([\d.]+)\s*(?:bytes|[KMGT]i?B)\s+in\s+(\d+)\s+objects?",
+    re.IGNORECASE,
+)
+_SIZE_TOLERANCE_BYTES = 1024 * 1024  # 1 MiB slack for listing quirks
 
 
 def aws_cli_available() -> bool:
     return shutil.which("aws") is not None
 
 
+def s5cmd_available() -> bool:
+    return shutil.which("s5cmd") is not None
+
+
+def upload_tool_available() -> bool:
+    return s5cmd_available() or aws_cli_available()
+
+
+def preferred_uploader() -> str:
+    """Return 's5cmd' or 'aws' — s5cmd preferred when both exist."""
+    if s5cmd_available():
+        return "s5cmd"
+    if aws_cli_available():
+        return "aws"
+    return ""
+
+
+def _numworkers() -> int:
+    try:
+        n = int(load_config().get("s5cmd_numworkers") or 20)
+    except (TypeError, ValueError):
+        n = 20
+    return max(1, min(n, 256))
+
+
+def _upload_retries() -> int:
+    try:
+        n = int(load_config().get("aws_upload_retries") or 5)
+    except (TypeError, ValueError):
+        n = 5
+    return max(1, min(n, 20))
+
+
 def test_aws_connection(s3_uri: str) -> dict:
     """Upload a tiny empty file via AWS CLI credentials (`aws configure`)."""
-    if not aws_cli_available():
-        raise RuntimeError("AWS CLI not found. Install AWS CLI v2, then run `aws configure`.")
+    if not upload_tool_available():
+        raise RuntimeError(
+            "Neither s5cmd nor AWS CLI found. Install s5cmd (preferred) or AWS CLI v2, then run `aws configure`."
+        )
 
     base = normalize_s3_uri(s3_uri)
     key = f"{base}_offloader_connection_test.txt"
+    tool = preferred_uploader()
 
     with tempfile.TemporaryDirectory() as tmp:
         local = Path(tmp) / "offloader_connection_test.txt"
         local.write_text("", encoding="utf-8")
-        put = subprocess.run(
-            ["aws", "s3", "cp", str(local), key],
-            capture_output=True,
-            text=True,
-        )
+        if tool == "s5cmd":
+            put = subprocess.run(
+                ["s5cmd", "cp", str(local), key],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            put = subprocess.run(
+                ["aws", "s3", "cp", str(local), key],
+                capture_output=True,
+                text=True,
+            )
         if put.returncode != 0:
-            detail = (put.stderr or put.stdout or "aws s3 cp failed").strip()
+            detail = (put.stderr or put.stdout or f"{tool} upload failed").strip()
             raise RuntimeError(detail)
 
-        delete = subprocess.run(
-            ["aws", "s3", "rm", key],
-            capture_output=True,
-            text=True,
-        )
+        if tool == "s5cmd":
+            delete = subprocess.run(
+                ["s5cmd", "rm", key],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            delete = subprocess.run(
+                ["aws", "s3", "rm", key],
+                capture_output=True,
+                text=True,
+            )
         cleaned = delete.returncode == 0
 
     return {
         "ok": True,
+        "uploader": tool,
         "message": (
-            f"AWS OK — uploaded and verified write to {key}"
+            f"AWS OK via {tool} — uploaded and verified write to {key}"
             + (" (test file removed)" if cleaned else " (could not delete test file; upload still worked)")
         ),
         "s3_key": key,
@@ -137,10 +203,14 @@ def start_batch_upload(
     external_window: bool = True,
     show_console: bool | None = None,
 ) -> dict:
-    """Start aws s3 sync in an external console (survives server restart)."""
+    """Start s5cmd/aws sync in an external console (survives server restart)."""
     del show_console  # always external + logged
-    if not aws_cli_available():
-        raise RuntimeError("AWS CLI not found. Install AWS CLI v2 and run `aws configure`.")
+    del external_window
+    tool = preferred_uploader()
+    if not tool:
+        raise RuntimeError(
+            "Neither s5cmd nor AWS CLI found. Install s5cmd (recommended) or AWS CLI v2, then `aws configure`."
+        )
 
     prefix = batch_s3_prefix(s3_uri, batch_name)
     roots = list_local_batch_roots(ssd1, ssd2, batch_name)
@@ -160,20 +230,187 @@ def start_batch_upload(
         sources = roots
         dest = prefix
 
+    return _launch_upload_job(
+        sources=sources,
+        dest=dest,
+        batch_name=batch_name,
+        card_id=card_id,
+        s3_uri=s3_uri,
+        tool=tool,
+    )
+
+
+def restart_job(job_id: str) -> dict:
+    """Re-run sync for a failed/interrupted/mismatched job (resume-safe)."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        if job.get("status") == "running":
+            raise RuntimeError("Upload still running — wait for it to finish or close its CMD window")
+        sources = [Path(p) for p in (job.get("sources") or []) if p]
+        dest = str(job.get("dest") or "").strip()
+        batch_name = str(job.get("batch") or "").strip() or "batch"
+        card_id = job.get("card_id")
+        s3_uri = str(job.get("s3_uri") or "").strip()
+
+    if not sources or not all(p.is_dir() for p in sources):
+        raise RuntimeError("Local source folder missing — pick the SSD batch and Upload again")
+    if not dest.startswith("s3://"):
+        raise RuntimeError("Job is missing an S3 destination")
+
+    tool = preferred_uploader()
+    if not tool:
+        raise RuntimeError("Neither s5cmd nor AWS CLI found")
+
+    # Replace this job id so the UI Restart button keeps a stable reference.
+    return _launch_upload_job(
+        sources=sources,
+        dest=dest,
+        batch_name=batch_name,
+        card_id=card_id,
+        s3_uri=s3_uri,
+        tool=tool,
+        reuse_job_id=job_id,
+        restart=True,
+    )
+
+
+def verify_job_sizes(job_id: str) -> dict:
+    """Compare local folder bytes vs S3 prefix; mark verified or mismatch."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        snap = dict(job)
+
+    sources = [Path(p) for p in (snap.get("sources") or []) if p]
+    dest = str(snap.get("dest") or "").strip()
+    if not sources:
+        raise RuntimeError("No local sources stored on this job")
+    if not dest.startswith("s3://"):
+        raise RuntimeError("No S3 destination on this job")
+
+    result = _compare_local_s3_sizes(sources, dest)
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        job["local_bytes"] = result["local_bytes"]
+        job["s3_bytes"] = result["s3_bytes"]
+        job["s3_objects"] = result["s3_objects"]
+        job["size_delta"] = result["delta"]
+        if result["ok"]:
+            job["status"] = "verified"
+            job["verified"] = True
+            job["message"] = (
+                f"Verified · local {result['local_bytes']} ≈ S3 {result['s3_bytes']} "
+                f"({result['s3_objects']} objects) — safe to delete local if you want"
+            )
+        else:
+            job["verified"] = False
+            if job.get("status") in {"completed", "verified", "mismatch"}:
+                job["status"] = "mismatch"
+            job["message"] = (
+                f"Size mismatch · local {result['local_bytes']} vs S3 {result['s3_bytes']} "
+                f"(Δ {result['delta']}) — click Restart to resume missing files"
+            )
+        _append_job_log(job, f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} ok={result['ok']}")
+    _persist_jobs()
+    return get_job(job_id) or result
+
+
+def delete_local_after_verify(job_id: str, *, confirmed: bool = False) -> dict:
+    """Delete local SSD sources only after size verification succeeded."""
+    if not confirmed:
+        raise RuntimeError("Deletion requires confirmed=true")
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        if job.get("status") != "verified" and not job.get("verified"):
+            raise RuntimeError("Verify sizes first — only delete after local ≈ S3")
+        sources = [Path(p) for p in (job.get("sources") or []) if p]
+        snap = dict(job)
+
+    if not sources:
+        raise RuntimeError("No local sources to delete")
+
+    # Re-check right before delete.
+    check = _compare_local_s3_sizes(sources, str(snap.get("dest") or ""))
+    if not check["ok"]:
+        with _lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["status"] = "mismatch"
+                job["verified"] = False
+                job["message"] = "Refusing delete — sizes no longer match. Restart upload."
+        _persist_jobs()
+        raise RuntimeError("Sizes no longer match — refusing to delete local files")
+
+    deleted: list[str] = []
+    errors: list[str] = []
+    for src in sources:
+        try:
+            if src.is_dir():
+                shutil.rmtree(src)
+                deleted.append(str(src))
+        except OSError as exc:
+            errors.append(f"{src}: {exc}")
+
+    with _lock:
+        job = _jobs.get(job_id)
+        if job:
+            job["status"] = "deleted_local"
+            job["message"] = (
+                f"Deleted local after verify ({len(deleted)} folder(s))"
+                + (f" · errors: {'; '.join(errors)}" if errors else "")
+            )
+            _append_job_log(job, f"DELETED {deleted}")
+    _persist_jobs()
+    if errors and not deleted:
+        raise RuntimeError("; ".join(errors))
+    return get_job(job_id) or {"ok": True, "deleted": deleted, "errors": errors}
+
+
+def _append_job_log(job: dict, line: str) -> None:
+    job["log"] = (job.get("log") or [])[-100:] + [line]
+
+
+def _launch_upload_job(
+    *,
+    sources: list[Path],
+    dest: str,
+    batch_name: str,
+    card_id: str | None,
+    s3_uri: str,
+    tool: str,
+    reuse_job_id: str | None = None,
+    restart: bool = False,
+) -> dict:
     total_bytes = sum(_dir_bytes(src) for src in sources)
     stamp = int(time.time())
     label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
-    job_id = f"aws:{label}"
-    safe = re.sub(r"[^\w.-]+", "_", label)
+    job_id = reuse_job_id or f"aws:{label}"
+    safe = re.sub(r"[^\w.-]+", "_", f"{batch_name}-{card_id or 'ALL'}-{stamp}")
 
     ensure_dirs()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{safe}.log"
     script_path = LOG_DIR / f"{safe}{'.bat' if platform.system() == 'Windows' else '.sh'}"
 
+    workers = _numworkers()
+    retries = _upload_retries()
     header = (
         f"AWS S3 upload  {batch_name}"
         + (f" / {card_id}" if card_id else "")
+        + f"\nTool: {tool}"
+        + (
+            f" · try default sync first, then --numworkers {workers} on failure"
+            if tool == "s5cmd"
+            else ""
+        )
+        + f"\nRetries: {retries}"
         + f"\nDestination: {dest}\n"
         f"Local size: {total_bytes} bytes\n"
         "This CMD window keeps uploading even if you restart the offloader.\n"
@@ -181,23 +418,48 @@ def start_batch_upload(
     )
     log_path.write_text(header, encoding="utf-8")
 
-    _write_external_script(script_path, sources=sources, dest=dest, log_path=log_path, title=f"AWS — {batch_name}")
-    _launch_external_script(script_path, title=f"AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""))
+    _write_external_script(
+        script_path,
+        sources=sources,
+        dest=dest,
+        log_path=log_path,
+        title=f"AWS — {batch_name}",
+        tool=tool,
+        numworkers=workers,
+        retries=retries,
+    )
+    _launch_external_script(
+        script_path,
+        title=f"AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""),
+    )
 
+    message = (
+        f"{'Restarted' if restart else 'CMD'} {tool} upload → {dest}"
+        + (
+            f" (default sync, then workers={workers} on fail · retries={retries})"
+            if tool == "s5cmd"
+            else f" (retries={retries})"
+        )
+    )
     with _lock:
+        prev = _jobs.get(job_id) if reuse_job_id else None
         _jobs[job_id] = {
             "id": job_id,
             "status": "running",
             "batch": batch_name,
             "card_id": card_id,
             "dest": dest,
-            "bytes_done": 0,
+            "s3_uri": s3_uri,
+            "uploader": tool,
+            "numworkers": workers if tool == "s5cmd" else None,
+            "retries": retries,
+            "bytes_done": int(prev.get("bytes_done") or 0) if prev else 0,
             "bytes_total": total_bytes,
             "files_done": 0,
             "speed_mbps": 0.0,
             "eta_seconds": None,
-            "message": f"CMD upload started → {dest} (survives server restart)",
-            "log": [f"Local size {total_bytes} bytes", f"Script {script_path}"],
+            "message": message,
+            "log": [f"Local size {total_bytes} bytes", f"Script {script_path}", f"Tool {tool}"],
             "started_at": time.time(),
             "external": True,
             "console": True,
@@ -207,6 +469,8 @@ def start_batch_upload(
             "log_offset": 0,
             "using_completed_meter": False,
             "transferred": 0,
+            "verified": False,
+            "progress_via_s3": True,
         }
     _persist_jobs()
     _ensure_monitor()
@@ -220,17 +484,30 @@ def _write_external_script(
     dest: str,
     log_path: Path,
     title: str,
+    tool: str = "aws",
+    numworkers: int = 20,
+    retries: int = 5,
 ) -> None:
-    """Write a console script that runs sync and tees output into log_path."""
+    """Write a console script that syncs with auto-retry and tees output into log_path.
+
+    For s5cmd: first try plain ``s5cmd sync`` (faster default workers). If that
+    fails, later retries use ``s5cmd --numworkers N`` (helps flaky multipart links).
+    """
     if platform.system() == "Windows":
-        # PowerShell Tee-Object → console + log; EXIT marker for the UI monitor.
         lines = [
             "@echo off",
-            "setlocal",
+            "setlocal EnableDelayedExpansion",
             f"title {title}",
             "echo ============================================",
             f"echo   {title}",
+            f"echo   Tool: {tool}",
+            (
+                f"echo   Strategy: plain s5cmd sync first, then --numworkers {numworkers} if it fails"
+                if tool == "s5cmd"
+                else "echo   Strategy: aws s3 sync with retries"
+            ),
             f"echo   Destination: {dest}",
+            f"echo   Auto-retries: {retries}",
             "echo   Progress also appears in the offloader web UI.",
             "echo   Closing this window STOPS the upload.",
             "echo   Restarting the offloader does NOT stop this window.",
@@ -238,59 +515,120 @@ def _write_external_script(
             "echo.",
         ]
         log_ps = str(log_path).replace("'", "''")
-        for src in sources:
+        for idx, src in enumerate(sources):
             src_ps = str(src).replace("'", "''")
             dest_ps = dest.replace("'", "''")
+            if tool == "s5cmd":
+                sync_default = f"s5cmd sync '{src_ps}' '{dest_ps}'"
+                sync_workers = (
+                    f"s5cmd --numworkers {numworkers} sync '{src_ps}' '{dest_ps}'"
+                )
+            else:
+                sync_default = f"aws s3 sync '{src_ps}' '{dest_ps}'"
+                sync_workers = sync_default
             lines.append(f'echo Syncing "{src}"')
-            # Tee live output to the log file the server watches.
+            lines.append(f"set MAX_TRIES={retries}")
+            lines.append("set TRY=1")
+            lines.append(f":retry_loop_{idx}")
+            lines.append("echo --- attempt !TRY! of %MAX_TRIES% ---")
+            # Attempt 1: plain sync. Later attempts: --numworkers (s5cmd only).
+            lines.append("if !TRY! equ 1 (")
+            lines.append('  echo Using default s5cmd sync' if tool == "s5cmd" else "  echo Using aws s3 sync")
             lines.append(
-                "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-                f"\"& {{ aws s3 sync '{src_ps}' '{dest_ps}' 2>&1 | "
+                "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"& {{ {sync_default} 2>&1 | "
                 f"Tee-Object -FilePath '{log_ps}' -Append ; "
                 f"if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }} else {{ exit 0 }} }}\""
             )
-            lines.append("set SYNC_ERR=%ERRORLEVEL%")
-            lines.append("if %SYNC_ERR% neq 0 (")
-            lines.append(f"  echo {EXIT_MARKER}%SYNC_ERR%>> \"{log_path}\"")
-            lines.append("  echo.")
-            lines.append("  echo ERROR: aws s3 sync failed. Fix network/credentials and re-run.")
-            lines.append("  pause")
-            lines.append("  exit /b %SYNC_ERR%")
+            lines.append(") else (")
+            if tool == "s5cmd":
+                lines.append(f"  echo Using s5cmd --numworkers {numworkers} sync")
+            else:
+                lines.append("  echo Retrying aws s3 sync")
+            lines.append(
+                "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                f"\"& {{ {sync_workers} 2>&1 | "
+                f"Tee-Object -FilePath '{log_ps}' -Append ; "
+                f"if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }} else {{ exit 0 }} }}\""
+            )
             lines.append(")")
+            lines.append("set SYNC_ERR=%ERRORLEVEL%")
+            lines.append(f"if %SYNC_ERR% equ 0 goto sync_ok_{idx}")
+            lines.append("echo Retrying after connection/upload error (exit %SYNC_ERR%)...")
+            lines.append("timeout /t 15 /nobreak >nul")
+            lines.append("set /a TRY+=1")
+            lines.append(f"if !TRY! leq %MAX_TRIES% goto retry_loop_{idx}")
+            lines.append(f"echo {EXIT_MARKER}%SYNC_ERR%>> \"{log_path}\"")
+            lines.append("echo.")
+            lines.append("echo ERROR: sync failed after retries. Click Restart in the UI.")
+            lines.append("pause")
+            lines.append("exit /b %SYNC_ERR%")
+            lines.append(f":sync_ok_{idx}")
             lines.append("echo.")
         lines.append(f"echo {EXIT_MARKER}0>> \"{log_path}\"")
         lines.append("echo ============================================")
-        lines.append("echo   Upload finished OK")
+        lines.append("echo   Upload finished OK — UI will verify sizes next")
         lines.append("echo ============================================")
-        lines.append("pause")
+        lines.append("timeout /t 8 /nobreak >nul")
         script_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
     else:
         lines = [
             "#!/bin/bash",
-            "set -e",
             f'echo "============================================"',
             f'echo "  {title}"',
+            f'echo "  Tool: {tool}"',
+            (
+                f'echo "  Strategy: plain s5cmd sync first, then --numworkers {numworkers} if it fails"'
+                if tool == "s5cmd"
+                else 'echo "  Strategy: aws s3 sync with retries"'
+            ),
             f'echo "  Destination: {dest}"',
+            f'echo "  Auto-retries: {retries}"',
             'echo "  Progress also appears in the offloader web UI."',
             'echo "============================================"',
             "echo",
         ]
         for src in sources:
+            if tool == "s5cmd":
+                sync_default = f's5cmd sync "{src}" "{dest}"'
+                sync_workers = f's5cmd --numworkers {numworkers} sync "{src}" "{dest}"'
+            else:
+                sync_default = f'aws s3 sync "{src}" "{dest}"'
+                sync_workers = sync_default
             lines.append(f'echo "Syncing {src}"')
-            lines.append(
-                f'aws s3 sync "{src}" "{dest}" 2>&1 | tee -a "{log_path}"'
-            )
-            lines.append("ec=${PIPESTATUS[0]}")
-            lines.append(f'echo "{EXIT_MARKER}${{ec}}" >> "{log_path}"')
-            lines.append('if [[ "$ec" -ne 0 ]]; then echo "ERROR: sync failed"; read -r; exit "$ec"; fi')
+            lines.append(f"MAX_TRIES={retries}")
+            lines.append("TRY=1")
+            lines.append("while true; do")
+            lines.append('  echo "--- attempt $TRY of $MAX_TRIES ---"')
+            lines.append('  if [[ "$TRY" -eq 1 ]]; then')
+            lines.append(f'    echo "Using default sync"')
+            lines.append(f'    set +e; {sync_default} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
+            lines.append("  else")
+            if tool == "s5cmd":
+                lines.append(f'    echo "Using s5cmd --numworkers {numworkers}"')
+            else:
+                lines.append('    echo "Retrying aws s3 sync"')
+            lines.append(f'    set +e; {sync_workers} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
+            lines.append("  fi")
+            lines.append('  if [[ "$ec" -eq 0 ]]; then break; fi')
+            lines.append('  echo "Retrying after error (exit $ec)..."')
+            lines.append("  sleep 15")
+            lines.append("  TRY=$((TRY+1))")
+            lines.append('  if [[ "$TRY" -gt "$MAX_TRIES" ]]; then')
+            lines.append(f'    echo "{EXIT_MARKER}${{ec}}" >> "{log_path}"')
+            lines.append('    echo "ERROR: sync failed after retries"')
+            lines.append("    read -r")
+            lines.append('    exit "$ec"')
+            lines.append("  fi")
+            lines.append("done")
             lines.append("echo")
         lines.append(f'echo "{EXIT_MARKER}0" >> "{log_path}"')
         lines.extend(
             [
                 'echo "============================================"',
-                'echo "  Upload finished OK"',
+                'echo "  Upload finished OK — UI will verify sizes next"',
                 'echo "============================================"',
-                'read -r -p "Press Enter to close…" _',
+                "sleep 5",
             ]
         )
         script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -380,9 +718,16 @@ def restore_jobs_from_disk() -> None:
                                 job["status"] = "completed"
                                 job["bytes_done"] = job.get("bytes_total") or job.get("bytes_done") or 0
                                 job["message"] = f"Uploaded to {job.get('dest') or 'S3'}"
+                                if not job.get("verified"):
+                                    threading.Thread(
+                                        target=_auto_verify_job,
+                                        args=(job["id"],),
+                                        daemon=True,
+                                        name=f"aws-verify-restore-{job['id'][-8:]}",
+                                    ).start()
                             else:
                                 job["status"] = "error"
-                                job["message"] = f"aws s3 sync failed (exit {code})"
+                                job["message"] = f"Sync failed (exit {code}) — click Restart"
                             job["speed_mbps"] = 0.0
                             job["eta_seconds"] = None
                         else:
@@ -446,8 +791,8 @@ def _finalize_checking_jobs() -> None:
                 continue
             job["status"] = "interrupted"
             job["message"] = (
-                "No live aws s3 sync found — if CMD is still uploading, wait a few seconds "
-                "or click Upload to resume (sync skips files already on S3)"
+                "No live upload found — click Restart to resume "
+                "(s5cmd/aws sync skips files already on S3)"
             )
 
 def _log_has_exit(log_path: Path) -> bool:
@@ -557,6 +902,43 @@ def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
     """Return (total_bytes, total_objects) already on S3 under dest, or None."""
     if not dest.startswith("s3://"):
         return None
+    # Prefer s5cmd du when available (faster); fall back to aws summarize.
+    if s5cmd_available():
+        try:
+            result = subprocess.run(
+                ["s5cmd", "du", dest],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            text = (result.stdout or "") + "\n" + (result.stderr or "")
+            if result.returncode == 0:
+                match = _S5CMD_DU_RE.search(text)
+                if match:
+                    # s5cmd may print human units — also accept a raw "N bytes in M objects"
+                    raw = re.search(
+                        r"(\d+)\s+bytes\s+in\s+(\d+)\s+objects?",
+                        text,
+                        re.IGNORECASE,
+                    )
+                    if raw:
+                        return int(raw.group(1)), int(raw.group(2))
+                    # Human-readable: convert first number + optional unit if present on same line
+                    human = re.search(
+                        r"([\d.]+)\s*([KMGT]i?B)?\s+in\s+(\d+)\s+objects?",
+                        text,
+                        re.IGNORECASE,
+                    )
+                    if human:
+                        val = float(human.group(1))
+                        unit = (human.group(2) or "B").upper()
+                        objects = int(human.group(3))
+                        return _to_bytes(val, unit), objects
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if not aws_cli_available():
+        return None
     try:
         result = subprocess.run(
             ["aws", "s3", "ls", dest, "--recursive", "--summarize"],
@@ -578,8 +960,47 @@ def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
     return size, objects
 
 
+def _compare_local_s3_sizes(sources: list[Path], dest: str) -> dict:
+    local_bytes = sum(_dir_bytes(src) for src in sources if src.exists())
+    summary = _s3_prefix_summary(dest)
+    if summary is None:
+        return {
+            "ok": False,
+            "local_bytes": local_bytes,
+            "s3_bytes": None,
+            "s3_objects": None,
+            "delta": None,
+            "error": "Could not read S3 size (aws/s5cmd)",
+        }
+    s3_bytes, s3_objects = summary
+    delta = abs(int(s3_bytes) - int(local_bytes))
+    ok = delta <= _SIZE_TOLERANCE_BYTES
+    return {
+        "ok": ok,
+        "local_bytes": local_bytes,
+        "s3_bytes": s3_bytes,
+        "s3_objects": s3_objects,
+        "delta": delta,
+    }
+
+
+def _auto_verify_job(job_id: str) -> None:
+    """Background size check after a successful sync exit."""
+    try:
+        verify_job_sizes(job_id)
+    except Exception:  # noqa: BLE001
+        with _lock:
+            job = _jobs.get(job_id)
+            if job and job.get("status") == "completed":
+                job["message"] = (
+                    (job.get("message") or "Uploaded")
+                    + " — click Verify sizes to confirm before deleting local"
+                )
+        _persist_jobs()
+
+
 def _discover_live_aws_processes() -> None:
-    """Detect aws s3 sync still running in CMD (including pre-log older uploads)."""
+    """Detect aws/s5cmd sync still running in CMD (including pre-log older uploads)."""
     if platform.system() != "Windows":
         return
     try:
@@ -588,8 +1009,8 @@ def _discover_live_aws_processes() -> None:
                 "powershell.exe",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"name='aws.exe'\" | "
-                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+                "Get-CimInstance Win32_Process -Filter \"name='aws.exe' OR name='s5cmd.exe'\" | "
+                "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
             ],
             capture_output=True,
             text=True,
@@ -609,7 +1030,13 @@ def _discover_live_aws_processes() -> None:
             continue
         cmd = str(row.get("CommandLine") or "")
         pid = row.get("ProcessId")
-        if "s3" not in cmd.lower() or "sync" not in cmd.lower():
+        name = str(row.get("Name") or "").lower()
+        cmd_l = cmd.lower()
+        if "sync" not in cmd_l:
+            continue
+        if "aws" in name and "s3" not in cmd_l:
+            continue
+        if "s5cmd" in name and "sync" not in cmd_l:
             continue
         src, dest, batch = _parse_sync_cmdline(cmd)
         # Never walk multi-TB trees here — that blocked server startup for minutes.
@@ -630,6 +1057,7 @@ def _discover_live_aws_processes() -> None:
                 if batch and j.get("batch") == batch:
                     existing_id = jid
                     break
+            uploader = "s5cmd" if "s5cmd" in name or "s5cmd" in cmd_l else "aws"
             if existing_id:
                 job = _jobs[existing_id]
                 job["status"] = "running"
@@ -637,6 +1065,7 @@ def _discover_live_aws_processes() -> None:
                 job["console"] = True
                 job["external"] = True
                 job["progress_via_s3"] = True
+                job["uploader"] = uploader
                 if src and not job.get("sources"):
                     job["sources"] = [src]
                 if dest:
@@ -650,7 +1079,7 @@ def _discover_live_aws_processes() -> None:
                 if bytes_total and not job.get("bytes_total"):
                     job["bytes_total"] = bytes_total
                 job["message"] = (
-                    f"Live CMD upload (PID {pid}"
+                    f"Live {uploader} upload (PID {pid}"
                     + (f", {batch}" if batch else "")
                     + ") — tracking progress via S3"
                 )
@@ -666,6 +1095,7 @@ def _discover_live_aws_processes() -> None:
                 job["console"] = True
                 job["external"] = True
                 job["progress_via_s3"] = True
+                job["uploader"] = uploader
                 if src:
                     job["sources"] = [src]
                 if dest:
@@ -675,7 +1105,7 @@ def _discover_live_aws_processes() -> None:
                 if bytes_total:
                     job["bytes_total"] = bytes_total
                 job["message"] = (
-                    f"Live CMD upload (PID {pid}"
+                    f"Live {uploader} upload (PID {pid}"
                     + (f", {batch}" if batch else "")
                     + ") — tracking progress via S3"
                 )
@@ -694,7 +1124,7 @@ def _discover_live_aws_processes() -> None:
                 "speed_mbps": 0.0,
                 "eta_seconds": None,
                 "message": (
-                    f"Live CMD upload (PID {pid}"
+                    f"Live {uploader} upload (PID {pid}"
                     + (f", {batch}" if batch else "")
                     + ") — measuring progress via S3 (safe to leave CMD open)"
                 ),
@@ -703,6 +1133,7 @@ def _discover_live_aws_processes() -> None:
                 "external": True,
                 "console": True,
                 "aws_pid": pid,
+                "uploader": uploader,
                 "sources": [src] if src else [],
                 "log_path": "",
                 "log_offset": 0,
@@ -719,8 +1150,9 @@ def _persist_jobs() -> None:
     with _lock:
         rows = []
         for job in sorted(_jobs.values(), key=lambda x: x.get("started_at", 0), reverse=True)[:40]:
-            row = {k: v for k, v in job.items() if k not in {"sources"}}
+            row = dict(job)
             row["log"] = list(row.get("log") or [])[-40:]
+            # Keep sources so Restart / Verify / Delete still work after server restart.
             rows.append(row)
     try:
         JOBS_FILE.write_text(json.dumps(rows, indent=2), encoding="utf-8")
@@ -965,13 +1397,22 @@ def _ingest_log_progress(job_id: str) -> bool:
                 if code == 0:
                     job["status"] = "completed"
                     job["bytes_done"] = job.get("bytes_total") or job.get("bytes_done") or 0
-                    job["message"] = f"Uploaded to {job.get('dest') or 'S3'}"
+                    job["message"] = f"Uploaded to {job.get('dest') or 'S3'} — verifying sizes…"
                     job["eta_seconds"] = 0
+                    job["log_offset"] = new_offset
+                    threading.Thread(
+                        target=_auto_verify_job,
+                        args=(job_id,),
+                        daemon=True,
+                        name=f"aws-verify-{job_id[-12:]}",
+                    ).start()
                 else:
                     job["status"] = "error"
-                    job["message"] = f"aws s3 sync failed (exit {code})"
+                    job["message"] = (
+                        f"Sync failed (exit {code}) — click Restart (resume-safe)"
+                    )
+                    job["log_offset"] = new_offset
                 job["speed_mbps"] = 0.0
-                job["log_offset"] = new_offset
                 return True
             job["message"] = line[:220]
 
@@ -1072,10 +1513,14 @@ def _resolve_upload_size(src_root: Path, rel: str) -> int:
 
 
 def _parse_upload_rel(line: str) -> str | None:
-    match = _UPLOAD_RE.search(line.strip())
-    if not match:
-        return None
-    return match.group(1).strip()
+    text = line.strip()
+    match = _UPLOAD_RE.search(text)
+    if match:
+        return match.group(1).strip()
+    match = _S5CMD_CP_RE.search(text)
+    if match:
+        return match.group(1).strip().strip('"')
+    return None
 
 
 def _to_bytes(value: float, unit: str) -> int:

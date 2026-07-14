@@ -42,11 +42,14 @@ def create_app() -> Flask:
 
     @app.get("/api/health/full")
     def health_full():
+        tool = aws_upload.preferred_uploader()
         return jsonify(
             {
                 "ok": True,
                 "version": __version__,
                 "aws_cli": aws_upload.aws_cli_available(),
+                "s5cmd": aws_upload.s5cmd_available(),
+                "uploader": tool,
                 "ready": True,
             }
         )
@@ -136,9 +139,56 @@ def create_app() -> Flask:
                     card_id=None,
                     show_console=True,
                 )
-                engine.log_message(f"AWS CMD upload started for batch {batch} (survives restart; UI tracks log)")
+                engine.log_message(
+                    f"AWS upload started for batch {batch} via "
+                    f"{job.get('uploader') or 'sync'} (survives restart; UI tracks log)"
+                )
             else:
                 job = engine.upload_batch_now(external_window=True)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "job": job})
+
+    @app.post("/api/aws/restart")
+    def aws_restart():
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            return jsonify({"error": "job_id required"}), 400
+        try:
+            job = aws_upload.restart_job(job_id)
+            engine.log_message(f"AWS upload restarted: {job_id}")
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "job": job})
+
+    @app.post("/api/aws/verify")
+    def aws_verify():
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            return jsonify({"error": "job_id required"}), 400
+        try:
+            job = aws_upload.verify_job_sizes(job_id)
+            engine.log_message(
+                f"AWS size verify {job_id}: "
+                f"{'OK' if job.get('verified') else 'MISMATCH'} "
+                f"local={job.get('local_bytes')} s3={job.get('s3_bytes')}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "job": job})
+
+    @app.post("/api/aws/delete-local")
+    def aws_delete_local():
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+        confirmed = bool(payload.get("confirmed"))
+        if not job_id:
+            return jsonify({"error": "job_id required"}), 400
+        try:
+            job = aws_upload.delete_local_after_verify(job_id, confirmed=confirmed)
+            engine.log_message(f"Deleted local after AWS verify: {job_id}")
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, "job": job})

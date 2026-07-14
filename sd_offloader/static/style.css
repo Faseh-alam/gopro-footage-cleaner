@@ -263,10 +263,41 @@ button.secondary {
   text-overflow: ellipsis;
 }
 
+.job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+
+.job-actions button {
+  padding: 0.28rem 0.55rem;
+  font-size: 0.75rem;
+}
+
+button.danger {
+  background: rgba(248, 81, 73, 0.15);
+  color: #ff8b84;
+  border: 1px solid rgba(248, 81, 73, 0.4);
+}
+
+.phase.verified {
+  color: var(--ok);
+}
+
 .phase.running,
 .phase.uploading,
 .phase.copying {
   color: var(--accent);
+}
+
+.phase.mismatch,
+.phase.error {
+  color: var(--danger);
+}
+
+.phase.deleted_local {
+  color: var(--muted);
 }
 
 .phase.interrupted {

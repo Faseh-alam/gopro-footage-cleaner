@@ -21,6 +21,8 @@ DEFAULT_CONFIG = {
     "last_batch": "",
     "mode": "ssd_only",  # ssd_only | ssd_and_aws
     "port": 8877,
+    "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)
+    "aws_upload_retries": 5,  # auto-retries inside the CMD upload script
 }
 
 

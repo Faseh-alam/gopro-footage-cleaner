@@ -12,10 +12,10 @@
         <div>
           <p class="eyebrow">Server ingest</p>
           <h1>SD Card Offloader</h1>
-          <p class="hint">Pick an existing batch on the SSDs or create a new one · SD→SSD parallel · AWS in a local CMD window (resume-safe)</p>
+          <p class="hint">Pick an existing batch on the SSDs or create a new one · SD→SSD parallel · AWS via s5cmd (preferred) or AWS CLI in CMD</p>
         </div>
         <div class="header-meta">
-          <span id="aws-cli-status" class="pill">AWS CLI…</span>
+          <span id="aws-cli-status" class="pill">Uploader…</span>
           <span id="app-version" class="pill">v{{ version }}</span>
         </div>
       </header>
@@ -45,7 +45,7 @@
             Mode
             <select id="mode">
               <option value="ssd_only">SSD only (upload to AWS later)</option>
-              <option value="ssd_and_aws">SSD + AWS (CMD survives restart · live UI progress)</option>
+              <option value="ssd_and_aws">SSD + AWS (s5cmd in CMD · auto-retry · live UI)</option>
             </select>
           </label>
           <label class="full">
@@ -58,7 +58,7 @@
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
           <button id="start-session" type="button" class="primary">Start SD → SSD for this batch</button>
           <button id="stop-session" type="button" class="secondary">Stop watching</button>
-          <button id="upload-batch" type="button" class="primary" title="Opens a local Command Prompt — survives browser close; aws s3 sync resumes">Upload this batch to AWS (CMD)</button>
+          <button id="upload-batch" type="button" class="primary" title="Opens CMD with s5cmd (or aws) sync — auto-retries; resumes files already on S3">Upload this batch to AWS (CMD)</button>
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
@@ -76,7 +76,12 @@
       <section class="panel grid-2-panels">
         <div>
           <h2>AWS uploads (batches)</h2>
-          <p class="hint">Each batch/card upload runs in CMD (survives server restart). The UI re-attaches and shows size, speed, and bytes from the live log.</p>
+          <p class="hint">
+            Prefers <strong>s5cmd sync</strong> (default workers, usually faster).
+            If that fails, retries with <strong>--numworkers 20</strong>. Falls back to aws CLI.
+            After upload, sizes are checked (local vs S3). Use <strong>Restart</strong> if needed,
+            then <strong>Delete local</strong> only when verified.
+          </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>
         <div>

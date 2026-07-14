@@ -207,17 +207,34 @@ function renderAwsJobs(jobs) {
     const statusLabel =
       job.status === "running"
         ? job.console
-          ? "live + console"
+          ? `live ${job.uploader || "sync"}`
           : "uploading"
-        : job.status || "";
+        : job.status === "verified"
+          ? "verified"
+          : job.status === "mismatch"
+            ? "size mismatch"
+            : job.status || "";
     const recent = (job.log || []).slice(-4);
+    const canRestart = ["error", "interrupted", "mismatch", "completed", "verified"].includes(
+      job.status,
+    );
+    const canVerify = ["completed", "verified", "mismatch", "error", "interrupted"].includes(
+      job.status,
+    );
+    const canDelete = job.status === "verified" || job.verified;
+    const sizeLine =
+      job.local_bytes != null || job.s3_bytes != null
+        ? `<div class="hint">Local ${formatBytes(job.local_bytes || 0)} · S3 ${formatBytes(
+            job.s3_bytes || 0,
+          )}${job.size_delta != null ? ` · Δ ${formatBytes(job.size_delta)}` : ""}</div>`
+        : "";
     const div = document.createElement("div");
     div.className = "job";
     div.innerHTML = `
       <div class="job-top">
         <span><strong>${job.batch || "?"}</strong>${
           job.card_id ? " / " + job.card_id : " · full batch"
-        }</span>
+        }${job.uploader ? ` · ${job.uploader}` : ""}</span>
         <span class="phase ${job.status || ""}">${statusLabel}</span>
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
@@ -233,6 +250,30 @@ function renderAwsJobs(jobs) {
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${job.message || job.dest || ""}</div>
+      ${sizeLine}
+      <div class="job-actions">
+        ${
+          canRestart
+            ? `<button type="button" class="secondary job-restart" data-job="${escapeHtml(
+                job.id,
+              )}">Restart</button>`
+            : ""
+        }
+        ${
+          canVerify
+            ? `<button type="button" class="secondary job-verify" data-job="${escapeHtml(
+                job.id,
+              )}">Verify sizes</button>`
+            : ""
+        }
+        ${
+          canDelete
+            ? `<button type="button" class="danger job-delete-local" data-job="${escapeHtml(
+                job.id,
+              )}">Delete local</button>`
+            : ""
+        }
+      </div>
       ${
         recent.length
           ? `<div class="job-console">${recent
@@ -242,6 +283,72 @@ function renderAwsJobs(jobs) {
       }
     `;
     el.awsJobs.appendChild(div);
+  }
+
+  el.awsJobs.querySelectorAll(".job-restart").forEach((btn) => {
+    btn.addEventListener("click", () => restartAwsJob(btn.getAttribute("data-job")));
+  });
+  el.awsJobs.querySelectorAll(".job-verify").forEach((btn) => {
+    btn.addEventListener("click", () => verifyAwsJob(btn.getAttribute("data-job")));
+  });
+  el.awsJobs.querySelectorAll(".job-delete-local").forEach((btn) => {
+    btn.addEventListener("click", () => deleteLocalAwsJob(btn.getAttribute("data-job")));
+  });
+}
+
+async function restartAwsJob(jobId) {
+  if (!jobId) return;
+  try {
+    setStatus(`Restarting AWS upload…`);
+    const data = await api("/api/aws/restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+    setStatus(data.job?.message || "Upload restarted — resume-safe", "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
+async function verifyAwsJob(jobId) {
+  if (!jobId) return;
+  try {
+    setStatus("Comparing local size vs S3…");
+    const data = await api("/api/aws/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+    const ok = data.job?.verified;
+    setStatus(data.job?.message || (ok ? "Sizes match" : "Mismatch"), ok ? "ok" : "error");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
+async function deleteLocalAwsJob(jobId) {
+  if (!jobId) return;
+  if (
+    !window.confirm(
+      "Delete local SSD copy for this upload?\n\nOnly do this after Verify shows sizes match. This cannot be undone.",
+    )
+  ) {
+    return;
+  }
+  try {
+    setStatus("Deleting local after verify…");
+    const data = await api("/api/aws/delete-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, confirmed: true }),
+    });
+    setStatus(data.job?.message || "Local deleted", "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
   }
 }
 
@@ -305,14 +412,22 @@ async function bootstrap() {
     return;
   }
 
-  // Non-blocking AWS CLI check
+  // Non-blocking uploader check (s5cmd preferred, aws fallback)
   api("/api/health/full", { timeoutMs: 8000 })
     .then((health) => {
-      el.awsCliStatus.textContent = health.aws_cli ? "AWS CLI ready" : "AWS CLI missing";
-      el.awsCliStatus.className = `pill ${health.aws_cli ? "ok" : "warn"}`;
+      if (health.s5cmd) {
+        el.awsCliStatus.textContent = "s5cmd ready";
+        el.awsCliStatus.className = "pill ok";
+      } else if (health.aws_cli) {
+        el.awsCliStatus.textContent = "AWS CLI ready";
+        el.awsCliStatus.className = "pill ok";
+      } else {
+        el.awsCliStatus.textContent = "s5cmd/AWS missing";
+        el.awsCliStatus.className = "pill warn";
+      }
     })
     .catch(() => {
-      el.awsCliStatus.textContent = "AWS CLI ?";
+      el.awsCliStatus.textContent = "Uploader ?";
       el.awsCliStatus.className = "pill warn";
     });
 
