@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, inventory, progress, space
+from . import aws_upload, eject, inventory, progress, segment_trim, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -127,6 +127,7 @@ def get_status() -> dict:
             "cards": sorted(cards, key=lambda c: c.get("started_at") or 0, reverse=True),
             "log": list(_log[-80:]),
             "aws_jobs": aws_upload.list_jobs()[:20],
+            "trim_jobs": segment_trim.list_trim_jobs()[:20],
             # volumes are heavy on Windows — UI loads them via /api/volumes
         }
     _save_snapshot(force=False)
@@ -541,12 +542,41 @@ def _copy_card_worker(
         _update_card(
             card_id,
             status="completed",
-            message="Copy verified — wiping & ejecting…",
+            message="Copy verified — auto-trimming mapped segments on SSD…",
             dest=str(dest),
             speed_mbps=0,
             eta_seconds=0,
             bytes_done=total_bytes,
         )
+
+        # Timestamp maps (*.segments.json) → task clips on SSD (no live trim on card).
+        def _on_trim_done(result: dict, _card: str = card_id, _dest: Path = dest) -> None:
+            made = int(result.get("clips_made") or 0)
+            errs = result.get("errors") or []
+            if errs:
+                _log_line(
+                    f"{_card}: auto-trim {made} clip(s), {len(errs)} error(s) under {_dest}",
+                    kind="error",
+                )
+                for err in errs[:5]:
+                    _log_line(f"{_card}: trim error — {err}", kind="error")
+            else:
+                _log_line(f"{_card}: auto-trim wrote {made} clip(s) under {_dest}", kind="ok")
+            _update_card(
+                _card,
+                status="completed",
+                message=(
+                    f"Ready — auto-trim {made} clip(s)"
+                    + (f", {len(errs)} error(s)" if errs else "")
+                ),
+                dest=str(_dest),
+            )
+
+        try:
+            segment_trim.start_trim_async(dest, card_id=card_id, on_done=_on_trim_done)
+            _log_line(f"{card_id}: auto-trim started for mapped segments → {dest}", kind="ok")
+        except Exception as trim_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: auto-trim failed to start — {trim_exc}", kind="error")
 
         try:
             _update_card(card_id, status="wiping", message="Wiping transferred folders on card…")

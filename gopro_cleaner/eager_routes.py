@@ -18,6 +18,7 @@ from .core.eager import (
 from .core.eager_trim_queue import eager_trim_queue
 from .core.folder_picker import pick_folder
 from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
+from .core.segments import load_segments, save_segments
 from .core.snapshot_strip import (
     cancel_snapshots,
     resolve_snapshot_frame,
@@ -277,6 +278,43 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, **result})
+
+    @eager.get("/api/eager/segments")
+    def eager_get_segments():
+        raw = str(request.args.get("path", "")).strip()
+        if not raw:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            path = Path(raw).expanduser().resolve()
+            data = load_segments(path)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "path": str(path), **data})
+
+    @eager.post("/api/eager/segments")
+    def eager_save_segments():
+        """Save timestamp map beside the MP4 (no live trim)."""
+        payload = request.get_json(silent=True) or {}
+        raw = str(payload.get("path", "")).strip()
+        segments = payload.get("segments") or []
+        if not raw:
+            return jsonify({"error": "path is required"}), 400
+        if not isinstance(segments, list):
+            return jsonify({"error": "segments must be a list"}), 400
+        try:
+            path = Path(raw).expanduser().resolve()
+            data = save_segments(path, segments)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "path": str(path),
+                "json": str(path.with_name(f"{path.stem}.segments.json")),
+                "txt": str(path.with_name(f"{path.stem}.segments.txt")),
+                **data,
+            }
+        )
 
     @eager.post("/api/eager/finish")
     def eager_finish():

@@ -28,10 +28,18 @@
             <span class="wc-name">World Context</span>
           </a>
           <p class="pipeline-hint" id="context-message">
-            Clean? Type task + Enter. Garbage from the start? Jump to where work ends → O → T (start is 0:00). Later parts: I → O → T.
+            Clean? Search task + Enter to bind a shortcut. G = start useful work. Press the task key at each change. Timestamps save beside the MP4 — trim runs later on the server.
           </p>
         </div>
         <div class="header-tools">
+          <button
+            type="button"
+            id="browse-folder-btn"
+            class="laptop-folder-btn"
+            title="Choose a local folder of MP4 footage. Label, trim, and Delete affect files in that folder."
+          >
+            Choose laptop footage
+          </button>
           <div class="card-tabs" id="card-tabs">
             <div id="card-tab-list" class="card-tab-list"></div>
             <button type="button" id="add-card-tab" class="card-tab-add" title="Another SD card">+</button>
@@ -43,7 +51,6 @@
         <select id="camera-select" class="hidden-select" aria-hidden="true"></select>
         <button id="scan-btn" type="button" class="hidden" aria-hidden="true">Scan</button>
         <button id="refresh-sd-btn" type="button" class="hidden" aria-hidden="true">Refresh</button>
-        <button id="browse-folder-btn" type="button" class="hidden" aria-hidden="true">Browse</button>
         <p id="sd-card-hint" class="hidden" aria-hidden="true"></p>
       </header>
 
@@ -122,12 +129,12 @@
               <ul>
                 <li><kbd>S</kbd> Focus task search</li>
                 <li><kbd>↑</kbd> <kbd>↓</kbd> Choose task</li>
-                <li><kbd>Enter</kbd> Label &amp; next</li>
-                <li><kbd>O</kbd> End mark (start = 0:00 if I not set)</li>
-                <li><kbd>I</kbd> Mark start (later useful parts)</li>
-                <li><kbd>T</kbd> Queue trim</li>
-                <li><kbd>Home</kbd> Jump to 0:00</li>
-                <li><kbd>N</kbd> Finish trims / next</li>
+                <li><kbd>Enter</kbd> Bind shortcut (no move)</li>
+                <li><kbd>G</kbd> Start useful work / next segment</li>
+                <li><kbd>A</kbd>–<kbd>Z</kbd> Close segment with that task</li>
+                <li><kbd>E</kbd> Clear open start (no write)</li>
+                <li><kbd>U</kbd> Undo last segment</li>
+                <li><kbd>N</kbd> Next file</li>
                 <li><kbd>D</kbd> Delete file</li>
                 <li><kbd>←</kbd> <kbd>→</kbd> Filmstrip step</li>
                 <li><kbd>,</kbd> <kbd>.</kbd> −3s / +3s</li>
@@ -137,7 +144,7 @@
             </div>
 
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Label <kbd>Enter</kbd></button>
+              <button id="label-btn" type="button" class="primary">Bind shortcut <kbd>Enter</kbd></button>
               <button id="next-clean-btn" type="button" class="secondary">Next <kbd>N</kbd></button>
               <button id="delete-file-btn" type="button" class="secondary danger-btn">Delete <kbd>D</kbd></button>
             </div>

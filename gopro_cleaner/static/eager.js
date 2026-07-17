@@ -8,6 +8,12 @@ const state = {
   pendingIn: null,
   pendingClip: null,
   savedClips: [],
+  /** Timestamp map for current video (saved beside MP4 — no live trim). */
+  mappedSegments: [],
+  /** Open segment start (set by G). */
+  mapAnchor: null,
+  /** task name → single-letter shortcut for rapid mapping. */
+  taskShortcuts: {},
   /** Per-source mark/trim state so filmstrip tints survive navigation. */
   clipsByPath: {},
   trimPollTimer: null,
@@ -732,6 +738,11 @@ function renderFileList() {
 }
 
 function renderClips() {
+  // Prefer timestamp map list; fall back to legacy trim job rows if any.
+  if (state.mappedSegments.length || state.mapAnchor !== null || !state.savedClips.length) {
+    renderMappedSegments();
+    return;
+  }
   el.clipList.innerHTML = "";
   for (const job of state.savedClips) {
     const item = document.createElement("li");
@@ -751,41 +762,11 @@ function renderClips() {
       cls = "failed";
       label = `Failed: ${job.error || "trim error"}`;
     } else {
-      const imu =
-        job.output_has_gpmf === true
-          ? " · IMU ✓"
-          : job.source_has_gpmf === true && job.output_has_gpmf === false
-            ? " · IMU missing"
-            : "";
-      label = `Saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}${imu}`;
+      label = `Saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}`;
     }
     item.className = cls;
-    if (job.status === "running" && job.progress > 0) {
-      const bar = document.createElement("div");
-      bar.className = "clip-progress";
-      bar.innerHTML = `<div class="clip-progress-fill" style="width:${Math.min(100, job.progress)}%"></div>`;
-      item.appendChild(document.createTextNode(label));
-      item.appendChild(bar);
-    } else {
-      item.textContent = label;
-    }
+    item.textContent = label;
     el.clipList.appendChild(item);
-  }
-  if (state.pendingIn !== null && !state.pendingClip) {
-    const item = document.createElement("li");
-    item.className = "pending";
-    item.textContent = `Start ${formatTime(state.pendingIn)} — press O for end, then T`;
-    el.clipList.appendChild(item);
-  }
-  if (state.pendingClip) {
-    const item = document.createElement("li");
-    item.className = "pending";
-    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T`;
-    el.clipList.appendChild(item);
-  }
-  if (el.pendingIn) {
-    el.pendingIn.textContent = "";
-    el.pendingIn.className = "hidden";
   }
 }
 
@@ -1415,7 +1396,7 @@ function renderTasks(preferred = "") {
     el.taskList.innerHTML = '<div class="hint">No matching tasks — keep typing or clear search.</div>';
     if (el.taskSelectedHint) {
       el.taskSelectedHint.textContent = state.lastLabelTask
-        ? `Last used: ${state.lastLabelTask} — clear search or press Esc, then N`
+        ? `Last used: ${state.lastLabelTask} — clear search or press Esc`
         : "";
     }
     updateContextHint();
@@ -1428,10 +1409,13 @@ function renderTasks(preferred = "") {
     option.textContent = task;
     el.taskSelect.appendChild(option);
 
+    const shortcut = shortcutForTask(task);
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "task-item";
-    btn.textContent = task;
+    btn.innerHTML = shortcut
+      ? `<kbd class="task-shortcut">${shortcut.toUpperCase()}</kbd> ${task}`
+      : task;
     if (task === selected) btn.classList.add("active");
     btn.addEventListener("click", () => {
       el.taskSelect.value = task;
@@ -1448,11 +1432,208 @@ function renderTasks(preferred = "") {
   }
   if (el.taskSelectedHint) {
     const active = selectedTask();
+    const sc = active ? shortcutForTask(active) : "";
     el.taskSelectedHint.textContent = active
-      ? `Selected: ${active} — Enter / N moves current file`
-      : "Press S to search, arrows to choose, Enter to move";
+      ? sc
+        ? `Selected: ${active} · shortcut ${sc.toUpperCase()} · Enter rebinds`
+        : `Selected: ${active} — Enter binds a letter shortcut`
+      : "Press S to search, arrows to choose, Enter to bind shortcut";
   }
   updateContextHint();
+}
+
+const RESERVED_SHORTCUTS = new Set([
+  "s", "g", "e", "n", "d", "i", "o", "t", "u", " ",
+]);
+const SHORTCUT_POOL = "abcfhjklmpqrvwxyz".split("");
+
+function shortcutForTask(task) {
+  return state.taskShortcuts[task] || "";
+}
+
+function taskForShortcut(letter) {
+  const key = String(letter || "").toLowerCase();
+  for (const [task, sc] of Object.entries(state.taskShortcuts)) {
+    if (sc === key) return task;
+  }
+  return "";
+}
+
+function nextFreeShortcut() {
+  const used = new Set(Object.values(state.taskShortcuts));
+  for (const letter of SHORTCUT_POOL) {
+    if (!used.has(letter) && !RESERVED_SHORTCUTS.has(letter)) return letter;
+  }
+  return "";
+}
+
+function bindTaskShortcut(taskName) {
+  const task = (taskName || selectedTask() || "").trim();
+  if (!task) {
+    setStatus("Choose a task first", "error");
+    focusTaskSearch();
+    return null;
+  }
+  if (!state.tasks.includes(task)) {
+    setStatus("Add the task first", "error");
+    return null;
+  }
+  let letter = shortcutForTask(task);
+  if (!letter) {
+    letter = nextFreeShortcut();
+    if (!letter) {
+      setStatus("No free shortcut letters left — unbind some tasks", "error");
+      return null;
+    }
+    state.taskShortcuts[task] = letter;
+  }
+  state.lastLabelTask = task;
+  renderTasks(task);
+  setStatus(`Bound ${task} → ${letter.toUpperCase()} — G then press ${letter.toUpperCase()} while playing`, "ok");
+  return letter;
+}
+
+async function loadMappedSegments(video) {
+  state.mappedSegments = [];
+  state.mapAnchor = null;
+  if (!video?.path) return;
+  try {
+    const data = await api(`/api/eager/segments?path=${encodeURIComponent(video.path)}`);
+    state.mappedSegments = Array.isArray(data.segments) ? data.segments : [];
+  } catch {
+    state.mappedSegments = [];
+  }
+  renderMappedSegments();
+  renderFilmstrip();
+}
+
+async function persistMappedSegments() {
+  const video = currentVideo();
+  if (!video) return;
+  try {
+    const data = await api("/api/eager/segments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: video.path, segments: state.mappedSegments }),
+    });
+    state.mappedSegments = Array.isArray(data.segments) ? data.segments : state.mappedSegments;
+    setStatus(
+      `Saved ${state.mappedSegments.length} segment(s) → ${basenamePath(data.txt || data.json || "")}`,
+      "ok",
+    );
+  } catch (error) {
+    setStatus(error.message || "Could not save segments", "error");
+  }
+  renderMappedSegments();
+  renderFilmstrip();
+}
+
+function mapMarkStart() {
+  if (!currentVideo()) return;
+  const t = currentScrubTime();
+  state.mapAnchor = t;
+  setStatus(`G · segment start ${formatTime(t)} — press a task key at the next change`, "ok");
+  renderMappedSegments();
+}
+
+async function mapMarkTask(letter) {
+  const video = currentVideo();
+  if (!video) return;
+  const key = String(letter || "").toLowerCase();
+  const task = taskForShortcut(key);
+  if (!task) {
+    setStatus(`No task bound to ${key.toUpperCase()} — search + Enter to bind`, "error");
+    return;
+  }
+  const end = currentScrubTime();
+  let start = state.mapAnchor;
+  if (start === null) {
+    start = 0;
+  }
+  if (end <= start + 0.05) {
+    setStatus("Move a little forward before pressing the task key", "error");
+    return;
+  }
+  state.mappedSegments.push({ start, end, task, shortcut: key });
+  state.mapAnchor = end;
+  state.lastLabelTask = task;
+  await persistMappedSegments();
+  setStatus(
+    `${formatTime(start)} → ${formatTime(end)} · ${task} (${key.toUpperCase()}) · next starts here`,
+    "ok",
+  );
+}
+
+async function undoLastSegment() {
+  if (!state.mappedSegments.length) {
+    if (state.mapAnchor !== null) {
+      state.mapAnchor = null;
+      setStatus("Cleared open G mark", "ok");
+      renderMappedSegments();
+      return;
+    }
+    setStatus("No segments to undo", "error");
+    return;
+  }
+  const removed = state.mappedSegments.pop();
+  state.mapAnchor = removed.start;
+  await persistMappedSegments();
+  setStatus(`Undid ${removed.task} · G mark back at ${formatTime(removed.start)}`, "ok");
+}
+
+function clearMapAnchor() {
+  state.mapAnchor = null;
+  setStatus("Cleared open start (E)", "ok");
+  renderMappedSegments();
+}
+
+function renderMappedSegments() {
+  if (!el.clipList) return;
+  el.clipList.innerHTML = "";
+  for (const seg of state.mappedSegments) {
+    const item = document.createElement("li");
+    item.className = "saved";
+    const sc = seg.shortcut ? ` [${String(seg.shortcut).toUpperCase()}]` : "";
+    item.textContent = `${formatTime(seg.start)} → ${formatTime(seg.end)} · ${seg.task}${sc}`;
+    el.clipList.appendChild(item);
+  }
+  if (state.mapAnchor !== null) {
+    const item = document.createElement("li");
+    item.className = "pending";
+    item.textContent = `Open from ${formatTime(state.mapAnchor)} — press task key`;
+    el.clipList.appendChild(item);
+  }
+  if (!state.mappedSegments.length && state.mapAnchor === null) {
+    const item = document.createElement("li");
+    item.className = "pending";
+    item.textContent = "No segments yet — G to start, then task keys";
+    el.clipList.appendChild(item);
+  }
+}
+
+/** Kept ranges from mapped segments (green tint). */
+function keptClipRanges() {
+  const ranges = [];
+  for (const seg of state.mappedSegments) {
+    const start = Number(seg.start);
+    const end = Number(seg.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      ranges.push({ start, end });
+    }
+  }
+  if (state.pendingClip) {
+    ranges.push({ start: state.pendingClip.start, end: state.pendingClip.end });
+  }
+  for (const job of state.savedClips) {
+    if (job.status === "failed") continue;
+    const start = Number(job.start);
+    const end = Number(job.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      ranges.push({ start, end });
+    }
+  }
+  ranges.sort((a, b) => a.start - b.start);
+  return ranges;
 }
 
 function moveTaskSelection(delta) {
@@ -1582,24 +1763,6 @@ function jumpToClipStart() {
   setStatus("At start of clip (0:00)", "ok");
 }
 
-/** Kept ranges from queued/done trims + the pending mark. */
-function keptClipRanges() {
-  const ranges = [];
-  for (const job of state.savedClips) {
-    if (job.status === "failed") continue;
-    const start = Number(job.start);
-    const end = Number(job.end);
-    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-      ranges.push({ start, end });
-    }
-  }
-  if (state.pendingClip) {
-    ranges.push({ start: state.pendingClip.start, end: state.pendingClip.end });
-  }
-  ranges.sort((a, b) => a.start - b.start);
-  return ranges;
-}
-
 function filmstripTintForTime(t, ranges) {
   if (!ranges.length) return "";
   for (const r of ranges) {
@@ -1666,6 +1829,7 @@ async function loadVideo(index) {
 
   renderFileList();
   renderClips();
+  loadMappedSegments(video);
   renderFilmstrip();
 
   el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
@@ -1726,7 +1890,7 @@ async function loadVideo(index) {
 
 async function chooseFootageFolder() {
   el.browseFolderBtn.disabled = true;
-  setStatus("Choose a folder in the dialog…");
+  setStatus("Choose a laptop footage folder…");
   try {
     const initial = el.sourcePath.value.trim() || el.sdCardSelect?.value || "";
     const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
@@ -1735,9 +1899,18 @@ async function chooseFootageFolder() {
       setStatus("Folder selection cancelled");
       return;
     }
-    applySelectedPath(data.path, { label: "Manual folder", manual: true });
-    setStatus(`Selected ${data.path}`, "ok");
-    updateContextHint();
+    const useFolder = window.confirm(
+      `Use this laptop folder directly?\n\n${data.path}\n\n` +
+        "For a safe demo, use a duplicate folder: labeling moves files into task folders, " +
+        "trimming writes new files, and D/Delete removes the selected file.",
+    );
+    if (!useFolder) {
+      setStatus("Laptop folder not opened");
+      return;
+    }
+    applySelectedPath(data.path, { label: "Laptop", manual: true });
+    setStatus(`Scanning laptop footage in ${data.path}…`);
+    await scanSource();
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
@@ -2037,51 +2210,20 @@ async function trimMarkedClip() {
 async function finishCleaningFile() {
   const video = currentVideo();
   if (!video) return;
-
-  if (state.pendingClip) {
-    setStatus("Press T to queue the marked clip first", "error");
+  if (state.mapAnchor !== null) {
+    setStatus("Open G mark still set — press a task key or E to clear, then N", "error");
     return;
   }
-  if (state.pendingIn !== null) {
-    setStatus("Finish the mark (O then T) or Undo before Next", "error");
-    return;
-  }
-
-  const hasClips = state.savedClips.some(
-    (j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running",
+  state.donePaths.add(video.path);
+  saveActiveWorkspace();
+  setStatus(
+    state.mappedSegments.length
+      ? `Mapped ${state.mappedSegments.length} segment(s) on ${video.name} — next`
+      : `Skipping ${video.name} (no segments) — next`,
+    "ok",
   );
-
-  if (!hasClips) {
-    setStatus("No trims queued — type a task and press Enter to label this clean file", "error");
-    focusTaskSearch();
-    return;
-  }
-
-  try {
-    const data = await api("/api/eager/clean", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: video.path }),
-    });
-    state.trimmingPaths.add(video.path);
-    stashClipState(video.path);
-    stopTrimPolling();
-    saveActiveWorkspace();
-    if (data.scheduled) {
-      setStatus(
-        `Trimming in background (${data.active}) — label those clips when they appear · + for another card`,
-        "ok",
-      );
-    } else if (data.deleted_source) {
-      setStatus(`Finished ${video.name} — raw removed; label new clips when listed`, "ok");
-    } else {
-      setStatus(`Finished ${video.name}`, "ok");
-    }
-    renderFileList();
-    advanceToNext();
-  } catch (error) {
-    setStatus(error.message, "error");
-  }
+  renderFileList();
+  advanceToNext();
 }
 
 async function deleteCurrentFile() {
@@ -2113,119 +2255,8 @@ async function deleteCurrentFile() {
 }
 
 async function labelCurrentClip() {
-  if (state.busy) return;
-  const video = currentVideo();
-  if (!video) return;
-
-  if (state.trimmingPaths.has(video.path)) {
-    setStatus("This file is still trimming — wait for clips, then label those", "error");
-    return;
-  }
-  if (state.pendingIn !== null || state.pendingClip) {
-    setStatus("Finish or undo the current mark before labeling", "error");
-    return;
-  }
-  if (activeTrimCount() > 0 || state.savedClips.some((j) => j.status === "queued" || j.status === "running")) {
-    setStatus("Press N to finish trims first — label the new clips when they appear", "error");
-    return;
-  }
-  if (!video.is_trimmed && state.savedClips.some((j) => j.status === "completed" || j.output)) {
-    setStatus("Press N to finish this file — then label the trimmed clips", "error");
-    return;
-  }
-
-  let task = selectedTask();
-  if (!task) {
-    setStatus("Type or choose a task first", "error");
-    focusTaskSearch();
-    return;
-  }
-
-  if (!state.tasks.some((item) => item.toLowerCase() === task.toLowerCase())) {
-    try {
-      const data = await api("/api/eager/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: task,
-          label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
-        }),
-      });
-      state.tasks = data.tasks || [];
-      renderTasks(task);
-    } catch (error) {
-      setStatus(error.message, "error");
-      return;
-    }
-  }
-
-  state.busy = true;
-  el.labelBtn.disabled = true;
-  setStatus(`Moving to ${task}...`);
-  try {
-    const data = await api("/api/eager/label", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        path: video.path,
-        label_root: state.labelRoot || state.scanRoot,
-        task,
-      }),
-    });
-    // Invalidate any in-flight soft refresh that could put this path back.
-    state.labelScanToken += 1;
-    const oldPath = video.path;
-    const newPath = data.output || oldPath;
-    // Stay in the list with a green "labeled" badge (do not remove / grey as deleted).
-    if (newPath !== oldPath) {
-      video.path = newPath;
-      video.name = basenamePath(newPath) || video.name;
-      if (data.task_dir) {
-        video.relative = `${basenamePath(data.task_dir)}/${video.name}`;
-      }
-      migrateClipState(oldPath, newPath);
-      if (state.trimmingPaths.has(oldPath)) {
-        state.trimmingPaths.delete(oldPath);
-        state.trimmingPaths.add(newPath);
-      }
-    }
-    delete state.labeledTasks[oldPath];
-    state.labeledTasks[newPath] = task;
-    state.lastLabelTask = task;
-    saveActiveWorkspace();
-    el.taskSearch.value = "";
-    renderTasks(task);
-    el.taskSearch.blur();
-    if (state.labelProgress) {
-      const nextUnlabeled = Math.max(0, (state.labelProgress.unlabeled || 0) - 1);
-      const nextLabeled = (state.labelProgress.labeled || 0) + 1;
-      state.labelProgress = {
-        ...state.labelProgress,
-        unlabeled: nextUnlabeled,
-        labeled: nextLabeled,
-        complete: nextUnlabeled === 0,
-        message:
-          nextUnlabeled === 0
-            ? "All footage is inside task folders"
-            : `${nextUnlabeled} file(s) still outside task folders`,
-      };
-    }
-    const already = data.already_there
-      ? `Already in ${task} — removed leftover copy`
-      : `Moved to ${task}`;
-    setStatus(
-      `${already} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
-      "ok",
-    );
-    renderFileList();
-    advanceToNext();
-    refreshLabelProgress({ quiet: true });
-  } catch (error) {
-    setStatus(error.message, "error");
-  } finally {
-    state.busy = false;
-    el.labelBtn.disabled = false;
-  }
+  // Mapping pipeline: Enter binds a letter shortcut (does not move the file).
+  bindTaskShortcut(selectedTask());
 }
 
 function advanceToNext() {
@@ -2350,17 +2381,25 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (key === "i") {
+  if (key === "g") {
     event.preventDefault();
-    markStart();
+    mapMarkStart();
+    return;
   }
-  if (key === "o") {
+  if (key === "e") {
     event.preventDefault();
-    markEnd();
+    clearMapAnchor();
+    return;
   }
-  if (key === "t") {
+  if (key === "u") {
     event.preventDefault();
-    trimMarkedClip();
+    undoLastSegment();
+    return;
+  }
+  if (/^[a-z]$/.test(key) && taskForShortcut(key)) {
+    event.preventDefault();
+    mapMarkTask(key);
+    return;
   }
   if (key === "home" || event.key === "Home") {
     event.preventDefault();

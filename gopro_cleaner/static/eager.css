@@ -71,6 +71,27 @@
   min-width: 0;
 }
 
+.laptop-folder-btn {
+  flex-shrink: 0;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid rgba(62, 166, 255, 0.45);
+  border-radius: 7px;
+  background: rgba(62, 166, 255, 0.12);
+  color: #d9ecff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.laptop-folder-btn:hover {
+  background: rgba(62, 166, 255, 0.22);
+}
+
+.laptop-folder-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .card-select {
   max-width: 9.5rem;
   background: #141414;
@@ -1278,6 +1299,20 @@ body.scrub-cursor-hidden * {
   max-height: 11rem;
   overflow: auto;
   margin: 0.5rem 0;
+}
+
+.task-shortcut {
+  display: inline-block;
+  min-width: 1.25rem;
+  margin-right: 0.35rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  border: 1px solid rgba(62, 166, 255, 0.45);
+  background: rgba(62, 166, 255, 0.15);
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-align: center;
 }
 
 .task-item {
