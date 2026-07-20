@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, inventory, progress, segment_trim, space
+from . import aws_upload, duration, eject, hours_ledger, inventory, progress, segment_trim, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -32,6 +32,7 @@ ACTIVE_COPY_STATUSES = {
     "queued",
     "copying",
     "verifying",
+    "probing",
     "wiping",
     "ejecting",
     "uploading",
@@ -128,6 +129,7 @@ def get_status() -> dict:
             "log": list(_log[-80:]),
             "aws_jobs": aws_upload.list_jobs()[:20],
             "trim_jobs": segment_trim.list_trim_jobs()[:20],
+            "hours": hours_ledger.get_summary(),
             # volumes are heavy on Windows — UI loads them via /api/volumes
         }
     _save_snapshot(force=False)
@@ -143,8 +145,6 @@ def start_session(
     s3_uri: str = "",
 ) -> dict:
     batch = batch.strip()
-    if not batch:
-        raise ValueError("Batch name is required")
     if mode not in {"ssd_only", "ssd_and_aws"}:
         raise ValueError("mode must be ssd_only or ssd_and_aws")
     if not ssd1 and not ssd2:
@@ -157,6 +157,14 @@ def start_session(
     for path in (ssd1_path, ssd2_path):
         if path and not Path(path).exists():
             raise ValueError(f"SSD path not found: {path}")
+
+    # Auto / empty → hours ledger active batch (batch-1, batch-2, …)
+    if not batch or batch.lower() in {"__auto__", "auto"}:
+        batch = hours_ledger.ensure_active_batch(ssd1_path, ssd2_path)
+    else:
+        hours_ledger.ensure_active_batch(ssd1_path, ssd2_path)
+        # Manual override: keep writing into the chosen folder for this session
+        # until soft-roll updates the active name after cards land.
 
     with _lock:
         _session.update(
@@ -185,7 +193,7 @@ def start_session(
             space.batch_root(ssd, batch).mkdir(parents=True, exist_ok=True)
 
     _ensure_watcher()
-    _log_line(f"Session started: {batch} ({mode})")
+    _log_line(f"Session started: {batch} ({mode}) · hours → {hours_ledger.LEDGER_TXT}")
     # Immediately scan once
     _scan_for_cards()
     return get_status()
@@ -224,9 +232,18 @@ def _scan_for_cards() -> None:
         ssd1 = _session.get("ssd1") or ""
         ssd2 = _session.get("ssd2") or ""
         exclude = {p for p in (ssd1, ssd2) if p}
-        batch = _session.get("batch") or ""
         mode = _session.get("mode") or "ssd_only"
         s3_uri = _session.get("s3_uri") or ""
+
+    # Soft-roll: new cards always land in the ledger's open active batch.
+    batch = hours_ledger.ensure_active_batch(ssd1, ssd2)
+    with _lock:
+        prev = _session.get("batch") or ""
+        if prev != batch:
+            _session["batch"] = batch
+            if prev:
+                _log_line(f"Active batch switched {prev} → {batch} (hours ledger)", kind="ok")
+            save_config({"last_batch": batch})
 
     cards = find_card_volumes(exclude_paths=exclude)
     for vol in cards:
@@ -538,6 +555,52 @@ def _copy_card_worker(
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
+        # Note card hours (ffprobe) into the batch ledger; may soft-roll to next batch.
+        try:
+            _update_card(card_id, status="probing", message="Measuring card hours (ffprobe)…")
+            video_paths = duration.video_paths_under(
+                dest, [item["rel"] for item in files]
+            )
+            seconds, ok_n, fail_n = duration.sum_video_seconds(video_paths)
+            with _lock:
+                ssd1 = _session.get("ssd1") or ""
+                ssd2 = _session.get("ssd2") or ""
+                ssd_for_card = (_cards.get(card_id) or {}).get("ssd") or ""
+            hours_info = hours_ledger.record_card(
+                card_id=card_id,
+                seconds=seconds,
+                batch=batch,
+                dest=str(dest),
+                ssd=ssd_for_card,
+                probed_ok=ok_n,
+                probed_fail=fail_n,
+                ssd1=ssd1,
+                ssd2=ssd2,
+            )
+            hours = seconds / 3600.0
+            _log_line(
+                f"{card_id}: +{hours:.2f}h into {batch} "
+                f"(batch now {hours_info.get('active_hours', '?')}h / "
+                f"{hours_info.get('target_hours')}h active={hours_info.get('active_batch')})",
+                kind="ok",
+            )
+            if hours_info.get("rolled_to"):
+                with _lock:
+                    _session["batch"] = hours_info["rolled_to"]
+                save_config({"last_batch": hours_info["rolled_to"]})
+                _log_line(
+                    f"Batch {batch} hit {hours_info.get('target_hours')}h — "
+                    f"new cards → {hours_info['rolled_to']}",
+                    kind="ok",
+                )
+            _update_card(
+                card_id,
+                hours=round(hours, 3),
+                batch_hours=hours_info.get("active_hours"),
+            )
+        except Exception as hours_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: hours probe warning — {hours_exc}", kind="error")
+
         # Mark DONE before wipe/eject so a mid-wipe watcher pass cannot flip us to ERROR.
         _update_card(
             card_id,
@@ -697,3 +760,38 @@ def upload_batch_now(*, external_window: bool = True) -> dict:
     )
     _log_line(f"AWS upload started for batch {batch} → {job.get('dest')} (live progress in UI)")
     return job
+
+
+def upload_all_batches_now() -> dict:
+    cfg = load_config()
+    with _lock:
+        ssd1 = _session.get("ssd1") or cfg.get("ssd1") or ""
+        ssd2 = _session.get("ssd2") or cfg.get("ssd2") or ""
+        s3_uri = _session.get("s3_uri") or cfg.get("s3_uri") or ""
+    if not s3_uri:
+        raise ValueError("Set S3 URI first")
+    if not ssd1 and not ssd2:
+        raise ValueError("Pick SSD 1 / SSD 2")
+    result = aws_upload.start_all_batches_upload(s3_uri=s3_uri, ssd1=ssd1, ssd2=ssd2)
+    _log_line(result.get("message") or "AWS upload-all started", kind="ok")
+    return result
+
+
+def delete_or_resume_uploaded() -> dict:
+    cfg = load_config()
+    with _lock:
+        ssd1 = _session.get("ssd1") or cfg.get("ssd1") or ""
+        ssd2 = _session.get("ssd2") or cfg.get("ssd2") or ""
+        s3_uri = _session.get("s3_uri") or cfg.get("s3_uri") or ""
+    if not s3_uri:
+        raise ValueError("Set S3 URI first")
+    if not ssd1 and not ssd2:
+        raise ValueError("Pick SSD 1 / SSD 2")
+    result = aws_upload.delete_or_resume_uploaded(s3_uri=s3_uri, ssd1=ssd1, ssd2=ssd2)
+    _log_line(result.get("message") or "Delete/resume finished", kind="ok")
+    for action in result.get("actions") or []:
+        kind = "ok" if action.get("action") in {"deleted", "deleted_empty"} else "info"
+        if action.get("action") == "error":
+            kind = "error"
+        _log_line(action.get("message") or "", kind=kind)
+    return result

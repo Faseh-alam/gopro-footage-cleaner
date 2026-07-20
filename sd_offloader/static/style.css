@@ -114,6 +114,27 @@ select {
   margin-top: 0.9rem;
 }
 
+.hours-panel {
+  margin: 0.75rem 0 0.25rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(62, 166, 255, 0.06);
+}
+
+.hours-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  margin-bottom: 0.35rem;
+}
+
+.hours-batches {
+  display: grid;
+  gap: 0.2rem;
+}
+
 button {
   border-radius: 10px;
   border: 1px solid var(--border);

@@ -34,18 +34,19 @@
           <label>
             Batch on SSDs
             <select id="batch-select">
+              <option value="__auto__">Auto (active batch-N from hours ledger)</option>
               <option value="">Refresh drives to list batches…</option>
             </select>
           </label>
           <label id="new-batch-row" class="hidden">
             New batch name
-            <input id="batch-name" type="text" placeholder="batch 6" />
+            <input id="batch-name" type="text" placeholder="batch-3" />
           </label>
           <label>
             Mode
             <select id="mode">
-              <option value="ssd_only">SSD only (upload to AWS later)</option>
-              <option value="ssd_and_aws">SSD + AWS (s5cmd in CMD · auto-retry · live UI)</option>
+              <option value="ssd_only">SSD only (upload to AWS later · daily dump)</option>
+              <option value="ssd_and_aws">SSD + AWS (auto upload each card — usually leave off)</option>
             </select>
           </label>
           <label class="full">
@@ -53,12 +54,21 @@
             <input id="s3-uri" type="text" placeholder="s3://your-bucket/footage/" />
           </label>
         </div>
-        <p id="batch-hint" class="hint">Existing batches appear after you pick SSD 1 / SSD 2.</p>
+        <p id="batch-hint" class="hint">Use Auto for batch-1 / batch-2… Soft-rolls to the next folder at 1000 hours (current card finishes first).</p>
+        <div id="hours-panel" class="hours-panel">
+          <div class="hours-main">
+            <strong id="hours-active">Active: batch-1</strong>
+            <span id="hours-progress" class="hint">0 / 1000 h</span>
+          </div>
+          <div id="hours-batches" class="hours-batches hint">No cards logged yet</div>
+        </div>
         <div class="row actions">
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
-          <button id="start-session" type="button" class="primary">Start SD → SSD for this batch</button>
+          <button id="start-session" type="button" class="primary">Start SD → SSD (note hours)</button>
           <button id="stop-session" type="button" class="secondary">Stop watching</button>
-          <button id="upload-batch" type="button" class="primary" title="Opens CMD with s5cmd (or aws) sync — auto-retries; resumes files already on S3">Upload this batch to AWS (CMD)</button>
+          <button id="upload-batch" type="button" class="secondary" title="One CMD per drive for the selected batch only">Upload selected batch</button>
+          <button id="upload-all-batches" type="button" class="primary" title="One CMD per batch folder on each SSD — never syncs the parent Batches/ folder">Upload all batches (both drives)</button>
+          <button id="delete-or-resume" type="button" class="danger" title="Re-check local vs S3: delete only if complete, otherwise resume upload">Delete uploaded (or resume if not done)</button>
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
@@ -77,10 +87,10 @@
         <div>
           <h2>AWS uploads (batches)</h2>
           <p class="hint">
-            Prefers <strong>s5cmd sync</strong> (default workers, usually faster).
-            If that fails, retries with <strong>--numworkers 20</strong>. Falls back to aws CLI.
-            After upload, sizes are checked (local vs S3). Use <strong>Restart</strong> if needed,
-            then <strong>Delete local</strong> only when verified.
+            Prefers <strong>s5cmd sync</strong> per <strong>batch folder per drive</strong>
+            (never syncs the parent <code>Batches/</code> folder — deleting local batch-1 cannot remove remote batch-2).
+            End of day: <strong>Upload all batches</strong>. Next morning:
+            <strong>Delete uploaded</strong> re-checks sizes — deletes only what matches S3, resumes the rest.
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>

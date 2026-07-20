@@ -11,6 +11,8 @@ const el = {
   startSession: document.getElementById("start-session"),
   stopSession: document.getElementById("stop-session"),
   uploadBatch: document.getElementById("upload-batch"),
+  uploadAllBatches: document.getElementById("upload-all-batches"),
+  deleteOrResume: document.getElementById("delete-or-resume"),
   testAws: document.getElementById("test-aws"),
   sessionStatus: document.getElementById("session-status"),
   cards: document.getElementById("cards"),
@@ -19,6 +21,9 @@ const el = {
   log: document.getElementById("log"),
   awsCliStatus: document.getElementById("aws-cli-status"),
   appVersion: document.getElementById("app-version"),
+  hoursActive: document.getElementById("hours-active"),
+  hoursProgress: document.getElementById("hours-progress"),
+  hoursBatches: document.getElementById("hours-batches"),
 };
 
 async function api(url, options = {}) {
@@ -86,6 +91,7 @@ function fillVolumeSelect(select, volumes, selected) {
 
 function selectedBatchName() {
   const pick = el.batchSelect.value;
+  if (pick === "__auto__") return "__auto__";
   if (pick === "__new__") return el.batchName.value.trim();
   return (pick || "").trim();
 }
@@ -93,12 +99,15 @@ function selectedBatchName() {
 function onBatchSelectChange() {
   const isNew = el.batchSelect.value === "__new__";
   el.newBatchRow.classList.toggle("hidden", !isNew);
-  if (!isNew && el.batchSelect.value) {
+  if (el.batchSelect.value === "__auto__") {
+    el.batchHint.textContent =
+      "Auto uses the hours ledger active batch (batch-1, batch-2…). Soft-rolls at 1000h after the current card finishes.";
+  } else if (!isNew && el.batchSelect.value) {
     el.batchHint.textContent =
       el.batchSelect.selectedOptions[0]?.dataset?.detail ||
-      "Selected batch — Start SD→SSD and/or Upload to AWS.";
+      "Selected batch — Start SD→SSD and/or Upload.";
   } else if (isNew) {
-    el.batchHint.textContent = "Type a new batch name (e.g. batch 6). Folder is created on the SSDs when you start.";
+    el.batchHint.textContent = "Type a name like batch-3. Prefer Auto unless you need a special folder.";
   }
 }
 
@@ -109,14 +118,19 @@ async function refreshBatches(preferred) {
     `/api/batches?ssd1=${encodeURIComponent(ssd1)}&ssd2=${encodeURIComponent(ssd2)}`,
   );
   const batches = data.batches || [];
-  const keep = preferred || selectedBatchName() || el.batchSelect.value;
+  const keep = preferred || el.batchSelect.value || "__auto__";
   el.batchSelect.innerHTML = "";
+
+  const auto = document.createElement("option");
+  auto.value = "__auto__";
+  auto.textContent = "Auto (active batch-N from hours ledger)";
+  el.batchSelect.appendChild(auto);
 
   const placeholder = document.createElement("option");
   placeholder.value = "";
   placeholder.textContent = batches.length
-    ? `Select a batch (${batches.length} found)…`
-    : "No batches on SSDs yet — create new";
+    ? `— or pick a batch (${batches.length} on SSD) —`
+    : "No batches on SSDs yet";
   el.batchSelect.appendChild(placeholder);
 
   for (const batch of batches) {
@@ -133,15 +147,15 @@ async function refreshBatches(preferred) {
 
   const create = document.createElement("option");
   create.value = "__new__";
-  create.textContent = "+ Create new batch…";
+  create.textContent = "+ Create named batch…";
   el.batchSelect.appendChild(create);
 
   if (keep && keep !== "__new__" && [...el.batchSelect.options].some((o) => o.value === keep)) {
     el.batchSelect.value = keep;
   } else if (keep === "__new__") {
     el.batchSelect.value = "__new__";
-  } else if (batches.length === 1) {
-    el.batchSelect.value = batches[0].name;
+  } else {
+    el.batchSelect.value = "__auto__";
   }
   onBatchSelectChange();
   return batches;
@@ -164,7 +178,7 @@ function renderCards(cards) {
     return;
   }
   const active = cards.filter((c) =>
-    ["copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"].includes(
+    ["copying", "verifying", "probing", "wiping", "ejecting", "uploading", "queued", "scanning"].includes(
       c.status,
     ),
   ).length;
@@ -187,6 +201,7 @@ function renderCards(cards) {
         <span>ETA ${formatEta(card.eta_seconds)}</span>
         <span>${card.files_done || 0}/${card.files_total || 0} files</span>
         <span>${pct.toFixed(0)}%</span>
+        ${card.hours != null ? `<span>${Number(card.hours).toFixed(2)} h</span>` : ""}
       </div>
       <div class="message">${card.message || ""}</div>
       ${card.dest ? `<div class="hint">SSD dest: ${card.dest}</div>` : ""}
@@ -371,6 +386,31 @@ function renderLog(lines) {
   }
 }
 
+function renderHours(hours) {
+  if (!el.hoursActive) return;
+  const h = hours || {};
+  const target = Number(h.target_hours || 1000);
+  const active = h.active_batch || "batch-1";
+  const activeHours = Number(h.active_hours || 0);
+  el.hoursActive.textContent = `Active: ${active}`;
+  el.hoursProgress.textContent = `${activeHours.toFixed(1)} / ${target.toFixed(0)} h · remaining ${(
+    h.active_remaining_hours ?? Math.max(0, target - activeHours)
+  ).toFixed(1)} h · grand ${Number(h.grand_total_hours || 0).toFixed(1)} h`;
+  const rows = h.batches || [];
+  if (!rows.length) {
+    el.hoursBatches.textContent = "No cards logged yet — hours noted after each SD→SSD verify.";
+    return;
+  }
+  el.hoursBatches.innerHTML = rows
+    .map((b) => {
+      const mark = b.is_active ? " ← writing here" : b.status === "full" ? " (full)" : "";
+      return `<div><code>${escapeHtml(b.name)}</code> · ${Number(b.hours || 0).toFixed(1)} h · ${
+        b.cards || 0
+      } card(s)${mark}</div>`;
+    })
+    .join("");
+}
+
 async function pollStatus() {
   try {
     const data = await api("/api/status");
@@ -386,6 +426,7 @@ async function pollStatus() {
     renderCards(data.cards || []);
     renderAwsJobs(data.aws_jobs || []);
     renderLog(data.log || []);
+    renderHours(data.hours || {});
   } catch {
     /* ignore transient */
   }
@@ -445,12 +486,9 @@ async function bootstrap() {
     await refreshVolumes();
     if (config.ssd1) el.ssd1.value = config.ssd1;
     if (config.ssd2) el.ssd2.value = config.ssd2;
-    await refreshBatches(config.last_batch || "");
-    if (config.last_batch && ![...el.batchSelect.options].some((o) => o.value === config.last_batch)) {
-      el.batchSelect.value = "__new__";
-      el.batchName.value = config.last_batch;
-      onBatchSelectChange();
-    }
+    await refreshBatches("__auto__");
+    el.batchSelect.value = "__auto__";
+    onBatchSelectChange();
     setStatus("Ready — click Start SD → SSD when you want to watch cards", "ok");
   } catch (error) {
     setStatus(`Drive list failed: ${error.message} — click Refresh drives`, "error");
@@ -476,8 +514,12 @@ el.batchSelect.addEventListener("change", onBatchSelectChange);
 el.startSession.addEventListener("click", async () => {
   try {
     const payload = sessionPayload();
+    if (!payload.ssd1 && !payload.ssd2) {
+      setStatus("Pick SSD 1 and/or SSD 2", "error");
+      return;
+    }
     if (!payload.batch) {
-      setStatus("Select an existing batch or create a new one", "error");
+      setStatus("Select Auto, an existing batch, or create a new one", "error");
       return;
     }
     await api("/api/session/start", {
@@ -485,8 +527,13 @@ el.startSession.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    setStatus(`Watching for SD cards → batch "${payload.batch}"`, "ok");
-    await refreshBatches(payload.batch);
+    setStatus(
+      payload.batch === "__auto__"
+        ? "Watching for SD cards → auto batch (hours logged after each card)"
+        : `Watching for SD cards → batch "${payload.batch}"`,
+      "ok",
+    );
+    await refreshBatches(payload.batch === "__auto__" ? "__auto__" : payload.batch);
     await pollStatus();
   } catch (error) {
     setStatus(error.message, "error");
@@ -505,7 +552,13 @@ el.stopSession.addEventListener("click", async () => {
 el.uploadBatch.addEventListener("click", async () => {
   try {
     const payload = sessionPayload();
-    if (!payload.batch) {
+    let batch = payload.batch;
+    if (batch === "__auto__") {
+      const hours = await api("/api/hours");
+      batch = hours.active_batch || "";
+      payload.batch = batch;
+    }
+    if (!batch) {
       setStatus("Select the batch that is already on the SSDs", "error");
       return;
     }
@@ -513,7 +566,7 @@ el.uploadBatch.addEventListener("click", async () => {
       setStatus("Paste S3 URI first", "error");
       return;
     }
-    setStatus(`Opening AWS Command Prompt for "${payload.batch}"…`);
+    setStatus(`Opening AWS Command Prompt for "${batch}" (one per drive)…`);
     const data = await api("/api/aws/upload-batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -521,9 +574,65 @@ el.uploadBatch.addEventListener("click", async () => {
     });
     setStatus(
       data.job?.message ||
-        `AWS upload started for ${payload.batch} — watch progress here and in the console`,
+        `AWS upload started for ${batch} — watch progress here and in the console`,
       "ok",
     );
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.uploadAllBatches?.addEventListener("click", async () => {
+  try {
+    const payload = sessionPayload();
+    if (!payload.s3_uri) {
+      setStatus("Paste S3 URI first", "error");
+      return;
+    }
+    if (!payload.ssd1 && !payload.ssd2) {
+      setStatus("Pick SSD 1 and/or SSD 2", "error");
+      return;
+    }
+    setStatus("Starting one AWS upload per batch folder on each drive…");
+    const data = await api("/api/aws/upload-all-batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      timeoutMs: 120000,
+    });
+    setStatus(data.message || `Started ${data.started || 0} upload(s)`, "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.deleteOrResume?.addEventListener("click", async () => {
+  try {
+    const payload = sessionPayload();
+    if (!payload.s3_uri) {
+      setStatus("Paste S3 URI first", "error");
+      return;
+    }
+    if (
+      !confirm(
+        "Re-check every batch folder on both SSDs against S3.\n\n" +
+          "• If sizes match → delete local batch folder\n" +
+          "• If not done → resume upload (do not delete)\n\nContinue?",
+      )
+    ) {
+      return;
+    }
+    setStatus("Checking S3 sizes — deleting complete batches, resuming the rest…");
+    const data = await api("/api/aws/delete-or-resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, confirmed: true }),
+      timeoutMs: 300000,
+    });
+    setStatus(data.message || "Done", "ok");
+    await refreshBatches("__auto__");
     await pollStatus();
   } catch (error) {
     setStatus(error.message, "error");

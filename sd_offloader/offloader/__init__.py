@@ -2,4 +2,4 @@
 
 from __future__ import annotations
 
-__version__ = "1.6.0-testing"
+__version__ = "1.7.0-testing"

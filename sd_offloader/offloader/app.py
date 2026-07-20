@@ -61,7 +61,7 @@ def create_app() -> Flask:
     @app.post("/api/config")
     def post_config():
         payload = request.get_json(silent=True) or {}
-        allowed = {"s3_uri", "ssd1", "ssd2", "last_batch", "mode", "port"}
+        allowed = {"s3_uri", "ssd1", "ssd2", "last_batch", "mode", "port", "batch_hours_target"}
         data = {k: payload[k] for k in allowed if k in payload}
         return jsonify(save_config(data))
 
@@ -140,14 +140,50 @@ def create_app() -> Flask:
                     show_console=True,
                 )
                 engine.log_message(
-                    f"AWS upload started for batch {batch} via "
-                    f"{job.get('uploader') or 'sync'} (survives restart; UI tracks log)"
+                    job.get("message")
+                    or f"AWS upload started for batch {batch}"
                 )
             else:
                 job = engine.upload_batch_now(external_window=True)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"ok": True, "job": job})
+        return jsonify({"ok": True, "job": job, "jobs": job.get("jobs") if isinstance(job, dict) else None})
+
+    @app.post("/api/aws/upload-all-batches")
+    def aws_upload_all_batches():
+        payload = request.get_json(silent=True) or {}
+        try:
+            cfg = load_config()
+            s3_uri = str(payload.get("s3_uri") or cfg.get("s3_uri") or "").strip()
+            ssd1 = str(payload.get("ssd1") or cfg.get("ssd1") or "").strip()
+            ssd2 = str(payload.get("ssd2") or cfg.get("ssd2") or "").strip()
+            if s3_uri or ssd1 or ssd2:
+                save_config({"s3_uri": s3_uri, "ssd1": ssd1, "ssd2": ssd2})
+            result = engine.upload_all_batches_now()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
+    @app.post("/api/aws/delete-or-resume")
+    def aws_delete_or_resume():
+        payload = request.get_json(silent=True) or {}
+        if not bool(payload.get("confirmed")):
+            return jsonify({"error": "confirmed=true required"}), 400
+        try:
+            cfg = load_config()
+            s3_uri = str(payload.get("s3_uri") or cfg.get("s3_uri") or "").strip()
+            ssd1 = str(payload.get("ssd1") or cfg.get("ssd1") or "").strip()
+            ssd2 = str(payload.get("ssd2") or cfg.get("ssd2") or "").strip()
+            if s3_uri or ssd1 or ssd2:
+                save_config({"s3_uri": s3_uri, "ssd1": ssd1, "ssd2": ssd2})
+            result = engine.delete_or_resume_uploaded()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
+    @app.get("/api/hours")
+    def api_hours():
+        return jsonify(engine.get_status().get("hours") or {})
 
     @app.post("/api/aws/restart")
     def aws_restart():

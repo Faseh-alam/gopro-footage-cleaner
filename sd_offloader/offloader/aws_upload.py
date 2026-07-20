@@ -202,8 +202,13 @@ def start_batch_upload(
     card_id: str | None = None,
     external_window: bool = True,
     show_console: bool | None = None,
+    split_per_drive: bool = True,
 ) -> dict:
-    """Start s5cmd/aws sync in an external console (survives server restart)."""
+    """Start s5cmd/aws sync in an external console (survives server restart).
+
+    When uploading a full batch (no card_id), defaults to **one job per SSD
+    batch folder** (never syncs the parent ``Batches/`` tree).
+    """
     del show_console  # always external + logged
     del external_window
     tool = preferred_uploader()
@@ -217,8 +222,8 @@ def start_batch_upload(
     if not roots:
         raise RuntimeError(f"No local batch folder found for {batch_name} on the selected SSDs")
 
-    sources: list[Path] = []
     if card_id:
+        sources: list[Path] = []
         for root in roots:
             card_path = root / card_id.upper()
             if card_path.is_dir():
@@ -226,18 +231,249 @@ def start_batch_upload(
         if not sources:
             raise RuntimeError(f"Card folder {card_id} not found under batch {batch_name}")
         dest = f"{prefix}{card_id.upper()}/"
-    else:
-        sources = roots
-        dest = prefix
+        job = _launch_upload_job(
+            sources=sources,
+            dest=dest,
+            batch_name=batch_name,
+            card_id=card_id,
+            s3_uri=s3_uri,
+            tool=tool,
+        )
+        return job
 
-    return _launch_upload_job(
-        sources=sources,
-        dest=dest,
-        batch_name=batch_name,
-        card_id=card_id,
-        s3_uri=s3_uri,
-        tool=tool,
-    )
+    # Full batch: sync each drive's batch folder → s3://…/{batch}/ (not parent Batches/)
+    if not split_per_drive or len(roots) == 1:
+        return _launch_upload_job(
+            sources=roots,
+            dest=prefix,
+            batch_name=batch_name,
+            card_id=None,
+            s3_uri=s3_uri,
+            tool=tool,
+        )
+
+    jobs = []
+    for root in roots:
+        jobs.append(
+            _launch_upload_job(
+                sources=[root],
+                dest=prefix,
+                batch_name=batch_name,
+                card_id=None,
+                s3_uri=s3_uri,
+                tool=tool,
+                drive_hint=str(root),
+            )
+        )
+    return {
+        "ok": True,
+        "batch": batch_name,
+        "dest": prefix,
+        "jobs": jobs,
+        "id": jobs[0].get("id") if jobs else "",
+        "status": "running",
+        "message": f"Started {len(jobs)} upload job(s) for {batch_name} (one per drive)",
+        "uploader": tool,
+    }
+
+
+def start_all_batches_upload(*, s3_uri: str, ssd1: str, ssd2: str) -> dict:
+    """Upload every local Batches/<name> folder on both SSDs — one job each.
+
+    Never syncs the parent ``Batches/`` folder (so deleting a local batch later
+    cannot cascade-delete other remote batches via folder sync).
+    """
+    from . import hours_ledger
+
+    tool = preferred_uploader()
+    if not tool:
+        raise RuntimeError(
+            "Neither s5cmd nor AWS CLI found. Install s5cmd (recommended) or AWS CLI v2, then `aws configure`."
+        )
+    entries = hours_ledger.list_numbered_batches_on_ssds(ssd1, ssd2)
+    jobs = []
+    skipped = []
+    for entry in entries:
+        path = Path(entry["path"])
+        if not entry.get("has_files"):
+            skipped.append({**entry, "reason": "empty"})
+            continue
+        if _is_source_uploading(path):
+            skipped.append({**entry, "reason": "already_uploading"})
+            continue
+        batch_name = entry["batch"]
+        dest = batch_s3_prefix(s3_uri, batch_name)
+        jobs.append(
+            _launch_upload_job(
+                sources=[path],
+                dest=dest,
+                batch_name=batch_name,
+                card_id=None,
+                s3_uri=s3_uri,
+                tool=tool,
+                drive_hint=entry.get("drive") or str(path),
+            )
+        )
+    return {
+        "ok": True,
+        "jobs": jobs,
+        "started": len(jobs),
+        "skipped": skipped,
+        "message": (
+            f"Started {len(jobs)} batch upload(s) (one CMD per batch per drive)"
+            + (f"; skipped {len(skipped)}" if skipped else "")
+        ),
+    }
+
+
+def delete_or_resume_uploaded(*, s3_uri: str, ssd1: str, ssd2: str) -> dict:
+    """Re-check each local batch folder vs S3; delete only if complete, else resume upload.
+
+    Matches the manual workflow: re-run sync — if nothing left to send, safe to
+    delete; if sync starts transferring again, keep uploading and do not delete.
+    """
+    from . import hours_ledger
+
+    if not preferred_uploader():
+        raise RuntimeError("Neither s5cmd nor AWS CLI found")
+
+    entries = hours_ledger.list_numbered_batches_on_ssds(ssd1, ssd2)
+    actions: list[dict] = []
+    deleted = []
+    resumed = []
+
+    for entry in entries:
+        path = Path(entry["path"])
+        batch_name = entry["batch"]
+        drive = entry.get("drive") or "?"
+        dest = batch_s3_prefix(s3_uri, batch_name)
+
+        if _is_source_uploading(path):
+            actions.append(
+                {
+                    "drive": drive,
+                    "batch": batch_name,
+                    "action": "skipped_running",
+                    "message": f"{drive}: {batch_name} still uploading — left alone",
+                }
+            )
+            continue
+
+        if not entry.get("has_files"):
+            # Empty folder — remove husk
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                actions.append(
+                    {
+                        "drive": drive,
+                        "batch": batch_name,
+                        "action": "deleted_empty",
+                        "message": f"{drive}: removed empty {batch_name}",
+                    }
+                )
+                deleted.append(str(path))
+            except OSError as exc:
+                actions.append(
+                    {
+                        "drive": drive,
+                        "batch": batch_name,
+                        "action": "error",
+                        "message": f"{drive}: {batch_name} — {exc}",
+                    }
+                )
+            continue
+
+        check = _compare_local_s3_sizes([path], dest)
+        if check["ok"]:
+            try:
+                shutil.rmtree(path)
+                deleted.append(str(path))
+                actions.append(
+                    {
+                        "drive": drive,
+                        "batch": batch_name,
+                        "action": "deleted",
+                        "message": (
+                            f"{drive}: deleted {batch_name} "
+                            f"(local {check['local_bytes']} ≈ S3 {check['s3_bytes']})"
+                        ),
+                        "local_bytes": check["local_bytes"],
+                        "s3_bytes": check["s3_bytes"],
+                    }
+                )
+            except OSError as exc:
+                actions.append(
+                    {
+                        "drive": drive,
+                        "batch": batch_name,
+                        "action": "error",
+                        "message": f"{drive}: failed to delete {batch_name} — {exc}",
+                    }
+                )
+            continue
+
+        # Not complete — resume upload (do not delete)
+        tool = preferred_uploader()
+        job = _launch_upload_job(
+            sources=[path],
+            dest=dest,
+            batch_name=batch_name,
+            card_id=None,
+            s3_uri=s3_uri,
+            tool=tool,
+            drive_hint=drive,
+        )
+        resumed.append(job.get("id"))
+        actions.append(
+            {
+                "drive": drive,
+                "batch": batch_name,
+                "action": "resumed",
+                "job_id": job.get("id"),
+                "message": (
+                    f"{drive}: {batch_name} not finished "
+                    f"(local {check['local_bytes']} vs S3 {check['s3_bytes']}) — resumed upload"
+                ),
+                "local_bytes": check["local_bytes"],
+                "s3_bytes": check["s3_bytes"],
+            }
+        )
+
+    summary_parts = []
+    del_msgs = [a["message"] for a in actions if a["action"] in {"deleted", "deleted_empty"}]
+    res_msgs = [a["message"] for a in actions if a["action"] == "resumed"]
+    if del_msgs:
+        summary_parts.append("Deleted: " + "; ".join(del_msgs))
+    if res_msgs:
+        summary_parts.append("Still uploading: " + "; ".join(res_msgs))
+    other = [a["message"] for a in actions if a["action"] not in {"deleted", "deleted_empty", "resumed"}]
+    if other:
+        summary_parts.append("; ".join(other))
+
+    return {
+        "ok": True,
+        "actions": actions,
+        "deleted": deleted,
+        "resumed_jobs": resumed,
+        "message": " · ".join(summary_parts) if summary_parts else "Nothing to do — no batch folders found",
+    }
+
+
+def _is_source_uploading(source: Path) -> bool:
+    needle = str(source.resolve()) if source.exists() else str(source)
+    with _lock:
+        for job in _jobs.values():
+            if job.get("status") != "running":
+                continue
+            for src in job.get("sources") or []:
+                try:
+                    if str(Path(src).resolve()) == needle or str(src) == str(source):
+                        return True
+                except OSError:
+                    if str(src) == str(source):
+                        return True
+    return False
 
 
 def restart_job(job_id: str) -> dict:
@@ -387,12 +623,22 @@ def _launch_upload_job(
     tool: str,
     reuse_job_id: str | None = None,
     restart: bool = False,
+    drive_hint: str | None = None,
 ) -> dict:
     total_bytes = sum(_dir_bytes(src) for src in sources)
     stamp = int(time.time())
-    label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
+    drive_tag = ""
+    if drive_hint:
+        drive_tag = re.sub(r"[^\w.-]+", "", Path(drive_hint).name or drive_hint)[:12]
+        if len(str(drive_hint)) >= 2 and str(drive_hint)[1] == ":":
+            drive_tag = str(drive_hint)[:2].replace(":", "")
+    label_bits = [batch_name, card_id or "ALL"]
+    if drive_tag:
+        label_bits.append(drive_tag)
+    label_bits.append(str(stamp))
+    label = "-".join(label_bits)
     job_id = reuse_job_id or f"aws:{label}"
-    safe = re.sub(r"[^\w.-]+", "_", f"{batch_name}-{card_id or 'ALL'}-{stamp}")
+    safe = re.sub(r"[^\w.-]+", "_", label)
 
     ensure_dirs()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -401,9 +647,12 @@ def _launch_upload_job(
 
     workers = _numworkers()
     retries = _upload_retries()
+    title_extra = f" / {card_id}" if card_id else ""
+    if drive_hint:
+        title_extra += f" · {drive_hint}"
     header = (
         f"AWS S3 upload  {batch_name}"
-        + (f" / {card_id}" if card_id else "")
+        + title_extra
         + f"\nTool: {tool}"
         + (
             f" · try default sync first, then --numworkers {workers} on failure"
@@ -430,7 +679,7 @@ def _launch_upload_job(
     )
     _launch_external_script(
         script_path,
-        title=f"AWS upload — {batch_name}" + (f" / {card_id}" if card_id else ""),
+        title=f"AWS upload — {batch_name}" + title_extra,
     )
 
     message = (
@@ -448,6 +697,7 @@ def _launch_upload_job(
             "status": "running",
             "batch": batch_name,
             "card_id": card_id,
+            "drive": drive_hint,
             "dest": dest,
             "s3_uri": s3_uri,
             "uploader": tool,
