@@ -2087,9 +2087,8 @@ async function saveTaskSnippet() {
     renderFilmstrip();
     startTrimPolling();
     loadTasks().catch(() => {});
-    const capNote = data.capped_to_8_seconds ? " (capped to 8 seconds)" : "";
     setStatus(
-      `Snippet queued → ${task}/${basenamePath(data.output)}${capNote}. Original footage stays on the card.`,
+      `Snippet queued → ${task}/${basenamePath(data.output)}. Original footage stays on the card.`,
       "ok",
     );
   } catch (error) {

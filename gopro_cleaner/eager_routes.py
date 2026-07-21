@@ -240,22 +240,21 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
 
     @eager.post("/api/eager/snippet")
     def eager_snippet():
-        """Save an up-to-8-second I→O sample directly in a task folder."""
+        """Save the marked I→O range as a task-folder sample (any length)."""
         payload = request.get_json(silent=True) or {}
         raw_source = str(payload.get("path", "")).strip()
         raw_root = str(payload.get("label_root", "")).strip()
         task_name = str(payload.get("task", "")).strip()
         try:
             start = float(payload.get("start", 0))
-            requested_end = float(payload.get("end", 0))
+            end = float(payload.get("end", 0))
         except (TypeError, ValueError):
             return jsonify({"error": "start and end must be numbers"}), 400
         if not raw_source or not raw_root or not task_name:
             return jsonify({"error": "path, label_root, and task are required"}), 400
-        if requested_end <= start + 0.05:
+        if end <= start + 0.05:
             return jsonify({"error": "Snippet end must be after start"}), 400
 
-        end = min(requested_end, start + 8.0)
         try:
             source = Path(raw_source).expanduser().resolve(strict=True)
             root = Path(raw_root).expanduser().resolve(strict=True)
@@ -285,7 +284,6 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
                 "output": record.output,
                 "task": task_name,
                 "task_dir": str(task_dir),
-                "capped_to_8_seconds": requested_end > end,
                 "source_has_gpmf": record.source_has_gpmf,
             }
         )
