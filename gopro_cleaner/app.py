@@ -18,7 +18,7 @@ from .core.volumes import list_volume_roots
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
-APP_VERSION = "2.14.8"
+APP_VERSION = "2.15.0"
 
 
 def create_app() -> Flask:
@@ -49,6 +49,18 @@ def create_app() -> Flask:
                 "ffmpeg_hint": tools.get("hint") or "",
             }
         )
+
+    @app.post("/api/update")
+    def self_update():
+        """Pull latest main from GitHub and restart the app (Update button)."""
+        from .core.self_update import pull_latest_main, relaunch_and_exit
+
+        try:
+            result = pull_latest_main()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        relaunch_and_exit()
+        return jsonify({"ok": True, "restarting": True, **result})
 
     @app.get("/api/volumes")
     def volumes():

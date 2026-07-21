@@ -127,6 +127,7 @@ const el = {
   appVersion: document.getElementById("app-version"),
   cardTabList: document.getElementById("card-tab-list"),
   addCardTab: document.getElementById("add-card-tab"),
+  updateBtn: document.getElementById("update-btn"),
 };
 
 el.player.muted = true;
@@ -2457,6 +2458,70 @@ document.addEventListener("keydown", (event) => {
     labelCurrentClip();
   }
 });
+
+async function runSelfUpdate() {
+  if (
+    !window.confirm(
+      "Update to the latest version?\n\nThe app restarts itself — this takes a minute or two. Finish any trims in progress first.",
+    )
+  ) {
+    return;
+  }
+  el.updateBtn.disabled = true;
+  let oldVersion = "";
+  try {
+    const health = await api("/api/health");
+    oldVersion = health.version || "";
+  } catch {
+    /* still try to update */
+  }
+  showLoading("Updating", "Pulling the latest version from GitHub…", 10);
+  try {
+    const data = await api("/api/update", { method: "POST" });
+    if (data.changed === false) {
+      showLoading("Restarting", "Already on the latest version — restarting anyway…", 40);
+    } else {
+      showLoading("Restarting", `Updated ${data.before} → ${data.after} — restarting…`, 40);
+    }
+  } catch (error) {
+    hideLoading();
+    el.updateBtn.disabled = false;
+    setStatus(error.message, "error");
+    return;
+  }
+
+  // Server is going down; poll health until the new process is up, then reload.
+  let sawDown = false;
+  const startedAt = Date.now();
+  const timer = setInterval(async () => {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > 5 * 60 * 1000) {
+      clearInterval(timer);
+      hideLoading();
+      setStatus("Update is taking long — check the server window, then reload this page", "error");
+      el.updateBtn.disabled = false;
+      return;
+    }
+    try {
+      const res = await fetch("/api/health", { cache: "no-store" });
+      if (!res.ok) throw new Error("down");
+      const health = await res.json();
+      const cameBack = sawDown || (health.version && oldVersion && health.version !== oldVersion);
+      if (cameBack) {
+        clearInterval(timer);
+        showLoading("Ready", `Now on v${health.version} — reloading…`, 100);
+        setTimeout(() => window.location.reload(), 600);
+      } else {
+        showLoading("Restarting", "Installing dependencies and starting up…", 60);
+      }
+    } catch {
+      sawDown = true;
+      showLoading("Restarting", "Server is restarting — this page reloads automatically…", 70);
+    }
+  }, 2000);
+}
+
+el.updateBtn?.addEventListener("click", runSelfUpdate);
 
 loadTasks()
   .then(() => {

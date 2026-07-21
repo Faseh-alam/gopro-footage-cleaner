@@ -971,6 +971,27 @@ body.scrub-cursor-hidden * {
   background: rgba(62, 166, 255, 0.12);
 }
 
+.update-btn {
+  border: 1px solid rgba(46, 160, 67, 0.5);
+  background: rgba(46, 160, 67, 0.12);
+  color: #4cc768;
+  border-radius: 8px;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.update-btn:hover {
+  background: rgba(46, 160, 67, 0.22);
+}
+
+.update-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .scan-summary-inline {
   display: block;
   margin-top: 0.15rem;
