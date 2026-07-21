@@ -25,6 +25,8 @@ class EagerTrimRecord:
     error: str | None = None
     trim_job_id: str | None = None
     clip_number: int | None = None
+    kind: str = "trim"
+    task: str | None = None
     source_has_gpmf: bool | None = None
     output_has_gpmf: bool | None = None
     created_at: float = field(default_factory=time.time)
@@ -41,7 +43,16 @@ class EagerTrimQueue:
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="eager-trim-queue")
         self._worker.start()
 
-    def submit(self, source: Path, start_seconds: float, end_seconds: float) -> EagerTrimRecord:
+    def submit(
+        self,
+        source: Path,
+        start_seconds: float,
+        end_seconds: float,
+        *,
+        output_dir: Path | None = None,
+        kind: str = "trim",
+        task: str | None = None,
+    ) -> EagerTrimRecord:
         source = source.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"Source not found: {source}")
@@ -57,12 +68,14 @@ class EagerTrimQueue:
         with self._condition:
             reserved = self._reserved_clip_numbers_locked(source)
             clip_number = _next_clip_number(source, reserved=reserved)
-            output_path = build_output_path(source, clip_number, source.parent)
+            target_dir = output_dir.expanduser().resolve() if output_dir else source.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            output_path = build_output_path(source, clip_number, target_dir)
             # Avoid colliding with a file already on disk while another job is mid-flight.
             while output_path.exists() or clip_number in reserved:
                 reserved.add(clip_number)
                 clip_number = _next_clip_number(source, reserved=reserved)
-                output_path = build_output_path(source, clip_number, source.parent)
+                output_path = build_output_path(source, clip_number, target_dir)
 
             record = EagerTrimRecord(
                 job_id=job_id,
@@ -72,6 +85,8 @@ class EagerTrimQueue:
                 source_has_gpmf=source_has_gpmf,
                 clip_number=clip_number,
                 output=str(output_path),
+                kind=kind,
+                task=task,
             )
             self._records[job_id] = record
             self._pending.append(job_id)
@@ -178,6 +193,8 @@ class EagerTrimQueue:
                 "message": message,
                 "output": record.output,
                 "error": record.error,
+                "kind": record.kind,
+                "task": record.task,
             }
 
         # Always include every active job first (never drop them behind a 40-cap).
@@ -244,6 +261,8 @@ class EagerTrimQueue:
                     "message": message,
                     "output": record.output,
                     "error": record.error,
+                    "kind": record.kind,
+                    "task": record.task,
                     "source_has_gpmf": record.source_has_gpmf,
                     "output_has_gpmf": record.output_has_gpmf,
                 }
@@ -333,7 +352,7 @@ class EagerTrimQueue:
                         reserved = self._reserved_clip_numbers_locked(source)
                         reserved.add(clip_number)
                     clip_number = _next_clip_number(source, reserved=reserved)
-                    output_path = build_output_path(source, clip_number, source.parent)
+                    output_path = build_output_path(source, clip_number, output_path.parent)
                     record.clip_number = clip_number
                     record.output = str(output_path)
 

@@ -738,15 +738,16 @@ function renderClips() {
     let cls = "saved";
     let label = "";
     const range = `${formatTime(job.start)} → ${formatTime(job.end)}`;
+    const prefix = job.kind === "snippet" ? "Snippet " : "";
     if (job.status === "queued") {
       cls = "queued";
-      label = `Queued: ${range}`;
+      label = `${prefix}queued: ${range}`;
     } else if (job.status === "running") {
       cls = "running";
       const pct = Number.isFinite(job.progress) ? ` · ${Math.round(job.progress)}%` : "";
       const left =
         job.remaining_seconds > 0 ? ` · ~${formatDurationShort(job.remaining_seconds)} left` : "";
-      label = `Trimming: ${range}${pct}${left}`;
+      label = `${prefix}trimming: ${range}${pct}${left}`;
     } else if (job.status === "failed") {
       cls = "failed";
       label = `Failed: ${job.error || "trim error"}`;
@@ -757,7 +758,7 @@ function renderClips() {
           : job.source_has_gpmf === true && job.output_has_gpmf === false
             ? " · IMU missing"
             : "";
-      label = `Saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}${imu}`;
+      label = `${prefix}saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}${imu}`;
     }
     item.className = cls;
     if (job.status === "running" && job.progress > 0) {
@@ -999,6 +1000,8 @@ function syncTrimJobsFromServer(jobs) {
         output: job.output,
         name: job.output ? basenamePath(job.output) : null,
         error: job.error,
+        kind: job.kind || "trim",
+        task: job.task || null,
         source_has_gpmf: job.source_has_gpmf,
         output_has_gpmf: job.output_has_gpmf,
       });
@@ -2034,6 +2037,66 @@ async function trimMarkedClip() {
   }
 }
 
+async function saveTaskSnippet() {
+  const video = currentVideo();
+  if (!video || !state.pendingClip) {
+    focusTaskSearch();
+    return;
+  }
+  const task = selectedTask();
+  if (!task) {
+    setStatus("Choose or add the task first, then press S again", "error");
+    focusTaskSearch();
+    return;
+  }
+  if (!state.labelRoot) {
+    setStatus("No SD-card task root is available for this clip", "error");
+    return;
+  }
+
+  const clip = { start: state.pendingClip.start, end: state.pendingClip.end };
+  try {
+    const data = await api("/api/eager/snippet", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: video.path,
+        label_root: state.labelRoot,
+        task,
+        start: clip.start,
+        end: clip.end,
+      }),
+    });
+    state.pendingClip = null;
+    state.savedClips.push({
+      job_id: data.job_id,
+      status: data.status || "queued",
+      kind: "snippet",
+      task,
+      start: data.start_seconds,
+      end: data.end_seconds,
+      duration_seconds: data.duration_seconds,
+      progress: 0,
+      remaining_seconds: data.duration_seconds,
+      output: data.output,
+      name: data.output ? basenamePath(data.output) : null,
+      source_has_gpmf: data.source_has_gpmf,
+    });
+    stashClipState(video.path);
+    renderClips();
+    renderFilmstrip();
+    startTrimPolling();
+    loadTasks().catch(() => {});
+    const capNote = data.capped_to_8_seconds ? " (capped to 8 seconds)" : "";
+    setStatus(
+      `Snippet queued → ${task}/${basenamePath(data.output)}${capNote}. Original footage stays on the card.`,
+      "ok",
+    );
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
 async function finishCleaningFile() {
   const video = currentVideo();
   if (!video) return;
@@ -2048,7 +2111,9 @@ async function finishCleaningFile() {
   }
 
   const hasClips = state.savedClips.some(
-    (j) => j.status === "completed" || j.output || j.status === "queued" || j.status === "running",
+    (j) =>
+      j.kind !== "snippet" &&
+      (j.status === "completed" || j.output || j.status === "queued" || j.status === "running"),
   );
 
   if (!hasClips) {
@@ -2381,7 +2446,8 @@ document.addEventListener("keydown", (event) => {
   }
   if (key === "s") {
     event.preventDefault();
-    focusTaskSearch();
+    if (state.pendingClip) saveTaskSnippet();
+    else focusTaskSearch();
     return;
   }
   if (event.key === "Enter") {
