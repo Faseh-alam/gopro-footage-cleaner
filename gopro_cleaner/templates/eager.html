@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>World Context</title>
+    <title>World Context — Batch Annotation</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@600;700&display=swap" rel="stylesheet" />
@@ -28,7 +28,7 @@
             <span class="wc-name">World Context</span>
           </a>
           <p class="pipeline-hint" id="context-message">
-            Clean? Type task + Enter. Save an example: choose task → I → O → S (full marked range, saved in that task folder).
+            Play with Space · T ends a work segment · S + Enter labels it · G marks garbage · cover the whole clip.
           </p>
         </div>
         <div class="header-tools">
@@ -36,7 +36,7 @@
             <div id="card-tab-list" class="card-tab-list"></div>
             <button type="button" id="add-card-tab" class="card-tab-add" title="Another SD card">+</button>
           </div>
-          <button type="button" id="update-btn" class="update-btn" title="Get the latest version from GitHub — the app restarts itself">Update</button>
+          <button type="button" id="update-btn" class="update-btn" title="Pull latest main and restart">Update</button>
         </div>
         <select id="sd-card-select" class="hidden" aria-hidden="true"></select>
         <span id="scan-summary" class="hidden" aria-hidden="true"></span>
@@ -48,6 +48,31 @@
         <p id="sd-card-hint" class="hidden" aria-hidden="true"></p>
       </header>
 
+      <section id="batch-panel" class="batch-panel panel">
+        <div class="batch-panel-grid">
+          <div>
+            <h2>Batch</h2>
+            <p class="hint">Import CSV columns: <code>batch_name,factory,card_badge,device_type,device_id</code></p>
+            <textarea id="batch-csv-input" class="batch-csv-input" rows="4" placeholder="batch_name,factory,card_badge,device_type,device_id
+batch-1,Factory A,C1234,gopro,GP-01
+batch-1,Factory A,C1235,stereo,ST-02"></textarea>
+            <div class="row actions">
+              <button id="import-batch-btn" type="button" class="primary">Start batch from CSV</button>
+              <button id="refresh-batch-btn" type="button" class="secondary">Refresh batch</button>
+              <button id="finish-card-btn" type="button" class="secondary">Finish card</button>
+              <button id="complete-batch-btn" type="button" class="primary">Batch complete</button>
+              <a id="download-report-json" class="secondary link-btn hidden" href="#">Report JSON</a>
+              <a id="download-report-csv" class="secondary link-btn hidden" href="#">Report CSV</a>
+            </div>
+          </div>
+          <div>
+            <div id="batch-status" class="batch-status hint">No active batch — paste CSV and start.</div>
+            <div id="batch-cards" class="batch-cards"></div>
+            <div id="batch-report" class="batch-report hidden"></div>
+          </div>
+        </div>
+      </section>
+
       <main class="eager-main">
         <aside class="eager-list panel">
           <div class="list-head">
@@ -55,7 +80,7 @@
             <span id="list-summary" class="hint"></span>
           </div>
           <div id="file-list" class="file-list"></div>
-          <div id="trim-progress-panel" class="trim-progress-panel hidden">
+          <div id="trim-progress-panel" class="trim-progress-panel hidden" aria-hidden="true">
             <div class="trim-progress-head">
               <span>Background trims</span>
               <span id="trim-active-count">0</span> ·
@@ -73,8 +98,10 @@
               <h2 id="current-name">No file loaded</h2>
               <p id="current-meta" class="hint"></p>
               <span id="gpmf-status" class="gpmf-badge hidden" aria-hidden="true"></span>
+              <p id="identity-meta" class="hint identity-meta"></p>
             </div>
             <div class="player-time">
+              <span id="coverage-meta" class="coverage-meta">0% covered</span>
               <span id="allowed-garbage" class="allowed-garbage hidden"></span>
               <span id="time-display">00:00:00 / 00:00:00</span>
             </div>
@@ -85,6 +112,7 @@
               <span id="preview-status" class="preview-status"></span>
             </div>
             <div id="scrub-track" class="scrub-track">
+              <div id="scrub-ranges" class="scrub-ranges"></div>
               <div id="scrub-fill" class="scrub-fill"></div>
               <div id="scrub-playhead" class="scrub-playhead"></div>
             </div>
@@ -97,19 +125,19 @@
             <div id="filmstrip" class="filmstrip" tabindex="0"></div>
           </div>
           <div id="context-banner" class="hidden" aria-hidden="true"></div>
-          <p id="pending-in" class="hidden" aria-hidden="true"></p>
+          <p id="pending-in" class="pending-banner"></p>
           <ul id="clip-list" class="clip-list"></ul>
         </section>
 
         <aside class="eager-side panel">
           <div id="clean-panel">
             <h2>Task</h2>
-            <div id="label-trim-banner" class="label-trim-banner hidden">
+            <div id="label-trim-banner" class="label-trim-banner hidden" aria-hidden="true">
               <strong>Trims running</strong>
               <span id="label-trim-banner-text">—</span>
             </div>
             <input id="task-search" type="search" placeholder="Search task…" autocomplete="off" />
-            <p id="task-selected-hint" class="task-selected-hint">↑↓ select · Enter confirm</p>
+            <p id="task-selected-hint" class="task-selected-hint">T → S → Enter assigns work · G = garbage</p>
             <div id="task-list" class="task-list"></div>
             <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
             <div class="row">
@@ -121,26 +149,26 @@
             <div class="keys-sheet" id="keys-sheet">
               <h3>Keys</h3>
               <ul>
-                <li><kbd>S</kbd> Save marked I→O as task snippet (otherwise focus search)</li>
-                <li><kbd>↑</kbd> <kbd>↓</kbd> Choose task</li>
-                <li><kbd>Enter</kbd> Label &amp; next</li>
-                <li><kbd>O</kbd> End mark (start = 0:00 if I not set)</li>
-                <li><kbd>I</kbd> Mark start (later useful parts)</li>
-                <li><kbd>T</kbd> Queue trim</li>
-                <li><kbd>Home</kbd> Jump to 0:00</li>
-                <li><kbd>N</kbd> Finish trims / next</li>
-                <li><kbd>D</kbd> Delete file</li>
-                <li><kbd>←</kbd> <kbd>→</kbd> Filmstrip step</li>
-                <li><kbd>,</kbd> <kbd>.</kbd> −3s / +3s</li>
                 <li><kbd>Space</kbd> Play / pause</li>
-                <li><kbd>+</kbd> Another card tab</li>
+                <li><kbd>T</kbd> End work segment (from last mark)</li>
+                <li><kbd>S</kbd> Focus task search</li>
+                <li><kbd>Enter</kbd> Assign task to pending work</li>
+                <li><kbd>G</kbd> Mark garbage to playhead</li>
+                <li><kbd>U</kbd> Undo last segment</li>
+                <li><kbd>N</kbd> Next unfinished video</li>
+                <li><kbd>←</kbd> <kbd>→</kbd> Snapshot step</li>
+                <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
+                <li><kbd>Home</kbd> Jump to 0:00</li>
               </ul>
             </div>
 
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Label <kbd>Enter</kbd></button>
+              <button id="label-btn" type="button" class="primary">Assign task <kbd>Enter</kbd></button>
+              <button id="mark-work-btn" type="button" class="secondary">Mark work <kbd>T</kbd></button>
+              <button id="mark-garbage-btn" type="button" class="secondary">Mark garbage <kbd>G</kbd></button>
+              <button id="undo-segment-btn" type="button" class="secondary">Undo <kbd>U</kbd></button>
               <button id="next-clean-btn" type="button" class="secondary">Next <kbd>N</kbd></button>
-              <button id="delete-file-btn" type="button" class="secondary danger-btn">Delete <kbd>D</kbd></button>
+              <button id="delete-file-btn" type="button" class="secondary danger-btn hidden" aria-hidden="true">Delete</button>
             </div>
           </div>
 
@@ -167,7 +195,6 @@
       </footer>
     </div>
 
-    <!-- Hook-only nodes for JS/keyboard — never shown (see .js-hook-hidden) -->
     <button type="button" id="phase-clean" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
     <button type="button" id="phase-label" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
     <div id="mark-section" class="js-hook-hidden" aria-hidden="true">

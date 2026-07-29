@@ -5,8 +5,9 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
-from flask import Blueprint, jsonify, render_template, request, send_file
+from flask import Blueprint, Response, jsonify, render_template, request, send_file
 
+from .core import annotation_store, batch_registry
 from .core.eager import (
     assign_clip_to_task,
     label_progress,
@@ -129,8 +130,8 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         raw_path = str(payload.get("path", "")).strip()
         recursive = bool(payload.get("recursive", True))
         mode = str(payload.get("mode", "all")).strip().lower()
-        if mode not in {"all", "raw", "clips", "label"}:
-            return jsonify({"error": "mode must be all, raw, clips, or label"}), 400
+        if mode not in {"all", "raw", "clips", "label", "annotate"}:
+            return jsonify({"error": "mode must be all, raw, clips, label, or annotate"}), 400
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         try:
@@ -443,5 +444,221 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
         return send_file(path, mimetype="image/jpeg", conditional=True)
+
+    # ---- Batch annotation (sidecar timestamps, no live trim) ----------------
+
+    @eager.get("/api/eager/batches")
+    def eager_batches():
+        return jsonify({"batches": batch_registry.list_batches()})
+
+    @eager.post("/api/eager/batches/import-csv")
+    def eager_batches_import_csv():
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("csv") or payload.get("text") or "")
+        if not text.strip() and request.files.get("file"):
+            text = request.files["file"].read().decode("utf-8-sig", errors="replace")
+        if not text.strip():
+            return jsonify({"error": "csv text is required"}), 400
+        try:
+            if bool(payload.get("preview_only")):
+                return jsonify({"ok": True, "preview": batch_registry.parse_batch_csv(text)})
+            detail = batch_registry.create_batch_from_csv(text)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>")
+    def eager_batch_detail(batch_id: str):
+        try:
+            detail = batch_registry.sync_asset_annotations(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>/match-cards")
+    def eager_batch_match_cards(batch_id: str):
+        try:
+            result = batch_registry.match_detected_cards(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/batches/<batch_id>/bind-card")
+    def eager_batch_bind_card(batch_id: str):
+        payload = request.get_json(silent=True) or {}
+        card_badge = str(payload.get("card_badge") or "").strip()
+        mount_path = str(payload.get("mount_path") or payload.get("path") or "").strip()
+        scan_path = str(payload.get("scan_path") or mount_path).strip()
+        if not card_badge or not scan_path:
+            return jsonify({"error": "card_badge and scan_path are required"}), 400
+        try:
+            root = normalize_path(scan_path)
+            videos = scan_mp4_files(root, recursive=True, mode="annotate")
+            detail = batch_registry.bind_card(
+                batch_id,
+                card_badge=card_badge,
+                mount_path=mount_path or str(root),
+                scan_path=str(root),
+                videos=videos,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail, "videos": videos, "count": len(videos)})
+
+    @eager.post("/api/eager/batches/<batch_id>/finish-card")
+    def eager_batch_finish_card(batch_id: str):
+        payload = request.get_json(silent=True) or {}
+        card_badge = str(payload.get("card_badge") or "").strip()
+        if not card_badge:
+            return jsonify({"error": "card_badge is required"}), 400
+        try:
+            detail = batch_registry.finish_card(batch_id, card_badge)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.post("/api/eager/batches/<batch_id>/complete")
+    def eager_batch_complete(batch_id: str):
+        try:
+            detail = batch_registry.complete_batch(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>/report.json")
+    def eager_batch_report_json(batch_id: str):
+        try:
+            detail = batch_registry.sync_asset_annotations(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        return jsonify(detail.get("report") or {})
+
+    @eager.get("/api/eager/batches/<batch_id>/report.csv")
+    def eager_batch_report_csv(batch_id: str):
+        data = batch_registry.get_batch(batch_id)
+        if not data:
+            return jsonify({"error": "Batch not found"}), 404
+        batch_registry.sync_asset_annotations(batch_id)
+        data = batch_registry.get_batch(batch_id) or data
+        csv_text = batch_registry.report_csv(data)
+        return Response(
+            csv_text,
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{data.get("batch_name", batch_id)}-report.csv"'
+            },
+        )
+
+    @eager.get("/api/eager/annotations")
+    def eager_annotations_get():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        path = Path(raw_path).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        annotation = annotation_store.load_annotation(path)
+        if annotation is None:
+            annotation = annotation_store.empty_annotation(source=path.name)
+            try:
+                from .core.probe import probe_media
+
+                annotation["duration"] = probe_media(path).duration
+            except Exception:  # noqa: BLE001
+                pass
+        summary = annotation_store.coverage_summary(annotation)
+        return jsonify({"ok": True, "annotation": annotation, "summary": summary, "path": str(path)})
+
+    @eager.post("/api/eager/annotations")
+    def eager_annotations_save():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = annotation_store.save_annotation(
+                Path(raw_path),
+                payload.get("annotation") or payload,
+                require_complete=bool(payload.get("require_complete")),
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/annotations/append")
+    def eager_annotations_append():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        kind = str(payload.get("kind") or "").strip()
+        task = str(payload.get("task") or "").strip()
+        try:
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "end must be a number"}), 400
+        if not raw_path or not kind:
+            return jsonify({"error": "path and kind are required"}), 400
+        context = {
+            "batch_name": payload.get("batch_name"),
+            "factory": payload.get("factory"),
+            "card_badge": payload.get("card_badge"),
+            "device_type": payload.get("device_type"),
+            "device_id": payload.get("device_id"),
+            "duration": payload.get("duration"),
+        }
+        try:
+            result = annotation_store.append_segment(
+                Path(raw_path),
+                kind=kind,
+                end=end,
+                task=task,
+                context=context,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/annotations/undo")
+    def eager_annotations_undo():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = annotation_store.undo_last_segment(Path(raw_path))
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
 
     return eager

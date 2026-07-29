@@ -214,7 +214,7 @@ def scan_mp4_files(
     recursive: bool = True,
     mode: str = "all",
 ) -> list[dict]:
-    """mode: all | raw | clips | label"""
+    """mode: all | raw | clips | label | annotate"""
     from .ffmpeg_tools import FFmpegNotFoundError, ffmpeg_available
 
     tools = ffmpeg_available()
@@ -233,6 +233,11 @@ def scan_mp4_files(
             candidates.append(path)
         elif mode == "label" and is_labelable_footage(path, root=root):
             candidates.append(path)
+        elif mode == "annotate":
+            # Original source footage only — skip already-trimmed -N clips and
+            # anything already sitting inside a task folder.
+            if is_raw_footage(path, root=root):
+                candidates.append(path)
         elif (
             mode == "all"
             and path.suffix.upper() == ".MP4"

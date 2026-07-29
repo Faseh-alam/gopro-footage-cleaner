@@ -1,5 +1,5 @@
 const state = {
-  phase: "clean", // unified review: trim marks + label in one pass
+  phase: "clean", // annotation review: contiguous work/garbage marks (no live trim)
   videos: [],
   index: -1,
   tasks: [],
@@ -10,6 +10,11 @@ const state = {
   savedClips: [],
   /** Per-source mark/trim state so filmstrip tints survive navigation. */
   clipsByPath: {},
+  batchId: null,
+  batchDetail: null,
+  cardIdentity: { factory: "", card_badge: "", device_type: "", device_id: "" },
+  annotationsByPath: {}, // path -> {segments, duration, complete, pendingWork:null|{start,end}}
+  anchorByPath: {},
   trimPollTimer: null,
   globalTrimPollTimer: null,
   globalTrimActive: 0,
@@ -128,6 +133,22 @@ const el = {
   cardTabList: document.getElementById("card-tab-list"),
   addCardTab: document.getElementById("add-card-tab"),
   updateBtn: document.getElementById("update-btn"),
+  batchCsvInput: document.getElementById("batch-csv-input"),
+  importBatchBtn: document.getElementById("import-batch-btn"),
+  refreshBatchBtn: document.getElementById("refresh-batch-btn"),
+  finishCardBtn: document.getElementById("finish-card-btn"),
+  completeBatchBtn: document.getElementById("complete-batch-btn"),
+  downloadReportJson: document.getElementById("download-report-json"),
+  downloadReportCsv: document.getElementById("download-report-csv"),
+  batchStatus: document.getElementById("batch-status"),
+  batchCards: document.getElementById("batch-cards"),
+  batchReport: document.getElementById("batch-report"),
+  identityMeta: document.getElementById("identity-meta"),
+  coverageMeta: document.getElementById("coverage-meta"),
+  scrubRanges: document.getElementById("scrub-ranges"),
+  markWorkBtn: document.getElementById("mark-work-btn"),
+  markGarbageBtn: document.getElementById("mark-garbage-btn"),
+  undoSegmentBtn: document.getElementById("undo-segment-btn"),
 };
 
 el.player.muted = true;
@@ -393,6 +414,15 @@ function setStatus(message, kind = "") {
   el.statusLine.className = `status-line ${kind}`.trim();
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function scanTargetPath() {
   const card = (el.sdCardSelect?.value || "").trim();
   if (card) return card;
@@ -582,11 +612,146 @@ function remainingUnlabeledCount() {
 }
 
 function isHandledPath(path) {
-  return (
-    state.donePaths.has(path)
-    || Boolean(state.labeledTasks[path])
-    || state.trimmingPaths.has(path)
+  return Boolean(state.annotationsByPath[path]?.complete);
+}
+
+function annotationFor(path) {
+  if (!path) return null;
+  return state.annotationsByPath[path] || null;
+}
+
+function currentAnnotation() {
+  return annotationFor(currentVideo()?.path);
+}
+
+function currentPendingWork() {
+  return currentAnnotation()?.pendingWork || null;
+}
+
+function computeAnchor(segments) {
+  if (!segments?.length) return 0;
+  const last = segments[segments.length - 1];
+  const end = Number(last?.end);
+  return Number.isFinite(end) ? end : 0;
+}
+
+function normalizeMarkEnd(time) {
+  const video = currentVideo();
+  const duration =
+    el.player.duration
+    || video?.duration
+    || annotationFor(video?.path)?.duration
+    || state.snapshots?.duration
+    || 0;
+  let value = Math.max(0, Number(time) || 0);
+  if (duration > 0 && value >= duration - 0.05) value = duration;
+  return value;
+}
+
+function annotationContext() {
+  const id = state.cardIdentity || {};
+  const batch = state.batchDetail || {};
+  const video = currentVideo();
+  const duration =
+    el.player.duration
+    || video?.duration
+    || annotationFor(video?.path)?.duration
+    || undefined;
+  return {
+    batch_name: batch.batch_name || "",
+    factory: id.factory || "",
+    card_badge: id.card_badge || "",
+    device_type: id.device_type || "",
+    device_id: id.device_id || "",
+    duration,
+  };
+}
+
+function applyAnnotationPayload(path, payload, { keepPending = false } = {}) {
+  if (!path) return null;
+  const annotation = payload?.annotation || payload || {};
+  const summary = payload?.summary || {};
+  const prev = state.annotationsByPath[path];
+  const segments = Array.isArray(annotation.segments) ? annotation.segments : [];
+  const duration =
+    annotation.duration != null
+      ? Number(annotation.duration)
+      : summary.duration != null
+        ? Number(summary.duration)
+        : prev?.duration ?? null;
+  const complete = Boolean(
+    summary.complete != null ? summary.complete : annotation.complete,
   );
+  const next = {
+    segments,
+    duration: Number.isFinite(duration) ? duration : null,
+    complete,
+    pendingWork: keepPending ? prev?.pendingWork || null : null,
+    summary,
+  };
+  state.annotationsByPath[path] = next;
+  state.anchorByPath[path] = computeAnchor(segments);
+  return next;
+}
+
+async function loadAnnotationForPath(path, { keepPending = false } = {}) {
+  if (!path) return null;
+  try {
+    const data = await api(`/api/eager/annotations?path=${encodeURIComponent(path)}`);
+    return applyAnnotationPayload(path, data, { keepPending });
+  } catch (error) {
+    if (!state.annotationsByPath[path]) {
+      state.annotationsByPath[path] = {
+        segments: [],
+        duration: null,
+        complete: false,
+        pendingWork: null,
+      };
+      state.anchorByPath[path] = 0;
+    }
+    setStatus(error.message || "Could not load annotations", "error");
+    return state.annotationsByPath[path];
+  }
+}
+
+function updateIdentityMeta() {
+  if (!el.identityMeta) return;
+  const id = state.cardIdentity || {};
+  const bits = [
+    id.factory && `Factory ${id.factory}`,
+    id.card_badge && `Card ${id.card_badge}`,
+    id.device_type && id.device_type,
+    id.device_id && id.device_id,
+  ].filter(Boolean);
+  el.identityMeta.textContent = bits.length
+    ? bits.join(" · ")
+    : state.batchId
+      ? "Batch active — insert matching SD card"
+      : "";
+}
+
+function updateCoverageMeta() {
+  if (!el.coverageMeta) return;
+  const video = currentVideo();
+  const ann = annotationFor(video?.path);
+  const duration =
+    ann?.duration
+    || el.player.duration
+    || video?.duration
+    || state.snapshots?.duration
+    || 0;
+  const covered = (ann?.segments || []).reduce((sum, seg) => {
+    const start = Number(seg.start);
+    const end = Number(seg.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return sum;
+    return sum + (end - start);
+  }, 0);
+  const unreviewed = Math.max(0, (duration || 0) - covered);
+  const pct = duration > 0 ? Math.round((covered / duration) * 100) : 0;
+  el.coverageMeta.textContent =
+    duration > 0
+      ? `${pct}% covered · ${formatDurationShort(unreviewed)} unreviewed`
+      : "0% covered";
 }
 
 function stashClipState(path) {
@@ -695,35 +860,23 @@ function renderLabelProgress() {
 function renderFileList() {
   const items = filteredVideos();
   el.fileList.innerHTML = "";
-  const labeledCount = Object.keys(state.labeledTasks).length;
-  const deletedCount = [...state.donePaths].filter((p) => !state.labeledTasks[p]).length;
-  const trimCount = state.trimmingPaths.size;
-  const bits = [];
-  if (labeledCount) bits.push(`${labeledCount} labeled`);
-  if (deletedCount) bits.push(`${deletedCount} deleted`);
-  if (trimCount) bits.push(`${trimCount} trimming`);
-  el.listSummary.textContent = bits.join(" · ");
+  const completeCount = items.filter((v) => state.annotationsByPath[v.path]?.complete).length;
+  el.listSummary.textContent = items.length
+    ? `${completeCount}/${items.length} complete`
+    : "";
 
   for (const video of items) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "file-item";
     if (state.videos[state.index]?.path === video.path) btn.classList.add("active");
-    const assignedTask = state.labeledTasks[video.path];
-    if (assignedTask) {
+    const ann = state.annotationsByPath[video.path];
+    if (ann?.complete) {
       btn.classList.add("labeled");
-    } else if (state.donePaths.has(video.path)) {
-      btn.classList.add("done");
-    } else if (state.trimmingPaths.has(video.path)) {
+    } else if (ann?.segments?.length || ann?.pendingWork) {
       btn.classList.add("trimming");
-    } else {
-      btn.classList.add("unlabeled");
     }
-    const typeHint = `${video.is_trimmed ? "clip" : "whole"} · `;
-    const taskBadge = assignedTask
-      ? `<span class="task-badge" title="Moved to ${assignedTask}">${assignedTask}</span>`
-      : "";
-    btn.innerHTML = `<span class="name">${video.name}${taskBadge}</span><span class="meta">${typeHint}${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
+    btn.innerHTML = `<span class="name">${video.name}</span><span class="meta">${video.duration_label || "?"} · ${formatBytes(video.size_bytes)}</span>`;
     btn.addEventListener("click", () => {
       const idx = state.videos.findIndex((item) => item.path === video.path);
       if (idx >= 0) loadVideo(idx);
@@ -734,61 +887,32 @@ function renderFileList() {
 
 function renderClips() {
   el.clipList.innerHTML = "";
-  for (const job of state.savedClips) {
+  const ann = currentAnnotation();
+  for (const seg of ann?.segments || []) {
     const item = document.createElement("li");
-    let cls = "saved";
-    let label = "";
-    const range = `${formatTime(job.start)} → ${formatTime(job.end)}`;
-    const prefix = job.kind === "snippet" ? "Snippet " : "";
-    if (job.status === "queued") {
-      cls = "queued";
-      label = `${prefix}queued: ${range}`;
-    } else if (job.status === "running") {
-      cls = "running";
-      const pct = Number.isFinite(job.progress) ? ` · ${Math.round(job.progress)}%` : "";
-      const left =
-        job.remaining_seconds > 0 ? ` · ~${formatDurationShort(job.remaining_seconds)} left` : "";
-      label = `${prefix}trimming: ${range}${pct}${left}`;
-    } else if (job.status === "failed") {
-      cls = "failed";
-      label = `Failed: ${job.error || "trim error"}`;
+    const range = `${formatTime(seg.start)} → ${formatTime(seg.end)}`;
+    if (seg.kind === "garbage") {
+      item.className = "failed";
+      item.textContent = `Garbage ${range}`;
     } else {
-      const imu =
-        job.output_has_gpmf === true
-          ? " · IMU ✓"
-          : job.source_has_gpmf === true && job.output_has_gpmf === false
-            ? " · IMU missing"
-            : "";
-      label = `${prefix}saved: ${job.name || job.output?.split(/[/\\]/).pop() || "clip"}${imu}`;
-    }
-    item.className = cls;
-    if (job.status === "running" && job.progress > 0) {
-      const bar = document.createElement("div");
-      bar.className = "clip-progress";
-      bar.innerHTML = `<div class="clip-progress-fill" style="width:${Math.min(100, job.progress)}%"></div>`;
-      item.appendChild(document.createTextNode(label));
-      item.appendChild(bar);
-    } else {
-      item.textContent = label;
+      item.className = "saved";
+      const task = seg.task ? ` · ${seg.task}` : "";
+      item.textContent = `Work ${range}${task}`;
     }
     el.clipList.appendChild(item);
   }
-  if (state.pendingIn !== null && !state.pendingClip) {
+  if (ann?.pendingWork) {
     const item = document.createElement("li");
     item.className = "pending";
-    item.textContent = `Start ${formatTime(state.pendingIn)} — press O for end, then T`;
-    el.clipList.appendChild(item);
-  }
-  if (state.pendingClip) {
-    const item = document.createElement("li");
-    item.className = "pending";
-    item.textContent = `Marked: ${formatTime(state.pendingClip.start)} → ${formatTime(state.pendingClip.end)} — press T`;
+    item.textContent = `Pending work ${formatTime(ann.pendingWork.start)} → ${formatTime(ann.pendingWork.end)} — press S then Enter`;
     el.clipList.appendChild(item);
   }
   if (el.pendingIn) {
     el.pendingIn.textContent = "";
     el.pendingIn.className = "hidden";
   }
+  updateCoverageMeta();
+  updateIdentityMeta();
 }
 
 function basenamePath(path) {
@@ -1144,6 +1268,8 @@ function renderFilmstrip() {
   const video = currentVideo();
   if (!video) return;
   const ranges = keptClipRanges();
+  const pending = currentPendingWork();
+  const anchor = state.anchorByPath[video.path] ?? 0;
 
   state.snapshots.frames.forEach((frame) => {
     const btn = document.createElement("button");
@@ -1152,7 +1278,13 @@ function renderFilmstrip() {
     if (frame.index === state.snapshotIndex) btn.classList.add("active");
     const tint = filmstripTintForTime(frame.t, ranges);
     if (tint) btn.classList.add(tint);
-    if (state.pendingIn !== null && Math.abs(frame.t - state.pendingIn) < (state.snapshots.interval_seconds || 1) / 2) {
+    if (pending && Math.abs(frame.t - pending.start) < (state.snapshots.interval_seconds || 1) / 2) {
+      btn.classList.add("mark-start");
+    } else if (
+      !pending
+      && Math.abs(frame.t - anchor) < (state.snapshots.interval_seconds || 1) / 2
+      && anchor > 0
+    ) {
       btn.classList.add("mark-start");
     }
     const img = document.createElement("img");
@@ -1173,37 +1305,30 @@ function renderFilmstrip() {
 }
 
 function updateScrubRangeTints(ranges) {
-  const track = el.scrubTrack;
-  if (!track) return;
-  track.querySelectorAll(".scrub-range").forEach((node) => node.remove());
+  const host = el.scrubRanges || el.scrubTrack;
+  if (!host) return;
+  if (el.scrubRanges) {
+    el.scrubRanges.innerHTML = "";
+    el.scrubRanges.style.position = "absolute";
+    el.scrubRanges.style.inset = "0";
+    el.scrubRanges.style.pointerEvents = "none";
+    el.scrubRanges.style.zIndex = "0";
+  } else {
+    host.querySelectorAll(".scrub-range").forEach((node) => node.remove());
+  }
   const duration = el.player.duration || currentVideo()?.duration || state.snapshots?.duration || 0;
   if (!duration || !ranges.length) return;
 
-  // Leading garbage
-  if (ranges[0].start > 0.25) {
-    const gap = document.createElement("div");
-    gap.className = "scrub-range garbage";
-    gap.style.left = "0%";
-    gap.style.width = `${(ranges[0].start / duration) * 100}%`;
-    track.appendChild(gap);
-  }
-  for (let i = 0; i < ranges.length; i += 1) {
-    const r = ranges[i];
-    const kept = document.createElement("div");
-    kept.className = "scrub-range kept";
-    kept.style.left = `${(r.start / duration) * 100}%`;
-    kept.style.width = `${((r.end - r.start) / duration) * 100}%`;
-    track.appendChild(kept);
-    if (i < ranges.length - 1) {
-      const next = ranges[i + 1];
-      if (next.start > r.end) {
-        const gap = document.createElement("div");
-        gap.className = "scrub-range garbage";
-        gap.style.left = `${(r.end / duration) * 100}%`;
-        gap.style.width = `${((next.start - r.end) / duration) * 100}%`;
-        track.appendChild(gap);
-      }
-    }
+  for (const r of ranges) {
+    const start = Math.max(0, Number(r.start) || 0);
+    const end = Math.min(duration, Number(r.end) || 0);
+    if (end <= start) continue;
+    const seg = document.createElement("div");
+    const kindClass = r.kind === "garbage" ? "garbage" : "kept";
+    seg.className = `scrub-range ${kindClass}`;
+    seg.style.left = `${(start / duration) * 100}%`;
+    seg.style.width = `${((end - start) / duration) * 100}%`;
+    host.appendChild(seg);
   }
 }
 
@@ -1453,8 +1578,8 @@ function renderTasks(preferred = "") {
   if (el.taskSelectedHint) {
     const active = selectedTask();
     el.taskSelectedHint.textContent = active
-      ? `Selected: ${active} — Enter / N moves current file`
-      : "Press S to search, arrows to choose, Enter to move";
+      ? `Selected: ${active} — Enter assigns pending work`
+      : "T marks work · S search · Enter assigns · G garbage";
   }
   updateContextHint();
 }
@@ -1479,7 +1604,12 @@ function focusTaskSearch() {
   el.taskSearch.focus();
   el.taskSearch.select();
   renderTasks(selectedTask() || state.lastLabelTask || undefined);
-  setStatus("Search a task — ↑↓ to choose, Enter to label", "ok");
+  setStatus(
+    currentPendingWork()
+      ? "Search a task — ↑↓ to choose, Enter to assign pending work"
+      : "Search a task — ↑↓ to choose, Enter selects",
+    "ok",
+  );
 }
 
 function leaveTaskSearch({ clear = false } = {}) {
@@ -1526,55 +1656,15 @@ function seekToFraction(fraction) {
 }
 
 function markStart() {
-  if (!currentVideo()) return;
-  state.pendingIn = currentScrubTime();
-  state.pendingClip = null;
-  stashClipState(currentVideo().path);
-  setStatus(`Start marked at ${formatTime(state.pendingIn)}`, "ok");
-  renderClips();
-  renderFilmstrip();
+  markWork();
 }
 
 function markEnd() {
-  if (!currentVideo()) return;
-  const end = currentScrubTime();
-  // O alone = useful from the beginning of the file to here (no need to arrow back to 0).
-  let start = state.pendingIn;
-  if (start === null) {
-    start = 0;
-  }
-  if (end <= start + 0.05) {
-    setStatus(
-      "You're still at the start — jump to where work ends, then press O (start is auto 0:00)",
-      "error",
-    );
-    return;
-  }
-  state.pendingClip = { start, end };
-  state.pendingIn = null;
-  stashClipState(currentVideo().path);
-  const autoFromZero = start === 0;
-  setStatus(
-    autoFromZero
-      ? `Marked 0:00 → ${formatTime(end)} (from start) — press T to trim`
-      : `Marked ${formatTime(start)} → ${formatTime(end)} — press T`,
-    "ok",
-  );
-  renderClips();
-  renderFilmstrip();
+  markWork();
 }
 
-function undoMark() {
-  if (state.pendingClip) {
-    state.pendingClip = null;
-  } else if (state.pendingIn !== null) {
-    state.pendingIn = null;
-  } else {
-    state.savedClips.pop();
-  }
-  stashClipState(currentVideo()?.path);
-  renderClips();
-  renderFilmstrip();
+async function undoMark() {
+  await undoSegment();
 }
 
 function jumpToClipStart() {
@@ -1586,34 +1676,37 @@ function jumpToClipStart() {
   setStatus("At start of clip (0:00)", "ok");
 }
 
-/** Kept ranges from queued/done trims + the pending mark. */
+/** Annotation ranges for filmstrip/scrub tints (work=green/kept, garbage=red). */
 function keptClipRanges() {
+  const video = currentVideo();
+  const ann = annotationFor(video?.path);
   const ranges = [];
-  for (const job of state.savedClips) {
-    if (job.status === "failed") continue;
-    const start = Number(job.start);
-    const end = Number(job.end);
+  for (const seg of ann?.segments || []) {
+    const start = Number(seg.start);
+    const end = Number(seg.end);
     if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-      ranges.push({ start, end });
+      ranges.push({ start, end, kind: seg.kind === "garbage" ? "garbage" : "work" });
     }
   }
-  if (state.pendingClip) {
-    ranges.push({ start: state.pendingClip.start, end: state.pendingClip.end });
+  if (ann?.pendingWork) {
+    ranges.push({
+      start: ann.pendingWork.start,
+      end: ann.pendingWork.end,
+      kind: "work",
+      pending: true,
+    });
   }
   ranges.sort((a, b) => a.start - b.start);
   return ranges;
 }
 
 function filmstripTintForTime(t, ranges) {
-  if (!ranges.length) return "";
   for (const r of ranges) {
-    if (t >= r.start - 0.05 && t <= r.end + 0.05) return "kept";
+    if (t >= r.start - 0.05 && t <= r.end + 0.05) {
+      return r.kind === "garbage" ? "garbage" : "kept";
+    }
   }
-  if (t < ranges[0].start - 0.05) return "garbage"; // leading unused
-  for (let i = 0; i < ranges.length - 1; i += 1) {
-    if (t > ranges[i].end + 0.05 && t < ranges[i + 1].start - 0.05) return "garbage";
-  }
-  return ""; // after last kept — still reviewing
+  return ""; // unreviewed — neutral
 }
 
 async function cancelPreviewJob(path) {
@@ -1655,6 +1748,7 @@ async function loadVideo(index) {
   const video = state.videos[index];
   const token = ++state.previewToken;
   state.lastVideoPath = video.path;
+  await loadAnnotationForPath(video.path, { keepPending: true });
 
   el.currentName.textContent = video.name;
   el.currentMeta.textContent = `${video.relative || video.path} · ${video.duration_label || "?"}`;
@@ -1670,6 +1764,7 @@ async function loadVideo(index) {
 
   renderFileList();
   renderClips();
+  updateCoverageMeta();
   renderFilmstrip();
 
   el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
@@ -1849,6 +1944,7 @@ function onSdCardChanged() {
   const path = (el.sdCardSelect?.value || "").trim();
   if (!path) return;
   applySelectedPath(path, { label: selectedSdCardLabel() });
+  setIdentityFromSelectedCard();
   scanSource();
 }
 
@@ -1889,20 +1985,106 @@ async function addTask() {
 }
 
 async function refreshLabelProgress({ quiet = false } = {}) {
-  const path = state.labelRoot || state.scanRoot || scanTargetPath();
-  if (!path) return null;
-  try {
-    const data = await api(`/api/eager/label-progress?path=${encodeURIComponent(path)}`);
-    state.labelProgress = data;
-    renderFileList();
-    updateContextHint();
-    if (!quiet) {
-      setStatus(data.message || `${data.unlabeled} unlabeled left`, data.complete ? "ok" : "");
+  if (!quiet) setStatus("Annotation mode active", "ok");
+  return null;
+}
+
+async function loadBatchDetail(id = state.batchId) {
+  if (!id) return null;
+  const data = await api(`/api/eager/batches/${encodeURIComponent(id)}`);
+  state.batchDetail = data.batch || null;
+  renderBatchUi();
+  return state.batchDetail;
+}
+
+function cardFromBadge(badge) {
+  const cards = state.batchDetail?.cards || [];
+  const b = String(badge || "").toUpperCase();
+  return cards.find((c) => String(c.card_badge || "").toUpperCase() === b) || null;
+}
+
+function setIdentityFromSelectedCard() {
+  const badge = selectedSdCardLabel();
+  const card = cardFromBadge(badge);
+  state.cardIdentity = card
+    ? {
+        factory: card.factory || state.batchDetail?.factory || "",
+        card_badge: card.card_badge || "",
+        device_type: card.device_type || "",
+        device_id: card.device_id || "",
+      }
+    : { factory: "", card_badge: "", device_type: "", device_id: "" };
+  updateIdentityMeta();
+}
+
+function renderBatchUi() {
+  const b = state.batchDetail;
+  if (!el.batchStatus) return;
+  if (!b) {
+    el.batchStatus.textContent = "No active batch — paste CSV and start.";
+    if (el.batchCards) el.batchCards.innerHTML = "";
+    if (el.batchReport) {
+      el.batchReport.innerHTML = "";
+      el.batchReport.classList.add("hidden");
     }
-    return data;
-  } catch (error) {
-    if (!quiet) setStatus(error.message, "error");
-    return null;
+    if (el.downloadReportJson) el.downloadReportJson.classList.add("hidden");
+    if (el.downloadReportCsv) el.downloadReportCsv.classList.add("hidden");
+    return;
+  }
+  const done = b.cards_done ?? (b.cards || []).filter((c) => c.status === "complete").length;
+  const total = b.card_count ?? (b.cards || []).length;
+  el.batchStatus.textContent = `${b.batch_name} · ${b.factory || "?"} · ${done}/${total} cards · ${b.status || "open"}`;
+  if (el.batchCards) {
+    el.batchCards.innerHTML = (b.cards || [])
+      .map((c) => {
+        const vids = (c.assets || []).length;
+        return `<div class="batch-card-row ${c.status || ""}"><strong>${escapeHtml(c.card_badge)}</strong> · ${escapeHtml(
+          c.device_type || "?",
+        )} / ${escapeHtml(c.device_id || "?")} · ${vids} video(s) · ${escapeHtml(c.status || "expected")}</div>`;
+      })
+      .join("");
+  }
+  const report = b.report || {};
+  const t = report.totals || {};
+  const blocking = report.blocking || b.blocking || [];
+  if (el.batchReport) {
+    el.batchReport.classList.remove("hidden");
+    const taskLines = (report.tasks || [])
+      .slice(0, 8)
+      .map((row) => `${escapeHtml(row.task)}: ${Number(row.hours || 0).toFixed(2)}h`)
+      .join(" · ");
+    const deviceLines = (report.devices || [])
+      .map(
+        (d) =>
+          `${escapeHtml(d.device_type)}: ${Number(d.raw_hours || 0).toFixed(2)}h raw / ${Number(
+            d.clean_hours || 0,
+          ).toFixed(2)}h clean`,
+      )
+      .join("<br>");
+    el.batchReport.innerHTML = `
+      <div><strong>Raw</strong> ${Number(t.raw_hours || 0).toFixed(2)}h ·
+      <strong>Clean</strong> ${Number(t.clean_hours || 0).toFixed(2)}h ·
+      <strong>Garbage</strong> ${Number(t.garbage_hours || 0).toFixed(2)}h ·
+      <strong>Unreviewed</strong> ${Number(t.unreviewed_hours || 0).toFixed(2)}h</div>
+      <div>Videos ${t.video_count || 0} · Tasks ${t.task_count || 0} · Device types ${t.device_type_count || 0}</div>
+      ${taskLines ? `<div class="hint">Tasks: ${taskLines}</div>` : ""}
+      ${deviceLines ? `<div class="hint">${deviceLines}</div>` : ""}
+      ${
+        blocking.length
+          ? `<div class="batch-blocking"><strong>Blocking completion</strong><ul>${blocking
+              .map((x) => `<li>${escapeHtml(x)}</li>`)
+              .join("")}</ul></div>`
+          : `<div class="hint ok-text">No blockers</div>`
+      }
+    `;
+  }
+  if (el.downloadReportJson) {
+    el.downloadReportJson.href = `/api/eager/batches/${encodeURIComponent(b.id)}/report.json`;
+    el.downloadReportJson.classList.remove("hidden");
+  }
+  if (el.downloadReportCsv) {
+    el.downloadReportCsv.href = `/api/eager/batches/${encodeURIComponent(b.id)}/report.csv`;
+    el.downloadReportCsv.classList.remove("hidden");
   }
 }
 
@@ -1916,8 +2098,7 @@ async function scanSource() {
   state.scanRoot = path;
   state.labelRoot = path;
   ensureWorkTimerRunning(path);
-  // Unified list: raw wholes + finished trimmed clips (busy outputs excluded server-side).
-  const mode = "label";
+  const mode = "annotate";
 
   setStatus("Scanning...");
   el.scanBtn.disabled = true;
@@ -1927,33 +2108,44 @@ async function scanSource() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, recursive: true, mode }),
     });
-    const keepDone = state.donePaths;
-    const keepTrim = state.trimmingPaths;
-    const keepLabeled = state.labeledTasks;
-    const incoming = (data.videos || []).filter((v) => !keepDone.has(v.path));
-    state.donePaths = keepDone;
-    state.trimmingPaths = keepTrim;
-    state.labeledTasks = keepLabeled;
-    // Keep prior labeled/trimming rows that the label-mode scan omits.
-    state.videos = mergeScanVideos(incoming);
+
+    if (state.batchId) {
+      const badge = selectedSdCardLabel();
+      if (badge && cardFromBadge(badge)) {
+        const bind = await api(`/api/eager/batches/${encodeURIComponent(state.batchId)}/bind-card`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            card_badge: badge,
+            mount_path: el.sdCardSelect?.selectedOptions?.[0]?.dataset?.volume || path,
+            scan_path: path,
+          }),
+        });
+        state.batchDetail = bind.batch || state.batchDetail;
+      }
+    }
+
+    state.videos = data.videos || [];
     state.index = -1;
-    state.labelProgress = data.progress || null;
+    await Promise.all(state.videos.map((v) => loadAnnotationForPath(v.path)));
+    setIdentityFromSelectedCard();
+    renderBatchUi();
     saveActiveWorkspace();
     renderCardTabs();
     renderFileList();
     el.scanSummary.textContent = selectedSdCardLabel() || "";
-    if (state.videos.length) {
+
+    const first = nextIncompleteIndex(0);
+    if (first >= 0) {
       showLoading("Loading folder", `Found ${state.videos.length} files`, 10);
-      await loadVideo(0);
+      await loadVideo(first);
       hideLoading();
-      setStatus(`Found ${state.videos.length} files — Enter to label · I/O/T then N to trim`, "ok");
+      setStatus(`Found ${state.videos.length} files — T/G annotate, S/Enter assign, N next unfinished`, "ok");
+    } else if (state.videos.length) {
+      await loadVideo(0);
+      setStatus(`All ${state.videos.length} files complete`, "ok");
     } else {
-      setStatus(
-        state.labelProgress?.complete
-          ? "All footage is inside task folders"
-          : "No footage found",
-        state.labelProgress?.complete ? "ok" : "error",
-      );
+      setStatus("No footage found", "error");
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -1991,306 +2183,171 @@ function prefetchSnapshotsBackground(fromIndex) {
 }
 
 async function trimMarkedClip() {
-  const video = currentVideo();
-  if (!video || !state.pendingClip) {
-    setStatus("Mark a clip first (Mark start + Mark end)", "error");
-    return;
-  }
-
-  const clip = { start: state.pendingClip.start, end: state.pendingClip.end };
-  state.pendingClip = null;
-  renderClips();
-
-  try {
-    const data = await api("/api/eager/trim", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        path: video.path,
-        start: clip.start,
-        end: clip.end,
-      }),
-    });
-    state.savedClips.push({
-      job_id: data.job_id,
-      status: data.status || "queued",
-      start: clip.start,
-      end: clip.end,
-      duration_seconds: clip.end - clip.start,
-      progress: 0,
-      remaining_seconds: clip.end - clip.start,
-      output: null,
-      name: null,
-      source_has_gpmf: data.source_has_gpmf,
-    });
-    stashClipState(video.path);
-    renderClips();
-    startTrimPolling();
-    renderFilmstrip();
-    const imuNote =
-      data.source_has_gpmf === true ? " (IMU will be verified)" : "";
-    setStatus(`Queued trim ${formatTime(clip.start)} → ${formatTime(clip.end)}${imuNote} — mark next with I/O or O-from-here`, "ok");
-  } catch (error) {
-    state.pendingClip = clip;
-    stashClipState(video.path);
-    renderClips();
-    setStatus(error.message, "error");
-  }
+  setStatus("Trim disabled in annotation mode", "error");
 }
 
 async function saveTaskSnippet() {
-  const video = currentVideo();
-  if (!video || !state.pendingClip) {
-    focusTaskSearch();
-    return;
-  }
-  const task = selectedTask();
-  if (!task) {
-    setStatus("Choose or add the task first, then press S again", "error");
-    focusTaskSearch();
-    return;
-  }
-  if (!state.labelRoot) {
-    setStatus("No SD-card task root is available for this clip", "error");
-    return;
-  }
+  focusTaskSearch();
+}
 
-  const clip = { start: state.pendingClip.start, end: state.pendingClip.end };
-  try {
-    const data = await api("/api/eager/snippet", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        path: video.path,
-        label_root: state.labelRoot,
-        task,
-        start: clip.start,
-        end: clip.end,
-      }),
-    });
-    state.pendingClip = null;
-    state.savedClips.push({
-      job_id: data.job_id,
-      status: data.status || "queued",
-      kind: "snippet",
-      task,
-      start: data.start_seconds,
-      end: data.end_seconds,
-      duration_seconds: data.duration_seconds,
-      progress: 0,
-      remaining_seconds: data.duration_seconds,
-      output: data.output,
-      name: data.output ? basenamePath(data.output) : null,
-      source_has_gpmf: data.source_has_gpmf,
-    });
-    stashClipState(video.path);
-    renderClips();
-    renderFilmstrip();
-    startTrimPolling();
-    loadTasks().catch(() => {});
-    setStatus(
-      `Snippet queued → ${task}/${basenamePath(data.output)}. Original footage stays on the card.`,
-      "ok",
-    );
-  } catch (error) {
-    setStatus(error.message, "error");
+function nextIncompleteIndex(startAt = state.index + 1) {
+  for (let i = startAt; i < state.videos.length; i += 1) {
+    const v = state.videos[i];
+    if (!state.annotationsByPath[v.path]?.complete) return i;
   }
+  for (let i = 0; i < startAt; i += 1) {
+    const v = state.videos[i];
+    if (!state.annotationsByPath[v.path]?.complete) return i;
+  }
+  return -1;
 }
 
 async function finishCleaningFile() {
-  const video = currentVideo();
-  if (!video) return;
-
-  if (state.pendingClip) {
-    setStatus("Press T to queue the marked clip first", "error");
+  const next = nextIncompleteIndex(state.index + 1);
+  if (next >= 0 && next !== state.index) {
+    await loadVideo(next);
+    setStatus("Moved to next unfinished video", "ok");
     return;
   }
-  if (state.pendingIn !== null) {
-    setStatus("Finish the mark (O then T) or Undo before Next", "error");
-    return;
-  }
-
-  const hasClips = state.savedClips.some(
-    (j) =>
-      j.kind !== "snippet" &&
-      (j.status === "completed" || j.output || j.status === "queued" || j.status === "running"),
-  );
-
-  if (!hasClips) {
-    setStatus("No trims queued — type a task and press Enter to label this clean file", "error");
-    focusTaskSearch();
-    return;
-  }
-
-  try {
-    const data = await api("/api/eager/clean", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: video.path }),
-    });
-    state.trimmingPaths.add(video.path);
-    stashClipState(video.path);
-    stopTrimPolling();
-    saveActiveWorkspace();
-    if (data.scheduled) {
-      setStatus(
-        `Trimming in background (${data.active}) — label those clips when they appear · + for another card`,
-        "ok",
-      );
-    } else if (data.deleted_source) {
-      setStatus(`Finished ${video.name} — raw removed; label new clips when listed`, "ok");
-    } else {
-      setStatus(`Finished ${video.name}`, "ok");
-    }
-    renderFileList();
-    advanceToNext();
-  } catch (error) {
-    setStatus(error.message, "error");
-  }
+  setStatus("All videos complete", "ok");
 }
 
 async function deleteCurrentFile() {
-  const video = currentVideo();
-  if (!video) return;
-  if (state.pendingClip || state.pendingIn !== null) {
-    setStatus("Clear the current mark before deleting file", "error");
-    return;
-  }
-  if (activeTrimCount() > 0) {
-    setStatus("Cannot delete while trim jobs are running for this file", "error");
-    return;
-  }
-  if (!window.confirm(`Delete whole file?\n\n${video.name}`)) return;
-
-  try {
-    const data = await api("/api/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: video.path, confirmed: true }),
-    });
-    state.donePaths.add(video.path);
-    stopTrimPolling();
-    setStatus(data.message || `Deleted ${video.name}`, "ok");
-    advanceToNext();
-  } catch (error) {
-    setStatus(error.message, "error");
-  }
+  setStatus("Delete disabled in annotation mode", "error");
 }
 
-async function labelCurrentClip() {
-  if (state.busy) return;
+async function markWork() {
   const video = currentVideo();
   if (!video) return;
+  const ann = currentAnnotation() || await loadAnnotationForPath(video.path);
+  const anchor = state.anchorByPath[video.path] ?? computeAnchor(ann?.segments || []);
+  const end = normalizeMarkEnd(currentScrubTime());
+  if (end <= anchor + 0.05) {
+    setStatus(`Playhead must be after ${formatTime(anchor)} to mark work`, "error");
+    return;
+  }
+  state.annotationsByPath[video.path] = {
+    ...(ann || { segments: [], duration: null, complete: false }),
+    pendingWork: { start: anchor, end },
+  };
+  el.player.pause();
+  setStatus(`Pending work ${formatTime(anchor)} → ${formatTime(end)} — press S then Enter`, "ok");
+  renderClips();
+  renderFilmstrip();
+}
 
-  if (state.trimmingPaths.has(video.path)) {
-    setStatus("This file is still trimming — wait for clips, then label those", "error");
-    return;
-  }
-  if (state.pendingIn !== null || state.pendingClip) {
-    setStatus("Finish or undo the current mark before labeling", "error");
-    return;
-  }
-  if (activeTrimCount() > 0 || state.savedClips.some((j) => j.status === "queued" || j.status === "running")) {
-    setStatus("Press N to finish trims first — label the new clips when they appear", "error");
-    return;
-  }
-  if (!video.is_trimmed && state.savedClips.some((j) => j.status === "completed" || j.output)) {
-    setStatus("Press N to finish this file — then label the trimmed clips", "error");
+async function assignPendingWork() {
+  const video = currentVideo();
+  if (!video) return;
+  const ann = currentAnnotation() || await loadAnnotationForPath(video.path);
+  const pending = ann?.pendingWork;
+  if (!pending) {
+    setStatus("No pending work — press T to mark", "error");
     return;
   }
 
   let task = selectedTask();
   if (!task) {
-    setStatus("Type or choose a task first", "error");
+    setStatus("Choose a task first", "error");
     focusTaskSearch();
     return;
   }
-
   if (!state.tasks.some((item) => item.toLowerCase() === task.toLowerCase())) {
-    try {
-      const data = await api("/api/eager/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: task,
-          label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
-        }),
-      });
-      state.tasks = data.tasks || [];
-      renderTasks(task);
-    } catch (error) {
-      setStatus(error.message, "error");
-      return;
-    }
-  }
-
-  state.busy = true;
-  el.labelBtn.disabled = true;
-  setStatus(`Moving to ${task}...`);
-  try {
-    const data = await api("/api/eager/label", {
+    const data = await api("/api/eager/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        path: video.path,
-        label_root: state.labelRoot || state.scanRoot,
-        task,
+        name: task,
+        label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
       }),
     });
-    // Invalidate any in-flight soft refresh that could put this path back.
-    state.labelScanToken += 1;
-    const oldPath = video.path;
-    const newPath = data.output || oldPath;
-    // Stay in the list with a green "labeled" badge (do not remove / grey as deleted).
-    if (newPath !== oldPath) {
-      video.path = newPath;
-      video.name = basenamePath(newPath) || video.name;
-      if (data.task_dir) {
-        video.relative = `${basenamePath(data.task_dir)}/${video.name}`;
-      }
-      migrateClipState(oldPath, newPath);
-      if (state.trimmingPaths.has(oldPath)) {
-        state.trimmingPaths.delete(oldPath);
-        state.trimmingPaths.add(newPath);
-      }
-    }
-    delete state.labeledTasks[oldPath];
-    state.labeledTasks[newPath] = task;
-    state.lastLabelTask = task;
-    saveActiveWorkspace();
-    el.taskSearch.value = "";
-    renderTasks(task);
-    el.taskSearch.blur();
-    if (state.labelProgress) {
-      const nextUnlabeled = Math.max(0, (state.labelProgress.unlabeled || 0) - 1);
-      const nextLabeled = (state.labelProgress.labeled || 0) + 1;
-      state.labelProgress = {
-        ...state.labelProgress,
-        unlabeled: nextUnlabeled,
-        labeled: nextLabeled,
-        complete: nextUnlabeled === 0,
-        message:
-          nextUnlabeled === 0
-            ? "All footage is inside task folders"
-            : `${nextUnlabeled} file(s) still outside task folders`,
-      };
-    }
-    const already = data.already_there
-      ? `Already in ${task} — removed leftover copy`
-      : `Moved to ${task}`;
-    setStatus(
-      `${already} · ${remainingUnlabeledCount()} left · N/Enter reuses "${task}" · S to search`,
-      "ok",
-    );
-    renderFileList();
-    advanceToNext();
-    refreshLabelProgress({ quiet: true });
+    state.tasks = data.tasks || [];
+  }
+
+  await api("/api/eager/annotations/append", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: video.path,
+      kind: "work",
+      end: pending.end,
+      task,
+      ...annotationContext(),
+    }),
+  });
+  state.lastLabelTask = task;
+  applyAnnotationPayload(video.path, { annotation: { ...(ann || {}), pendingWork: null }, summary: ann?.summary || {} });
+  await loadAnnotationForPath(video.path);
+  setStatus(`Assigned work to ${task}`, "ok");
+  renderTasks(task);
+  renderClips();
+  renderFilmstrip();
+  renderFileList();
+  if (state.annotationsByPath[video.path]?.complete) await finishCleaningFile();
+}
+
+async function markGarbage() {
+  const video = currentVideo();
+  if (!video) return;
+  const ann = currentAnnotation() || await loadAnnotationForPath(video.path);
+  if (ann?.pendingWork) {
+    setStatus("Assign task first", "error");
+    return;
+  }
+  const anchor = state.anchorByPath[video.path] ?? computeAnchor(ann?.segments || []);
+  const end = normalizeMarkEnd(currentScrubTime());
+  if (end <= anchor + 0.05) {
+    setStatus(`Playhead must be after ${formatTime(anchor)} to mark garbage`, "error");
+    return;
+  }
+  await api("/api/eager/annotations/append", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: video.path,
+      kind: "garbage",
+      end,
+      ...annotationContext(),
+    }),
+  });
+  await loadAnnotationForPath(video.path);
+  setStatus(`Marked garbage ${formatTime(anchor)} → ${formatTime(end)}`, "ok");
+  renderClips();
+  renderFilmstrip();
+  renderFileList();
+  if (state.annotationsByPath[video.path]?.complete) await finishCleaningFile();
+}
+
+async function undoSegment() {
+  const video = currentVideo();
+  if (!video) return;
+  const ann = currentAnnotation();
+  if (ann?.pendingWork) {
+    ann.pendingWork = null;
+    setStatus("Cleared pending work", "ok");
+    renderClips();
+    renderFilmstrip();
+    return;
+  }
+  try {
+    await api("/api/eager/annotations/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: video.path }),
+    });
   } catch (error) {
     setStatus(error.message, "error");
-  } finally {
-    state.busy = false;
-    el.labelBtn.disabled = false;
+    return;
   }
+  await loadAnnotationForPath(video.path);
+  setStatus("Undid last segment", "ok");
+  renderClips();
+  renderFilmstrip();
+  renderFileList();
+}
+
+async function labelCurrentClip() {
+  await assignPendingWork();
 }
 
 function advanceToNext() {
@@ -2311,11 +2368,7 @@ function advanceToNext() {
   }
   const remaining = state.videos.filter((v) => !isHandledPath(v.path)).length;
   setStatus(
-    remaining === 0
-      ? state.trimmingPaths.size
-        ? `All files handled — ${state.trimmingPaths.size} still trimming in background`
-        : "All files done"
-      : `${remaining} file(s) left`,
+    remaining === 0 ? "All files complete" : `${remaining} file(s) left`,
     remaining === 0 ? "ok" : "",
   );
   renderFileList();
@@ -2342,6 +2395,9 @@ el.scanBtn?.addEventListener("click", scanSource);
 el.undoClipBtn?.addEventListener("click", undoMark);
 el.trimBtn?.addEventListener("click", trimMarkedClip);
 el.deleteFileBtn?.addEventListener("click", deleteCurrentFile);
+el.markWorkBtn?.addEventListener("click", markWork);
+el.markGarbageBtn?.addEventListener("click", markGarbage);
+el.undoSegmentBtn?.addEventListener("click", undoSegment);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
 el.addCardTab?.addEventListener("click", addWorkspaceTab);
 el.taskSearch.addEventListener("input", () => renderTasks());
@@ -2358,11 +2414,11 @@ el.taskSearch.addEventListener("keydown", (event) => {
   }
   if (event.key === "Enter") {
     event.preventDefault();
-    if (!selectedTask() && state.lastLabelTask) {
-      renderTasks(state.lastLabelTask);
+    if (currentPendingWork()) {
+      labelCurrentClip();
+    } else {
+      leaveTaskSearch({ clear: false });
     }
-    leaveTaskSearch({ clear: true });
-    labelCurrentClip();
     return;
   }
   if (event.key === "Escape") {
@@ -2415,46 +2471,44 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (key === "i") {
-    event.preventDefault();
-    markStart();
-  }
-  if (key === "o") {
-    event.preventDefault();
-    markEnd();
-  }
   if (key === "t") {
     event.preventDefault();
-    trimMarkedClip();
+    markWork();
+    return;
+  }
+  if (key === "g") {
+    event.preventDefault();
+    markGarbage();
+    return;
+  }
+  if (key === "u") {
+    event.preventDefault();
+    undoSegment();
+    return;
   }
   if (key === "home" || event.key === "Home") {
     event.preventDefault();
     jumpToClipStart();
+    return;
   }
   if (key === "n") {
     event.preventDefault();
     finishCleaningFile();
-  }
-  if (key === "d" || event.key === "Delete") {
-    event.preventDefault();
-    deleteCurrentFile();
+    return;
   }
   if (key === " ") {
     event.preventDefault();
     if (el.player.paused) el.player.play();
     else el.player.pause();
+    return;
   }
   if (key === "s") {
     event.preventDefault();
-    if (state.pendingClip) saveTaskSnippet();
-    else focusTaskSearch();
+    focusTaskSearch();
     return;
   }
   if (event.key === "Enter") {
     event.preventDefault();
-    if (!selectedTask() && state.lastLabelTask) {
-      renderTasks(state.lastLabelTask);
-    }
     labelCurrentClip();
   }
 });
@@ -2521,6 +2575,79 @@ async function runSelfUpdate() {
   }, 2000);
 }
 
+el.importBatchBtn?.addEventListener("click", async () => {
+  const csv = el.batchCsvInput?.value || "";
+  if (!csv.trim()) {
+    setStatus("Paste batch CSV first", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/eager/batches/import-csv", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ csv }),
+    });
+    state.batchDetail = data.batch || null;
+    state.batchId = state.batchDetail?.id || null;
+    renderBatchUi();
+    setIdentityFromSelectedCard();
+    setStatus("Batch imported", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.refreshBatchBtn?.addEventListener("click", async () => {
+  try {
+    if (!state.batchId) {
+      setStatus("No active batch", "error");
+      return;
+    }
+    await loadBatchDetail(state.batchId);
+    setIdentityFromSelectedCard();
+    setStatus("Batch refreshed", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.finishCardBtn?.addEventListener("click", async () => {
+  const badge = state.cardIdentity.card_badge || selectedSdCardLabel();
+  if (!state.batchId || !badge) {
+    setStatus("Select a batch card first", "error");
+    return;
+  }
+  try {
+    const data = await api(`/api/eager/batches/${encodeURIComponent(state.batchId)}/finish-card`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ card_badge: badge }),
+    });
+    state.batchDetail = data.batch || state.batchDetail;
+    renderBatchUi();
+    setStatus(`Card ${badge} finished`, "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.completeBatchBtn?.addEventListener("click", async () => {
+  if (!state.batchId) {
+    setStatus("No active batch", "error");
+    return;
+  }
+  try {
+    const data = await api(`/api/eager/batches/${encodeURIComponent(state.batchId)}/complete`, {
+      method: "POST",
+    });
+    state.batchDetail = data.batch || state.batchDetail;
+    renderBatchUi();
+    setStatus("Batch complete", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
 el.updateBtn?.addEventListener("click", runSelfUpdate);
 
 loadTasks()
@@ -2531,15 +2658,31 @@ loadTasks()
     return Promise.all([
       api("/api/health"),
       api("/api/eager/config"),
+      api("/api/eager/batches"),
       refreshSdCards({ quiet: true, autoScan: true }),
     ]);
   })
-  .then(([health, perf]) => {
+  .then(([health, perf, batches]) => {
     if (el.appVersion) el.appVersion.textContent = `v${health.version || "?"}`;
     state.perf = { ...state.perf, ...perf };
+    const open = (batches?.batches || []).find((b) => b.status !== "complete") || null;
+    if (open?.id) {
+      state.batchId = open.id;
+      return loadBatchDetail(open.id).then(() => {
+        setIdentityFromSelectedCard();
+        startGlobalTrimPolling();
+        setStatus("Batch workflow ready — insert matching card and annotate contiguously", "ok");
+        if (health.ffmpeg_ok === false) {
+          setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
+        }
+      });
+    }
+    renderBatchUi();
     startGlobalTrimPolling();
+    setStatus("No active batch — import CSV to start batch workflow", "ok");
     if (health.ffmpeg_ok === false) {
       setStatus(health.ffmpeg_hint || "FFmpeg missing — install and restart", "error");
     }
+    return null;
   })
   .catch((error) => setStatus(error.message, "error"));
