@@ -237,7 +237,7 @@
 
 .eager-main {
   display: grid;
-  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr) minmax(220px, 280px);
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
   gap: 0.75rem;
   padding: 0.75rem;
   min-height: 0;
@@ -289,7 +289,28 @@
   min-height: 0;
 }
 
-.eager-list .trim-progress-panel {
+.side-footage {
+  margin-top: 0.85rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.side-footage .file-list {
+  max-height: 32vh;
+  margin-top: 0.35rem;
+}
+
+.side-footage .file-item {
+  padding: 0.4rem 0.55rem;
+  border-radius: 8px;
+  font-size: 0.82rem;
+}
+
+.eager-list .trim-progress-panel,
+.side-footage .trim-progress-panel {
   flex-shrink: 0;
   margin-top: 0.65rem;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
@@ -299,17 +320,18 @@
 }
 
 .keys-sheet {
-  margin: 0.85rem 0 0.75rem;
-  padding: 0.65rem 0.7rem;
+  margin: 0.85rem 0 0.25rem;
+  padding: 0.5rem 0.7rem;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
   background: #101010;
+  flex-shrink: 0;
 }
 
-.keys-sheet h3 {
-  margin: 0 0 0.45rem;
+.keys-sheet summary {
+  cursor: pointer;
   font-family: "Syne", "DM Sans", sans-serif;
-  font-size: 0.8rem;
+  font-size: 0.78rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: #9a9a9a;
@@ -317,7 +339,7 @@
 
 .keys-sheet ul {
   list-style: none;
-  margin: 0;
+  margin: 0.5rem 0 0;
   padding: 0;
   display: grid;
   gap: 0.28rem;
@@ -435,7 +457,7 @@
   max-width: 100%;
   aspect-ratio: 16 / 9;
   /* Leave room for filmstrip on Windows laptops (~768–900px tall) */
-  max-height: min(48vh, 640px);
+  max-height: min(64vh, 820px);
   border-radius: 10px;
   overflow: hidden;
   background: #000;
@@ -1426,20 +1448,23 @@ body.scrub-cursor-hidden * {
 
 .clip-list {
   list-style: none;
-  margin: 0.75rem 0 0;
+  margin: 0.4rem 0 0;
   padding: 0;
-  display: grid;
-  gap: 0.35rem;
-  max-height: 140px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  max-height: 4.6rem;
   overflow: auto;
 }
 
 .clip-list li {
   background: #111820;
   border: 1px solid var(--panel-border);
-  border-radius: 10px;
-  padding: 0.45rem 0.65rem;
-  font-size: 0.9rem;
+  border-radius: 999px;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .radio-card,
@@ -1487,7 +1512,7 @@ body.scrub-cursor-hidden * {
   }
 
   #player-wrap {
-    max-height: min(42vh, 480px);
+    max-height: min(52vh, 560px);
   }
 }
 
@@ -1499,7 +1524,7 @@ body.scrub-cursor-hidden * {
   }
 
   #player-wrap {
-    max-height: min(40vh, 420px);
+    max-height: min(56vh, 560px);
   }
 
   .pipeline-hint {

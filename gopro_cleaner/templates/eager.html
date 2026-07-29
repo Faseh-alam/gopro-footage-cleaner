@@ -74,24 +74,6 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
       </section>
 
       <main class="eager-main">
-        <aside class="eager-list panel">
-          <div class="list-head">
-            <h2 id="list-title">Footage</h2>
-            <span id="list-summary" class="hint"></span>
-          </div>
-          <div id="file-list" class="file-list"></div>
-          <div id="trim-progress-panel" class="trim-progress-panel hidden" aria-hidden="true">
-            <div class="trim-progress-head">
-              <span>Background trims</span>
-              <span id="trim-active-count">0</span> ·
-              <span id="trim-eta-total">~0s</span>
-            </div>
-            <div id="trim-progress-by-card" class="trim-progress-by-card"></div>
-            <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
-            <div id="trim-progress-list" class="trim-progress-list"></div>
-          </div>
-        </aside>
-
         <section class="eager-player panel">
           <div class="player-top">
             <div>
@@ -150,29 +132,27 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
             </div>
             <p id="task-added-msg" class="task-added"></p>
 
-            <div class="keys-sheet" id="keys-sheet">
-              <h3>Keys</h3>
-              <ul>
-                <li><kbd>Space</kbd> Play / pause</li>
-                <li><kbd>→</kbd> While playing: speed +0.5×</li>
-                <li><kbd>T</kbd> End work segment + select task</li>
-                <li><kbd>Enter</kbd> Assign task to pending work</li>
-                <li><kbd>G</kbd> Mark garbage to playhead</li>
-                <li><kbd>U</kbd> Delete last markup</li>
-                <li><kbd>N</kbd> Next unfinished video</li>
-                <li><kbd>←</kbd> <kbd>→</kbd> Paused: snapshot step</li>
-                <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
-                <li><kbd>Home</kbd> Jump to 0:00</li>
-              </ul>
-            </div>
-
             <div class="action-stack">
-              <button id="label-btn" type="button" class="primary">Assign task <kbd>Enter</kbd></button>
-              <button id="mark-work-btn" type="button" class="secondary">Mark work <kbd>T</kbd></button>
-              <button id="mark-garbage-btn" type="button" class="secondary">Mark garbage <kbd>G</kbd></button>
               <button id="undo-segment-btn" type="button" class="secondary danger-btn">Delete last markup <kbd>U</kbd></button>
-              <button id="next-clean-btn" type="button" class="secondary">Next <kbd>N</kbd></button>
               <button id="delete-file-btn" type="button" class="secondary danger-btn">Move video to Trash</button>
+            </div>
+          </div>
+
+          <div class="side-footage">
+            <div class="list-head">
+              <h2 id="list-title">Footage</h2>
+              <span id="list-summary" class="hint"></span>
+            </div>
+            <div id="file-list" class="file-list"></div>
+            <div id="trim-progress-panel" class="trim-progress-panel hidden" aria-hidden="true">
+              <div class="trim-progress-head">
+                <span>Background trims</span>
+                <span id="trim-active-count">0</span> ·
+                <span id="trim-eta-total">~0s</span>
+              </div>
+              <div id="trim-progress-by-card" class="trim-progress-by-card"></div>
+              <div class="trim-progress-bar"><div id="trim-progress-fill" class="trim-progress-fill"></div></div>
+              <div id="trim-progress-list" class="trim-progress-list"></div>
             </div>
           </div>
 
@@ -190,6 +170,22 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
           </div>
 
           <p id="status-line" class="status-line"></p>
+
+          <details class="keys-sheet" id="keys-sheet">
+            <summary>Keys</summary>
+            <ul>
+              <li><kbd>Space</kbd> Play / pause (resets speed)</li>
+              <li><kbd>→</kbd> While playing: speed +0.5×</li>
+              <li><kbd>T</kbd> End work segment + select task</li>
+              <li><kbd>Enter</kbd> Assign task to pending work</li>
+              <li><kbd>G</kbd> Mark garbage to playhead</li>
+              <li><kbd>U</kbd> Delete last markup</li>
+              <li><kbd>N</kbd> Next unfinished video</li>
+              <li><kbd>←</kbd> <kbd>→</kbd> Paused: snapshot step</li>
+              <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
+              <li><kbd>Home</kbd> Jump to 0:00</li>
+            </ul>
+          </details>
         </aside>
       </main>
 
@@ -202,6 +198,10 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
     <button type="button" id="phase-clean" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
     <button type="button" id="phase-label" class="js-hook-hidden" tabindex="-1" aria-hidden="true"></button>
     <div id="mark-section" class="js-hook-hidden" aria-hidden="true">
+      <button id="label-btn" type="button" tabindex="-1"></button>
+      <button id="mark-work-btn" type="button" tabindex="-1"></button>
+      <button id="mark-garbage-btn" type="button" tabindex="-1"></button>
+      <button id="next-clean-btn" type="button" tabindex="-1"></button>
       <button id="mark-start-btn" type="button" tabindex="-1"></button>
       <button id="mark-end-btn" type="button" tabindex="-1"></button>
       <button id="undo-clip-btn" type="button" tabindex="-1"></button>
