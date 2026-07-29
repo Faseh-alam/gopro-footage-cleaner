@@ -77,7 +77,6 @@ const el = {
   loadingBarFill: document.getElementById("loading-bar-fill"),
   loadingHint: document.getElementById("loading-hint"),
   filmstripPanel: document.getElementById("filmstrip-panel"),
-  filmstripMeta: document.getElementById("filmstrip-meta"),
   filmstrip: document.getElementById("filmstrip"),
   contextBanner: document.getElementById("context-banner"),
   contextMessage: document.getElementById("context-message"),
@@ -89,9 +88,7 @@ const el = {
   markEndBtn: document.getElementById("mark-end-btn"),
   markSection: document.getElementById("mark-section"),
   currentName: document.getElementById("current-name"),
-  currentMeta: document.getElementById("current-meta"),
   timeDisplay: document.getElementById("time-display"),
-  allowedGarbage: document.getElementById("allowed-garbage"),
   undoClipBtn: document.getElementById("undo-clip-btn"),
   pendingIn: document.getElementById("pending-in"),
   gpmfStatus: document.getElementById("gpmf-status"),
@@ -144,7 +141,6 @@ const el = {
   batchStatus: document.getElementById("batch-status"),
   batchCards: document.getElementById("batch-cards"),
   batchReport: document.getElementById("batch-report"),
-  identityMeta: document.getElementById("identity-meta"),
   coverageMeta: document.getElementById("coverage-meta"),
   scrubRanges: document.getElementById("scrub-ranges"),
   markWorkBtn: document.getElementById("mark-work-btn"),
@@ -373,43 +369,6 @@ function formatDurationShort(seconds) {
   return `${s}s`;
 }
 
-/** Matches snapshot_settings.json garbage_percent (default 10% of clip). */
-const DEFAULT_GARBAGE_PERCENT = 0.1;
-
-function allowedGarbageSeconds(duration) {
-  const fromSnap = state.snapshots?.max_garbage_seconds;
-  if (Number.isFinite(fromSnap) && fromSnap > 0) return fromSnap;
-  const pct = Number(state.snapshots?.garbage_percent);
-  const usePct = Number.isFinite(pct) && pct > 0 ? pct : DEFAULT_GARBAGE_PERCENT;
-  if (!Number.isFinite(duration) || duration <= 0) return 0;
-  return duration * usePct;
-}
-
-function updateAllowedGarbage() {
-  if (!el.allowedGarbage) return;
-  const video = currentVideo();
-  const duration =
-    state.snapshots?.duration
-    || video?.duration
-    || el.player?.duration
-    || 0;
-  const allowed = allowedGarbageSeconds(duration);
-  if (!allowed) {
-    el.allowedGarbage.classList.add("hidden");
-    el.allowedGarbage.textContent = "";
-    return;
-  }
-  const pct = Math.round(
-    (Number(state.snapshots?.garbage_percent) > 0
-      ? Number(state.snapshots.garbage_percent)
-      : DEFAULT_GARBAGE_PERCENT) * 100,
-  );
-  el.allowedGarbage.classList.remove("hidden");
-  el.allowedGarbage.textContent = `Allowed garbage time ${formatDurationShort(allowed)} (${pct}%)`;
-  el.allowedGarbage.title =
-    `${pct}% of this clip may be non-work. Filmstrip spacing is based on that budget.`;
-}
-
 function setStatus(message, kind = "") {
   el.statusLine.textContent = message || "";
   el.statusLine.className = `status-line ${kind}`.trim();
@@ -545,7 +504,6 @@ function applyWorkspace(ws) {
     loadVideo(state.index);
   } else {
     el.currentName.textContent = "No file loaded";
-    el.currentMeta.textContent = "";
     el.player.removeAttribute("src");
     updateContextHint();
   }
@@ -713,22 +671,6 @@ async function loadAnnotationForPath(path, { keepPending = false } = {}) {
     setStatus(error.message || "Could not load annotations", "error");
     return state.annotationsByPath[path];
   }
-}
-
-function updateIdentityMeta() {
-  if (!el.identityMeta) return;
-  const id = state.cardIdentity || {};
-  const bits = [
-    id.factory && `Factory ${id.factory}`,
-    id.card_badge && `Card ${id.card_badge}`,
-    id.device_type && id.device_type,
-    id.device_id && id.device_id,
-  ].filter(Boolean);
-  el.identityMeta.textContent = bits.length
-    ? bits.join(" · ")
-    : state.batchId
-      ? "Batch active — insert matching SD card"
-      : "";
 }
 
 function updateCoverageMeta() {
@@ -915,7 +857,6 @@ function renderClips() {
     el.pendingIn.className = "hidden";
   }
   updateCoverageMeta();
-  updateIdentityMeta();
 }
 
 function basenamePath(path) {
@@ -1098,7 +1039,6 @@ async function softRefreshLabelScan() {
     } else {
       state.index = -1;
       el.currentName.textContent = "No file loaded";
-      el.currentMeta.textContent = "";
       renderFileList();
       updateContextHint();
     }
@@ -1226,25 +1166,6 @@ function hideLoading() {
   el.loadingOverlay?.classList.add("hidden");
 }
 
-function updateFilmstripMeta() {
-  if (!el.filmstripMeta || !state.snapshots) return;
-  const m = state.snapshots;
-  const idx = state.snapshotIndex + 1;
-  const total = m.frames?.length || 0;
-  updateAllowedGarbage();
-  if (state.snapshotPurpose === "label") {
-    el.filmstripMeta.textContent = `Opening preview ${idx}/${total} · use , . ±3s to scrub`;
-    return;
-  }
-  const parts = [];
-  if (m.duration) parts.push(`Clip ${formatDurationShort(m.duration)}`);
-  parts.push(`every ${formatDurationShort(m.interval_seconds)} (${idx}/${total})`);
-  if (m.max_garbage_seconds > 0) {
-    parts.push(`Allowed garbage time ${formatDurationShort(m.max_garbage_seconds)}`);
-  }
-  el.filmstripMeta.textContent = parts.join(" · ");
-}
-
 function attachSnapshotImage(img, video, frameIndex) {
   let attempt = 0;
   const maxAttempts = 4;
@@ -1314,7 +1235,6 @@ function renderFilmstrip({ scrollToActive = false } = {}) {
     btn.addEventListener("click", () => goToSnapshotIndex(frame.index));
     el.filmstrip.appendChild(btn);
   });
-  updateFilmstripMeta();
   updateScrubRangeTints(ranges);
   if (scrollToActive) {
     scrollFilmstripActiveIntoView();
@@ -1481,7 +1401,6 @@ function continueSnapshotRefresh(video) {
       if (status.status === "ready") {
         state.snapshots = status.manifest;
         renderFilmstrip();
-        updateFilmstripMeta();
         // Only prefetch the next clip once this one is fully done — otherwise the
         // next file sits behind leftover frames and N shows "Starting soon…".
         if (state.phase === "clean" && state.perf.prefetch) {
@@ -1503,7 +1422,6 @@ function goToSnapshotIndex(index) {
   const t = frames[clamped].t;
   scheduleSeek(t, true);
   renderFilmstrip({ scrollToActive: true });
-  updateFilmstripMeta();
 }
 
 function goToSnapshot(delta) {
@@ -1776,8 +1694,6 @@ async function loadVideo(index) {
   setTaskSelectionMode(Boolean(currentPendingWork()));
 
   el.currentName.textContent = video.name;
-  el.currentMeta.textContent = `${video.relative || video.path} · ${video.duration_label || "?"}`;
-  updateAllowedGarbage();
   el.previewStatus.textContent = "";
   el.playerWrap.classList.add("loading");
   setStatus(`Loading ${video.name}...`);
@@ -2039,7 +1955,6 @@ function setIdentityFromSelectedCard() {
         device_id: card.device_id || "",
       }
     : { factory: "", card_badge: "", device_type: "", device_id: "" };
-  updateIdentityMeta();
 }
 
 function renderBatchUi() {
@@ -2279,7 +2194,6 @@ async function deleteCurrentFile() {
       el.player.removeAttribute("src");
       el.player.load();
       el.currentName.textContent = "No file loaded";
-      el.currentMeta.textContent = "";
       renderFileList();
       renderClips();
     }
@@ -2541,7 +2455,6 @@ el.player.addEventListener("timeupdate", () => {
 });
   el.player.addEventListener("loadedmetadata", () => {
     updateScrubUi();
-    updateAllowedGarbage();
   });
 
 document.addEventListener("keydown", (event) => {

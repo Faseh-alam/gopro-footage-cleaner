@@ -1427,18 +1427,6 @@ body.scrub-cursor-hidden * {
   flex-shrink: 0;
 }
 
-.allowed-garbage {
-  display: inline-block;
-  font-size: 0.78rem;
-  font-weight: 600;
-  color: #f0c674;
-  background: rgba(240, 198, 116, 0.12);
-  border: 1px solid rgba(240, 198, 116, 0.35);
-  border-radius: 6px;
-  padding: 0.2rem 0.45rem;
-  white-space: nowrap;
-}
-
 .mark-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -1622,7 +1610,6 @@ body.scrub-cursor-hidden * {
   color: var(--text);
 }
 
-.identity-meta,
 .coverage-meta {
   display: block;
   margin-top: 0.15rem;
