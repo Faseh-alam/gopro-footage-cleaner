@@ -120,7 +120,6 @@ const el = {
   footerHints: document.getElementById("footer-hints"),
   appVersion: document.getElementById("app-version"),
   cardTabList: document.getElementById("card-tab-list"),
-  addCardTab: document.getElementById("add-card-tab"),
   updateBtn: document.getElementById("update-btn"),
   batchCsvInput: document.getElementById("batch-csv-input"),
   importBatchBtn: document.getElementById("import-batch-btn"),
@@ -429,7 +428,7 @@ function createWorkspace(title) {
   const n = state.workspaces.length + 1;
   return {
     id: `ws-${Date.now()}-${n}`,
-    title: title || `Card ${n}`,
+    title: title || `Footage ${n}`,
     scanRoot: "",
     labelRoot: "",
     videos: [],
@@ -505,7 +504,7 @@ function renderCardTabs() {
     btn.type = "button";
     btn.className = "card-tab" + (ws.id === state.activeWorkspaceId ? " active" : "");
     btn.textContent = shortCardTitle(ws.title);
-    btn.title = ws.scanRoot || "No card yet";
+    btn.title = ws.scanRoot || "No footage selected";
     btn.addEventListener("click", () => switchWorkspace(ws.id));
     el.cardTabList.appendChild(btn);
   }
@@ -520,18 +519,9 @@ function switchWorkspace(id) {
   setStatus(`Switched to ${ws.title}`, "ok");
 }
 
-function addWorkspaceTab() {
-  saveActiveWorkspace();
-  const ws = createWorkspace();
-  state.workspaces.push(ws);
-  applyWorkspace(ws);
-  setStatus("New card tab — pick a card (auto-scans)", "ok");
-  refreshSdCards({ quiet: false, autoScan: true });
-}
-
 function ensureWorkspaces() {
   if (state.workspaces.length) return;
-  const ws = createWorkspace("Card 1");
+  const ws = createWorkspace("Footage");
   state.workspaces.push(ws);
   state.activeWorkspaceId = ws.id;
 }
@@ -1510,7 +1500,7 @@ async function loadVideo(index) {
 
 async function chooseFootageFolder() {
   el.browseFolderBtn.disabled = true;
-  setStatus("Choose a folder in the dialog…");
+  setStatus("Choose footage on this computer or an external drive…");
   try {
     const initial = el.sourcePath.value.trim() || el.sdCardSelect?.value || "";
     const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
@@ -1519,9 +1509,20 @@ async function chooseFootageFolder() {
       setStatus("Folder selection cancelled");
       return;
     }
-    applySelectedPath(data.path, { label: "Manual folder", manual: true });
-    setStatus(`Selected ${data.path}`, "ok");
+
+    saveActiveWorkspace();
+    const current = state.workspaces.find((ws) => ws.id === state.activeWorkspaceId);
+    if (current?.scanRoot || current?.videos?.length) {
+      const ws = createWorkspace();
+      state.workspaces.push(ws);
+      applyWorkspace(ws);
+    }
+
+    const folderName = data.path.split(/[/\\]/).filter(Boolean).pop() || "Footage";
+    applySelectedPath(data.path, { label: folderName, manual: true });
+    setStatus(`Scanning ${folderName}…`);
     updateContextHint();
+    await scanSource();
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
@@ -1775,7 +1776,7 @@ function renderBatchUi() {
 async function scanSource() {
   const path = scanTargetPath();
   if (!path) {
-    setStatus("Select an SD card first (or press Refresh)", "error");
+    setStatus("Open a footage folder first", "error");
     return;
   }
 
@@ -2110,7 +2111,6 @@ el.markWorkBtn?.addEventListener("click", markWork);
 el.markGarbageBtn?.addEventListener("click", markGarbage);
 el.undoSegmentBtn?.addEventListener("click", undoSegment);
 el.nextCleanBtn.addEventListener("click", finishCleaningFile);
-el.addCardTab?.addEventListener("click", addWorkspaceTab);
 el.taskSearch.addEventListener("input", () => renderTasks());
 el.taskSearch.addEventListener("keydown", (event) => {
   if (event.key === "ArrowDown") {

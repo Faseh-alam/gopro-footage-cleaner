@@ -935,11 +935,12 @@ body.scrub-cursor-hidden * {
 }
 
 .card-tab-add {
-  font-size: 1.15rem;
+  font-size: 0.78rem;
   font-weight: 700;
   line-height: 1;
   min-width: 2.1rem;
-  padding: 0.35rem 0.55rem;
+  padding: 0.45rem 0.7rem;
+  white-space: nowrap;
   color: var(--accent);
   border-color: rgba(62, 166, 255, 0.45);
 }
