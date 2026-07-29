@@ -28,7 +28,7 @@
             <span class="wc-name">World Context</span>
           </a>
           <p class="pipeline-hint" id="context-message">
-            Play with Space · → adds 0.5× speed · T ends work and opens task search · G marks garbage.
+            Play with Space · [ ] change speed · ← → jump snapshots · T / G mark · , . scrub 1s.
           </p>
         </div>
         <div class="header-tools">
@@ -82,6 +82,7 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
             </div>
             <div class="player-time">
               <span id="coverage-meta" class="coverage-meta">0% covered</span>
+              <span id="playback-rate" class="playback-rate">1.0×</span>
               <span id="time-display">00:00:00 / 00:00:00</span>
             </div>
           </div>
@@ -170,15 +171,15 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
           <details class="keys-sheet" id="keys-sheet">
             <summary>Keys</summary>
             <ul>
-              <li><kbd>Space</kbd> Play / pause (resets speed)</li>
-              <li><kbd>→</kbd> While playing: speed +0.5×</li>
+              <li><kbd>Space</kbd> Play / pause (resets to 1×)</li>
+              <li><kbd>[</kbd> <kbd>]</kbd> Speed −0.5× / +0.5×</li>
+              <li><kbd>←</kbd> <kbd>→</kbd> Jump snapshots</li>
+              <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
               <li><kbd>T</kbd> End work segment + select task</li>
               <li><kbd>Enter</kbd> Assign task to pending work</li>
               <li><kbd>G</kbd> Mark garbage to playhead</li>
               <li><kbd>U</kbd> Delete last markup</li>
               <li><kbd>N</kbd> Next unfinished video</li>
-              <li><kbd>←</kbd> <kbd>→</kbd> Paused: snapshot step</li>
-              <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
               <li><kbd>Home</kbd> Jump to 0:00</li>
             </ul>
           </details>

@@ -89,6 +89,7 @@ const el = {
   markSection: document.getElementById("mark-section"),
   currentName: document.getElementById("current-name"),
   timeDisplay: document.getElementById("time-display"),
+  playbackRate: document.getElementById("playback-rate"),
   undoClipBtn: document.getElementById("undo-clip-btn"),
   pendingIn: document.getElementById("pending-in"),
   gpmfStatus: document.getElementById("gpmf-status"),
@@ -1569,6 +1570,35 @@ function updateScrubUi() {
   el.scrubFill.style.width = `${pct}%`;
   el.scrubPlayhead.style.left = `${pct}%`;
   el.timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
+  updatePlaybackRateUi();
+}
+
+const PLAYBACK_RATE_MIN = 0.5;
+const PLAYBACK_RATE_MAX = 8;
+const PLAYBACK_RATE_STEP = 0.5;
+
+function updatePlaybackRateUi() {
+  if (!el.playbackRate) return;
+  const rate = Number(el.player.playbackRate) || 1;
+  el.playbackRate.textContent = `${rate.toFixed(1)}×`;
+  el.playbackRate.classList.toggle("boosted", rate > 1.01);
+  el.playbackRate.classList.toggle("slow", rate < 0.99);
+}
+
+function setPlaybackRate(rate, { announce = true } = {}) {
+  const clamped = Math.min(
+    PLAYBACK_RATE_MAX,
+    Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
+  );
+  el.player.playbackRate = clamped;
+  updatePlaybackRateUi();
+  if (announce) {
+    setStatus(`Playback ${clamped.toFixed(1)}×`, "ok");
+  }
+}
+
+function bumpPlaybackRate(delta) {
+  setPlaybackRate((Number(el.player.playbackRate) || 1) + delta);
 }
 
 function scheduleSeek(time, immediate = false) {
@@ -2468,12 +2498,17 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "ArrowRight") {
     event.preventDefault();
-    if (!el.player.paused) {
-      el.player.playbackRate = Math.min(4, el.player.playbackRate + 0.5);
-      setStatus(`Playback speed ${el.player.playbackRate.toFixed(1)}× — Space resets to 1×`, "ok");
-    } else {
-      goToSnapshot(1);
-    }
+    goToSnapshot(1);
+    return;
+  }
+  if (event.key === "[" || event.key === "{") {
+    event.preventDefault();
+    bumpPlaybackRate(-PLAYBACK_RATE_STEP);
+    return;
+  }
+  if (event.key === "]" || event.key === "}") {
+    event.preventDefault();
+    bumpPlaybackRate(PLAYBACK_RATE_STEP);
     return;
   }
   if (event.key === ",") {
@@ -2514,13 +2549,13 @@ document.addEventListener("keydown", (event) => {
   }
   if (key === " ") {
     event.preventDefault();
-    el.player.playbackRate = 1;
+    setPlaybackRate(1, { announce: false });
     if (el.player.paused) {
       el.player.play();
       setStatus("Playing at 1.0×", "ok");
     } else {
       el.player.pause();
-      setStatus("Paused — playback speed reset to 1.0×", "ok");
+      setStatus("Paused", "ok");
     }
     return;
   }

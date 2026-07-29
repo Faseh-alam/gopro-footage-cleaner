@@ -1420,11 +1420,29 @@ body.scrub-cursor-hidden * {
 }
 
 .player-time {
-  display: grid;
-  gap: 0.25rem;
-  justify-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.75rem;
+  justify-content: flex-end;
+  align-items: baseline;
   text-align: right;
   flex-shrink: 0;
+}
+
+.playback-rate {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: #c8c8c8;
+  min-width: 3.2rem;
+}
+
+.playback-rate.boosted {
+  color: #7ec8ff;
+}
+
+.playback-rate.slow {
+  color: #e3c26c;
 }
 
 .mark-toolbar {
@@ -1618,7 +1636,6 @@ body.scrub-cursor-hidden * {
 .coverage-meta {
   color: #7ddea0;
   font-weight: 600;
-  margin-right: 0.75rem;
 }
 
 .pending-banner:not(:empty) {
