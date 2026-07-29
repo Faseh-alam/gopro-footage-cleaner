@@ -462,6 +462,37 @@
   pointer-events: none;
 }
 
+.task-focus-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: none;
+  place-content: center;
+  gap: 0.35rem;
+  text-align: center;
+  background: rgba(22, 26, 31, 0.78);
+  color: #f2f2f2;
+  pointer-events: none;
+}
+
+.task-focus-overlay strong {
+  font-size: 1.15rem;
+}
+
+.task-focus-overlay span {
+  color: #b8c0c8;
+  font-size: 0.85rem;
+}
+
+#player-wrap.task-selection #player {
+  filter: grayscale(1);
+  opacity: 0.35;
+}
+
+#player-wrap.task-selection .task-focus-overlay {
+  display: grid;
+}
+
 .scrub-overlay {
   position: absolute;
   left: 0;
@@ -583,7 +614,7 @@
   overflow-y: hidden;
   max-width: 100%;
   padding: 0.35rem 0.15rem 0.5rem;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   min-height: 96px;
   height: 96px;
   align-items: stretch;

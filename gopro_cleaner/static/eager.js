@@ -66,6 +66,7 @@ const el = {
   listSummary: document.getElementById("list-summary"),
   playerWrap: document.getElementById("player-wrap"),
   player: document.getElementById("player"),
+  taskFocusOverlay: document.getElementById("task-focus-overlay"),
   scrubTrack: document.getElementById("scrub-track"),
   scrubFill: document.getElementById("scrub-fill"),
   scrubPlayhead: document.getElementById("scrub-playhead"),
@@ -859,6 +860,7 @@ function renderLabelProgress() {
 
 function renderFileList() {
   const items = filteredVideos();
+  const prevScroll = el.fileList.scrollTop;
   el.fileList.innerHTML = "";
   const completeCount = items.filter((v) => state.annotationsByPath[v.path]?.complete).length;
   el.listSummary.textContent = items.length
@@ -883,6 +885,7 @@ function renderFileList() {
     });
     el.fileList.appendChild(btn);
   }
+  el.fileList.scrollTop = prevScroll;
 }
 
 function renderClips() {
@@ -904,7 +907,7 @@ function renderClips() {
   if (ann?.pendingWork) {
     const item = document.createElement("li");
     item.className = "pending";
-    item.textContent = `Pending work ${formatTime(ann.pendingWork.start)} → ${formatTime(ann.pendingWork.end)} — press S then Enter`;
+    item.textContent = `Pending work ${formatTime(ann.pendingWork.start)} → ${formatTime(ann.pendingWork.end)} — choose task then Enter`;
     el.clipList.appendChild(item);
   }
   if (el.pendingIn) {
@@ -1258,8 +1261,21 @@ function attachSnapshotImage(img, video, frameIndex) {
   load();
 }
 
-function renderFilmstrip() {
+function scrollFilmstripActiveIntoView({ smooth = true } = {}) {
   if (!el.filmstrip) return;
+  const active = el.filmstrip.querySelector(".filmstrip-item.active");
+  if (!active) return;
+  // Scroll only the filmstrip — scrollIntoView also moves parent columns and can feel inverted.
+  const left = active.offsetLeft - (el.filmstrip.clientWidth - active.offsetWidth) / 2;
+  el.filmstrip.scrollTo({
+    left: Math.max(0, left),
+    behavior: smooth ? "smooth" : "auto",
+  });
+}
+
+function renderFilmstrip({ scrollToActive = false } = {}) {
+  if (!el.filmstrip) return;
+  const prevScroll = el.filmstrip.scrollLeft;
   el.filmstrip.innerHTML = "";
   if (!state.snapshots?.frames?.length) {
     el.filmstrip.innerHTML = '<div class="hint">No snapshots yet</div>';
@@ -1300,8 +1316,11 @@ function renderFilmstrip() {
   });
   updateFilmstripMeta();
   updateScrubRangeTints(ranges);
-  const active = el.filmstrip.querySelector(".filmstrip-item.active");
-  active?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+  if (scrollToActive) {
+    scrollFilmstripActiveIntoView();
+  } else {
+    el.filmstrip.scrollLeft = prevScroll;
+  }
 }
 
 function updateScrubRangeTints(ranges) {
@@ -1483,7 +1502,7 @@ function goToSnapshotIndex(index) {
   state.snapshotIndex = clamped;
   const t = frames[clamped].t;
   scheduleSeek(t, true);
-  renderFilmstrip();
+  renderFilmstrip({ scrollToActive: true });
   updateFilmstripMeta();
 }
 
@@ -1579,7 +1598,7 @@ function renderTasks(preferred = "") {
     const active = selectedTask();
     el.taskSelectedHint.textContent = active
       ? `Selected: ${active} — Enter assigns pending work`
-      : "T marks work · S search · Enter assigns · G garbage";
+      : "T marks work and focuses search · Enter assigns · G garbage";
   }
   updateContextHint();
 }
@@ -1610,6 +1629,11 @@ function focusTaskSearch() {
       : "Search a task — ↑↓ to choose, Enter selects",
     "ok",
   );
+}
+
+function setTaskSelectionMode(active) {
+  el.playerWrap?.classList.toggle("task-selection", active);
+  el.taskFocusOverlay?.setAttribute("aria-hidden", active ? "false" : "true");
 }
 
 function leaveTaskSearch({ clear = false } = {}) {
@@ -1749,6 +1773,7 @@ async function loadVideo(index) {
   const token = ++state.previewToken;
   state.lastVideoPath = video.path;
   await loadAnnotationForPath(video.path, { keepPending: true });
+  setTaskSelectionMode(Boolean(currentPendingWork()));
 
   el.currentName.textContent = video.name;
   el.currentMeta.textContent = `${video.relative || video.path} · ${video.duration_label || "?"}`;
@@ -2231,9 +2256,11 @@ async function markWork() {
     pendingWork: { start: anchor, end },
   };
   el.player.pause();
-  setStatus(`Pending work ${formatTime(anchor)} → ${formatTime(end)} — press S then Enter`, "ok");
+  setTaskSelectionMode(true);
+  setStatus(`Pending work ${formatTime(anchor)} → ${formatTime(end)} — choose a task and press Enter`, "ok");
   renderClips();
   renderFilmstrip();
+  focusTaskSearch();
 }
 
 async function assignPendingWork() {
@@ -2278,6 +2305,8 @@ async function assignPendingWork() {
   state.lastLabelTask = task;
   applyAnnotationPayload(video.path, { annotation: { ...(ann || {}), pendingWork: null }, summary: ann?.summary || {} });
   await loadAnnotationForPath(video.path);
+  setTaskSelectionMode(false);
+  leaveTaskSearch({ clear: true });
   setStatus(`Assigned work to ${task}`, "ok");
   renderTasks(task);
   renderClips();
@@ -2324,6 +2353,8 @@ async function undoSegment() {
   const ann = currentAnnotation();
   if (ann?.pendingWork) {
     ann.pendingWork = null;
+    setTaskSelectionMode(false);
+    leaveTaskSearch({ clear: true });
     setStatus("Cleared pending work", "ok");
     renderClips();
     renderFilmstrip();
@@ -2340,7 +2371,8 @@ async function undoSegment() {
     return;
   }
   await loadAnnotationForPath(video.path);
-  setStatus("Undid last segment", "ok");
+  setTaskSelectionMode(false);
+  setStatus("Deleted last markup — choose a new timestamp", "ok");
   renderClips();
   renderFilmstrip();
   renderFileList();
@@ -2380,6 +2412,21 @@ el.fineBackBtn?.addEventListener("click", () => fineTune(-3));
 el.fineFwdBtn?.addEventListener("click", () => fineTune(3));
 el.markStartBtn?.addEventListener("click", markStart);
 el.markEndBtn?.addEventListener("click", markEnd);
+
+// Map vertical wheel to horizontal filmstrip scroll with natural direction
+// (browser default often feels inverted: wheel-up → later frames).
+el.filmstrip?.addEventListener(
+  "wheel",
+  (event) => {
+    if (!el.filmstrip) return;
+    const mostlyVertical = Math.abs(event.deltaY) >= Math.abs(event.deltaX);
+    if (!mostlyVertical) return;
+    if (el.filmstrip.scrollWidth <= el.filmstrip.clientWidth + 1) return;
+    event.preventDefault();
+    el.filmstrip.scrollLeft -= event.deltaY + event.deltaX;
+  },
+  { passive: false },
+);
 
 el.scrubTrack.addEventListener("mousedown", (event) => {
   if (!currentVideo()) return;
@@ -2457,7 +2504,12 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "ArrowRight") {
     event.preventDefault();
-    goToSnapshot(1);
+    if (!el.player.paused) {
+      el.player.playbackRate = Math.min(4, el.player.playbackRate + 0.5);
+      setStatus(`Playback speed ${el.player.playbackRate.toFixed(1)}× — Space resets to 1×`, "ok");
+    } else {
+      goToSnapshot(1);
+    }
     return;
   }
   if (event.key === ",") {
@@ -2498,8 +2550,14 @@ document.addEventListener("keydown", (event) => {
   }
   if (key === " ") {
     event.preventDefault();
-    if (el.player.paused) el.player.play();
-    else el.player.pause();
+    el.player.playbackRate = 1;
+    if (el.player.paused) {
+      el.player.play();
+      setStatus("Playing at 1.0×", "ok");
+    } else {
+      el.player.pause();
+      setStatus("Paused — playback speed reset to 1.0×", "ok");
+    }
     return;
   }
   if (key === "s") {

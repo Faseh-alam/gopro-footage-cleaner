@@ -28,7 +28,7 @@
             <span class="wc-name">World Context</span>
           </a>
           <p class="pipeline-hint" id="context-message">
-            Play with Space · T ends a work segment · S + Enter labels it · G marks garbage · cover the whole clip.
+            Play with Space · → adds 0.5× speed · T ends work and opens task search · G marks garbage.
           </p>
         </div>
         <div class="header-tools">
@@ -108,6 +108,10 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
           </div>
           <div id="player-wrap" class="player-wrap" tabindex="0">
             <video id="player" playsinline muted preload="metadata"></video>
+            <div id="task-focus-overlay" class="task-focus-overlay" aria-hidden="true">
+              <strong>Select task</strong>
+              <span>Type to search · ↑↓ select · Enter assign</span>
+            </div>
             <div class="scrub-overlay">
               <span id="preview-status" class="preview-status"></span>
             </div>
@@ -137,7 +141,7 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
               <span id="label-trim-banner-text">—</span>
             </div>
             <input id="task-search" type="search" placeholder="Search task…" autocomplete="off" />
-            <p id="task-selected-hint" class="task-selected-hint">T → S → Enter assigns work · G = garbage</p>
+            <p id="task-selected-hint" class="task-selected-hint">T focuses task search · Enter assigns work · G = garbage</p>
             <div id="task-list" class="task-list"></div>
             <select id="task-select" class="hidden-select" size="1" aria-hidden="true"></select>
             <div class="row">
@@ -150,13 +154,13 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
               <h3>Keys</h3>
               <ul>
                 <li><kbd>Space</kbd> Play / pause</li>
-                <li><kbd>T</kbd> End work segment (from last mark)</li>
-                <li><kbd>S</kbd> Focus task search</li>
+                <li><kbd>→</kbd> While playing: speed +0.5×</li>
+                <li><kbd>T</kbd> End work segment + select task</li>
                 <li><kbd>Enter</kbd> Assign task to pending work</li>
                 <li><kbd>G</kbd> Mark garbage to playhead</li>
-                <li><kbd>U</kbd> Undo last segment</li>
+                <li><kbd>U</kbd> Delete last markup</li>
                 <li><kbd>N</kbd> Next unfinished video</li>
-                <li><kbd>←</kbd> <kbd>→</kbd> Snapshot step</li>
+                <li><kbd>←</kbd> <kbd>→</kbd> Paused: snapshot step</li>
                 <li><kbd>,</kbd> <kbd>.</kbd> −1s / +1s</li>
                 <li><kbd>Home</kbd> Jump to 0:00</li>
               </ul>
@@ -166,7 +170,7 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
               <button id="label-btn" type="button" class="primary">Assign task <kbd>Enter</kbd></button>
               <button id="mark-work-btn" type="button" class="secondary">Mark work <kbd>T</kbd></button>
               <button id="mark-garbage-btn" type="button" class="secondary">Mark garbage <kbd>G</kbd></button>
-              <button id="undo-segment-btn" type="button" class="secondary">Undo <kbd>U</kbd></button>
+              <button id="undo-segment-btn" type="button" class="secondary danger-btn">Delete last markup <kbd>U</kbd></button>
               <button id="next-clean-btn" type="button" class="secondary">Next <kbd>N</kbd></button>
               <button id="delete-file-btn" type="button" class="secondary danger-btn hidden" aria-hidden="true">Delete</button>
             </div>
