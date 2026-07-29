@@ -34,6 +34,7 @@ const state = {
   pendingSeek: null,
   lastVideoPath: "",
   scrubTime: 0,
+  activeClipKey: "",
   labelProgress: null,
   workspaces: [],
   activeWorkspaceId: null,
@@ -858,8 +859,12 @@ function renderFileList() {
 function renderClips() {
   el.clipList.innerHTML = "";
   const ann = currentAnnotation();
-  for (const seg of ann?.segments || []) {
+  for (let index = 0; index < (ann?.segments || []).length; index += 1) {
+    const seg = ann.segments[index];
     const item = document.createElement("li");
+    item.dataset.segmentIndex = String(index);
+    item.dataset.start = String(seg.start);
+    item.dataset.end = String(seg.end);
     const range = `${formatTime(seg.start)} → ${formatTime(seg.end)}`;
     if (seg.kind === "garbage") {
       item.className = "failed";
@@ -874,6 +879,9 @@ function renderClips() {
   if (ann?.pendingWork) {
     const item = document.createElement("li");
     item.className = "pending";
+    item.dataset.pending = "1";
+    item.dataset.start = String(ann.pendingWork.start);
+    item.dataset.end = String(ann.pendingWork.end);
     item.textContent = `Pending work ${formatTime(ann.pendingWork.start)} → ${formatTime(ann.pendingWork.end)} — choose task then Enter`;
     el.clipList.appendChild(item);
   }
@@ -882,6 +890,54 @@ function renderClips() {
     el.pendingIn.className = "hidden";
   }
   updateCoverageMeta();
+  syncClipListToPlayhead({ forceScroll: true });
+}
+
+function playheadClipKey(time, ann) {
+  if (!ann) return "";
+  for (let index = 0; index < (ann.segments || []).length; index += 1) {
+    const seg = ann.segments[index];
+    const start = Number(seg.start);
+    const end = Number(seg.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && time >= start && time < end) {
+      return `seg:${index}`;
+    }
+  }
+  if (ann.pendingWork) {
+    const start = Number(ann.pendingWork.start);
+    const end = Number(ann.pendingWork.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && time >= start && time < end) {
+      return "pending";
+    }
+  }
+  return "";
+}
+
+function syncClipListToPlayhead({ forceScroll = false } = {}) {
+  if (!el.clipList) return;
+  const ann = currentAnnotation();
+  const time = state.scrubTime;
+  const nextKey = playheadClipKey(time, ann);
+  const keyChanged = nextKey !== state.activeClipKey;
+  state.activeClipKey = nextKey;
+
+  let activeEl = null;
+  for (const item of el.clipList.querySelectorAll("li")) {
+    const start = Number(item.dataset.start);
+    const end = Number(item.dataset.end);
+    const active =
+      nextKey &&
+      Number.isFinite(start) &&
+      Number.isFinite(end) &&
+      time >= start &&
+      time < end;
+    item.classList.toggle("at-playhead", active);
+    if (active) activeEl = item;
+  }
+
+  if (activeEl && (forceScroll || keyChanged)) {
+    activeEl.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
 }
 
 function basenamePath(path) {
@@ -1400,6 +1456,7 @@ function updateScrubUi() {
   el.scrubPlayhead.style.left = `${pct}%`;
   el.timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
   updatePlaybackRateUi();
+  syncClipListToPlayhead();
 }
 
 const PLAYBACK_RATE_MIN = 0.5;
@@ -1529,6 +1586,7 @@ async function loadVideo(index) {
   stopTrimPolling();
   state.pendingSeek = null;
   state.scrubTime = 0;
+  state.activeClipKey = "";
   if (state.seekTimer) {
     clearTimeout(state.seekTimer);
     state.seekTimer = null;
