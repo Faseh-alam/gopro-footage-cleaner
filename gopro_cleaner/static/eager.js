@@ -622,6 +622,16 @@ function computeAnchor(segments) {
   return Number.isFinite(end) ? end : 0;
 }
 
+/** Where to start playback for a partially reviewed file (end of last saved markup). */
+function resumeTimeForPath(path) {
+  const ann = annotationFor(path);
+  if (!ann || ann.complete) return 0;
+  const segments = ann.segments || [];
+  if (!segments.length) return 0;
+  const anchor = state.anchorByPath[path] ?? computeAnchor(segments);
+  return Number.isFinite(anchor) && anchor > 0 ? anchor : 0;
+}
+
 function normalizeMarkEnd(time) {
   const video = currentVideo();
   const duration =
@@ -1596,6 +1606,8 @@ async function loadVideo(index) {
   const token = ++state.previewToken;
   state.lastVideoPath = video.path;
   await loadAnnotationForPath(video.path, { keepPending: true });
+  const resumeTime = resumeTimeForPath(video.path);
+  state.scrubTime = resumeTime;
   setTaskSelectionMode(Boolean(currentPendingWork()));
 
   el.currentName.textContent = video.name;
@@ -1620,11 +1632,12 @@ async function loadVideo(index) {
     if (token !== state.previewToken) return;
     el.playerWrap.classList.remove("loading");
     el.player.pause();
-    state.scrubTime = 0;
+    const startAt = resumeTimeForPath(video.path);
+    state.scrubTime = startAt;
     try {
-      el.player.currentTime = 0;
+      el.player.currentTime = startAt;
     } catch {
-      /* ignore */
+      /* large files may not support seek — scrub time still updates */
     }
     setPlaybackRate(1, { announce: false });
     updateScrubUi();
@@ -1634,7 +1647,12 @@ async function loadVideo(index) {
       startTrimPolling();
     }
     updateContextHint();
-    setStatus(`Ready — ${video.name} (Space to play, ← → speed)`, "ok");
+    setStatus(
+      startAt > 0
+        ? `Ready — ${video.name} at ${formatTime(startAt)} (Space to play, ← → speed)`
+        : `Ready — ${video.name} (Space to play, ← → speed)`,
+      "ok",
+    );
   };
 
   el.player.addEventListener("loadedmetadata", onReady, { once: true });
