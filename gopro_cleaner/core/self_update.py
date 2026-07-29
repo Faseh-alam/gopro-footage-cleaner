@@ -1,8 +1,8 @@
-"""One-click updater: pull latest main from GitHub, then relaunch the app.
+"""One-click updater: pull the currently checked-out branch, then relaunch.
 
 Made for operators who don't use git — the Update button in the review UI
 calls this. Machine-local settings (offloader config) are preserved across
-the hard reset to origin/main.
+the hard reset to the matching branch on ``origin``.
 """
 
 from __future__ import annotations
@@ -57,8 +57,18 @@ def _dirty_tracked_files() -> list[str]:
     return dirty
 
 
-def pull_latest_main() -> dict:
-    """Fetch origin/main and hard-reset to it. Returns before/after commits."""
+def current_branch() -> str:
+    """Return the checked-out local branch; detached HEAD is unsafe to update."""
+    branch = _git("symbolic-ref", "--quiet", "--short", "HEAD").strip()
+    if not branch:
+        raise RuntimeError(
+            "This checkout is not on a branch — ask the developer to select main or testing"
+        )
+    return branch
+
+
+def pull_latest_current_branch() -> dict:
+    """Fetch and hard-reset the current branch to ``origin/<branch>``."""
     if not shutil.which("git"):
         raise RuntimeError("git is not installed on this computer — install Git for Windows first")
     if not (PROJECT_ROOT / ".git").exists():
@@ -78,10 +88,10 @@ def pull_latest_main() -> dict:
         if path.is_file():
             preserved[rel] = path.read_bytes()
 
+    branch = current_branch()
     before = _git("rev-parse", "HEAD")
-    _git("fetch", "origin", "main")
-    _git("checkout", "-f", "main")
-    _git("reset", "--hard", "origin/main")
+    _git("fetch", "origin", branch)
+    _git("reset", "--hard", f"origin/{branch}")
     after = _git("rev-parse", "HEAD")
 
     for rel, data in preserved.items():
@@ -91,10 +101,16 @@ def pull_latest_main() -> dict:
             pass
 
     return {
+        "branch": branch,
         "before": before[:7],
         "after": after[:7],
         "changed": before != after,
     }
+
+
+def pull_latest_main() -> dict:
+    """Backward-compatible route helper; now updates the current branch."""
+    return pull_latest_current_branch()
 
 
 def relaunch_and_exit(delay_seconds: float = 1.5) -> None:

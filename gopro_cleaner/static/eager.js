@@ -2532,10 +2532,19 @@ async function runSelfUpdate() {
   showLoading("Updating", "Pulling the latest version from GitHub…", 10);
   try {
     const data = await api("/api/update", { method: "POST" });
+    const branch = data.branch || "current branch";
     if (data.changed === false) {
-      showLoading("Restarting", "Already on the latest version — restarting anyway…", 40);
+      showLoading(
+        "Restarting",
+        `${branch} is already up to date — restarting anyway…`,
+        40,
+      );
     } else {
-      showLoading("Restarting", `Updated ${data.before} → ${data.after} — restarting…`, 40);
+      showLoading(
+        "Restarting",
+        `Updated ${branch}: ${data.before} → ${data.after} — restarting…`,
+        40,
+      );
     }
   } catch (error) {
     hideLoading();
