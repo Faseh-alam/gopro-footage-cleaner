@@ -8,7 +8,7 @@ const state = {
   pendingIn: null,
   pendingClip: null,
   savedClips: [],
-  /** Per-source mark/trim state so filmstrip tints survive navigation. */
+  /** Per-source mark/trim state so scrub-bar tints survive navigation. */
   clipsByPath: {},
   batchId: null,
   batchDetail: null,
@@ -32,18 +32,12 @@ const state = {
   seekTimer: null,
   pendingSeek: null,
   lastVideoPath: "",
-  snapshots: null,
-  snapshotIndex: 0,
-  snapshotBuildToken: 0,
   scrubTime: 0,
-  snapshotPurpose: "clean",
   labelProgress: null,
   workspaces: [],
   activeWorkspaceId: null,
   perf: {
     lite_mode: false,
-    prefetch: true,
-    snapshot_poll_ms: 1000,
     trim_poll_ms: 1200,
     hint: "",
   },
@@ -76,12 +70,8 @@ const el = {
   loadingDetail: document.getElementById("loading-detail"),
   loadingBarFill: document.getElementById("loading-bar-fill"),
   loadingHint: document.getElementById("loading-hint"),
-  filmstripPanel: document.getElementById("filmstrip-panel"),
-  filmstrip: document.getElementById("filmstrip"),
   contextBanner: document.getElementById("context-banner"),
   contextMessage: document.getElementById("context-message"),
-  snapPrevBtn: document.getElementById("snap-prev-btn"),
-  snapNextBtn: document.getElementById("snap-next-btn"),
   fineBackBtn: document.getElementById("fine-back-btn"),
   fineFwdBtn: document.getElementById("fine-fwd-btn"),
   markStartBtn: document.getElementById("mark-start-btn"),
@@ -415,17 +405,6 @@ function visibleTasks() {
   return state.tasks.filter((task) => task.toLowerCase().includes(q));
 }
 
-function snapshotQuery(video, { priority } = {}) {
-  const purpose = state.snapshotPurpose || "clean";
-  let q = `path=${encodeURIComponent(video.path)}&purpose=${purpose}`;
-  if (priority) q += `&priority=${encodeURIComponent(priority)}`;
-  const duration = Number(video?.duration);
-  if (Number.isFinite(duration) && duration > 0) {
-    q += `&duration=${encodeURIComponent(String(duration))}`;
-  }
-  return q;
-}
-
 function scrubStepSeconds() {
   return state.phase === "label" ? 3 : 1;
 }
@@ -433,7 +412,6 @@ function scrubStepSeconds() {
 function setPhase(_phase) {
   // Unified clean+label flow — marking tools stay available; labeling always on.
   state.phase = "clean";
-  state.snapshotPurpose = "clean";
   if (el.phaseClean) el.phaseClean.classList.add("active");
   if (el.phaseLabel) el.phaseLabel.classList.remove("active");
   if (el.cleanPanel) el.cleanPanel.classList.remove("hidden");
@@ -464,7 +442,7 @@ function createWorkspace(title) {
   };
 }
 
-function snapshotWorkspace() {
+function captureWorkspace() {
   return {
     scanRoot: state.scanRoot,
     labelRoot: state.labelRoot,
@@ -492,7 +470,6 @@ function applyWorkspace(ws) {
   state.pendingIn = null;
   state.pendingClip = null;
   state.savedClips = [];
-  state.snapshots = null;
   el.sourcePath.value = state.scanRoot || "";
   if (state.scanRoot && el.sdCardSelect) {
     const opt = [...el.sdCardSelect.options].find((o) => o.value === state.scanRoot);
@@ -513,7 +490,7 @@ function applyWorkspace(ws) {
 function saveActiveWorkspace() {
   const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
   if (!ws) return;
-  Object.assign(ws, snapshotWorkspace());
+  Object.assign(ws, captureWorkspace());
   if (state.scanRoot) {
     const label = selectedSdCardLabel() || state.scanRoot.split(/[/\\]/).filter(Boolean).pop();
     if (label) ws.title = shortCardTitle(label);
@@ -601,7 +578,6 @@ function normalizeMarkEnd(time) {
     el.player.duration
     || video?.duration
     || annotationFor(video?.path)?.duration
-    || state.snapshots?.duration
     || 0;
   let value = Math.max(0, Number(time) || 0);
   if (duration > 0 && value >= duration - 0.05) value = duration;
@@ -682,7 +658,6 @@ function updateCoverageMeta() {
     ann?.duration
     || el.player.duration
     || video?.duration
-    || state.snapshots?.duration
     || 0;
   const covered = (ann?.segments || []).reduce((sum, seg) => {
     const start = Number(seg.start);
@@ -1080,7 +1055,7 @@ function syncTrimJobsFromServer(jobs) {
   const path = currentVideo()?.path;
   if (path) stashClipState(path);
   renderClips();
-  renderFilmstrip();
+  renderMarkTints();
 }
 
 async function pollTrimStatus() {
@@ -1167,81 +1142,9 @@ function hideLoading() {
   el.loadingOverlay?.classList.add("hidden");
 }
 
-function attachSnapshotImage(img, video, frameIndex) {
-  let attempt = 0;
-  const maxAttempts = 4;
-  const load = () => {
-    const retry = attempt > 0 ? `&retry=${attempt}&t=${Date.now()}` : "";
-    img.src = `/api/eager/snapshots/frame?${snapshotQuery(video)}&index=${frameIndex}${retry}`;
-  };
-  img.onerror = () => {
-    attempt += 1;
-    if (attempt < maxAttempts) {
-      setTimeout(load, 250 * attempt);
-    }
-  };
-  load();
-}
-
-function scrollFilmstripActiveIntoView({ smooth = true } = {}) {
-  if (!el.filmstrip) return;
-  const active = el.filmstrip.querySelector(".filmstrip-item.active");
-  if (!active) return;
-  // Scroll only the filmstrip — scrollIntoView also moves parent columns and can feel inverted.
-  const left = active.offsetLeft - (el.filmstrip.clientWidth - active.offsetWidth) / 2;
-  el.filmstrip.scrollTo({
-    left: Math.max(0, left),
-    behavior: smooth ? "smooth" : "auto",
-  });
-}
-
-function renderFilmstrip({ scrollToActive = false } = {}) {
-  if (!el.filmstrip) return;
-  const prevScroll = el.filmstrip.scrollLeft;
-  el.filmstrip.innerHTML = "";
-  if (!state.snapshots?.frames?.length) {
-    el.filmstrip.innerHTML = '<div class="hint">No snapshots yet</div>';
-    return;
-  }
-  const video = currentVideo();
-  if (!video) return;
-  const ranges = keptClipRanges();
-  const pending = currentPendingWork();
-  const anchor = state.anchorByPath[video.path] ?? 0;
-
-  state.snapshots.frames.forEach((frame) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "filmstrip-item";
-    if (frame.index === state.snapshotIndex) btn.classList.add("active");
-    const tint = filmstripTintForTime(frame.t, ranges);
-    if (tint) btn.classList.add(tint);
-    if (pending && Math.abs(frame.t - pending.start) < (state.snapshots.interval_seconds || 1) / 2) {
-      btn.classList.add("mark-start");
-    } else if (
-      !pending
-      && Math.abs(frame.t - anchor) < (state.snapshots.interval_seconds || 1) / 2
-      && anchor > 0
-    ) {
-      btn.classList.add("mark-start");
-    }
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    img.alt = formatTime(frame.t);
-    attachSnapshotImage(img, video, frame.index);
-    const label = document.createElement("span");
-    label.textContent = formatTime(frame.t);
-    btn.appendChild(img);
-    btn.appendChild(label);
-    btn.addEventListener("click", () => goToSnapshotIndex(frame.index));
-    el.filmstrip.appendChild(btn);
-  });
-  updateScrubRangeTints(ranges);
-  if (scrollToActive) {
-    scrollFilmstripActiveIntoView();
-  } else {
-    el.filmstrip.scrollLeft = prevScroll;
-  }
+/** Repaint the work/garbage bands on the scrub bar. */
+function renderMarkTints() {
+  updateScrubRangeTints(keptClipRanges());
 }
 
 function updateScrubRangeTints(ranges) {
@@ -1256,7 +1159,7 @@ function updateScrubRangeTints(ranges) {
   } else {
     host.querySelectorAll(".scrub-range").forEach((node) => node.remove());
   }
-  const duration = el.player.duration || currentVideo()?.duration || state.snapshots?.duration || 0;
+  const duration = el.player.duration || currentVideo()?.duration || 0;
   if (!duration || !ranges.length) return;
 
   for (const r of ranges) {
@@ -1270,163 +1173,6 @@ function updateScrubRangeTints(ranges) {
     seg.style.width = `${((end - start) / duration) * 100}%`;
     host.appendChild(seg);
   }
-}
-
-async function cancelSnapshotJob(path) {
-  if (!path) return;
-  try {
-    await api("/api/eager/snapshots/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-  } catch {
-    /* ignore */
-  }
-}
-
-async function waitForSnapshots(video, token, { showOverlay = true } = {}) {
-  const isLabel = state.snapshotPurpose === "label";
-  await api(`/api/eager/snapshots/status?${snapshotQuery(video, { priority: "foreground" })}&start=1`);
-  let uiOpen = !showOverlay || isLabel;
-  if (!showOverlay && !isLabel) {
-    hideLoading();
-  }
-  const maxPolls = isLabel ? 120 : 3600;
-  for (let i = 0; i < maxPolls; i += 1) {
-    if (token !== state.snapshotBuildToken) return null;
-    const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
-    const partial = status.manifest;
-    const frameCount = partial?.frames?.length || 0;
-    const minFrames = isLabel ? 1 : state.perf.lite_mode ? 2 : 3;
-
-    if (partial?.frames?.length) {
-      state.snapshots = partial;
-      renderFilmstrip();
-      if (!uiOpen && (status.status === "ready" || frameCount >= minFrames)) {
-        uiOpen = true;
-        hideLoading();
-        if (!isLabel && frameCount >= 3 && status.status === "running") {
-          setStatus(`Review started — loading remaining snapshots (${frameCount}/${partial.snapshot_count || "?"})`, "ok");
-        }
-      }
-    }
-
-    if (showOverlay && status.status === "running" && !uiOpen && !isLabel) {
-      showLoading(
-        "Building snapshots",
-        `${video.name} — ${frameCount}/${status.plan?.snapshot_count || status.manifest?.snapshot_count || "?"} frames`,
-        status.progress || Math.min(95, Math.round((frameCount / (status.plan?.snapshot_count || status.manifest?.snapshot_count || 1)) * 100)),
-        status.plan?.garbage_hint || status.manifest?.garbage_hint || "",
-      );
-    }
-    if (showOverlay && status.status === "queued" && !uiOpen && !isLabel) {
-      if (i >= 4) {
-        hideLoading();
-        uiOpen = true;
-        setStatus(
-          `Snapshots loading in background — use the scrub bar below the video (${video.name})`,
-          "ok",
-        );
-      } else {
-        const pos = status.queue_position;
-        const waitHint =
-          typeof pos === "number" && pos > 0
-            ? `Position ${pos + 1} in queue`
-            : "Starting soon…";
-        showLoading("Queued for snapshots", video.name, 5, waitHint);
-      }
-    }
-
-    if (status.status === "ready" && status.manifest) {
-      hideLoading();
-      return status.manifest;
-    }
-    if (uiOpen && partial?.frames?.length >= minFrames && (status.status === "running" || status.status === "ready")) {
-      return partial;
-    }
-    if (status.status === "error") {
-      hideLoading();
-      throw new Error(status.error || "Snapshot build failed");
-    }
-    await new Promise((r) => setTimeout(r, uiOpen ? state.perf.snapshot_poll_ms : Math.min(400, state.perf.snapshot_poll_ms)));
-  }
-  hideLoading();
-  throw new Error("Snapshot build timed out");
-}
-
-async function ensureSnapshots(video, showOverlay = true) {
-  const isLabel = state.snapshotPurpose === "label";
-  const token = ++state.snapshotBuildToken;
-  if (showOverlay && !isLabel) {
-    showLoading("Checking snapshots", video.name, 5);
-  } else if (isLabel) {
-    setStatus(`Loading opening preview for ${video.name}...`);
-  } else {
-    hideLoading();
-  }
-  const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
-  if (status.status === "ready" && status.manifest) {
-    if (token !== state.snapshotBuildToken) return null;
-    state.snapshots = status.manifest;
-    state.snapshotIndex = 0;
-    renderFilmstrip();
-    hideLoading();
-    return status.manifest;
-  }
-  if (showOverlay && !isLabel) {
-    showLoading("Building snapshots", video.name, 0, status.plan?.garbage_hint || "");
-  }
-  const manifest = await waitForSnapshots(video, token, { showOverlay });
-  if (token !== state.snapshotBuildToken || !manifest) return null;
-  state.snapshots = manifest;
-  renderFilmstrip();
-  hideLoading();
-  return manifest;
-}
-
-function continueSnapshotRefresh(video) {
-  if (state.snapshotPurpose === "label") return;
-  const token = state.snapshotBuildToken;
-  const pollMs = state.perf.snapshot_poll_ms || 1000;
-  (async () => {
-    for (let i = 0; i < 180; i += 1) {
-      if (token !== state.snapshotBuildToken) return;
-      if (currentVideo()?.path !== video.path) return;
-      const status = await api(`/api/eager/snapshots/status?${snapshotQuery(video)}`);
-      if (status.manifest?.frames?.length) {
-        const prev = state.snapshots?.frames?.length || 0;
-        state.snapshots = status.manifest;
-        if (status.manifest.frames.length !== prev) renderFilmstrip();
-      }
-      if (status.status === "ready") {
-        state.snapshots = status.manifest;
-        renderFilmstrip();
-        // Only prefetch the next clip once this one is fully done — otherwise the
-        // next file sits behind leftover frames and N shows "Starting soon…".
-        if (state.phase === "clean" && state.perf.prefetch) {
-          prefetchSnapshotsBackground(state.index + 1);
-        }
-        return;
-      }
-      if (status.status === "error") return;
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
-  })();
-}
-
-function goToSnapshotIndex(index) {
-  if (!state.snapshots?.frames?.length) return;
-  const frames = state.snapshots.frames;
-  const clamped = Math.max(0, Math.min(frames.length - 1, index));
-  state.snapshotIndex = clamped;
-  const t = frames[clamped].t;
-  scheduleSeek(t, true);
-  renderFilmstrip({ scrollToActive: true });
-}
-
-function goToSnapshot(delta) {
-  goToSnapshotIndex(state.snapshotIndex + delta);
 }
 
 function fineTune(seconds) {
@@ -1598,7 +1344,11 @@ function setPlaybackRate(rate, { announce = true } = {}) {
 }
 
 function bumpPlaybackRate(delta) {
+  if (!currentVideo()) return;
   setPlaybackRate((Number(el.player.playbackRate) || 1) + delta);
+  // Speeding up while paused means "skim ahead" — start rolling instead of
+  // forcing a second Space press, which would reset the rate to 1×.
+  if (el.player.paused) el.player.play().catch(() => {});
 }
 
 function scheduleSeek(time, immediate = false) {
@@ -1642,13 +1392,10 @@ async function undoMark() {
 function jumpToClipStart() {
   if (!currentVideo()) return;
   scheduleSeek(0, true);
-  if (state.snapshots?.frames?.length) {
-    goToSnapshotIndex(0);
-  }
   setStatus("At start of clip (0:00)", "ok");
 }
 
-/** Annotation ranges for filmstrip/scrub tints (work=green/kept, garbage=red). */
+/** Annotation ranges for scrub-bar tints (work=green/kept, garbage=red). */
 function keptClipRanges() {
   const video = currentVideo();
   const ann = annotationFor(video?.path);
@@ -1672,15 +1419,6 @@ function keptClipRanges() {
   return ranges;
 }
 
-function filmstripTintForTime(t, ranges) {
-  for (const r of ranges) {
-    if (t >= r.start - 0.05 && t <= r.end + 0.05) {
-      return r.kind === "garbage" ? "garbage" : "kept";
-    }
-  }
-  return ""; // unreviewed — neutral
-}
-
 async function cancelPreviewJob(path) {
   if (!path) return;
   try {
@@ -1701,16 +1439,12 @@ async function loadVideo(index) {
   if (previous?.path && previous.path !== state.videos[index]?.path) {
     stashClipState(previous.path);
     await cancelPreviewJob(previous.path);
-    // Free the snapshot worker so the next clip isn't stuck behind leftover frames.
-    await cancelSnapshotJob(previous.path);
   }
 
   state.index = index;
   restoreClipState(state.videos[index]?.path);
   stopTrimPolling();
   state.pendingSeek = null;
-  state.snapshots = null;
-  state.snapshotIndex = 0;
   state.scrubTime = 0;
   if (state.seekTimer) {
     clearTimeout(state.seekTimer);
@@ -1736,7 +1470,7 @@ async function loadVideo(index) {
   renderFileList();
   renderClips();
   updateCoverageMeta();
-  renderFilmstrip();
+  renderMarkTints();
 
   el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
   el.player.load();
@@ -1751,35 +1485,15 @@ async function loadVideo(index) {
     } catch {
       /* ignore */
     }
+    setPlaybackRate(1, { announce: false });
     updateScrubUi();
-    if (state.phase === "clean" || state.phase === "label") {
-      hideLoading();
-      if (state.phase === "clean") {
-        startTrimPolling();
-      }
-      setStatus(`Ready — ${video.name} (loading snapshots…)`, "ok");
-      updateContextHint();
-      ensureSnapshots(video, false)
-        .then((manifest) => {
-          if (token !== state.previewToken || !manifest) return;
-          if (manifest.frames?.length) {
-            goToSnapshotIndex(0);
-          }
-          continueSnapshotRefresh(video);
-          const readyMsg =
-            state.phase === "label"
-              ? `Ready — , . ±3s to scrub (${video.name})`
-              : `Ready — use snapshot strip (${video.name})`;
-          setStatus(readyMsg, "ok");
-        })
-        .catch((error) => {
-          if (token !== state.previewToken) return;
-          hideLoading();
-          setStatus(error.message || "Snapshot build failed — use scrub bar", "error");
-        });
-    } else {
-      setStatus(`Ready — ${video.name}`, "ok");
+    renderMarkTints();
+    hideLoading();
+    if (state.phase === "clean") {
+      startTrimPolling();
     }
+    updateContextHint();
+    setStatus(`Ready — ${video.name} (Space to play, ← → speed)`, "ok");
   };
 
   el.player.addEventListener("loadedmetadata", onReady, { once: true });
@@ -2124,34 +1838,6 @@ async function scanSource() {
   }
 }
 
-const PREFETCH_AHEAD = 2;
-
-function prefetchSnapshotsBackground(fromIndex) {
-  if (state.phase !== "clean" || !state.perf.prefetch) return;
-  const start = fromIndex ?? state.index + 1;
-  const end = Math.min(state.videos.length, start + PREFETCH_AHEAD);
-  (async () => {
-    for (let i = start; i < end; i += 1) {
-      if (state.phase !== "clean") return;
-      const video = state.videos[i];
-      if (!video) continue;
-      try {
-        const q = snapshotQuery(video, { priority: "background" });
-        const status = await api(`/api/eager/snapshots/status?${q}`);
-        if (
-          status.status !== "ready"
-          && status.status !== "running"
-          && status.status !== "queued"
-        ) {
-          await api(`/api/eager/snapshots/status?${q}&start=1`);
-        }
-      } catch {
-        /* background prefetch — ignore */
-      }
-    }
-  })();
-}
-
 async function trimMarkedClip() {
   setStatus("Trim disabled in annotation mode", "error");
 }
@@ -2254,7 +1940,7 @@ async function markWork() {
   setTaskSelectionMode(true);
   setStatus(`Pending work ${formatTime(anchor)} → ${formatTime(end)} — choose a task and press Enter`, "ok");
   renderClips();
-  renderFilmstrip();
+  renderMarkTints();
   focusTaskSearch();
 }
 
@@ -2305,7 +1991,7 @@ async function assignPendingWork() {
   setStatus(`Assigned work to ${task}`, "ok");
   renderTasks(task);
   renderClips();
-  renderFilmstrip();
+  renderMarkTints();
   renderFileList();
   if (state.annotationsByPath[video.path]?.complete) await finishCleaningFile();
 }
@@ -2337,7 +2023,7 @@ async function markGarbage() {
   await loadAnnotationForPath(video.path);
   setStatus(`Marked garbage ${formatTime(anchor)} → ${formatTime(end)}`, "ok");
   renderClips();
-  renderFilmstrip();
+  renderMarkTints();
   renderFileList();
   if (state.annotationsByPath[video.path]?.complete) await finishCleaningFile();
 }
@@ -2352,7 +2038,7 @@ async function undoSegment() {
     leaveTaskSearch({ clear: true });
     setStatus("Cleared pending work", "ok");
     renderClips();
-    renderFilmstrip();
+    renderMarkTints();
     return;
   }
   try {
@@ -2369,7 +2055,7 @@ async function undoSegment() {
   setTaskSelectionMode(false);
   setStatus("Deleted last markup — choose a new timestamp", "ok");
   renderClips();
-  renderFilmstrip();
+  renderMarkTints();
   renderFileList();
 }
 
@@ -2401,27 +2087,10 @@ function advanceToNext() {
   renderFileList();
 }
 
-el.snapPrevBtn?.addEventListener("click", () => goToSnapshot(-1));
-el.snapNextBtn?.addEventListener("click", () => goToSnapshot(1));
 el.fineBackBtn?.addEventListener("click", () => fineTune(-3));
 el.fineFwdBtn?.addEventListener("click", () => fineTune(3));
 el.markStartBtn?.addEventListener("click", markStart);
 el.markEndBtn?.addEventListener("click", markEnd);
-
-// Map vertical wheel to horizontal filmstrip scroll with natural direction
-// (browser default often feels inverted: wheel-up → later frames).
-el.filmstrip?.addEventListener(
-  "wheel",
-  (event) => {
-    if (!el.filmstrip) return;
-    const mostlyVertical = Math.abs(event.deltaY) >= Math.abs(event.deltaX);
-    if (!mostlyVertical) return;
-    if (el.filmstrip.scrollWidth <= el.filmstrip.clientWidth + 1) return;
-    event.preventDefault();
-    el.filmstrip.scrollLeft -= event.deltaY + event.deltaX;
-  },
-  { passive: false },
-);
 
 el.scrubTrack.addEventListener("mousedown", (event) => {
   if (!currentVideo()) return;
@@ -2493,12 +2162,12 @@ document.addEventListener("keydown", (event) => {
 
   if (event.key === "ArrowLeft") {
     event.preventDefault();
-    goToSnapshot(-1);
+    bumpPlaybackRate(-PLAYBACK_RATE_STEP);
     return;
   }
   if (event.key === "ArrowRight") {
     event.preventDefault();
-    goToSnapshot(1);
+    bumpPlaybackRate(PLAYBACK_RATE_STEP);
     return;
   }
   if (event.key === "[" || event.key === "{") {

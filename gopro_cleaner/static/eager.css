@@ -262,7 +262,6 @@
   gap: 0.35rem;
 }
 
-/* Always reserve filmstrip space on short laptop screens */
 .eager-player .player-top {
   flex-shrink: 0;
 }
@@ -456,8 +455,7 @@
   width: 100%;
   max-width: 100%;
   aspect-ratio: 16 / 9;
-  /* Leave room for filmstrip on Windows laptops (~768–900px tall) */
-  max-height: min(64vh, 820px);
+  max-height: min(76vh, 900px);
   border-radius: 10px;
   overflow: hidden;
   background: #000;
@@ -620,28 +618,6 @@
   transition: width 0.25s ease;
 }
 
-.filmstrip-panel {
-  margin: 0.15rem 0 0.35rem;
-  min-width: 0;
-  max-width: 100%;
-  overflow: hidden;
-  flex: 0 0 auto;
-  min-height: 118px;
-}
-
-.filmstrip {
-  display: flex;
-  gap: 0.4rem;
-  overflow-x: auto;
-  overflow-y: hidden;
-  max-width: 100%;
-  padding: 0.35rem 0.15rem 0.5rem;
-  scroll-behavior: auto;
-  min-height: 96px;
-  height: 96px;
-  align-items: stretch;
-}
-
 .js-hook-hidden {
   display: none !important;
   position: absolute !important;
@@ -654,22 +630,6 @@
   border: 0 !important;
   visibility: hidden !important;
   pointer-events: none !important;
-}
-
-.filmstrip-head {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 0.35rem;
-  margin-bottom: 0.35rem;
-  min-width: 0;
-}
-
-.filmstrip-label {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--accent);
 }
 
 .context-banner {
@@ -851,68 +811,6 @@ kbd {
   margin-left: 0.35rem;
   font-size: 0.7rem;
   opacity: 0.85;
-}
-
-.filmstrip-item {
-  flex: 0 0 auto;
-  width: 112px;
-  height: 88px;
-  border: 2px solid transparent;
-  border-radius: 8px;
-  background: #0d1117;
-  cursor: pointer;
-  padding: 0;
-  overflow: hidden;
-  text-align: left;
-}
-
-.filmstrip-item img {
-  display: block;
-  width: 112px;
-  height: 63px;
-  object-fit: cover;
-  background: #000;
-}
-
-.filmstrip-item span {
-  display: block;
-  font-size: 0.72rem;
-  padding: 0.2rem 0.35rem;
-  color: var(--muted);
-}
-
-.filmstrip-item.active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(62, 166, 255, 0.35);
-}
-
-.filmstrip-item.mark-start {
-  border-color: var(--success);
-}
-
-.filmstrip-item.mark-end {
-  border-color: var(--warning);
-}
-
-.filmstrip-item.kept {
-  border-color: rgba(76, 217, 100, 0.85);
-  box-shadow: 0 0 0 1px rgba(76, 217, 100, 0.35);
-}
-
-.filmstrip-item.kept img {
-  filter: brightness(1.05) saturate(1.1);
-  outline: 3px solid rgba(46, 160, 67, 0.55);
-  outline-offset: -3px;
-}
-
-.filmstrip-item.garbage {
-  border-color: rgba(248, 81, 73, 0.75);
-}
-
-.filmstrip-item.garbage img {
-  filter: grayscale(0.35) brightness(0.85);
-  outline: 3px solid rgba(248, 81, 73, 0.45);
-  outline-offset: -3px;
 }
 
 .scrub-range {
