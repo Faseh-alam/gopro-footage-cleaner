@@ -48,31 +48,6 @@
         <p id="sd-card-hint" class="hidden" aria-hidden="true"></p>
       </header>
 
-      <section id="batch-panel" class="batch-panel panel">
-        <div class="batch-panel-grid">
-          <div>
-            <h2>Batch</h2>
-            <p class="hint">Import CSV columns: <code>batch_name,factory,card_badge,device_type,device_id</code></p>
-            <textarea id="batch-csv-input" class="batch-csv-input" rows="4" placeholder="batch_name,factory,card_badge,device_type,device_id
-batch-1,Factory A,C1234,gopro,GP-01
-batch-1,Factory A,C1235,stereo,ST-02"></textarea>
-            <div class="row actions">
-              <button id="import-batch-btn" type="button" class="primary">Start batch from CSV</button>
-              <button id="refresh-batch-btn" type="button" class="secondary">Refresh batch</button>
-              <button id="finish-card-btn" type="button" class="secondary">Finish card</button>
-              <button id="complete-batch-btn" type="button" class="primary">Batch complete</button>
-              <a id="download-report-json" class="secondary link-btn hidden" href="#">Report JSON</a>
-              <a id="download-report-csv" class="secondary link-btn hidden" href="#">Report CSV</a>
-            </div>
-          </div>
-          <div>
-            <div id="batch-status" class="batch-status hint">No active batch — paste CSV and start.</div>
-            <div id="batch-cards" class="batch-cards"></div>
-            <div id="batch-report" class="batch-report hidden"></div>
-          </div>
-        </div>
-      </section>
-
       <main class="eager-main">
         <section class="eager-player panel">
           <div class="player-top">
@@ -178,6 +153,35 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
           </details>
         </aside>
       </main>
+
+      <section id="batch-panel" class="batch-panel panel">
+        <details class="batch-details">
+          <summary>
+            <span>Batch</span>
+            <span id="batch-status" class="batch-status hint">No active batch — paste CSV and start.</span>
+          </summary>
+          <div class="batch-panel-grid">
+            <div>
+              <p class="hint">Import CSV columns: <code>batch_name,factory,card_badge,device_type,device_id</code></p>
+              <textarea id="batch-csv-input" class="batch-csv-input" rows="4" placeholder="batch_name,factory,card_badge,device_type,device_id
+batch-1,Factory A,C1234,gopro,GP-01
+batch-1,Factory A,C1235,stereo,ST-02"></textarea>
+              <div class="row actions">
+                <button id="import-batch-btn" type="button" class="primary">Start batch from CSV</button>
+                <button id="refresh-batch-btn" type="button" class="secondary">Refresh batch</button>
+                <button id="finish-card-btn" type="button" class="secondary">Finish card</button>
+                <button id="complete-batch-btn" type="button" class="primary">Batch complete</button>
+                <a id="download-report-json" class="secondary link-btn hidden" href="#">Report JSON</a>
+                <a id="download-report-csv" class="secondary link-btn hidden" href="#">Report CSV</a>
+              </div>
+            </div>
+            <div>
+              <div id="batch-cards" class="batch-cards"></div>
+              <div id="batch-report" class="batch-report hidden"></div>
+            </div>
+          </div>
+        </details>
+      </section>
 
       <footer class="footer wc-footer">
         <span id="footer-hints"></span>
