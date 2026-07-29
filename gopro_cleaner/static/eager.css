@@ -1279,6 +1279,19 @@ body.scrub-cursor-hidden * {
   margin: 0.5rem 0;
 }
 
+.task-section-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted, #8b949e);
+  margin: 0.15rem 0 0.05rem;
+}
+
+.task-section-label:not(:first-child) {
+  margin-top: 0.45rem;
+}
+
 .task-item {
   text-align: left;
   background: #111820;
@@ -1287,6 +1300,11 @@ body.scrub-cursor-hidden * {
   border-radius: 10px;
   padding: 0.5rem 0.65rem;
   cursor: pointer;
+}
+
+.task-item.recent {
+  border-color: rgba(62, 166, 255, 0.35);
+  background: rgba(62, 166, 255, 0.06);
 }
 
 .task-item.active {

@@ -27,6 +27,7 @@ const state = {
   labeledTasks: {},
   trimmingPaths: new Set(),
   lastLabelTask: "",
+  recentTasks: [],
   busy: false,
   previewToken: 0,
   seekTimer: null,
@@ -398,10 +399,68 @@ function selectedTask() {
   return el.newTaskInput.value.trim();
 }
 
-function visibleTasks() {
+const RECENT_TASKS_KEY = "gopro_eager_recent_tasks";
+const RECENT_TASKS_MAX = 10;
+
+function loadRecentTasks() {
+  try {
+    const raw = localStorage.getItem(RECENT_TASKS_KEY);
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) => typeof item === "string" && item.trim());
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentTasks(recent) {
+  try {
+    localStorage.setItem(RECENT_TASKS_KEY, JSON.stringify(recent.slice(0, RECENT_TASKS_MAX)));
+  } catch {
+    /* private browsing / quota — MRU stays in memory for this session */
+  }
+}
+
+function touchRecentTask(task) {
+  const name = String(task || "").trim();
+  if (!name) return;
+  const key = name.toLowerCase();
+  const next = [name, ...state.recentTasks.filter((item) => item.toLowerCase() !== key)].slice(
+    0,
+    RECENT_TASKS_MAX,
+  );
+  state.recentTasks = next;
+  saveRecentTasks(next);
+}
+
+function recentTaskRank(task) {
+  const key = task.toLowerCase();
+  const idx = state.recentTasks.findIndex((item) => item.toLowerCase() === key);
+  return idx >= 0 ? idx : RECENT_TASKS_MAX + 1;
+}
+
+/** Recent tasks first (MRU order), then the rest alphabetically. Filtered search keeps the same priority. */
+function orderedTaskGroups() {
   const q = el.taskSearch.value.trim().toLowerCase();
-  if (!q) return [...state.tasks];
-  return state.tasks.filter((task) => task.toLowerCase().includes(q));
+  const pool = q
+    ? state.tasks.filter((task) => task.toLowerCase().includes(q))
+    : [...state.tasks];
+  const recent = [];
+  const others = [];
+  for (const task of pool) {
+    if (recentTaskRank(task) <= RECENT_TASKS_MAX) {
+      recent.push(task);
+    } else {
+      others.push(task);
+    }
+  }
+  recent.sort((a, b) => recentTaskRank(a) - recentTaskRank(b));
+  others.sort((a, b) => a.localeCompare(b));
+  return { recent, others, matches: [...recent, ...others], filtering: Boolean(q) };
+}
+
+function visibleTasks() {
+  return orderedTaskGroups().matches;
 }
 
 function scrubStepSeconds() {
@@ -1195,8 +1254,28 @@ function currentScrubTime() {
   return state.scrubTime;
 }
 
+function appendTaskListItem(task, { selected, recent = false } = {}) {
+  const option = document.createElement("option");
+  option.value = task;
+  option.textContent = task;
+  el.taskSelect.appendChild(option);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `task-item${recent ? " recent" : ""}`;
+  btn.textContent = task;
+  if (task === selected) btn.classList.add("active");
+  btn.addEventListener("click", () => {
+    el.taskSelect.value = task;
+    state.lastLabelTask = task;
+    touchRecentTask(task);
+    renderTasks(task);
+  });
+  el.taskList.appendChild(btn);
+}
+
 function renderTasks(preferred = "") {
-  const matches = visibleTasks();
+  const { recent, others, matches, filtering } = orderedTaskGroups();
   const current = el.taskSelect.value;
   const preferredTask = preferred || state.lastLabelTask || "";
   const selected =
@@ -1225,23 +1304,30 @@ function renderTasks(preferred = "") {
     return;
   }
 
-  for (const task of matches) {
-    const option = document.createElement("option");
-    option.value = task;
-    option.textContent = task;
-    el.taskSelect.appendChild(option);
-
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "task-item";
-    btn.textContent = task;
-    if (task === selected) btn.classList.add("active");
-    btn.addEventListener("click", () => {
-      el.taskSelect.value = task;
-      state.lastLabelTask = task;
-      renderTasks(task);
-    });
-    el.taskList.appendChild(btn);
+  if (recent.length && !filtering) {
+    const label = document.createElement("div");
+    label.className = "task-section-label";
+    label.textContent = "Recent";
+    el.taskList.appendChild(label);
+    for (const task of recent) {
+      appendTaskListItem(task, { selected, recent: true });
+    }
+    if (others.length) {
+      const allLabel = document.createElement("div");
+      allLabel.className = "task-section-label";
+      allLabel.textContent = "All tasks";
+      el.taskList.appendChild(allLabel);
+    }
+    for (const task of others) {
+      appendTaskListItem(task, { selected, recent: false });
+    }
+  } else {
+    for (const task of matches) {
+      appendTaskListItem(task, {
+        selected,
+        recent: recentTaskRank(task) <= RECENT_TASKS_MAX,
+      });
+    }
   }
 
   if (selected && [...el.taskSelect.options].some((opt) => opt.value === selected)) {
@@ -1253,7 +1339,9 @@ function renderTasks(preferred = "") {
     const active = selectedTask();
     el.taskSelectedHint.textContent = active
       ? `Selected: ${active} — Enter assigns pending work`
-      : "T marks work and focuses search · Enter assigns · G garbage";
+      : state.recentTasks.length
+        ? "Recent tasks pinned above · T then Enter to repeat last task"
+        : "T marks work and focuses search · Enter assigns · G garbage";
   }
   updateContextHint();
 }
@@ -1275,13 +1363,18 @@ function moveTaskSelection(delta) {
 
 function focusTaskSearch() {
   if (!el.taskSearch) return;
+  el.taskSearch.value = "";
+  renderTasks(state.lastLabelTask || selectedTask() || undefined);
   el.taskSearch.focus();
-  el.taskSearch.select();
-  renderTasks(selectedTask() || state.lastLabelTask || undefined);
+  const last = state.lastLabelTask;
   setStatus(
     currentPendingWork()
-      ? "Search a task — ↑↓ to choose, Enter to assign pending work"
-      : "Search a task — ↑↓ to choose, Enter selects",
+      ? last
+        ? `Enter = ${last} · ↑↓ recent tasks · type to filter`
+        : "Pick a recent task or type to filter — Enter assigns"
+      : last
+        ? `Enter selects ${last} · ↑↓ recent tasks · type to filter`
+        : "Pick a recent task or type to filter",
     "ok",
   );
 }
@@ -1939,7 +2032,13 @@ async function markWork() {
   };
   el.player.pause();
   setTaskSelectionMode(true);
-  setStatus(`Pending work ${formatTime(anchor)} → ${formatTime(end)} — choose a task and press Enter`, "ok");
+  const last = state.lastLabelTask;
+  setStatus(
+    last
+      ? `Pending work ${formatTime(anchor)} → ${formatTime(end)} — Enter for ${last}, or pick from recent`
+      : `Pending work ${formatTime(anchor)} → ${formatTime(end)} — choose a task and press Enter`,
+    "ok",
+  );
   renderClips();
   renderMarkTints();
   focusTaskSearch();
@@ -1985,6 +2084,7 @@ async function assignPendingWork() {
     }),
   });
   state.lastLabelTask = task;
+  touchRecentTask(task);
   applyAnnotationPayload(video.path, { annotation: { ...(ann || {}), pendingWork: null }, summary: ann?.summary || {} });
   await loadAnnotationForPath(video.path);
   setTaskSelectionMode(false);
@@ -2384,6 +2484,8 @@ el.completeBatchBtn?.addEventListener("click", async () => {
 });
 
 el.updateBtn?.addEventListener("click", runSelfUpdate);
+
+state.recentTasks = loadRecentTasks();
 
 loadTasks()
   .then(() => {
