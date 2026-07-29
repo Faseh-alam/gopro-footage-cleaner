@@ -2310,72 +2310,72 @@ el.player.addEventListener("timeupdate", () => {
     updateScrubUi();
   }
 });
-  el.player.addEventListener("loadedmetadata", () => {
-    updateScrubUi();
-  });
+el.player.addEventListener("loadedmetadata", () => {
+  updateScrubUi();
+});
 
-document.addEventListener("keydown", (event) => {
-  if (event.target.matches("input, textarea, select")) return;
+/** Review shortcuts stay active even when a text field has focus (except field-local keys). */
+function shouldDeferToFocusedField(event) {
+  if (!event.target.matches("input, textarea, select")) return false;
+  if (event.target === el.taskSearch) {
+    return ["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key);
+  }
+  if (event.target === el.newTaskInput && event.key === "Enter") {
+    return true;
+  }
+  return false;
+}
+
+function handleReviewShortcut(event) {
+  if (shouldDeferToFocusedField(event)) return false;
+
   const key = event.key.toLowerCase();
 
   if (event.key === "ArrowLeft") {
-    event.preventDefault();
     bumpPlaybackRate(-PLAYBACK_RATE_STEP);
-    return;
+    return true;
   }
   if (event.key === "ArrowRight") {
-    event.preventDefault();
     bumpPlaybackRate(PLAYBACK_RATE_STEP);
-    return;
+    return true;
   }
   if (event.key === "[" || event.key === "{") {
-    event.preventDefault();
     bumpPlaybackRate(-PLAYBACK_RATE_STEP);
-    return;
+    return true;
   }
   if (event.key === "]" || event.key === "}") {
-    event.preventDefault();
     bumpPlaybackRate(PLAYBACK_RATE_STEP);
-    return;
+    return true;
   }
   if (event.key === ",") {
-    event.preventDefault();
     fineTune(-scrubStepSeconds());
-    return;
+    return true;
   }
   if (event.key === ".") {
-    event.preventDefault();
     fineTune(scrubStepSeconds());
-    return;
+    return true;
   }
-
   if (key === "t") {
-    event.preventDefault();
     markWork();
-    return;
+    return true;
   }
   if (key === "g") {
-    event.preventDefault();
     markGarbage();
-    return;
+    return true;
   }
   if (key === "u") {
-    event.preventDefault();
     undoSegment();
-    return;
+    return true;
   }
   if (key === "home" || event.key === "Home") {
-    event.preventDefault();
     jumpToClipStart();
-    return;
+    return true;
   }
   if (key === "n") {
-    event.preventDefault();
     finishCleaningFile();
-    return;
+    return true;
   }
   if (key === " ") {
-    event.preventDefault();
     setPlaybackRate(1, { announce: false });
     if (el.player.paused) {
       el.player.play();
@@ -2384,18 +2384,28 @@ document.addEventListener("keydown", (event) => {
       el.player.pause();
       setStatus("Paused", "ok");
     }
-    return;
+    return true;
   }
   if (key === "s") {
-    event.preventDefault();
     focusTaskSearch();
-    return;
+    return true;
   }
-  if (event.key === "Enter") {
-    event.preventDefault();
+  if (event.key === "Enter" && !event.target.matches("input, textarea, select")) {
     labelCurrentClip();
+    return true;
   }
-});
+  return false;
+}
+
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (!handleReviewShortcut(event)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  },
+  true,
+);
 
 async function runSelfUpdate() {
   if (
