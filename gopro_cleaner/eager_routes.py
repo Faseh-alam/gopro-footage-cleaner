@@ -27,6 +27,7 @@ from .core.snapshot_strip import (
     snapshot_status,
 )
 from .core.task_store import add_task, load_tasks
+from .core.trimmer import move_to_trash
 from .core.work_log import append_work_session, list_work_sessions
 from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
 
@@ -312,6 +313,42 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/video/delete")
+    def eager_delete_video():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        if not payload.get("confirmed"):
+            return jsonify({"error": "Deletion must be confirmed"}), 400
+
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+            cancel_preview(source)
+            cancel_snapshots(source)
+            move_to_trash(source)
+
+            sidecar = annotation_store.sidecar_path_for(source)
+            text_sidecar = sidecar.with_suffix("").with_suffix(".segments.txt")
+            for companion in (sidecar, text_sidecar):
+                if companion.is_file():
+                    move_to_trash(companion)
+
+            batch = batch_registry.remove_asset(batch_id, str(source)) if batch_id else None
+        except FileNotFoundError:
+            return jsonify({"error": "Video not found"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify(
+            {
+                "ok": True,
+                "message": f"Moved to Trash: {source.name}",
+                "batch": batch,
+            }
+        )
 
     @eager.post("/api/eager/label")
     def eager_label():

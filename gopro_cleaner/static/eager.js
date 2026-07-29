@@ -2238,7 +2238,58 @@ async function finishCleaningFile() {
 }
 
 async function deleteCurrentFile() {
-  setStatus("Delete disabled in annotation mode", "error");
+  const video = currentVideo();
+  if (!video || state.busy) return;
+  const confirmed = window.confirm(
+    `Move ${video.name} to Trash?\n\nUse this for accidental or unusable footage. This also removes it from the active batch.`,
+  );
+  if (!confirmed) return;
+
+  state.busy = true;
+  el.deleteFileBtn.disabled = true;
+  el.player.pause();
+  setTaskSelectionMode(false);
+  setStatus(`Moving ${video.name} to Trash…`);
+  try {
+    const data = await api("/api/eager/video/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: video.path,
+        batch_id: state.batchId,
+        confirmed: true,
+      }),
+    });
+
+    const deletedIndex = state.index;
+    delete state.annotationsByPath[video.path];
+    delete state.anchorByPath[video.path];
+    delete state.clipsByPath[video.path];
+    state.donePaths.delete(video.path);
+    state.videos.splice(deletedIndex, 1);
+    state.index = -1;
+    if (data.batch) {
+      state.batchDetail = data.batch;
+      renderBatchStatus();
+    }
+
+    if (state.videos.length) {
+      await loadVideo(Math.min(deletedIndex, state.videos.length - 1));
+    } else {
+      el.player.removeAttribute("src");
+      el.player.load();
+      el.currentName.textContent = "No file loaded";
+      el.currentMeta.textContent = "";
+      renderFileList();
+      renderClips();
+    }
+    setStatus(`${video.name} moved to Trash`, "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    state.busy = false;
+    el.deleteFileBtn.disabled = false;
+  }
 }
 
 async function markWork() {

@@ -329,6 +329,32 @@ def bind_card(
     return get_batch_detail(batch_id)
 
 
+def remove_asset(batch_id: str, video_path: str) -> dict:
+    """Remove a deliberately discarded video from its batch card."""
+    target_path = str(Path(video_path).expanduser().resolve())
+    with _lock:
+        data = get_batch(batch_id)
+        if not data:
+            raise FileNotFoundError(f"Batch not found: {batch_id}")
+        if data.get("status") == "complete":
+            raise ValueError("Batch is already complete")
+
+        removed = False
+        for card in data.get("cards") or []:
+            assets = card.get("assets") or []
+            kept = [
+                asset
+                for asset in assets
+                if str(Path(str(asset.get("path") or "")).expanduser().resolve()) != target_path
+            ]
+            if len(kept) != len(assets):
+                card["assets"] = kept
+                removed = True
+        if removed:
+            _save(data)
+    return get_batch_detail(batch_id)
+
+
 def sync_asset_annotations(batch_id: str) -> dict:
     """Refresh coverage for every registered asset from on-disk sidecars."""
     with _lock:

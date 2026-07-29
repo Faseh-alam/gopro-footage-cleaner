@@ -162,6 +162,25 @@ class BatchRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch_registry.parse_batch_csv(csv_text)
 
+    def test_remove_discarded_asset(self) -> None:
+        detail = batch_registry.create_batch_from_csv(
+            "batch_name,factory,card_badge,device_type,device_id\n"
+            "batch-delete,Factory,C1001,gopro,GP-01\n"
+        )
+        video = self.state / "short.MP4"
+        video.write_bytes(b"x")
+        batch_registry.bind_card(
+            detail["id"],
+            card_badge="C1001",
+            mount_path=str(self.state),
+            scan_path=str(self.state),
+            videos=[{"path": str(video), "name": video.name, "duration": 3.0}],
+        )
+
+        updated = batch_registry.remove_asset(detail["id"], str(video))
+        card = next(c for c in updated["cards"] if c["card_badge"] == "C1001")
+        self.assertEqual(card["assets"], [])
+
     def test_report_csv_export(self) -> None:
         detail = batch_registry.create_batch_from_csv(
             "batch_name,factory,card_badge,device_type,device_id\n"
