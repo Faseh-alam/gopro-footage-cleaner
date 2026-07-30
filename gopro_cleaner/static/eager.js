@@ -1445,11 +1445,8 @@ function focusTaskSearch() {
   );
 }
 
-function focusNewTaskInput() {
-  if (!el.newTaskInput) return;
-  el.newTaskInput.focus();
-  el.newTaskInput.select();
-  setStatus("Type a new task name — Enter to add", "ok");
+function isTypingKey(event) {
+  return event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey;
 }
 
 function setTaskSelectionMode(active) {
@@ -2349,7 +2346,12 @@ el.player.addEventListener("loadedmetadata", () => {
 function shouldDeferToFocusedField(event) {
   if (!event.target.matches("input, textarea, select")) return false;
   if (event.target === el.taskSearch) {
-    return ["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key);
+    if (["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key)) return true;
+    if (isTypingKey(event)) {
+      if (event.key.toLowerCase() === "u" && !el.taskSearch.value.trim()) return false;
+      return true;
+    }
+    return false;
   }
   if (event.target === el.newTaskInput) {
     return true;
@@ -2415,10 +2417,6 @@ function handleReviewShortcut(event) {
       el.player.pause();
       setStatus("Paused", "ok");
     }
-    return true;
-  }
-  if (key === "s") {
-    focusNewTaskInput();
     return true;
   }
   if (event.key === "Enter" && !event.target.matches("input, textarea, select")) {
