@@ -46,23 +46,23 @@
 :root {
   --radius: 4px;
   --background: #1d1b1d;
-  --foreground: oklch(0.958 0 0);
+  --foreground: hsl(51, 22%, 88%);
   --surface: oklch(0.215 0.003 315);
   --surface-2: oklch(0.245 0.003 315);
   --card: oklch(0.215 0.003 315);
-  --card-foreground: oklch(0.958 0 0);
+  --card-foreground: hsl(51, 22%, 88%);
   --popover: oklch(0.195 0 0);
-  --popover-foreground: oklch(0.958 0 0);
-  --primary: oklch(0.958 0 0);
+  --popover-foreground: hsl(51, 22%, 88%);
+  --primary: hsl(51, 22%, 88%);
   --primary-foreground: oklch(0.155 0 0);
   --secondary: oklch(0.235 0 0);
-  --secondary-foreground: oklch(0.958 0 0);
+  --secondary-foreground: hsl(51, 22%, 88%);
   --muted: oklch(0.235 0 0);
   --muted-foreground: oklch(0.68 0 0);
   --accent: oklch(0.63 0.19 260);
-  --accent-foreground: oklch(0.98 0 0);
+  --accent-foreground: hsl(51, 22%, 90%);
   --destructive: oklch(0.62 0.2 22);
-  --destructive-foreground: oklch(0.98 0 0);
+  --destructive-foreground: hsl(51, 22%, 90%);
   --success: oklch(0.72 0.15 155);
   --warning: oklch(0.79 0.14 78);
   --border: oklch(1 0 0 / 10%);
@@ -73,7 +73,7 @@
 
 .dark {
   --background: #1d1b1d;
-  --foreground: oklch(0.958 0 0);
+  --foreground: hsl(51, 22%, 88%);
 }
 
 @layer base {

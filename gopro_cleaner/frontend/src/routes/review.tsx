@@ -181,12 +181,12 @@ function ReviewPage() {
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
             {sheets.statusText}
           </Button>
-          <Button size="sm" variant="accent" onClick={() => c.queueClips()} disabled={c.busy}>
+          <Button size="sm" variant="default" onClick={() => c.queueClips()} disabled={c.busy}>
             Queue clips
           </Button>
           <Link
             to="/"
-            className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-accent transition-opacity hover:opacity-75"
+            className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75"
           >
             Cleaner <ArrowUpRight className="size-3.5" />
           </Link>
