@@ -186,7 +186,7 @@ function ReviewPage() {
           </Button>
           <Link
             to="/"
-            className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75"
+            className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
           >
             Cleaner <ArrowUpRight className="size-3.5" />
           </Link>
