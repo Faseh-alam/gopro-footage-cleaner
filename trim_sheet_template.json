@@ -1,0 +1,15 @@
+{
+  "defaults": {
+    "delete_original": true
+  },
+  "videos": [
+    {
+      "footage": "GX012185.MP4",
+      "timestamps": "00:00 - 7:45, 10:00 - 12:00"
+    },
+    {
+      "footage": "26-04-26/C5223/task-Safety-Sticker/GX014891.MP4",
+      "timestamps": "00:00 - 5:30"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+flask>=3.0
+send2trash>=1.8
+static-ffmpeg>=2.13
+google-auth>=2.56.2
+gspread>=6.2.1
+flask_cors>=6.0.5

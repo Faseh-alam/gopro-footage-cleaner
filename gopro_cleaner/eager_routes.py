@@ -1,0 +1,619 @@
+"""Eager Review Station API routes."""
+
+from __future__ import annotations
+
+import mimetypes
+from pathlib import Path
+
+from flask import Blueprint, Response, jsonify, render_template, request, send_file
+
+from .core import annotation_store, batch_registry
+from .core.eager import (
+    assign_clip_to_task,
+    label_progress,
+    list_camera_folders,
+    process_reviewed_video,
+    scan_mp4_files,
+    task_directory,
+)
+from .core.eager_trim_queue import eager_trim_queue
+from .core.folder_picker import pick_folder
+from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
+from .core.lite_mode import performance_config
+from .core.snapshot_strip import cancel_snapshots
+from .core.task_store import add_task, load_tasks
+from .core.trimmer import move_to_trash
+from .core.work_log import append_work_session, list_work_sessions
+from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
+
+
+def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blueprint:
+    eager = Blueprint("eager", __name__, template_folder=template_folder)
+
+    @eager.get("/review")
+    def review_page():
+        return render_template("eager.html", version=version)
+
+    @eager.get("/api/eager/config")
+    def eager_config():
+        return jsonify(performance_config())
+
+    @eager.get("/api/eager/work-log")
+    def eager_work_log_list():
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        return jsonify({"sessions": list_work_sessions(limit=limit)})
+
+    @eager.post("/api/eager/work-log")
+    def eager_work_log_save():
+        payload = request.get_json(silent=True) or {}
+        try:
+            row = append_work_session(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "session": row})
+
+    @eager.get("/api/eager/volumes")
+    def eager_volumes():
+        return jsonify({"volumes": list_volume_roots()})
+
+    @eager.get("/api/eager/sd-cards")
+    def eager_sd_cards():
+        try:
+            cards = list_sd_cards()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"cards": cards, "count": len(cards)})
+
+    @eager.post("/api/eager/pick-folder")
+    def eager_pick_folder():
+        initial_raw = str(request.args.get("initial", "")).strip()
+        initial = None
+        if initial_raw:
+            try:
+                initial = normalize_path(initial_raw)
+            except (OSError, RuntimeError):
+                initial = None
+        try:
+            chosen = pick_folder(initial)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        if chosen is None:
+            return jsonify({"ok": True, "cancelled": True})
+        return jsonify({"ok": True, "path": str(chosen), "cancelled": False})
+
+    @eager.get("/api/eager/tasks")
+    def eager_tasks():
+        return jsonify({"tasks": load_tasks()})
+
+    @eager.post("/api/eager/tasks")
+    def eager_add_task():
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name", "")).strip()
+        raw_root = str(payload.get("label_root", "")).strip()
+        try:
+            tasks = add_task(name)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        task_dir = None
+        if raw_root and name:
+            root = normalize_path(raw_root)
+            task_dir = task_directory(root, name)
+            task_dir.mkdir(parents=True, exist_ok=True)
+        return jsonify({"tasks": tasks, "task_dir": str(task_dir) if task_dir else None})
+
+    @eager.get("/api/eager/cameras")
+    def eager_cameras():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            root = normalize_path(raw_path)
+            cameras = list_camera_folders(root)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"root": str(root), "cameras": cameras})
+
+    @eager.post("/api/eager/scan")
+    def eager_scan():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path", "")).strip()
+        recursive = bool(payload.get("recursive", True))
+        mode = str(payload.get("mode", "all")).strip().lower()
+        if mode not in {"all", "raw", "clips", "label", "annotate"}:
+            return jsonify({"error": "mode must be all, raw, clips, label, or annotate"}), 400
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            root = normalize_path(raw_path)
+            videos = scan_mp4_files(root, recursive=recursive, mode=mode)
+            progress = label_progress(root, recursive=recursive) if mode == "label" else None
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        payload_out = {"root": str(root), "count": len(videos), "videos": videos, "mode": mode}
+        if progress is not None:
+            payload_out["progress"] = progress
+        return jsonify(payload_out)
+
+    @eager.get("/api/eager/label-progress")
+    def eager_label_progress():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        recursive = request.args.get("recursive", "1").strip().lower() not in {"0", "false", "no"}
+        try:
+            root = normalize_path(raw_path)
+            return jsonify(label_progress(root, recursive=recursive))
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+    @eager.get("/api/eager/preview/status")
+    def eager_preview_status():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        try:
+            return jsonify(preview_status(Path(raw_path), start=start))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+
+    @eager.post("/api/eager/preview/cancel")
+    def eager_preview_cancel():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            payload = request.get_json(silent=True) or {}
+            raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        cancel_preview(Path(raw_path))
+        return jsonify({"ok": True})
+
+    @eager.get("/api/eager/preview")
+    def eager_preview():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            path = resolve_preview(Path(raw_path))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return send_file(path, mimetype="video/mp4", conditional=True)
+
+    @eager.get("/api/eager/stream")
+    def eager_stream():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        path = Path(raw_path).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        if path.suffix.upper() != ".MP4":
+            return jsonify({"error": "Only MP4 streaming is supported"}), 400
+        mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        return send_file(path, mimetype=mime, conditional=True)
+
+    @eager.post("/api/eager/trim")
+    def eager_trim():
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        try:
+            start = float(payload.get("start", 0))
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "start and end must be numbers"}), 400
+        if not raw_source:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            record = eager_trim_queue.submit(Path(raw_source), start, end)
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "job_id": record.job_id,
+                "status": record.status,
+                "start_seconds": record.start_seconds,
+                "end_seconds": record.end_seconds,
+                "source_has_gpmf": record.source_has_gpmf,
+            }
+        )
+
+    @eager.post("/api/eager/snippet")
+    def eager_snippet():
+        """Save the marked I→O range as a task-folder sample (any length)."""
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        raw_root = str(payload.get("label_root", "")).strip()
+        task_name = str(payload.get("task", "")).strip()
+        try:
+            start = float(payload.get("start", 0))
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "start and end must be numbers"}), 400
+        if not raw_source or not raw_root or not task_name:
+            return jsonify({"error": "path, label_root, and task are required"}), 400
+        if end <= start + 0.05:
+            return jsonify({"error": "Snippet end must be after start"}), 400
+
+        try:
+            source = Path(raw_source).expanduser().resolve(strict=True)
+            root = Path(raw_root).expanduser().resolve(strict=True)
+            add_task(task_name)
+            task_dir = task_directory(root, task_name)
+            record = eager_trim_queue.submit(
+                source,
+                start,
+                end,
+                output_dir=task_dir,
+                kind="snippet",
+                task=task_name,
+            )
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify(
+            {
+                "ok": True,
+                "job_id": record.job_id,
+                "status": record.status,
+                "start_seconds": record.start_seconds,
+                "end_seconds": record.end_seconds,
+                "duration_seconds": record.end_seconds - record.start_seconds,
+                "output": record.output,
+                "task": task_name,
+                "task_dir": str(task_dir),
+                "source_has_gpmf": record.source_has_gpmf,
+            }
+        )
+
+    @eager.get("/api/eager/trim/status")
+    def eager_trim_status():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        return jsonify(eager_trim_queue.status_for_source(Path(raw_path)))
+
+    @eager.get("/api/eager/trim/active")
+    def eager_trim_active():
+        """Global trim queue snapshot (survives clean↔label switch and reload)."""
+        return jsonify(eager_trim_queue.status_all())
+
+    @eager.post("/api/eager/clean")
+    def eager_clean():
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        if not raw_source:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = eager_trim_queue.schedule_source_finish(Path(raw_source))
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/video/delete")
+    def eager_delete_video():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        batch_id = str(payload.get("batch_id") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        if not payload.get("confirmed"):
+            return jsonify({"error": "Deletion must be confirmed"}), 400
+
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+            cancel_preview(source)
+            cancel_snapshots(source)
+            move_to_trash(source)
+
+            sidecar = annotation_store.sidecar_path_for(source)
+            text_sidecar = sidecar.with_suffix("").with_suffix(".segments.txt")
+            for companion in (sidecar, text_sidecar):
+                if companion.is_file():
+                    move_to_trash(companion)
+
+            batch = batch_registry.remove_asset(batch_id, str(source)) if batch_id else None
+        except FileNotFoundError:
+            return jsonify({"error": "Video not found"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify(
+            {
+                "ok": True,
+                "message": f"Moved to Trash: {source.name}",
+                "batch": batch,
+            }
+        )
+
+    @eager.post("/api/eager/label")
+    def eager_label():
+        payload = request.get_json(silent=True) or {}
+        raw_clip = str(payload.get("path", "")).strip()
+        raw_root = str(payload.get("label_root", "")).strip()
+        task_name = str(payload.get("task", "")).strip()
+        if not raw_clip or not raw_root or not task_name:
+            return jsonify({"error": "path, label_root, and task are required"}), 400
+        try:
+            result = assign_clip_to_task(Path(raw_clip), Path(raw_root), task_name)
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/finish")
+    def eager_finish():
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        raw_output = str(payload.get("output_root", "")).strip()
+        task_name = str(payload.get("task", "")).strip()
+        keep_entire = bool(payload.get("keep_entire"))
+        delete_source = bool(payload.get("delete_source", True))
+        clips_raw = payload.get("clips") or []
+
+        if not raw_source or not raw_output or not task_name:
+            return jsonify({"error": "path, output_root, and task are required"}), 400
+
+        clips: list[tuple[float, float]] = []
+        for item in clips_raw:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                return jsonify({"error": "Each clip must be [start_seconds, end_seconds]"}), 400
+            start = float(item[0])
+            end = float(item[1])
+            if end <= start:
+                return jsonify({"error": "Clip end must be after start"}), 400
+            clips.append((start, end))
+
+        try:
+            result = process_reviewed_video(
+                Path(raw_source),
+                Path(raw_output),
+                task_name,
+                keep_entire=keep_entire,
+                clips=clips,
+                delete_source=delete_source,
+            )
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify({"ok": True, **result})
+
+    # ---- Batch annotation (sidecar timestamps, no live trim) ----------------
+
+    @eager.get("/api/eager/batches")
+    def eager_batches():
+        return jsonify({"batches": batch_registry.list_batches()})
+
+    @eager.post("/api/eager/batches/import-csv")
+    def eager_batches_import_csv():
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("csv") or payload.get("text") or "")
+        if not text.strip() and request.files.get("file"):
+            text = request.files["file"].read().decode("utf-8-sig", errors="replace")
+        if not text.strip():
+            return jsonify({"error": "csv text is required"}), 400
+        try:
+            if bool(payload.get("preview_only")):
+                return jsonify({"ok": True, "preview": batch_registry.parse_batch_csv(text)})
+            detail = batch_registry.create_batch_from_csv(text)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>")
+    def eager_batch_detail(batch_id: str):
+        try:
+            detail = batch_registry.sync_asset_annotations(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>/match-cards")
+    def eager_batch_match_cards(batch_id: str):
+        try:
+            result = batch_registry.match_detected_cards(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/batches/<batch_id>/bind-card")
+    def eager_batch_bind_card(batch_id: str):
+        payload = request.get_json(silent=True) or {}
+        card_badge = str(payload.get("card_badge") or "").strip()
+        mount_path = str(payload.get("mount_path") or payload.get("path") or "").strip()
+        scan_path = str(payload.get("scan_path") or mount_path).strip()
+        if not card_badge or not scan_path:
+            return jsonify({"error": "card_badge and scan_path are required"}), 400
+        try:
+            root = normalize_path(scan_path)
+            videos = scan_mp4_files(root, recursive=True, mode="annotate")
+            detail = batch_registry.bind_card(
+                batch_id,
+                card_badge=card_badge,
+                mount_path=mount_path or str(root),
+                scan_path=str(root),
+                videos=videos,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail, "videos": videos, "count": len(videos)})
+
+    @eager.post("/api/eager/batches/<batch_id>/finish-card")
+    def eager_batch_finish_card(batch_id: str):
+        payload = request.get_json(silent=True) or {}
+        card_badge = str(payload.get("card_badge") or "").strip()
+        if not card_badge:
+            return jsonify({"error": "card_badge is required"}), 400
+        try:
+            detail = batch_registry.finish_card(batch_id, card_badge)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.post("/api/eager/batches/<batch_id>/complete")
+    def eager_batch_complete(batch_id: str):
+        try:
+            detail = batch_registry.complete_batch(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "batch": detail})
+
+    @eager.get("/api/eager/batches/<batch_id>/report.json")
+    def eager_batch_report_json(batch_id: str):
+        try:
+            detail = batch_registry.sync_asset_annotations(batch_id)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        return jsonify(detail.get("report") or {})
+
+    @eager.get("/api/eager/batches/<batch_id>/report.csv")
+    def eager_batch_report_csv(batch_id: str):
+        data = batch_registry.get_batch(batch_id)
+        if not data:
+            return jsonify({"error": "Batch not found"}), 404
+        batch_registry.sync_asset_annotations(batch_id)
+        data = batch_registry.get_batch(batch_id) or data
+        csv_text = batch_registry.report_csv(data)
+        return Response(
+            csv_text,
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{data.get("batch_name", batch_id)}-report.csv"'
+            },
+        )
+
+    @eager.get("/api/eager/annotations")
+    def eager_annotations_get():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        path = Path(raw_path).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        annotation = annotation_store.load_annotation(path)
+        if annotation is None:
+            annotation = annotation_store.empty_annotation(source=path.name)
+            try:
+                from .core.probe import probe_media
+
+                annotation["duration"] = probe_media(path).duration
+            except Exception:  # noqa: BLE001
+                pass
+        summary = annotation_store.coverage_summary(annotation)
+        return jsonify({"ok": True, "annotation": annotation, "summary": summary, "path": str(path)})
+
+    @eager.post("/api/eager/annotations")
+    def eager_annotations_save():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = annotation_store.save_annotation(
+                Path(raw_path),
+                payload.get("annotation") or payload,
+                require_complete=bool(payload.get("require_complete")),
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/annotations/append")
+    def eager_annotations_append():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        kind = str(payload.get("kind") or "").strip()
+        task = str(payload.get("task") or "").strip()
+        try:
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "end must be a number"}), 400
+        if not raw_path or not kind:
+            return jsonify({"error": "path and kind are required"}), 400
+        context = {
+            "batch_name": payload.get("batch_name"),
+            "factory": payload.get("factory"),
+            "card_badge": payload.get("card_badge"),
+            "device_type": payload.get("device_type"),
+            "device_id": payload.get("device_id"),
+            "duration": payload.get("duration"),
+        }
+        try:
+            result = annotation_store.append_segment(
+                Path(raw_path),
+                kind=kind,
+                end=end,
+                task=task,
+                context=context,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/annotations/undo")
+    def eager_annotations_undo():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = annotation_store.undo_last_segment(Path(raw_path))
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    return eager
