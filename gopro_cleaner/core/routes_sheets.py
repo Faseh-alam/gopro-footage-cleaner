@@ -25,7 +25,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_FILE = PROJECT_ROOT / "db.json"
 CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
 
-
 def read_db() -> Dict[str, Any]:
     if DB_FILE.exists():
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -47,6 +46,129 @@ def set_spreadsheet_id(sheet_id: str) -> None:
     db["spreadsheetId"] = sheet_id
     write_db(db)
 
+
+def _parse_gb_string(gb_str: str) -> float:
+    """Converts '1,025.65 GB' or '1025.65' into a float."""
+    if not gb_str:
+        return 0.0
+    clean_str = str(gb_str).replace(" GB", "").replace(",", "").strip()
+    try:
+        return float(clean_str)
+    except ValueError:
+        return 0.0
+
+def _parse_duration_to_seconds(time_str: str) -> float:
+    """Converts '88:52:04' into total seconds."""
+    if not time_str:
+        return 0.0
+    parts = str(time_str).split(":")
+    if len(parts) == 3:
+        try:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            return 0.0
+    return 0.0
+
+def _format_hours_mins(seconds: float) -> str:
+    """Converts seconds to '88h 52m' format."""
+    if not seconds or seconds < 0:
+        return "0h 0m"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}h {m}m"
+
+def _summary_headers() -> list[str]:
+    """Headers for the Summary sheet."""
+    return [
+        "Date",
+        "Total cards received",
+        "Total Used Space (GB) Before Labeling",
+        "Total Used Space (GB) After Labeling",
+        "Total storage before (TB)",
+        "Total storage after (TB)",
+        "Total Original Duration Before Labeling",
+        "Total Original Duration After Labeling",
+        "Total Hours Before",
+        "Total Hours After"
+    ]
+
+def _ensure_summary_sheet():
+    """Returns the Summary worksheet, creating it with headers if it doesn't exist."""
+    sheet_name = "Summary"
+    try:
+        ws = get_sheet(sheet_name)
+    except RuntimeError:
+        try:
+            create_new_worksheet(sheet_name)
+            ws = get_sheet(sheet_name)
+            ws.append_rows([_summary_headers()], value_input_option=ValueInputOption.user_entered)
+        except Exception:
+            ws = get_sheet(sheet_name)
+    return ws
+
+def _style_vertical_summary_card(ws: gspread.Worksheet, start_row: int) -> None:
+    """Styles a 11-row vertical summary card starting at the given row."""
+    try:
+        # 1. Merge Header Columns (B and C)
+        ws.merge_cells(f"B{start_row}:C{start_row}")
+        
+        # 2. Format Header (Purple background, white bold text)
+        ws.format(f"B{start_row}:C{start_row}", {
+            "backgroundColor": {"red": 0.45, "green": 0.35, "blue": 0.95}, # Vibrant purple
+            "textFormat": {
+                "fontFamily": "Lexend",
+                "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                "fontSize": 14,
+                "bold": True
+            },
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE"
+        })
+        
+        # 3. Format Labels in Col B (Right aligned, bold)
+        ws.format(f"B{start_row+1}:B{start_row+10}", {
+            "textFormat": {
+                "fontFamily": "Lexend",
+                "fontSize": 10,
+                "bold": True,
+                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
+            },
+            "horizontalAlignment": "RIGHT",
+            "verticalAlignment": "MIDDLE"
+        })
+        
+        # 4. Format Values in Col C (Center aligned, bold)
+        ws.format(f"C{start_row+1}:C{start_row+10}", {
+            "textFormat": {
+                "fontFamily": "Lexend",
+                "fontSize": 10,
+                "bold": True,
+                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
+            },
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE"
+        })
+        
+        # 5. Set Column Widths for B and C
+        requests = [
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, # Col B
+                    "properties": {"pixelSize": 260},
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, # Col C
+                    "properties": {"pixelSize": 180},
+                    "fields": "pixelSize"
+                }
+            }
+        ]
+        ws.spreadsheet.batch_update({"requests": requests})
+    except Exception as e:
+        print(f"Card style error: {e}") 
 
 # ----------------------------------------------------------------------
 # Google Sheets helpers
@@ -539,5 +661,91 @@ def create_sheets_blueprint() -> Blueprint:
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 400
+
+# --------------------------------------------------------------
+    # 7. Generate Daily Summary (Vertical Card Style)
+    # --------------------------------------------------------------
+    @bp.route("/process/summary", methods=["POST"])
+    def generate_daily_summary():
+        try:
+            ws_today = _ensure_today_sheet()
+            cards = _parse_sheet_to_cards(ws_today)
+        except RuntimeError as e:
+            return jsonify({"error": f"Failed to read today's sheet: {str(e)}"}), 500
+
+        if not cards:
+            return jsonify({"error": "No cards found in today's sheet to summarize."}), 400
+
+        # Calculate Totals
+        total_cards = len(cards)
+        space_before_gb = 0.0
+        space_after_gb = 0.0
+        duration_before_sec = 0.0
+        duration_after_sec = 0.0
+
+        for card in cards:
+            space_before_gb += _parse_gb_string(card.get("used_space_before_labeling_gb"))
+            space_after_gb += _parse_gb_string(card.get("used_space_after_labeling_gb"))
+            duration_before_sec += _parse_duration_to_seconds(card.get("original_duration_before_labeling"))
+            duration_after_sec += _parse_duration_to_seconds(card.get("original_duration_after_labeling"))
+
+        today_date_formatted = datetime.datetime.now().strftime("%d-%b-%Y")
+        
+        # Build the 11-row vertical card matrix
+        card_matrix = [
+            ["Daily summary", ""], # Row 1 (Header, will be merged)
+            ["Date", today_date_formatted],
+            ["Total cards received", str(total_cards)], # Screenshot mein "recvied" tha, I fixed the spelling to "received"
+            ["Total Used Space (GB) Before Labeling", f"{space_before_gb:,.2f} GB"],
+            ["Total Used Space (GB) After Labeling", f"{space_after_gb:,.2f} GB"],
+            ["Total storage before (TB)", f"{(space_before_gb / 1024):.2f} TB"],
+            ["Total storage after (TB)", f"{(space_after_gb / 1024):.2f} TB"],
+            ["Total Original Duration Before Labeling", _format_duration(duration_before_sec)],
+            ["Total Original Duration After Labeling", _format_duration(duration_after_sec)],
+            ["Total Hours Before", _format_hours_mins(duration_before_sec)],
+            ["Total Hours After", _format_hours_mins(duration_after_sec)]
+        ]
+
+        try:
+            sheet_name = "Summary"
+            try:
+                ws_summary = get_sheet(sheet_name)
+            except RuntimeError:
+                create_new_worksheet(sheet_name)
+                ws_summary = get_sheet(sheet_name)
+                
+            all_values = ws_summary.get_all_values()
+            
+            # Find if today's card already exists (checking Col B for "Date" and Col C for actual date)
+            start_row = None
+            for r_idx, row in enumerate(all_values):
+                # row is a list where index 1 is Col B, index 2 is Col C
+                if len(row) >= 3 and row[1].strip().lower() == "date" and row[2].strip() == today_date_formatted:
+                    start_row = r_idx # 1-based index pointing to the "Daily summary" header row just above the date
+                    break
+            
+            if start_row is not None:
+                actual_start_row = start_row
+                action = "updated"
+            else:
+                # Append new card at the bottom with a 2-row gap
+                actual_start_row = len(all_values) + 2 if len(all_values) > 0 else 2
+                action = "appended"
+
+            # 1. Update the block range (B to C)
+            range_str = f"B{actual_start_row}:C{actual_start_row + 10}"
+            ws_summary.update(values=card_matrix, range_name=range_str)
+            
+            # 2. Apply styling to this specific card
+            _style_vertical_summary_card(ws_summary, actual_start_row)
+
+            return jsonify({
+                "ok": True,
+                "action": action,
+                "start_row": actual_start_row
+            })
+
+        except Exception as e:
+            return jsonify({"error": f"Failed to update Summary sheet: {str(e)}"}), 500
 
     return bp

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { api, host } from "@/lib/api";
 
 export type SheetsIndicatorState = "connecting" | "connected" | "partial" | "error";
 
@@ -107,10 +107,13 @@ export function useSheetsIntegration(setStatus: (msg: string, kind?: "" | "ok" |
       return;
     }
     try {
-      await api("/api/sheets/process/card/finish", {
-        method: "POST",
-        body: JSON.stringify({ cardName: currentCardIdRef.current, finalDuration: 0, usedSpaceAfterLabelingGb: 0 }),
-      });
+      await Promise.all([
+        api("/api/sheets/process/card/finish", {
+          method: "POST",
+          body: JSON.stringify({ cardName: currentCardIdRef.current, finalDuration: 0, usedSpaceAfterLabelingGb: 0 }),
+        }),
+        updateSummary(),
+      ])
       await refreshProcess();
       currentCardIdRef.current = null;
       setStatus("Card finished and updated in sheet", "ok");
@@ -167,12 +170,24 @@ export function useSheetsIntegration(setStatus: (msg: string, kind?: "" | "ok" |
     setResult(null);
   }, []);
 
+
+  const updateSummary = async () => {
+    try {
+      const res = await fetch(host + "/api/sheets/process/summary", { method: "POST", body: JSON.stringify({}) });
+      if (res.ok) {
+
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
   const submitSetup = useCallback(
     async (formData: FormData) => {
       setSubmitting(true);
       setResult({ message: "Connecting...", ok: true });
       try {
-        const response = await fetch("/api/sheets/setup", { method: "POST", body: formData });
+        const response = await fetch(host + "/api/sheets/setup", { method: "POST", body: formData });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Setup failed");
         setResult({ message: `✅ Connected! Spreadsheet ID: ${data.spreadsheetId}`, ok: true });
@@ -191,7 +206,8 @@ export function useSheetsIntegration(setStatus: (msg: string, kind?: "" | "ok" |
 
   useEffect(() => {
     updateIndicator();
-    refreshProcess().catch(() => {});
+    refreshProcess().catch(() => { });
+    updateSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
