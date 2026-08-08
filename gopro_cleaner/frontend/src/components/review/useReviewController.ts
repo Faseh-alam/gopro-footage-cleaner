@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { api, formatClock, host } from "@/lib/api";
+import { api, downloadApi, formatClock, host } from "@/lib/api";
 import type {
   Annotation,
   BatchDetail,
@@ -107,6 +107,7 @@ export function useReviewController() {
   const [scanRoot, setScanRoot] = useState("");
   const [labelRoot, setLabelRoot] = useState("");
   const [tasks, setTasks] = useState<string[]>([]);
+  const [defaultTasks, setDefaultTasks] = useState<string[]>([]);
   const [annotationsByPath, setAnnotationsByPath] = useState<Record<string, Annotation>>({});
   const anchorByPathRef = useRef<Record<string, number>>({});
 
@@ -152,6 +153,13 @@ export function useReviewController() {
   const [scanning, setScanning] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [ffmpegHint, setFfmpegHint] = useState<string | null>(null);
+  // Off by default — when on, queue-work moves raw footage to Trash after trims finish.
+  const [deleteSourceAfterTrim, setDeleteSourceAfterTrim] = useState(false);
+  // In/out marks for WhatsApp share clips (independent of work/garbage markup).
+  const [shareClipIn, setShareClipIn] = useState<number | null>(null);
+  const [shareClipOut, setShareClipOut] = useState<number | null>(null);
+  const [shareClipBusy, setShareClipBusy] = useState(false);
+  const [shareClipQuality, setShareClipQuality] = useState<"720p" | "1080p">("1080p");
   const [appVersion, setAppVersion] = useState("");
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
 
@@ -185,6 +193,7 @@ export function useReviewController() {
     selectedTaskValue,
     scrubTime,
     duration,
+    deleteSourceAfterTrim,
   };
 
   const setStatus = useCallback((message: string, kind: StatusKind = "") => {
@@ -723,6 +732,8 @@ export function useReviewController() {
 
       setIndex(i);
       setScrubTime(0);
+      setShareClipIn(null);
+      setShareClipOut(null);
       setPreviewNote("");
       stopPreviewPoll();
       if (seekTimerRef.current) {
@@ -953,6 +964,37 @@ export function useReviewController() {
     if (stateRef.current.annotationsByPath[video.path]?.complete) await finishCleaningFile();
   }, [annotationContext, annotationFor, currentAnnotation, currentScrubTime, currentVideo, finishCleaningFile, loadAnnotationForPath, setStatus]);
 
+  const deleteSegmentAt = useCallback(
+    async (index: number) => {
+      const video = currentVideo();
+      if (!video) return;
+      const ann = currentAnnotation();
+      const segments = ann?.segments || [];
+      if (index < 0 || index >= segments.length) {
+        setStatus("Segment not found", "error");
+        return;
+      }
+      const seg = segments[index];
+      try {
+        await api("/api/eager/annotations/delete-segment", {
+          method: "POST",
+          body: JSON.stringify({
+            path: video.path,
+            segment_id: seg?.id || undefined,
+            index,
+          }),
+        });
+        setTaskSelectionMode(false);
+        leaveTaskSearch({ clear: true });
+        await loadAnnotationForPath(video.path);
+        setStatus("Deleted segment and everything after it", "ok");
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [currentAnnotation, currentVideo, leaveTaskSearch, loadAnnotationForPath, setStatus],
+  );
+
   const undoSegment = useCallback(async () => {
     const video = currentVideo();
     if (!video) return;
@@ -968,16 +1010,13 @@ export function useReviewController() {
       setStatus("Cleared pending work", "ok");
       return;
     }
-    try {
-      await api("/api/eager/annotations/undo", { method: "POST", body: JSON.stringify({ path: video.path }) });
-    } catch (error: any) {
-      setStatus(error.message, "error");
+    const last = (ann?.segments || []).length - 1;
+    if (last < 0) {
+      setStatus("No segments to undo", "error");
       return;
     }
-    await loadAnnotationForPath(video.path);
-    setTaskSelectionMode(false);
-    setStatus("Deleted last markup — choose a new timestamp", "ok");
-  }, [currentAnnotation, currentVideo, leaveTaskSearch, loadAnnotationForPath, setStatus]);
+    await deleteSegmentAt(last);
+  }, [currentAnnotation, currentVideo, deleteSegmentAt, leaveTaskSearch, setStatus]);
 
   const labelCurrentClip = useCallback(
     (taskOverride?: string) => assignPendingWork(taskOverride),
@@ -1205,6 +1244,33 @@ export function useReviewController() {
     globalTrimPollRef.current = setInterval(pollGlobalTrims, Math.max(1500, perf.trim_poll_ms || 1200));
   }, [perf.trim_poll_ms, pollGlobalTrims]);
 
+  const cancelTrim = useCallback(
+    async (jobId: string) => {
+      if (!jobId) return;
+      try {
+        const data = await api("/api/eager/trim/cancel", {
+          method: "POST",
+          body: JSON.stringify({ job_id: jobId }),
+        });
+        applyGlobalTrimUi(data);
+        setStatus("Cancelled trim", "ok");
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [applyGlobalTrimUi, setStatus],
+  );
+
+  const cancelAllTrims = useCallback(async () => {
+    try {
+      const data = await api("/api/eager/trim/cancel-all", { method: "POST" });
+      applyGlobalTrimUi(data);
+      setStatus(`Cancelled ${data.cancelled_count || 0} trim(s)`, "ok");
+    } catch (error: any) {
+      setStatus(error.message, "error");
+    }
+  }, [applyGlobalTrimUi, setStatus]);
+
   useEffect(() => {
     return () => {
       if (globalTrimPollRef.current) clearInterval(globalTrimPollRef.current);
@@ -1219,7 +1285,17 @@ export function useReviewController() {
   const loadTasks = useCallback(async () => {
     const data = await api("/api/eager/tasks");
     setTasks(data.tasks || []);
+    setDefaultTasks(data.default_tasks || []);
   }, []);
+
+  const isUserDefinedTask = useCallback(
+    (name: string) => {
+      const key = name.trim().toLowerCase();
+      if (!key) return false;
+      return !defaultTasks.some((t) => t.toLowerCase() === key);
+    },
+    [defaultTasks],
+  );
 
   const addTask = useCallback(
     async (name: string) => {
@@ -1234,13 +1310,40 @@ export function useReviewController() {
           body: JSON.stringify({ name: trimmed, label_root: stateRef.current.labelRoot || stateRef.current.scanRoot || scanTargetPath() }),
         });
         setTasks(data.tasks || []);
+        setDefaultTasks(data.default_tasks || defaultTasks);
         setTaskSearch("");
         setStatus(`Task added: ${trimmed}`, "ok");
       } catch (error: any) {
         setStatus(error.message, "error");
       }
     },
-    [scanTargetPath, setStatus],
+    [defaultTasks, scanTargetPath, setStatus],
+  );
+
+  const removeTask = useCallback(
+    async (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      if (!isUserDefinedTask(trimmed)) {
+        setStatus("Default tasks cannot be removed", "error");
+        return;
+      }
+      try {
+        const data = await api("/api/eager/tasks", {
+          method: "DELETE",
+          body: JSON.stringify({ name: trimmed }),
+        });
+        setTasks(data.tasks || []);
+        setDefaultTasks(data.default_tasks || defaultTasks);
+        if (stateRef.current.selectedTaskValue.toLowerCase() === trimmed.toLowerCase()) {
+          setSelectedTaskValue("");
+        }
+        setStatus(`Removed task: ${trimmed}`, "ok");
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [defaultTasks, isUserDefinedTask, setStatus],
   );
 
   const importBatchCsv = useCallback(
@@ -1308,28 +1411,115 @@ export function useReviewController() {
     }
   }, [setStatus]);
 
+  const queueWorkSegments = useCallback(
+    async (paths: string[], label: string) => {
+      if (!paths.length) {
+        setStatus("No videos to queue", "error");
+        return;
+      }
+      const deleteSource = Boolean(stateRef.current.deleteSourceAfterTrim);
+      try {
+        const data = await api("/api/eager/trim/queue-work", {
+          method: "POST",
+          body: JSON.stringify({ paths, delete_source: deleteSource }),
+        });
+        const queued = Number(data.queued || 0);
+        const skipped = Number(data.skipped || 0);
+        const parts = [`Queued ${queued} work segment${queued === 1 ? "" : "s"} ${label}`];
+        if (skipped) parts.push(`${skipped} already trimmed/queued`);
+        if (deleteSource) {
+          if (data.deleted_now) parts.push(`deleted ${data.deleted_now} raw`);
+          else if (data.finish_scheduled) parts.push("raw will be deleted after trims finish");
+          else parts.push("delete source on");
+        }
+        if (Array.isArray(data.errors) && data.errors.length) parts.push(`${data.errors.length} error(s)`);
+        setStatus(parts.join(" · "), data.errors?.length ? "error" : "ok");
+        startGlobalTrimPolling();
+        await pollGlobalTrims();
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [pollGlobalTrims, setStatus, startGlobalTrimPolling],
+  );
+
   const queueClips = useCallback(async () => {
     const current = currentVideo();
     if (!current) return;
-    let ann = currentAnnotation();
-    if (!ann) {
-      await loadAnnotationForPath(current.path);
-      ann = stateRef.current.annotationsByPath[current.path];
+    // Ensure the latest annotation sidecar exists before the server reads it.
+    if (!currentAnnotation()) await loadAnnotationForPath(current.path);
+    await queueWorkSegments([current.path], `for ${current.name}`);
+  }, [currentAnnotation, currentVideo, loadAnnotationForPath, queueWorkSegments]);
+
+  const queueAllClips = useCallback(async () => {
+    const paths = stateRef.current.videos.map((v: VideoItem) => v.path);
+    await queueWorkSegments(paths, "across all videos");
+  }, [queueWorkSegments]);
+
+  const markShareIn = useCallback(() => {
+    if (!currentVideo()) return;
+    const t = Math.max(0, currentScrubTime());
+    setShareClipIn(t);
+    setShareClipOut((out) => (out != null && out <= t ? null : out));
+    setStatus(`Share in: ${formatTime(t)}`, "ok");
+  }, [currentScrubTime, currentVideo, setStatus]);
+
+  const markShareOut = useCallback(() => {
+    if (!currentVideo()) return;
+    const t = Math.max(0, currentScrubTime());
+    const inn = shareClipIn;
+    if (inn == null) {
+      setStatus("Mark share in first (I)", "error");
+      return;
     }
-    const clips = (ann?.segments || [])
-      .filter((s) => s.kind === "work")
-      .map((s) => `${formatTime(s.start)} - ${formatTime(s.end)}`)
-      .join("\n");
+    if (t <= inn + 0.05) {
+      setStatus("Share out must be after in", "error");
+      return;
+    }
+    setShareClipOut(t);
+    setStatus(`Share out: ${formatTime(t)} (${formatTime(t - inn)} clip)`, "ok");
+  }, [currentScrubTime, currentVideo, setStatus, shareClipIn]);
+
+  const clearShareClip = useCallback(() => {
+    setShareClipIn(null);
+    setShareClipOut(null);
+    setStatus("Cleared share clip marks", "ok");
+  }, [setStatus]);
+
+  const downloadShareClip = useCallback(async () => {
+    const video = currentVideo();
+    if (!video) return;
+    if (shareClipIn == null || shareClipOut == null) {
+      setStatus("Mark share in (I) and out (O) first", "error");
+      return;
+    }
+    if (shareClipOut <= shareClipIn + 0.05) {
+      setStatus("Share out must be after in", "error");
+      return;
+    }
+    setShareClipBusy(true);
+    setStatus(`Encoding WhatsApp clip (${shareClipQuality})…`, "ok");
     try {
-      const data = await api("/api/batch", {
-        method: "POST",
-        body: JSON.stringify({ path: current.path, clips: clips.trim(), delete_original: false }),
-      });
-      setStatus(`Queued ${data.clip_count} clips for ${data.input_name}`, "ok");
+      await downloadApi(
+        "/api/eager/share-clip",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            path: video.path,
+            start: shareClipIn,
+            end: shareClipOut,
+            quality: shareClipQuality,
+          }),
+        },
+        `${video.name.replace(/\.[^.]+$/, "")}_share_${shareClipQuality}.mp4`,
+      );
+      setStatus(`WhatsApp clip downloaded (${shareClipQuality})`, "ok");
     } catch (error: any) {
-      setStatus(error.message, "error");
+      setStatus(error.message || "Share clip failed", "error");
+    } finally {
+      setShareClipBusy(false);
     }
-  }, [currentAnnotation, currentVideo, loadAnnotationForPath, setStatus]);
+  }, [currentVideo, setStatus, shareClipIn, shareClipOut, shareClipQuality]);
 
   // Init on mount.
   useEffect(() => {
@@ -1484,6 +1674,18 @@ export function useReviewController() {
     scanning,
     detecting,
     ffmpegHint,
+    deleteSourceAfterTrim,
+    setDeleteSourceAfterTrim,
+    shareClipIn,
+    shareClipOut,
+    shareClipBusy,
+    shareClipQuality,
+    setShareClipQuality,
+    markShareIn,
+    markShareOut,
+    clearShareClip,
+    downloadShareClip,
+    deleteSegmentAt,
     appVersion,
     currentVideo,
     currentAnnotation,
@@ -1511,11 +1713,16 @@ export function useReviewController() {
     chooseFootageFolder,
     refreshSdCards,
     addTask,
+    removeTask,
+    isUserDefinedTask,
     importBatchCsv,
     refreshBatch,
     finishCard,
     completeBatch,
     queueClips,
+    queueAllClips,
+    cancelTrim,
+    cancelAllTrims,
     formatTime,
     formatDurationShort,
     basenamePath,

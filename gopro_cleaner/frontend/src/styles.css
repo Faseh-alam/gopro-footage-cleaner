@@ -131,3 +131,9 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
+
+[data-sonner-toaster][data-sonner-theme='dark'] {
+  --error-text: hsl(356, 35%, 58%) !important;
+  --error-bg: hsl(356, 35%, 8.7%) !important;
+  --error-border: hsl(356, 35%, 26.1%) !important;
+}

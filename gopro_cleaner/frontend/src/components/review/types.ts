@@ -9,6 +9,7 @@ export interface VideoItem {
 }
 
 export interface Segment {
+  id?: string;
   start: number;
   end: number;
   kind: "work" | "garbage";

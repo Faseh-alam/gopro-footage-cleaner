@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -12,6 +13,10 @@ from pathlib import Path
 from .eager import _finish_source_after_trims, _next_clip_number
 from .probe import probe_media
 from .trimmer import TrimJob, _execute_trim, build_output_path, clip_base_stem, job_store
+
+
+class _JobCancelled(Exception):
+    """Internal signal that a queued/running record was cancelled."""
 
 
 @dataclass
@@ -32,16 +37,87 @@ class EagerTrimRecord:
     created_at: float = field(default_factory=time.time)
 
 
+def _worker_count() -> int:
+    """Stream-copy trims are I/O bound — a small pool overlaps them safely."""
+    try:
+        n = int(os.environ.get("GOPRO_TRIM_WORKERS", "2"))
+    except ValueError:
+        n = 2
+    return max(1, min(4, n))
+
+
 class EagerTrimQueue:
     def __init__(self) -> None:
         self._pending: deque[str] = deque()
         self._records: dict[str, EagerTrimRecord] = {}
-        self._pending_finish: set[str] = set()
+        # path -> whether to delete the raw file once its trims finish
+        self._pending_finish: dict[str, bool] = {}
         self._finish_errors: dict[str, str] = {}
+        self._cancelled: set[str] = set()
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="eager-trim-queue")
-        self._worker.start()
+        self._workers = [
+            threading.Thread(target=self._worker_loop, daemon=True, name=f"eager-trim-queue-{i}")
+            for i in range(_worker_count())
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a queued or running job. Returns True if it was still active.
+
+        Queued jobs are dropped immediately; running jobs have their ffmpeg
+        process terminated so the encode stops mid-flight.
+        """
+        with self._condition:
+            record = self._records.get(job_id)
+            if record is None or record.status not in {"queued", "running"}:
+                return False
+            self._cancelled.add(job_id)
+            if record.status == "queued":
+                record.status = "cancelled"
+                record.error = "Cancelled"
+                self._cancelled.discard(job_id)
+                try:
+                    self._pending.remove(job_id)
+                except ValueError:
+                    pass
+                self._condition.notify_all()
+                return True
+            trim_job_id = record.trim_job_id
+
+        # Running — terminate the ffmpeg encode outside the lock.
+        if trim_job_id:
+            trim_job = job_store.get(trim_job_id)
+            if trim_job is not None:
+                job_store.update(trim_job_id, cancel_requested=True)
+                proc = getattr(trim_job, "process", None)
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+        return True
+
+    def cancel_all(self) -> int:
+        """Cancel every queued and running job. Returns how many were cancelled."""
+        with self._lock:
+            active_ids = [
+                r.job_id for r in self._records.values() if r.status in {"queued", "running"}
+            ]
+        return sum(1 for jid in active_ids if self.cancel_job(jid))
+
+    def has_equivalent_job(self, source: Path, start_seconds: float, end_seconds: float) -> bool:
+        """True when a non-failed job already covers this exact source segment."""
+        key = str(source.expanduser().resolve())
+        with self._lock:
+            return any(
+                r.source_path == key
+                and r.status in {"queued", "running", "completed"}
+                and abs(r.start_seconds - start_seconds) < 0.05
+                and abs(r.end_seconds - end_seconds) < 0.05
+                for r in self._records.values()
+            )
 
     def submit(
         self,
@@ -161,7 +237,7 @@ class EagerTrimQueue:
         with self._lock:
             records = list(self._records.values())
         active_records = [r for r in records if r.status in {"queued", "running"}]
-        other_records = [r for r in records if r.status in {"completed", "failed"}]
+        other_records = [r for r in records if r.status in {"completed", "failed", "cancelled"}]
         jobs_out: list[dict] = []
         eta_total = 0.0
         active = len(active_records)
@@ -214,12 +290,18 @@ class EagerTrimQueue:
             "jobs": jobs_out,
         }
 
-    def schedule_source_finish(self, source: Path) -> dict:
-        """Delete raw file after queued trims finish; returns immediately if trims still running."""
+    def schedule_source_finish(self, source: Path, *, delete_source: bool = False) -> dict:
+        """Optionally delete the raw file after its trims finish.
+
+        Returns immediately if trims are still running; the worker retries when
+        the last job for this source completes. ``delete_source`` defaults to
+        False — once True is recorded for a path it sticks for that finish pass.
+        """
         source = source.expanduser().resolve()
         key = str(source)
         with self._condition:
-            self._pending_finish.add(key)
+            prev = self._pending_finish.get(key, False)
+            self._pending_finish[key] = bool(prev or delete_source)
         return self._try_finish_source(source)
 
     def status_for_source(self, source: Path) -> dict:
@@ -271,6 +353,7 @@ class EagerTrimQueue:
         key = str(source.expanduser().resolve())
         with self._lock:
             finish_pending = key in self._pending_finish
+            finish_delete = bool(self._pending_finish.get(key))
             finish_error = self._finish_errors.get(key)
 
         return {
@@ -278,6 +361,7 @@ class EagerTrimQueue:
             "active": active,
             "eta_total_seconds": round(eta_total, 1),
             "finish_pending": finish_pending,
+            "finish_delete_source": finish_delete,
             "finish_error": finish_error,
         }
 
@@ -303,6 +387,7 @@ class EagerTrimQueue:
         with self._condition:
             if key not in self._pending_finish:
                 return {"scheduled": False, "deleted_source": False, "active": 0}
+            delete_source = bool(self._pending_finish.get(key))
             active = sum(
                 1
                 for r in self._records.values()
@@ -311,13 +396,13 @@ class EagerTrimQueue:
         if active > 0:
             return {"scheduled": True, "deleted_source": False, "active": active}
         try:
-            result = _finish_source_after_trims(source, delete_source=True)
+            result = _finish_source_after_trims(source, delete_source=delete_source)
         except Exception as exc:
             with self._condition:
                 self._finish_errors[key] = str(exc)
             raise
         with self._condition:
-            self._pending_finish.discard(key)
+            self._pending_finish.pop(key, None)
             self._finish_errors.pop(key, None)
         return {"scheduled": False, "deleted_source": result.get("deleted_source", False), "active": 0}
 
@@ -329,6 +414,13 @@ class EagerTrimQueue:
                 job_id = self._pending.popleft()
                 record = self._records.get(job_id)
                 if record is None:
+                    continue
+                # Cancelled while still queued — skip without starting ffmpeg.
+                if job_id in self._cancelled:
+                    self._cancelled.discard(job_id)
+                    record.status = "cancelled"
+                    record.error = "Cancelled"
+                    self._condition.notify_all()
                     continue
                 record.status = "running"
 
@@ -367,8 +459,24 @@ class EagerTrimQueue:
                 record.trim_job_id = trim_job.job_id
                 record.output = str(output_path)
                 job_store.create(trim_job)
+
+                # Cancel may have landed between dequeue and job creation.
+                with self._condition:
+                    if job_id in self._cancelled:
+                        job_store.update(trim_job.job_id, cancel_requested=True)
+
                 _execute_trim(trim_job)
                 finished = job_store.get(trim_job.job_id)
+
+                with self._condition:
+                    was_cancelled = job_id in self._cancelled or (
+                        finished is not None and finished.status == "cancelled"
+                    )
+                    if was_cancelled:
+                        self._cancelled.discard(job_id)
+                if was_cancelled:
+                    raise _JobCancelled()
+
                 if finished is None or finished.status != "completed":
                     raise RuntimeError(finished.error if finished else "Trim failed")
 
@@ -385,6 +493,19 @@ class EagerTrimQueue:
                 with self._condition:
                     record.status = "completed"
                     record.output = str(output_path)
+                    self._condition.notify_all()
+            except _JobCancelled:
+                # Remove any partial output the cancelled encode may have left.
+                if record.output:
+                    try:
+                        partial = Path(record.output)
+                        if partial.exists():
+                            partial.unlink()
+                    except OSError:
+                        pass
+                with self._condition:
+                    record.status = "cancelled"
+                    record.error = "Cancelled"
                     self._condition.notify_all()
             except Exception as exc:  # noqa: BLE001
                 with self._condition:

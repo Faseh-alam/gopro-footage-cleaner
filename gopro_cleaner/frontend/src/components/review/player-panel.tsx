@@ -1,5 +1,7 @@
+import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/wc/panel";
+import { Button } from "@/components/ui/button";
 import type { ReviewController } from "./useReviewController";
 
 export function PlayerPanel({ c }: { c: ReviewController }) {
@@ -11,6 +13,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
   const covered = segments.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
   const coverage = duration > 0 ? Math.min(100, Math.round((covered / duration) * 100)) : 0;
   const playFraction = duration > 0 ? Math.min(1, c.scrubTime / duration) : 0;
+  const shareReady = c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
@@ -67,7 +70,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
         >
           {segments.map((s, i) => (
             <div
-              key={i}
+              key={s.id || i}
               title={`${s.kind}${s.task ? ` · ${s.task}` : ""}`}
               className={cn(
                 "absolute inset-y-0",
@@ -88,11 +91,83 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
               }}
             />
           )}
+          {shareReady && duration > 0 && (
+            <div
+              className="absolute inset-y-0 border-x border-sky-400/80 bg-sky-400/25"
+              title="Share clip range"
+              style={{
+                left: `${(c.shareClipIn! / duration) * 100}%`,
+                width: `${Math.max(0.4, ((c.shareClipOut! - c.shareClipIn!) / duration) * 100)}%`,
+              }}
+            />
+          )}
+          {c.shareClipIn != null && duration > 0 && (
+            <div
+              className="absolute top-0 bottom-0 w-0.5 bg-sky-400"
+              style={{ left: `${(c.shareClipIn / duration) * 100}%` }}
+              title={`In ${c.formatTime(c.shareClipIn)}`}
+            />
+          )}
+          {c.shareClipOut != null && duration > 0 && (
+            <div
+              className="absolute top-0 bottom-0 w-0.5 bg-sky-300"
+              style={{ left: `${(c.shareClipOut / duration) * 100}%` }}
+              title={`Out ${c.formatTime(c.shareClipOut)}`}
+            />
+          )}
           <div
             className="absolute inset-y-0 w-px bg-foreground"
             style={{ left: `${playFraction * 100}%` }}
           />
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2">
+        <span className="eyebrow mr-1">Share clip</span>
+        <Button size="sm" variant="outline" disabled={!video} onClick={() => c.markShareIn()}>
+          Mark in <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">I</kbd>
+        </Button>
+        <Button size="sm" variant="outline" disabled={!video} onClick={() => c.markShareOut()}>
+          Mark out <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">O</kbd>
+        </Button>
+        <div className="flex overflow-hidden rounded-sm border border-border">
+          {(["1080p", "720p"] as const).map((q) => (
+            <button
+              key={q}
+              type="button"
+              disabled={c.shareClipBusy}
+              onClick={() => c.setShareClipQuality(q)}
+              className={cn(
+                "px-2 py-1 font-mono text-[10px] uppercase tracking-[0.12em] transition-colors",
+                c.shareClipQuality === q
+                  ? "bg-accent text-accent-foreground"
+                  : "bg-background text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+              )}
+              title={q === "1080p" ? "Sharper, larger file" : "Faster encode, smaller file"}
+            >
+              {q}
+            </button>
+          ))}
+        </div>
+        <Button
+          size="sm"
+          variant="default"
+          disabled={!video || !shareReady || c.shareClipBusy}
+          onClick={() => c.downloadShareClip()}
+          title="Download a WhatsApp-friendly MP4 of the marked range"
+        >
+          {c.shareClipBusy ? `Encoding ${c.shareClipQuality}…` : "Download for WhatsApp"}
+        </Button>
+        {(c.shareClipIn != null || c.shareClipOut != null) && (
+          <Button size="sm" variant="ghost" onClick={() => c.clearShareClip()}>
+            Clear
+          </Button>
+        )}
+        <span className="ml-auto font-mono text-[11px] text-muted-foreground">
+          {c.shareClipIn != null ? c.formatTime(c.shareClipIn) : "—"} →{" "}
+          {c.shareClipOut != null ? c.formatTime(c.shareClipOut) : "—"}
+          {shareReady ? ` · ${c.formatTime(c.shareClipOut! - c.shareClipIn!)}` : ""}
+        </span>
       </div>
 
       {ann?.pendingWork && (
@@ -109,13 +184,24 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           </li>
         )}
         {segments.map((s, i) => (
-          <li key={i} className="flex items-center justify-between gap-3 px-4 py-2 text-xs">
-            <span className="flex items-center gap-2">
+          <li key={s.id || i} className="flex items-center justify-between gap-3 px-4 py-2 text-xs">
+            <span className="flex min-w-0 items-center gap-2">
               <Badge tone={s.kind === "work" ? "accent" : "danger"}>{s.kind}</Badge>
               <span className="truncate text-muted-foreground">{s.task || "—"}</span>
             </span>
-            <span className="font-mono text-[11px] text-muted-foreground">
-              {c.formatTime(s.start)} → {c.formatTime(s.end)}
+            <span className="flex shrink-0 items-center gap-2">
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {c.formatTime(s.start)} → {c.formatTime(s.end)}
+              </span>
+              <button
+                type="button"
+                title="Delete this segment and everything after it"
+                aria-label={`Delete segment ${i + 1}`}
+                onClick={() => c.deleteSegmentAt(i)}
+                className="grid size-6 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
+              >
+                <X className="size-3.5" strokeWidth={2} />
+              </button>
             </span>
           </li>
         ))}

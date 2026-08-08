@@ -361,6 +361,42 @@ def undo_last_segment(video: Path) -> dict:
     return save_annotation(video, existing)
 
 
+def delete_segment(
+    video: Path,
+    *,
+    segment_id: str | None = None,
+    index: int | None = None,
+) -> dict:
+    """Remove a segment and every segment after it (keeps coverage contiguous)."""
+    video = Path(video).expanduser().resolve()
+    existing = load_annotation(video)
+    segments = list((existing or {}).get("segments") or [])
+    if not existing or not segments:
+        raise ValueError("No segments to delete")
+
+    cut_at: int | None = None
+    if segment_id:
+        key = str(segment_id).strip()
+        for i, seg in enumerate(segments):
+            if str(seg.get("id") or "") == key:
+                cut_at = i
+                break
+        if cut_at is None:
+            raise ValueError("Segment not found")
+    elif index is not None:
+        try:
+            cut_at = int(index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("index must be an integer") from exc
+        if cut_at < 0 or cut_at >= len(segments):
+            raise ValueError("Segment index out of range")
+    else:
+        raise ValueError("segment_id or index is required")
+
+    existing["segments"] = segments[:cut_at]
+    return save_annotation(video, existing)
+
+
 def find_sidecars(root: Path) -> list[Path]:
     root = Path(root)
     if not root.is_dir():

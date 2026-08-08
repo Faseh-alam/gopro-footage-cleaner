@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
 from .eager_routes import create_eager_blueprint
@@ -28,20 +28,13 @@ def create_app() -> Flask:
 
     _load_env()
 
-    app = Flask(
-        __name__,
-        template_folder=str(APP_ROOT / "templates"),
-        static_folder=str(APP_ROOT / "static"),
-    )
+    # UI is served by the React/Vite app; Flask is API-only (no templates/static).
+    app = Flask(__name__, static_folder=None)
 
     CORS(app)
 
-    app.register_blueprint(create_eager_blueprint(str(APP_ROOT / "templates"), APP_VERSION))
+    app.register_blueprint(create_eager_blueprint())
     app.register_blueprint(create_cards_blueprint())
-
-    @app.get("/")
-    def index():
-        return render_template("index.html")
 
     @app.get("/api/health")
     def health():

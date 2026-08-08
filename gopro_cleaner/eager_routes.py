@@ -5,7 +5,7 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
-from flask import Blueprint, Response, jsonify, render_template, request, send_file
+from flask import Blueprint, Response, jsonify, request, send_file
 
 from .core import annotation_store, batch_registry
 from .core.eager import (
@@ -15,24 +15,23 @@ from .core.eager import (
     process_reviewed_video,
     scan_mp4_files,
     task_directory,
+    task_output_directory,
 )
 from .core.eager_trim_queue import eager_trim_queue
 from .core.folder_picker import pick_folder
 from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
-from .core.task_store import add_task, load_tasks
+from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
+from .core.share_clip import build_share_clip, download_filename
 from .core.trimmer import move_to_trash
 from .core.work_log import append_work_session, list_work_sessions
 from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
 
 
-def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blueprint:
-    eager = Blueprint("eager", __name__, template_folder=template_folder)
-
-    @eager.get("/review")
-    def review_page():
-        return render_template("eager.html", version=version)
+def create_eager_blueprint() -> Blueprint:
+    """API-only blueprint — the React/Vite app owns / and /review UI routes."""
+    eager = Blueprint("eager", __name__)
 
     @eager.get("/api/eager/config")
     def eager_config():
@@ -88,7 +87,7 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
 
     @eager.get("/api/eager/tasks")
     def eager_tasks():
-        return jsonify({"tasks": load_tasks()})
+        return jsonify({"tasks": load_tasks(), "default_tasks": bundled_tasks()})
 
     @eager.post("/api/eager/tasks")
     def eager_add_task():
@@ -104,7 +103,17 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             root = normalize_path(raw_root)
             task_dir = task_directory(root, name)
             task_dir.mkdir(parents=True, exist_ok=True)
-        return jsonify({"tasks": tasks, "task_dir": str(task_dir) if task_dir else None})
+        return jsonify({"tasks": tasks, "default_tasks": bundled_tasks(), "task_dir": str(task_dir) if task_dir else None})
+
+    @eager.delete("/api/eager/tasks")
+    def eager_remove_task():
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name", "")).strip()
+        try:
+            tasks = remove_task(name)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"tasks": tasks, "default_tasks": bundled_tasks()})
 
     @eager.get("/api/eager/cameras")
     def eager_cameras():
@@ -258,6 +267,151 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             }
         )
 
+    @eager.post("/api/eager/share-clip")
+    def eager_share_clip():
+        """Encode a marked in→out range as a WhatsApp-friendly MP4 download.
+
+        Body: {"path": "...mp4", "start": 12.5, "end": 28.0, "quality": "1080p"}
+        ``quality`` is ``720p`` or ``1080p`` (default). Returns the encoded file
+        as an attachment (not stored with work clips).
+        """
+        from flask import after_this_request
+
+        payload = request.get_json(silent=True) or {}
+        raw_source = str(payload.get("path", "")).strip()
+        quality = str(payload.get("quality") or "1080p").strip()
+        try:
+            start = float(payload.get("start", 0))
+            end = float(payload.get("end", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "start and end must be numbers"}), 400
+        if not raw_source:
+            return jsonify({"error": "path is required"}), 400
+
+        try:
+            source = Path(raw_source).expanduser().resolve(strict=True)
+            temp = build_share_clip(source, start, end, quality=quality)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+
+        path_to_delete = temp
+
+        @after_this_request
+        def _cleanup(response):  # type: ignore[misc]
+            try:
+                path_to_delete.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return response
+
+        return send_file(
+            temp,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=download_filename(source, start, end, quality=quality),
+            max_age=0,
+        )
+
+    @eager.post("/api/eager/trim/queue-work")
+    def eager_trim_queue_work():
+        """Queue every annotated work segment for the given videos.
+
+        Body: {"paths": ["...mp4", ...], "delete_source": false}.
+        Segments already queued/running/completed for the same range are skipped.
+        When ``delete_source`` is true, each source is moved to Trash after its
+        trims finish successfully (never while jobs are still active/cancelled).
+        """
+        payload = request.get_json(silent=True) or {}
+        raw_paths = payload.get("paths") or []
+        delete_source = bool(payload.get("delete_source", False))
+        if not isinstance(raw_paths, list) or not raw_paths:
+            return jsonify({"error": "paths (non-empty list) is required"}), 400
+
+        queued = 0
+        skipped = 0
+        files: list[dict] = []
+        errors: list[str] = []
+        finish_paths: list[Path] = []
+        for raw in raw_paths:
+            source = Path(str(raw)).expanduser()
+            try:
+                source = source.resolve(strict=True)
+            except FileNotFoundError:
+                errors.append(f"Not found: {raw}")
+                continue
+            annotation = annotation_store.load_annotation(source)
+            segments = [
+                s for s in (annotation or {}).get("segments") or []
+                if str(s.get("kind") or "").lower() == "work"
+            ]
+            if not segments:
+                continue
+            file_queued = 0
+            file_skipped = 0
+            for seg in segments:
+                try:
+                    start = float(seg.get("start", 0))
+                    end = float(seg.get("end", 0))
+                except (TypeError, ValueError):
+                    continue
+                if end <= start + 0.05:
+                    continue
+                task_name = str(seg.get("task") or "").strip()
+                if not task_name:
+                    errors.append(f"{source.name}: work segment missing task name")
+                    continue
+                if eager_trim_queue.has_equivalent_job(source, start, end):
+                    skipped += 1
+                    file_skipped += 1
+                    continue
+                try:
+                    # Save under DCIM/###GOPRO/{task-name}/ — one folder per task.
+                    output_dir = task_output_directory(source, task_name)
+                    eager_trim_queue.submit(
+                        source,
+                        start,
+                        end,
+                        output_dir=output_dir,
+                        task=task_name,
+                    )
+                    queued += 1
+                    file_queued += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{source.name}: {exc}")
+            if file_queued:
+                files.append({"path": str(source), "name": source.name, "queued": file_queued})
+            if delete_source and (file_queued or file_skipped):
+                finish_paths.append(source)
+
+        deleted_now = 0
+        finish_scheduled = 0
+        for source in finish_paths:
+            try:
+                result = eager_trim_queue.schedule_source_finish(source, delete_source=True)
+                if result.get("deleted_source"):
+                    deleted_now += 1
+                elif result.get("scheduled"):
+                    finish_scheduled += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{source.name}: finish/delete — {exc}")
+
+        return jsonify(
+            {
+                "ok": True,
+                "queued": queued,
+                "skipped": skipped,
+                "delete_source": delete_source,
+                "deleted_now": deleted_now,
+                "finish_scheduled": finish_scheduled,
+                "files": files,
+                "errors": errors,
+            }
+        )
+
     @eager.post("/api/eager/snippet")
     def eager_snippet():
         """Save the marked I→O range as a task-folder sample (any length)."""
@@ -319,6 +473,20 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
     def eager_trim_active():
         """Global trim queue snapshot (survives clean↔label switch and reload)."""
         return jsonify(eager_trim_queue.status_all())
+
+    @eager.post("/api/eager/trim/cancel")
+    def eager_trim_cancel():
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id", "")).strip()
+        if not job_id:
+            return jsonify({"error": "job_id is required"}), 400
+        cancelled = eager_trim_queue.cancel_job(job_id)
+        return jsonify({"ok": True, "cancelled": cancelled, **eager_trim_queue.status_all()})
+
+    @eager.post("/api/eager/trim/cancel-all")
+    def eager_trim_cancel_all():
+        count = eager_trim_queue.cancel_all()
+        return jsonify({"ok": True, "cancelled_count": count, **eager_trim_queue.status_all()})
 
     @eager.post("/api/eager/clean")
     def eager_clean():
@@ -391,7 +559,8 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         raw_output = str(payload.get("output_root", "")).strip()
         task_name = str(payload.get("task", "")).strip()
         keep_entire = bool(payload.get("keep_entire"))
-        delete_source = bool(payload.get("delete_source", True))
+        # Raw footage is never deleted after trimming, regardless of payload.
+        delete_source = False
         clips_raw = payload.get("clips") or []
 
         if not raw_source or not raw_output or not task_name:
@@ -631,6 +800,29 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": "path is required"}), 400
         try:
             result = annotation_store.undo_last_segment(Path(raw_path))
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @eager.post("/api/eager/annotations/delete-segment")
+    def eager_annotations_delete_segment():
+        """Delete a segment and all segments after it (contiguous timeline)."""
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        segment_id = str(payload.get("segment_id") or payload.get("id") or "").strip() or None
+        index = payload.get("index")
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            result = annotation_store.delete_segment(
+                Path(raw_path),
+                segment_id=segment_id,
+                index=None if index is None else int(index),
+            )
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 404
         except ValueError as exc:

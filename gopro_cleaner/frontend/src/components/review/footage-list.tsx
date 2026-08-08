@@ -1,5 +1,5 @@
 import { cn } from "@/lib/utils";
-import { Badge, ProgressBar } from "@/components/wc/panel";
+import { Badge } from "@/components/wc/panel";
 import type { ReviewController } from "./useReviewController";
 
 export function FootageList({ c }: { c: ReviewController }) {
@@ -50,31 +50,3 @@ export function FootageList({ c }: { c: ReviewController }) {
   );
 }
 
-export function TrimProgress({ c }: { c: ReviewController }) {
-  const { active, jobs, etaTotal } = c.globalTrim;
-  if (!active && !jobs.length) return null;
-
-  return (
-    <div className="border-b border-border p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="eyebrow">Background trims</div>
-        <span className="font-mono text-[10px] text-muted-foreground">
-          {active} · ~{c.formatDurationShort(etaTotal)}
-        </span>
-      </div>
-      <ProgressBar
-        value={jobs.length ? (jobs.reduce((a, j) => a + (j.progress || 0), 0) / jobs.length) * 100 : 0}
-      />
-      <ul className="mt-2 grid gap-1">
-        {jobs.slice(0, 6).map((job) => (
-          <li key={job.job_id} className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-            <span className="truncate">{job.name || c.basenamePath(job.output || job.source_path || "")}</span>
-            <span className="shrink-0 font-mono text-[10px]">
-              {job.status === "running" ? `${Math.round((job.progress || 0) * 100)}%` : job.status}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}

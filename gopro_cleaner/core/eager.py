@@ -28,9 +28,27 @@ NON_TASK_DIR_NAMES = SKIP_DIR_NAMES | {
 }
 
 
+def gopro_media_root_for(source: Path) -> Path:
+    """Nearest DCIM/<3-digit>GOPRO ancestor of a source file, else its parent.
+
+    Trimmed work clips are saved under this root as ``{task-name}/``.
+    """
+    path = source.expanduser().resolve()
+    cursor = path.parent if path.is_file() else path
+    for ancestor in [cursor, *cursor.parents]:
+        if GOPRO_MEDIA_DIR_RE.match(ancestor.name):
+            return ancestor
+    return cursor
+
+
 def task_directory(label_root: Path, task_name: str) -> Path:
-    """Task folder directly beside the footage (no Labeled/ wrapper)."""
+    """Task folder under the footage root: DCIM/###GOPRO/{task-name}/."""
     return label_root.expanduser().resolve() / task_folder_name(task_name)
+
+
+def task_output_directory(source: Path, task_name: str) -> Path:
+    """Where a work clip for ``task_name`` should be written for this source."""
+    return task_directory(gopro_media_root_for(source), task_name)
 
 
 def _looks_like_task_dir_name(name: str) -> bool:
@@ -54,14 +72,14 @@ def is_under_task_folder(path: Path, root: Path) -> bool:
         return False
     if not rel.parts:
         return False
-    task_slugs = {task_folder_name(task) for task in load_tasks()}
+    task_slugs = {task_folder_name(task).lower() for task in load_tasks()}
     first = rel.parts[0]
     if CAMERA_FOLDER_RE.match(first):
         if len(rel.parts) < 2:
             return False
         second = rel.parts[1]
-        return second in task_slugs or _looks_like_task_dir_name(second)
-    return first in task_slugs or _looks_like_task_dir_name(first)
+        return second.lower() in task_slugs or _looks_like_task_dir_name(second)
+    return first.lower() in task_slugs or _looks_like_task_dir_name(first)
 
 
 def _footage_blocked(path: Path, root: Path | None = None) -> bool:
@@ -321,7 +339,7 @@ def _next_clip_number(source: Path, reserved: set[int] | None = None) -> int:
             break
         cursor = cursor.parent
 
-    task_slugs = {task_folder_name(t) for t in load_tasks()}
+    task_slugs = {task_folder_name(t).lower() for t in load_tasks()}
     for ancestor in ancestors:
         try:
             siblings = list(ancestor.iterdir())
@@ -336,7 +354,7 @@ def _next_clip_number(source: Path, reserved: set[int] | None = None) -> int:
             except OSError:
                 continue
             name = sibling.name
-            if not (_looks_like_task_dir_name(name) or name in task_slugs):
+            if not (_looks_like_task_dir_name(name) or name.lower() in task_slugs):
                 continue
             _collect_used_clip_numbers(sibling, base, used)
 
@@ -381,7 +399,7 @@ def trim_single_clip(source: Path, start_seconds: float, end_seconds: float) -> 
     }
 
 
-def _finish_source_after_trims(source: Path, *, delete_source: bool = True) -> dict:
+def _finish_source_after_trims(source: Path, *, delete_source: bool = False) -> dict:
     """Remove the raw file once all trims for this source are done."""
     from .eager_trim_queue import eager_trim_queue
 
@@ -389,11 +407,20 @@ def _finish_source_after_trims(source: Path, *, delete_source: bool = True) -> d
     if not source.exists():
         raise FileNotFoundError(f"Source not found: {source}")
 
-    failed = [j for j in eager_trim_queue.jobs_for_source(source) if j.status == "failed"]
+    jobs = eager_trim_queue.jobs_for_source(source)
+    failed = [j for j in jobs if j.status == "failed"]
     if failed:
         raise RuntimeError(
             f"{len(failed)} trim job(s) failed — fix errors before removing the raw file"
         )
+    cancelled = [j for j in jobs if j.status == "cancelled"]
+    if cancelled and delete_source:
+        # Do not trash the raw file if the user aborted any of its trims.
+        return {
+            "deleted_source": False,
+            "source": str(source),
+            "skipped_delete_reason": "cancelled jobs present",
+        }
 
     deleted = False
     if delete_source and is_raw_footage(source):
@@ -403,7 +430,7 @@ def _finish_source_after_trims(source: Path, *, delete_source: bool = True) -> d
     return {"deleted_source": deleted, "source": str(source)}
 
 
-def finish_cleaning_file(source: Path, *, delete_source: bool = True) -> dict:
+def finish_cleaning_file(source: Path, *, delete_source: bool = False) -> dict:
     """Block until trims finish, then remove the raw file."""
     from .eager_trim_queue import eager_trim_queue
 

@@ -25,6 +25,49 @@ export async function api<T = any>(url: string, options: RequestInit = {}): Prom
   return payload as T;
 }
 
+/** Fetch a binary attachment and trigger a browser download. */
+export async function downloadApi(
+  url: string,
+  options: RequestInit = {},
+  fallbackName = "download.bin",
+): Promise<void> {
+  const isForm = options.body instanceof FormData;
+  const response = await fetch(host + url, {
+    ...options,
+    headers: isForm ? (options.headers ?? {}) : { ...JSON_HEADERS, ...(options.headers || {}) },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let message = `Download failed (${response.status})`;
+    try {
+      const payload = text ? JSON.parse(text) : {};
+      if (payload?.error) message = payload.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  let filename = fallbackName;
+  const cd = response.headers.get("Content-Disposition") || "";
+  const match = /filename\*?=(?:UTF-8''|")?([^\";]+)/i.exec(cd);
+  if (match?.[1]) {
+    try {
+      filename = decodeURIComponent(match[1].replace(/"/g, "").trim());
+    } catch {
+      filename = match[1].replace(/"/g, "").trim() || fallbackName;
+    }
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 export function formatBytes(bytes?: number | null) {
   if (bytes === null || bytes === undefined) return "";
   const units = ["B", "KB", "MB", "GB", "TB"];

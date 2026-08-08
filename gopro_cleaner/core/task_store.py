@@ -155,5 +155,30 @@ def add_task(name: str) -> list[str]:
         return _write_tasks_unlocked(path, tasks)
 
 
+def is_default_task(name: str) -> bool:
+    key = name.strip().lower()
+    if not key:
+        return False
+    return any(existing.lower() == key for existing in bundled_tasks())
+
+
+def remove_task(name: str) -> list[str]:
+    name = name.strip()
+    if not name:
+        raise ValueError("Task name cannot be empty")
+    if is_default_task(name):
+        raise ValueError("Default tasks cannot be removed")
+    with _lock:
+        path = _tasks_path()
+        tasks = _read_tasks_unlocked(path)
+        next_tasks = [t for t in tasks if t.lower() != name.lower()]
+        if len(next_tasks) == len(tasks):
+            raise ValueError("Task not found")
+        return _write_tasks_unlocked(path, next_tasks)
+
+
 def task_folder_name(task: str) -> str:
-    return _slug(task)
+    """Folder name for a task — keeps display casing, strips path-illegal chars."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", task.strip())
+    cleaned = re.sub(r"\s+", "-", cleaned).strip(" .-")
+    return cleaned or "task"

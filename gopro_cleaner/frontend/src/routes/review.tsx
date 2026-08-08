@@ -1,15 +1,25 @@
 import { Logo } from "@/components/wc/logo";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
-import { ArrowUpRight } from "lucide-react";
+import { ArrowUpRight, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Switch } from "@/components/ui/switch";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
 import { TaskPanel } from "@/components/review/task-panel";
-import { FootageList, TrimProgress } from "@/components/review/footage-list";
+import { FootageList } from "@/components/review/footage-list";
+import { TrimDock } from "@/components/review/trim-dock";
 import { BatchPanel } from "@/components/review/batch-panel";
 
 export const Route = createFileRoute("/review")({
@@ -36,6 +46,7 @@ const KEYS: [string, string][] = [
   ["Space", "Play / pause (resets to 1×)"],
   ["← →", "Speed −0.5× / +0.5×"],
   [", .", "−1s / +1s"],
+  ["I / O", "Mark share-clip in / out"],
   ["T", "End work segment + select task"],
   ["Enter", "Assign task to pending work"],
   ["G", "Mark garbage to playhead"],
@@ -128,6 +139,8 @@ function ReviewPage() {
       else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
       else if (event.key === ",") c.fineTune(-1);
       else if (event.key === ".") c.fineTune(1);
+      else if (key === "i") c.markShareIn();
+      else if (key === "o") c.markShareOut();
       else if (key === "t") c.markWork();
       else if (key === "g") c.markGarbage();
       else if (key === "u") c.undoSegment();
@@ -207,9 +220,59 @@ function ReviewPage() {
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
             {cards.statusText}
           </Button>
-          <Button size="sm" variant="default" onClick={() => c.queueClips()} disabled={c.busy}>
-            Queue clips
-          </Button>
+          <div className="flex items-center">
+            <Button
+              size="sm"
+              variant="default"
+              className="rounded-r-none"
+              onClick={() => c.queueClips()}
+              disabled={c.busy}
+              title="Trim all work segments of the current video"
+            >
+              Queue clips
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="default"
+                  className="rounded-l-none border-l border-background/30 px-1.5"
+                  disabled={c.busy}
+                  aria-label="More queue options"
+                >
+                  <ChevronDown className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuItem
+                  onClick={() => c.queueAllClips()}
+                  title="Trim work segments from every annotated video"
+                >
+                  Queue all clips
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="font-normal">
+                  <label
+                    className="flex cursor-pointer items-center justify-between gap-3 py-0.5"
+                    onClick={(e) => e.stopPropagation()}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <span className="text-xs font-medium text-foreground">
+                      Delete source
+                      <span className="mt-0.5 block text-[10px] font-normal text-muted-foreground">
+                        Trash raw footage after trims
+                      </span>
+                    </span>
+                    <Switch
+                      checked={c.deleteSourceAfterTrim}
+                      onCheckedChange={c.setDeleteSourceAfterTrim}
+                      aria-label="Delete source after trim"
+                    />
+                  </label>
+                </DropdownMenuLabel>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
           <Link
             to="/"
             className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
@@ -220,7 +283,7 @@ function ReviewPage() {
       </header>
 
       <p className="border-b border-border px-6 py-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-        Space play · ← → speed · , . scrub 1s · T ends work · G garbage · Enter assigns
+        Space play · ← → speed · , . scrub 1s · I/O share clip · T ends work · G garbage · Enter assigns
       </p>
 
       <main className="grid min-h-0 flex-1 gap-4 p-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)]">
@@ -232,7 +295,6 @@ function ReviewPage() {
         <aside className="panel-surface flex min-h-0 flex-col">
           <TaskPanel c={c} />
           <FootageList c={c} />
-          <TrimProgress c={c} />
           <details className="border-b border-border px-4 py-3">
             <summary className="eyebrow cursor-pointer">Keys</summary>
             <ul className="mt-2 grid gap-1">
@@ -259,6 +321,8 @@ function ReviewPage() {
           {c.status.message}
         </span>
       </footer>
+
+      <TrimDock c={c} />
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { TextInput } from "@/components/wc/field";
@@ -8,24 +9,48 @@ export function TaskPanel({ c }: { c: ReviewController }) {
   const [newTask, setNewTask] = useState("");
   const groups = c.orderedTaskGroups();
 
-  const renderTask = (task: string) => (
-    <button
-      key={task}
-      type="button"
-      onClick={() => {
-        c.setSelectedTaskValue(task);
-        c.touchRecentTask(task);
-      }}
-      className={cn(
-        "block w-full truncate rounded-sm border px-2 py-1.5 text-left text-xs transition-colors",
-        task === c.selectedTaskValue
-          ? "border-accent/50 bg-accent/10 text-foreground"
-          : "border-transparent text-muted-foreground hover:bg-surface-2 hover:text-foreground",
-      )}
-    >
-      {task}
-    </button>
-  );
+  const renderTask = (task: string) => {
+    const deletable = c.isUserDefinedTask(task);
+    return (
+      <div
+        key={task}
+        className={cn(
+          "flex min-w-0 items-center gap-0.5 rounded-sm border pr-0.5 transition-colors",
+          task === c.selectedTaskValue
+            ? "border-accent/50 bg-accent/10"
+            : "border-transparent hover:bg-surface-2",
+        )}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            c.setSelectedTaskValue(task);
+            c.touchRecentTask(task);
+          }}
+          className={cn(
+            "min-w-0 flex-1 truncate px-2 py-1.5 text-left text-xs transition-colors",
+            task === c.selectedTaskValue ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {task}
+        </button>
+        {deletable ? (
+          <button
+            type="button"
+            title={`Remove task “${task}”`}
+            aria-label={`Remove task ${task}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              void c.removeTask(task);
+            }}
+            className="grid size-7 shrink-0 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
+          >
+            <X className="size-3.5" strokeWidth={2} />
+          </button>
+        ) : null}
+      </div>
+    );
+  };
 
   return (
     <div className="grid gap-3 border-b border-border p-4">
@@ -43,7 +68,8 @@ export function TaskPanel({ c }: { c: ReviewController }) {
       />
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Filter only · pick a listed task · New task below to create · T then Enter repeats last · G = garbage
+        Filter only · pick a listed task · New task below to create · custom tasks show × to remove · T then Enter
+        repeats last · G = garbage
       </p>
 
       <div className="max-h-56 overflow-auto rounded-sm border border-border p-1">

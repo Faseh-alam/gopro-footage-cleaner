@@ -22,6 +22,10 @@ _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 _COPY_SUFFIX_RE = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
 
 
+class TrimCancelled(Exception):
+    """Raised when a trim is cancelled mid-flight (not a real failure)."""
+
+
 def _ffmpeg_exe() -> str:
     from .ffmpeg_tools import ffmpeg_bin
 
@@ -49,6 +53,8 @@ class TrimJob:
     message: str = ""
     error: str | None = None
     command: str = ""
+    cancel_requested: bool = False
+    process: subprocess.Popen | None = None
 
 
 @dataclass
@@ -179,6 +185,16 @@ def _run_ffmpeg(command: list[str], duration_seconds: float, job_id: str) -> Non
         raise FFmpegNotFoundError(
             "FFmpeg is not installed or not on PATH. Install FFmpeg and restart. Test: ffmpeg -version"
         ) from exc
+
+    # Publish the handle so cancel_job() can terminate this encode mid-flight.
+    job_store.update(job_id, process=process)
+    current = job_store.get(job_id)
+    if current is not None and current.cancel_requested:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
     assert process.stderr is not None
     stderr_lines: list[str] = []
     for line in process.stderr:
@@ -190,6 +206,11 @@ def _run_ffmpeg(command: list[str], duration_seconds: float, job_id: str) -> Non
             job_store.update(job_id, progress=progress)
 
     return_code = process.wait()
+    job_store.update(job_id, process=None)
+
+    current = job_store.get(job_id)
+    if current is not None and current.cancel_requested:
+        raise TrimCancelled()
     if return_code != 0:
         details = "\n".join(stderr_lines[-8:]) or "No ffmpeg output captured"
         raise RuntimeError(f"ffmpeg failed while trimming the clip:\n{details}")
@@ -336,6 +357,20 @@ def _execute_trim(job: TrimJob) -> None:
             progress=100.0,
             message=f"Saved {job.output_path}{imu_note}",
         )
+    except TrimCancelled:
+        # User cancelled — clean the partial file, no error surfaced.
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        job_store.update(
+            job.job_id,
+            status="cancelled",
+            process=None,
+            error="Cancelled",
+            message="Trim cancelled",
+        )
     except Exception as exc:  # noqa: BLE001 - surfaced to UI
         if temp_path is not None and temp_path.exists():
             try:
@@ -345,6 +380,7 @@ def _execute_trim(job: TrimJob) -> None:
         job_store.update(
             job.job_id,
             status="failed",
+            process=None,
             error=str(exc),
             message="Trim failed",
         )

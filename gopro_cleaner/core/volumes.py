@@ -61,6 +61,11 @@ def _windows_volume_label(letter: str) -> str:
 
 
 def _find_gopro_root(root: Path) -> Path | None:
+    """Footage lives only in DCIM/<3-digit>GOPRO folders.
+
+    One folder → scan it directly. Several (100GOPRO, 101GOPRO, …) → scan DCIM
+    so every GOPRO folder is covered by the recursive scan.
+    """
     dcim = root / "DCIM"
     if not dcim.is_dir():
         return None
@@ -73,8 +78,9 @@ def _find_gopro_root(root: Path) -> Path | None:
         return None
     if not candidates:
         return None
-    preferred = [p for p in candidates if p.name.upper() == "100GOPRO"]
-    return preferred[0] if preferred else sorted(candidates, key=lambda p: p.name)[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    return dcim
 
 
 def _card_id_for(root: Path, label: str) -> str | None:
