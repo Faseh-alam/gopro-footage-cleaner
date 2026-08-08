@@ -1,4 +1,8 @@
-"""Lightweight preview proxies for review scrubbing (optional, off by default for large files)."""
+"""Lightweight 720p preview proxies for reviewing large GoPro files.
+
+Originals stay untouched for trim/export. Review playback prefers the proxy once
+ready, and falls back to HTTP range streaming of the original while it builds.
+"""
 
 from __future__ import annotations
 
@@ -12,17 +16,18 @@ from pathlib import Path
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
-# Do not auto-build previews for huge GoPro files — scrub the original instead.
-MAX_PREVIEW_BYTES = int(os.environ.get("GOPRO_PREVIEW_MAX_MB", "1500")) * 1_000_000
+# Bump when encoder settings change so old caches are ignored.
+_PREVIEW_VERSION = "v6-review-720p"
+
+# Optional override: set GOPRO_PREVIEW_DISABLED=1 to force originals only.
+def _previews_disabled() -> bool:
+    return os.environ.get("GOPRO_PREVIEW_DISABLED", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _cache_dir() -> Path:
     path = Path.home() / ".cache" / "gopro-cleaner" / "previews"
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-_PREVIEW_VERSION = "v4-lite-480p"
 
 
 def _cache_key(source: Path) -> str:
@@ -37,11 +42,66 @@ def _cached_preview_path(source: Path) -> Path:
     return _cache_dir() / f"{_cache_key(source)}.mp4"
 
 
+def _probe_duration_seconds(source: Path) -> float:
+    try:
+        from .ffmpeg_tools import ffprobe_bin
+
+        result = subprocess.run(
+            [
+                ffprobe_bin(),
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        return max(0.0, float((result.stdout or "").strip() or 0))
+    except Exception:
+        return 0.0
+
+
 def _preview_encoder_args() -> list[str]:
-    if platform.system() == "Darwin":
-        return ["-c:v", "h264_videotoolbox", "-b:v", "900k", "-maxrate", "1100k", "-bufsize", "2200k"]
-  # ultrafast + high CRF = smallest/fastest proxy on weak Windows PCs
-    return ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "30", "-threads", "2"]
+    """Prefer hardware encode when available; otherwise fast software x264."""
+    system = platform.system()
+    if system == "Darwin":
+        return [
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "1200k",
+            "-maxrate",
+            "1500k",
+            "-bufsize",
+            "3000k",
+        ]
+    if system == "Windows":
+        # NVENC is much faster on big GoPro files when a GPU is present.
+        # Fall back path is selected at build time if this encoder is missing.
+        prefer = (os.environ.get("GOPRO_PREVIEW_ENCODER") or "auto").strip().lower()
+        if prefer in {"nvenc", "h264_nvenc"}:
+            return ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "1400k", "-maxrate", "1800k", "-bufsize", "2800k"]
+        if prefer in {"qsv", "h264_qsv"}:
+            return ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1400k"]
+    # ultrafast + moderate CRF: small proxy, quick encode, still scrubbable at 8×
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "fastdecode",
+        "-crf",
+        "28",
+        "-threads",
+        "0",
+    ]
 
 
 def _hwaccel_input_args() -> list[str]:
@@ -55,6 +115,7 @@ def _hwaccel_input_args() -> list[str]:
 def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list) -> None:
     from .ffmpeg_tools import ffmpeg_bin
 
+    duration = _probe_duration_seconds(source)
     command = [
         ffmpeg_bin(),
         "-hide_banner",
@@ -66,48 +127,120 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         str(source),
         "-an",
         "-vf",
-        "scale='min(480,iw)':-2,fps=10",
+        # 720p, 12fps — tiny decode cost so 5–8× review feels smooth.
+        "scale='min(720,iw)':-2:flags=fast_bilinear,fps=12",
         *_preview_encoder_args(),
+        "-pix_fmt",
+        "yuv420p",
         "-movflags",
         "+faststart",
         "-g",
-        "30",
+        "12",
         "-keyint_min",
-        "30",
+        "12",
+        "-sc_threshold",
+        "0",
         "-progress",
         "pipe:1",
         "-nostats",
         str(dest),
     ]
+    # Run below normal priority so the encode never starves live playback.
+    popen_kwargs: dict = {}
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+    else:
+        popen_kwargs["preexec_fn"] = lambda: os.nice(10)  # noqa: PLW1509
+    # stderr must go to a file, not a PIPE — an unread PIPE fills up and
+    # deadlocks ffmpeg mid-encode (build then hangs forever at N%).
+    stderr_log = dest.with_suffix(".stderr.log")
+    stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_handle,
         text=True,
         bufsize=1,
+        **popen_kwargs,
     )
     process_holder.append(process)
     with _lock:
         if job_key in _jobs:
             _jobs[job_key]["process"] = process
+
     assert process.stdout is not None
-    source_size = max(source.stat().st_size, 1)
-    target_size = max(source_size * 0.03, 8_000_000)
     for line in process.stdout:
         with _lock:
             job = _jobs.get(job_key)
             if not job or job.get("status") != "running":
                 process.terminate()
                 break
-        if line.startswith("out_time_ms="):
-            if dest.exists():
-                pct = min(95, int(dest.stat().st_size / target_size * 100))
-                with _lock:
-                    if job_key in _jobs and _jobs[job_key].get("status") == "running":
-                        _jobs[job_key]["progress"] = max(_jobs[job_key].get("progress", 0), pct)
+        if line.startswith("out_time_ms=") and duration > 0:
+            try:
+                out_ms = int(line.split("=", 1)[1].strip() or 0)
+                pct = min(99, int((out_ms / 1000.0) / duration * 100))
+            except ValueError:
+                continue
+            with _lock:
+                if job_key in _jobs and _jobs[job_key].get("status") == "running":
+                    _jobs[job_key]["progress"] = max(int(_jobs[job_key].get("progress") or 0), pct)
+
     code = process.wait()
+    try:
+        stderr_handle.close()
+    except OSError:
+        pass
+    err = ""
+    try:
+        err = stderr_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        err = ""
+    finally:
+        try:
+            stderr_log.unlink()
+        except OSError:
+            pass
     if code != 0:
-        raise RuntimeError("ffmpeg failed while building preview")
+        # Auto-fallback: if NVENC/QSV unavailable, retry once with libx264.
+        if "nvenc" in " ".join(command) or "qsv" in " ".join(command):
+            soft = [
+                ffmpeg_bin(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-an",
+                "-vf",
+                "scale='min(720,iw)':-2:flags=fast_bilinear,fps=12",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "fastdecode",
+                "-crf",
+                "28",
+                "-threads",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-g",
+                "12",
+                "-keyint_min",
+                "12",
+                "-sc_threshold",
+                "0",
+                str(dest),
+            ]
+            retry = subprocess.run(soft, capture_output=True, text=True, check=False)
+            if retry.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                return
+            err = (retry.stderr or err or "").strip()
+        raise RuntimeError(err.strip() or "ffmpeg failed while building preview")
 
 
 def cancel_preview(source: Path) -> None:
@@ -131,6 +264,18 @@ def cancel_preview(source: Path) -> None:
         _jobs.pop(key, None)
 
 
+def _public_job(job: dict, extra: dict | None = None) -> dict:
+    """Only JSON-safe fields — the raw job dict holds Thread/Popen objects."""
+    out = {
+        key: job.get(key)
+        for key in ("status", "progress", "path", "cached", "error", "message", "source_bytes", "preview_bytes")
+        if job.get(key) is not None
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
 def preview_status(source: Path, *, start: bool = False) -> dict:
     source = source.expanduser().resolve()
     if not source.exists():
@@ -140,35 +285,43 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
     size = source.stat().st_size
     cached = _cached_preview_path(source)
     if cached.exists() and cached.stat().st_size > 0:
-        return {"status": "ready", "path": str(cached), "cached": True, "progress": 100}
+        return {
+            "status": "ready",
+            "path": str(cached),
+            "cached": True,
+            "progress": 100,
+            "source_bytes": size,
+            "preview_bytes": cached.stat().st_size,
+        }
+
+    if _previews_disabled():
+        return {
+            "status": "skipped",
+            "reason": "disabled",
+            "message": "Preview proxies disabled (GOPRO_PREVIEW_DISABLED)",
+            "source_bytes": size,
+        }
 
     with _lock:
         job = _jobs.get(key)
         if job and job.get("status") == "ready" and Path(job["path"]).exists():
-            return job
+            return _public_job(job)
         if job and job.get("status") == "running":
-            return job
+            return _public_job(job, {"source_bytes": size})
         if job and job.get("status") in {"error", "cancelled"}:
             _jobs.pop(key, None)
 
     if not start:
-        if size > MAX_PREVIEW_BYTES:
-            return {
-                "status": "skipped",
-                "reason": "large_file",
-                "message": "File too large for background preview — scrubbing original",
-            }
-        return {"status": "idle", "progress": 0}
-
-    if size > MAX_PREVIEW_BYTES:
-        return {
-            "status": "skipped",
-            "reason": "large_file",
-            "message": "File too large for background preview — scrubbing original",
-        }
+        return {"status": "idle", "progress": 0, "source_bytes": size}
 
     with _lock:
-        _jobs[key] = {"status": "running", "progress": 0, "process": None}
+        _jobs[key] = {
+            "status": "running",
+            "progress": 0,
+            "process": None,
+            "source_bytes": size,
+            "message": "Building 720p preview for smooth review…",
+        }
 
     def worker() -> None:
         temp = cached.with_suffix(".part.mp4")
@@ -192,6 +345,9 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
                     "cached": False,
                     "progress": 100,
                     "process": None,
+                    "source_bytes": size,
+                    "preview_bytes": cached.stat().st_size,
+                    "message": "Preview ready",
                 }
         except Exception as exc:  # noqa: BLE001
             if temp.exists():
@@ -201,14 +357,20 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
                     pass
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":
-                    _jobs[key] = {"status": "error", "error": str(exc), "progress": 0, "process": None}
+                    _jobs[key] = {
+                        "status": "error",
+                        "error": str(exc),
+                        "progress": 0,
+                        "process": None,
+                        "source_bytes": size,
+                    }
 
     thread = threading.Thread(target=worker, daemon=True, name=f"preview-{source.name}")
     thread.start()
     with _lock:
         if key in _jobs:
             _jobs[key]["thread"] = thread
-    return {"status": "running", "progress": 0}
+    return {"status": "running", "progress": 0, "source_bytes": size, "message": "Building 720p preview…"}
 
 
 def resolve_preview(source: Path) -> Path:

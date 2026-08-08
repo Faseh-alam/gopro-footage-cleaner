@@ -78,10 +78,10 @@ def _bytes_to_gb(size_bytes: int) -> float:
 # ----------------------------------------------------------------------
 # Card statistics (directly from disk)
 # ----------------------------------------------------------------------
-def card_stats(card_path: str | Path) -> dict[str, Any]:
+def card_stats_light(card_path: str | Path) -> dict[str, Any]:
+    """Fast card snapshot: capacity, used space, mp4 count — no ffprobe."""
     root = Path(card_path).expanduser().resolve()
 
-    # Total volume capacity
     try:
         total_bytes = shutil.disk_usage(str(root)).total
         card_capacity = _bytes_to_gb(total_bytes)
@@ -89,33 +89,52 @@ def card_stats(card_path: str | Path) -> dict[str, Any]:
         card_capacity = None
 
     mp4_files = list(root.rglob("*.mp4"))
+    used_space_bytes = 0
+    for path in root.rglob("*"):
+        if path.is_file():
+            try:
+                used_space_bytes += path.stat().st_size
+            except OSError:
+                continue
+
+    used_gb = _bytes_to_gb(used_space_bytes)
+    return {
+        "total_mp4_videos": len(mp4_files),
+        "original_duration": 0.0,
+        "final_duration": 0.0,
+        "card_capacity": card_capacity,
+        "used_space_before_labeling_gb": used_gb,
+        "used_space_after_labeling_gb": used_gb,
+        "video_sizes": {},
+        "mp4_paths": [str(v) for v in mp4_files if v.is_file()],
+    }
+
+
+def card_stats(card_path: str | Path, *, probe_durations: bool = True) -> dict[str, Any]:
+    light = card_stats_light(card_path)
+    if not probe_durations:
+        return light
+
+    root = Path(card_path).expanduser().resolve()
+    mp4_files = list(root.rglob("*.mp4"))
 
     original_duration = 0.0
+    video_sizes: dict[Path, int] = {}
     for video in mp4_files:
+        if video.is_file():
+            try:
+                video_sizes[video.resolve()] = video.stat().st_size
+            except OSError:
+                pass
         dur = _probe_duration(video)
         if dur is not None:
             original_duration += dur
 
-    # Total used space on the card (all files)
-    used_space_before_bytes = 0
-    for path in root.rglob("*"):
-        if path.is_file():
-            try:
-                used_space_before_bytes += path.stat().st_size
-            except OSError:
-                continue
-
-    used_space_after_bytes = used_space_before_bytes   # no trimming
-
-    return {
-        "total_mp4_videos": len(mp4_files),
-        "original_duration": round(original_duration, 3),
-        "final_duration": round(original_duration, 3),
-        "card_capacity": card_capacity,
-        "used_space_before_labeling_gb": _bytes_to_gb(used_space_before_bytes),
-        "used_space_after_labeling_gb": _bytes_to_gb(used_space_after_bytes),
-        "video_sizes": {v.resolve(): v.stat().st_size for v in mp4_files if v.is_file()},
-    }
+    light["original_duration"] = round(original_duration, 3)
+    light["final_duration"] = round(original_duration, 3)
+    light["video_sizes"] = video_sizes
+    light.pop("mp4_paths", None)
+    return light
 
 
 # ----------------------------------------------------------------------

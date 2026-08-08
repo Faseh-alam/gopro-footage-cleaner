@@ -6,12 +6,11 @@ import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
 import { useReviewController } from "@/components/review/useReviewController";
-import { useSheetsIntegration } from "@/components/review/useSheetsIntegration";
+import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
 import { TaskPanel } from "@/components/review/task-panel";
 import { FootageList, TrimProgress } from "@/components/review/footage-list";
 import { BatchPanel } from "@/components/review/batch-panel";
-import { SheetsModal } from "@/components/review/sheets-modal";
 
 export const Route = createFileRoute("/review")({
   head: () => ({
@@ -47,19 +46,21 @@ const KEYS: [string, string][] = [
 
 function ReviewPage() {
   const c = useReviewController();
-  const sheets = useSheetsIntegration(c.setStatus);
+  const cards = useCardTracking(c.setStatus);
 
-  // Once an SD card is detected, register it in the sheet (name is unique).
+  // First encounter today → register card in DB (server skips if already saved today).
   const addedCardRef = useRef<string | null>(null);
   useEffect(() => {
     const path = c.sdCardValue;
     if (!path) return;
     const card = c.sdCards.find((x: any) => (x.scan_path || x.path) === path);
-    const name = card?.id || card?.label || "";
-    if (!name || addedCardRef.current === name) return;
+    const name = String(card?.id || card?.label || "").trim();
+    // Only register detected SD cards (C####), never folder picks / empty selection.
+    if (!name || !/^C\d{4}$/i.test(name)) return;
+    if (addedCardRef.current === name) return;
     addedCardRef.current = name;
-    sheets.addCardToSheets(path, name);
-  }, [c.sdCardValue, c.sdCards, sheets]);
+    cards.addCard(path, name);
+  }, [c.sdCardValue, c.sdCards, cards.addCard]);
 
 
   // Global review shortcuts — mirror the original keyboard model.
@@ -86,11 +87,27 @@ function ReviewPage() {
         }
         if (event.key === "Enter") {
           event.preventDefault();
+          // Filter field only filters — never invent a task from typed text.
           const query = c.taskSearch.trim();
-          const exact = c.orderedTaskGroups().matches.find((t) => t.toLowerCase() === query.toLowerCase());
-          if (exact) c.setSelectedTaskValue(exact);
-          else if (query) c.setSelectedTaskValue("");
-          if (c.currentAnnotation()?.pendingWork) c.labelCurrentClip();
+          const matches = c.orderedTaskGroups().matches;
+          const exact = matches.find((t) => t.toLowerCase() === query.toLowerCase());
+          const highlighted =
+            c.selectedTaskValue && matches.includes(c.selectedTaskValue)
+              ? c.selectedTaskValue
+              : "";
+          const task =
+            exact || highlighted || (!query ? c.lastLabelTask.trim() : "") || "";
+          if (!task) {
+            c.setStatus(
+              query
+                ? "No matching task — pick from the list or add via New task"
+                : "Choose a task first",
+              "error",
+            );
+            return;
+          }
+          c.setSelectedTaskValue(task);
+          if (c.currentAnnotation()?.pendingWork) c.labelCurrentClip(task);
           else c.leaveTaskSearch({ clear: false });
           return;
         }
@@ -131,13 +148,11 @@ function ReviewPage() {
   }, [c]);
 
   const indicatorTone =
-    sheets.indicator === "connected"
+    cards.indicator === "connected"
       ? "bg-success"
-      : sheets.indicator === "partial"
-        ? "bg-warning"
-        : sheets.indicator === "connecting"
-          ? "bg-muted-foreground"
-          : "bg-destructive";
+      : cards.indicator === "connecting"
+        ? "bg-muted-foreground"
+        : "bg-destructive";
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
@@ -171,15 +186,26 @@ function ReviewPage() {
           <Button size="sm" variant="outline" onClick={() => c.scanSource()}>
             Scan
           </Button>
-          <Button size="sm" variant="outline" onClick={() => c.finishCard()}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={async () => {
+              const path = c.sdCardValue;
+              const card = c.sdCards.find((x: any) => (x.scan_path || x.path) === path);
+              const name =
+                String(card?.id || card?.label || cards.currentCardIdRef.current || "").trim();
+              await c.finishCard();
+              if (name) await cards.finishCurrentCard(name);
+            }}
+          >
             Finish card
           </Button>
-          <Button size="sm" variant="outline" onClick={() => sheets.pushCardData()}>
-            Push card data
+          <Button size="sm" variant="outline" onClick={() => cards.pushCardData()}>
+            Save card data
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => sheets.openModal()}>
+          <Button size="sm" variant="ghost" disabled>
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
-            {sheets.statusText}
+            {cards.statusText}
           </Button>
           <Button size="sm" variant="default" onClick={() => c.queueClips()} disabled={c.busy}>
             Queue clips
@@ -233,8 +259,6 @@ function ReviewPage() {
           {c.status.message}
         </span>
       </footer>
-
-      <SheetsModal sheets={sheets} />
     </div>
   );
 }

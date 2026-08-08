@@ -10,7 +10,6 @@ cd "$ROOT"
 VENV_PY="${ROOT}/.venv/bin/python"
 PORT="${GOPRO_CLEANER_PORT:-8765}"
 FLASK_URL="http://127.0.0.1:${PORT}"
-VITE_URL="http://localhost:8081/review"
 
 if [[ ! -x "${VENV_PY}" ]]; then
   echo "Creating virtual environment..."
@@ -104,9 +103,14 @@ if ! curl -fsS "${FLASK_URL}/api/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Give Vite a moment to bind its port before opening the browser
-sleep 1
-open "${VITE_URL}" 2>/dev/null || true
+echo "Waiting for Vite to become ready (auto-detect port)..."
+# Opens the browser and prints: "Vite ready on port N; opening http://localhost:N/review"
+VITE_LINE="$("${VENV_PY}" "${ROOT}/scripts/wait_open_vite.py")"
+echo "${VITE_LINE}"
+VITE_URL="$(printf '%s\n' "${VITE_LINE}" | sed -n 's/.*opening //p')"
+if [[ -z "${VITE_URL}" ]]; then
+  VITE_URL="(auto-detected)"
+fi
 
 echo ""
 echo "========================================================"

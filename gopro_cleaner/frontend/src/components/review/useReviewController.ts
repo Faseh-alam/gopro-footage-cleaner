@@ -96,6 +96,9 @@ function createWorkspace(title?: string): Workspace {
 export function useReviewController() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const playPromiseRef = useRef<Promise<void> | null>(null);
+  const playGenerationRef = useRef(0);
+  const wantPlayingRef = useRef(false);
+  const playbackRateRef = useRef(1);
   const playerWrapRef = useRef<HTMLDivElement | null>(null);
   const taskSearchRef = useRef<HTMLInputElement | null>(null);
 
@@ -153,10 +156,12 @@ export function useReviewController() {
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
 
   const previewTokenRef = useRef(0);
+  const previewPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const seekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
   const trimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const globalTrimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [previewNote, setPreviewNote] = useState("");
 
   // Keep latest state accessible inside stable callbacks / keyboard handler.
   const stateRef = useRef<any>({});
@@ -290,29 +295,103 @@ export function useReviewController() {
     setDuration(v.duration || currentVideo()?.duration || 0);
   }, [currentVideo]);
 
-  // Guard against "play() interrupted by pause()" — always settle the pending
-  // play promise before pausing.
-  const safePlay = useCallback(() => {
+  // Guard against "play() interrupted by pause()" and hung play() promises.
+  // At high playback rates (5–8×) Chrome can stall progressive MP4 streams;
+  // play() then never settles and the old pause path waited forever on it,
+  // which made Space/play/pause dead until the footage was changed (reload).
+  const safePause = useCallback(() => {
     const v = videoRef.current;
+    wantPlayingRef.current = false;
+    playGenerationRef.current += 1;
+    playPromiseRef.current = null;
     if (!v) return;
-    const p = v.play();
-    if (p && typeof p.then === "function") {
-      playPromiseRef.current = p.catch(() => {}) as Promise<void>;
+    try {
+      v.pause();
+    } catch {
+      /* ignore */
     }
   }, []);
 
-  const safePause = useCallback(() => {
+  const safePlay = useCallback(() => {
     const v = videoRef.current;
-    if (!v || v.paused) return;
-    const pending = playPromiseRef.current;
-    if (pending) {
-      playPromiseRef.current = null;
-      pending.then(() => {
-        if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
-      });
-      return;
-    }
-    v.pause();
+    if (!v) return;
+    wantPlayingRef.current = true;
+    const generation = ++playGenerationRef.current;
+
+    const attempt = (isRetry: boolean) => {
+      if (generation !== playGenerationRef.current || !wantPlayingRef.current) return;
+      const el = videoRef.current;
+      if (!el) return;
+
+      try {
+        if (el.ended || (Number.isFinite(el.duration) && el.currentTime >= el.duration - 0.05)) {
+          el.currentTime = 0;
+        }
+      } catch {
+        /* ignore */
+      }
+
+      try {
+        el.playbackRate = playbackRateRef.current || 1;
+      } catch {
+        /* ignore */
+      }
+
+      let p: Promise<void> | undefined;
+      try {
+        p = el.play() as Promise<void>;
+      } catch {
+        p = Promise.reject(new Error("play() threw"));
+      }
+
+      if (!p || typeof p.then !== "function") {
+        playPromiseRef.current = null;
+        return;
+      }
+
+      const tracked = p
+        .then(() => {
+          if (generation !== playGenerationRef.current) return;
+          const cur = videoRef.current;
+          if (cur) {
+            try {
+              cur.playbackRate = playbackRateRef.current || 1;
+            } catch {
+              /* ignore */
+            }
+          }
+        })
+        .catch(() => {
+          if (generation !== playGenerationRef.current || !wantPlayingRef.current) return;
+          if (isRetry) return;
+          // Decoder/network stall recovery: nudge timeline then retry once.
+          const cur = videoRef.current;
+          if (!cur) return;
+          try {
+            const t = Number.isFinite(cur.currentTime) ? cur.currentTime : 0;
+            cur.pause();
+            cur.currentTime = Math.max(0, t);
+          } catch {
+            /* ignore */
+          }
+          window.setTimeout(() => attempt(true), 40);
+        })
+        .finally(() => {
+          if (playPromiseRef.current === tracked) playPromiseRef.current = null;
+        }) as Promise<void>;
+
+      playPromiseRef.current = tracked;
+
+      // Watchdog — hung play() promises freeze the transport controls otherwise.
+      window.setTimeout(() => {
+        if (playPromiseRef.current !== tracked) return;
+        if (generation !== playGenerationRef.current || !wantPlayingRef.current) return;
+        playPromiseRef.current = null;
+        if (!isRetry) attempt(true);
+      }, 1500);
+    };
+
+    attempt(false);
   }, []);
 
   const flushSeek = useCallback(() => {
@@ -326,7 +405,6 @@ export function useReviewController() {
       const v = videoRef.current;
       if (v) {
         safePause();
-
         try {
           v.currentTime = target;
         } catch {
@@ -335,7 +413,7 @@ export function useReviewController() {
       }
       pendingSeekRef.current = null;
     }
-  }, []);
+  }, [safePause]);
 
   const currentScrubTime = useCallback(() => {
     flushSeek();
@@ -382,22 +460,50 @@ export function useReviewController() {
   );
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
-    const clamped = Math.min(
+    const v = videoRef.current;
+    const onOriginal = Boolean(v?.src && v.src.includes("/api/eager/stream?"));
+    let clamped = Math.min(
       PLAYBACK_RATE_MAX,
       Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
     );
-    const v = videoRef.current;
-    if (v) v.playbackRate = clamped;
+    // Multi‑GB originals can't sustain 5–8×; soft-cap until 720p proxy is ready.
+    if (onOriginal && clamped > 2) {
+      clamped = 2;
+      if (announce) {
+        setStatus("Speed capped at 2× on original — wait for 720p preview for 5–8×", "ok");
+        announce = false;
+      }
+    }
+    playbackRateRef.current = clamped;
+    if (v) {
+      const wasPlaying = wantPlayingRef.current || !v.paused;
+      try {
+        v.playbackRate = clamped;
+      } catch {
+        /* ignore */
+      }
+      if (wasPlaying && v.paused) safePlay();
+      else if (wasPlaying) {
+        try {
+          v.playbackRate = clamped;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     setPlaybackRateState(clamped);
     if (announce) setStatus(`Playback ${clamped.toFixed(1)}×`, "ok");
-  }, [setStatus]);
+  }, [safePlay, setStatus]);
 
   const bumpPlaybackRate = useCallback(
     (delta: number) => {
       if (!currentVideo()) return;
       const v = videoRef.current;
-      setPlaybackRate((v?.playbackRate || 1) + delta);
-      if (v?.paused) safePlay();
+      setPlaybackRate((v?.playbackRate || playbackRateRef.current || 1) + delta);
+      if (v?.paused || !wantPlayingRef.current) {
+        // Speeding up while paused/stalled means "skim ahead".
+        safePlay();
+      }
     },
     [currentVideo, safePlay, setPlaybackRate],
   );
@@ -406,7 +512,8 @@ export function useReviewController() {
     const v = videoRef.current;
     if (!v) return;
     setPlaybackRate(1, false);
-    if (v.paused) {
+    // Prefer wantPlayingRef — after a high-speed stall, paused can lie.
+    if (v.paused || !wantPlayingRef.current) {
       safePlay();
       setStatus("Playing at 1.0×", "ok");
     } else {
@@ -460,9 +567,8 @@ export function useReviewController() {
   }, [taskSearch, tasks, recentTaskRank]);
 
   const selectedTask = useCallback(() => {
-    const picked = stateRef.current.selectedTaskValue?.trim();
-    if (picked) return picked;
-    return stateRef.current.taskSearch?.trim() || "";
+    // Filter text must never become a task name — only an explicit list selection.
+    return stateRef.current.selectedTaskValue?.trim() || "";
   }, []);
 
   const focusTaskSearch = useCallback(() => {
@@ -472,11 +578,11 @@ export function useReviewController() {
     setStatus(
       stateRef.current.annotationsByPath[currentVideo()?.path || ""]?.pendingWork
         ? last
-          ? `Enter = ${last} · ↑↓ recent tasks · type to filter or create`
-          : "Pick a recent task or type to create — Enter assigns"
+          ? `Enter = ${last} · ↑↓ filter matches · type to filter`
+          : "Pick a task from the list — Enter assigns"
         : last
-          ? `Enter selects ${last} · ↑↓ recent tasks · type to filter or create`
-          : "Pick a recent task or type to create",
+          ? `Enter selects ${last} · ↑↓ filter matches · type to filter`
+          : "Pick a task from the list or add via New task",
       "ok",
     );
   }, [currentVideo, setStatus]);
@@ -517,16 +623,108 @@ export function useReviewController() {
   }, []);
 
   // ---------------------------------------------------------------------
-  // Load video
+  // Load video (prefer 720p proxy; stream original while proxy builds)
   // ---------------------------------------------------------------------
+  const stopPreviewPoll = useCallback(() => {
+    if (previewPollRef.current) {
+      clearInterval(previewPollRef.current);
+      previewPollRef.current = null;
+    }
+  }, []);
+
+  const cancelPreviewJob = useCallback(async (path: string) => {
+    if (!path) return;
+    try {
+      await api("/api/eager/preview/cancel", {
+        method: "POST",
+        body: JSON.stringify({ path }),
+      });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const swapToPreview = useCallback(
+    (path: string, token: number) => {
+      const v = videoRef.current;
+      if (!v || token !== previewTokenRef.current) return;
+      const t = Number.isFinite(v.currentTime) ? v.currentTime : stateRef.current.scrubTime || 0;
+      const resume = wantPlayingRef.current || !v.paused;
+      const rate = playbackRateRef.current || 1;
+      const previewUrl = host + `/api/eager/preview?path=${encodeURIComponent(path)}`;
+      if (v.src.includes("/api/eager/preview?")) return;
+
+      const onReady = () => {
+        if (token !== previewTokenRef.current) return;
+        try {
+          v.currentTime = t;
+          v.playbackRate = rate;
+        } catch {
+          /* ignore */
+        }
+        setScrubTime(t);
+        setPreviewNote("720p preview");
+        setStatus(`Switched to 720p preview — smooth ${rate.toFixed(1)}× scrubbing`, "ok");
+        if (resume) safePlay();
+      };
+      v.addEventListener("loadedmetadata", onReady, { once: true });
+      v.src = previewUrl;
+      v.load();
+    },
+    [safePlay, setStatus],
+  );
+
+  const pollPreviewReady = useCallback(
+    (path: string, token: number) => {
+      stopPreviewPoll();
+      previewPollRef.current = setInterval(async () => {
+        if (token !== previewTokenRef.current) {
+          stopPreviewPoll();
+          return;
+        }
+        try {
+          // start=1 is idempotent: keeps a running job, restarts a lost one
+          // (e.g. after a backend restart or a cancelled build).
+          const st = await api(
+            `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`,
+          );
+          if (token !== previewTokenRef.current) return;
+          if (st.status === "running") {
+            const pct = Number(st.progress) || 0;
+            setPreviewNote(pct >= 99 ? "Finalizing preview…" : `Building preview ${pct}%`);
+            return;
+          }
+          if (st.status === "ready") {
+            stopPreviewPoll();
+            swapToPreview(path, token);
+            return;
+          }
+          if (st.status === "error" || st.status === "skipped") {
+            stopPreviewPoll();
+            setPreviewNote("Original file");
+          }
+        } catch {
+          /* ignore transient poll errors */
+        }
+      }, 1500);
+    },
+    [stopPreviewPoll, swapToPreview],
+  );
+
   const loadVideo = useCallback(
     async (i: number) => {
       const s = stateRef.current;
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
+      const previous = s.index >= 0 ? s.videos[s.index] : null;
+      if (previous?.path && previous.path !== video.path) {
+        await cancelPreviewJob(previous.path);
+      }
 
       setIndex(i);
       setScrubTime(0);
+      setPreviewNote("");
+      stopPreviewPoll();
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
         seekTimerRef.current = null;
@@ -543,39 +741,78 @@ export function useReviewController() {
       setStatus(`Loading ${video.name}...`);
 
       const v = videoRef.current;
-      if (v) {
-        v.src = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
-        v.load();
-        const onReady = () => {
-          if (token !== previewTokenRef.current) return;
-          setLoadingVideo(false);
-          v.pause();
-          const startAt = resumeTimeForPath(video.path);
-          setScrubTime(startAt);
-          try {
-            v.currentTime = startAt;
-          } catch {
-            /* ignore */
-          }
-          setPlaybackRate(1, false);
-          updateScrubUiFromEl();
-          setStatus(
-            startAt > 0
-              ? `Ready — ${video.name} at ${formatTime(startAt)} (Space to play, ← → speed)`
-              : `Ready — ${video.name} (Space to play, ← → speed)`,
-            "ok",
-          );
-        };
-        const onError = () => {
-          if (token !== previewTokenRef.current) return;
-          setLoadingVideo(false);
-          setStatus("Could not load video", "error");
-        };
-        v.addEventListener("loadedmetadata", onReady, { once: true });
-        v.addEventListener("error", onError, { once: true });
+      if (!v) return;
+
+      wantPlayingRef.current = false;
+      playGenerationRef.current += 1;
+      playPromiseRef.current = null;
+
+      let playUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
+      let usingPreview = false;
+      try {
+        const st = await api(
+          `/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`,
+        );
+        if (token !== previewTokenRef.current) return;
+        if (st.status === "ready") {
+          playUrl = host + `/api/eager/preview?path=${encodeURIComponent(video.path)}`;
+          usingPreview = true;
+          setPreviewNote("720p preview");
+        } else if (st.status === "running") {
+          setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
+          pollPreviewReady(video.path, token);
+        } else if (st.status === "skipped") {
+          setPreviewNote("Original file");
+        } else {
+          // idle → start was requested via start=1; poll until ready
+          setPreviewNote("Building preview…");
+          pollPreviewReady(video.path, token);
+        }
+      } catch {
+        setPreviewNote("Original file");
       }
+
+      v.src = playUrl;
+      v.load();
+      const onReady = () => {
+        if (token !== previewTokenRef.current) return;
+        setLoadingVideo(false);
+        v.pause();
+        const startAt = resumeTimeForPath(video.path);
+        setScrubTime(startAt);
+        try {
+          v.currentTime = startAt;
+        } catch {
+          /* ignore */
+        }
+        setPlaybackRate(1, false);
+        updateScrubUiFromEl();
+        const mode = usingPreview ? "720p preview" : "original (proxy building)";
+        setStatus(
+          startAt > 0
+            ? `Ready — ${video.name} at ${formatTime(startAt)} · ${mode}`
+            : `Ready — ${video.name} · ${mode}`,
+          "ok",
+        );
+      };
+      const onError = () => {
+        if (token !== previewTokenRef.current) return;
+        setLoadingVideo(false);
+        setStatus("Could not load video", "error");
+      };
+      v.addEventListener("loadedmetadata", onReady, { once: true });
+      v.addEventListener("error", onError, { once: true });
     },
-    [loadAnnotationForPath, resumeTimeForPath, setPlaybackRate, setStatus, updateScrubUiFromEl],
+    [
+      cancelPreviewJob,
+      loadAnnotationForPath,
+      pollPreviewReady,
+      resumeTimeForPath,
+      setPlaybackRate,
+      setStatus,
+      stopPreviewPoll,
+      updateScrubUiFromEl,
+    ],
   );
 
   const finishCleaningFile = useCallback(async () => {
@@ -627,7 +864,7 @@ export function useReviewController() {
     focusTaskSearch();
   }, [annotationFor, currentAnnotation, currentScrubTime, currentVideo, focusTaskSearch, loadAnnotationForPath, setStatus]);
 
-  const assignPendingWork = useCallback(async () => {
+  const assignPendingWork = useCallback(async (taskOverride?: string) => {
     const video = currentVideo();
     if (!video) return;
     let ann = currentAnnotation();
@@ -640,19 +877,21 @@ export function useReviewController() {
       setStatus("No pending work — press T to mark", "error");
       return;
     }
-    let task = selectedTask();
+    let task = (taskOverride ?? selectedTask()).trim() || stateRef.current.lastLabelTask?.trim() || "";
     if (!task) {
       setStatus("Choose a task first", "error");
       focusTaskSearch();
       return;
     }
-    if (!stateRef.current.tasks.some((item: string) => item.toLowerCase() === task.toLowerCase())) {
-      const data = await api("/api/eager/tasks", {
-        method: "POST",
-        body: JSON.stringify({ name: task, label_root: stateRef.current.labelRoot || stateRef.current.scanRoot || scanTargetPath() }),
-      });
-      setTasks(data.tasks || []);
+    const existing = stateRef.current.tasks.find(
+      (item: string) => item.toLowerCase() === task.toLowerCase(),
+    );
+    if (!existing) {
+      setStatus("Unknown task — pick from the list or add via New task", "error");
+      focusTaskSearch();
+      return;
     }
+    task = existing;
 
     await api("/api/eager/annotations/append", {
       method: "POST",
@@ -680,7 +919,6 @@ export function useReviewController() {
     focusTaskSearch,
     leaveTaskSearch,
     loadAnnotationForPath,
-    scanTargetPath,
     selectedTask,
     setStatus,
     touchRecentTask,
@@ -741,7 +979,10 @@ export function useReviewController() {
     setStatus("Deleted last markup — choose a new timestamp", "ok");
   }, [currentAnnotation, currentVideo, leaveTaskSearch, loadAnnotationForPath, setStatus]);
 
-  const labelCurrentClip = useCallback(() => assignPendingWork(), [assignPendingWork]);
+  const labelCurrentClip = useCallback(
+    (taskOverride?: string) => assignPendingWork(taskOverride),
+    [assignPendingWork],
+  );
 
   const deleteCurrentFile = useCallback(async () => {
     const video = currentVideo();
@@ -1137,25 +1378,72 @@ export function useReviewController() {
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+
+    let lastUiTick = 0;
     const onTimeUpdate = () => {
       if (!v.paused && Number.isFinite(v.currentTime) && v.currentTime > 0) {
+        // Throttle React updates — high rates otherwise churn the whole review UI.
+        const now = performance.now();
+        if (now - lastUiTick < 80) return;
+        lastUiTick = now;
         setScrubTime(v.currentTime);
       }
     };
     const onLoadedMeta = () => updateScrubUiFromEl();
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
+    const onPlay = () => {
+      wantPlayingRef.current = true;
+      setIsPlaying(true);
+      try {
+        v.playbackRate = playbackRateRef.current || 1;
+      } catch {
+        /* ignore */
+      }
+    };
+    const onPause = () => {
+      // Ignore transient pauses while a play attempt is still intentional.
+      if (wantPlayingRef.current && playPromiseRef.current) return;
+      setIsPlaying(false);
+    };
+    const onEnded = () => {
+      wantPlayingRef.current = false;
+      playPromiseRef.current = null;
+      setIsPlaying(false);
+    };
+    const onWaiting = () => {
+      // Progressive MP4 + 5–8× often underflows. Soft nudge if still meant to play.
+      if (!wantPlayingRef.current) return;
+      if ((playbackRateRef.current || 1) < 2.5) return;
+      window.setTimeout(() => {
+        const el = videoRef.current;
+        if (!el || !wantPlayingRef.current) return;
+        if (!el.paused && el.readyState >= 2) return;
+        try {
+          const t = el.currentTime;
+          el.currentTime = Math.max(0, t);
+        } catch {
+          /* ignore */
+        }
+        if (el.paused) safePlay();
+      }, 350);
+    };
+
     v.addEventListener("timeupdate", onTimeUpdate);
     v.addEventListener("loadedmetadata", onLoadedMeta);
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
+    v.addEventListener("ended", onEnded);
+    v.addEventListener("waiting", onWaiting);
+    v.addEventListener("stalled", onWaiting);
     return () => {
       v.removeEventListener("timeupdate", onTimeUpdate);
       v.removeEventListener("loadedmetadata", onLoadedMeta);
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
+      v.removeEventListener("ended", onEnded);
+      v.removeEventListener("waiting", onWaiting);
+      v.removeEventListener("stalled", onWaiting);
     };
-  }, [updateScrubUiFromEl]);
+  }, [safePlay, updateScrubUiFromEl]);
 
   return {
     videoRef,
@@ -1190,6 +1478,7 @@ export function useReviewController() {
     playbackRate,
     isPlaying,
     loadingVideo,
+    previewNote,
     globalTrim,
     busy,
     scanning,

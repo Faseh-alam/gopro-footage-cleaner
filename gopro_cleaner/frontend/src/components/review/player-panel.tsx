@@ -21,6 +21,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
         </div>
         <div className="flex shrink-0 items-center gap-2 font-mono text-[11px] text-muted-foreground">
           <Badge tone={coverage >= 100 ? "ok" : "muted"}>{coverage}% covered</Badge>
+          {c.previewNote ? <Badge tone="muted">{c.previewNote}</Badge> : null}
           <span>{c.playbackRate.toFixed(1)}×</span>
           <span>
             {c.formatTime(c.scrubTime)} / {c.formatTime(duration)}
@@ -45,7 +46,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           <div className="pointer-events-none absolute inset-0 grid place-items-center gap-1 bg-background/70 text-center backdrop-blur-[2px]">
             <strong className="text-sm">Select task</strong>
             <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-              Type to search · ↑↓ select · Enter assign
+              Type to filter · ↑↓ select · Enter assign
             </span>
           </div>
         )}

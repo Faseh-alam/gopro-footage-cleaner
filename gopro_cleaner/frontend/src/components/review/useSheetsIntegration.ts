@@ -1,71 +1,47 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, host } from "@/lib/api";
+import { api } from "@/lib/api";
 
-export type SheetsIndicatorState = "connecting" | "connected" | "partial" | "error";
+export type CardsIndicatorState = "connecting" | "connected" | "error";
 
-export function useSheetsIntegration(setStatus: (msg: string, kind?: "" | "ok" | "error") => void) {
-  const [indicator, setIndicator] = useState<SheetsIndicatorState>("connecting");
+export function useCardTracking(setStatus: (msg: string, kind?: "" | "ok" | "error") => void) {
+  const [indicator, setIndicator] = useState<CardsIndicatorState>("connecting");
   const [statusText, setStatusText] = useState("Connecting...");
-  const [modalOpen, setModalOpen] = useState(false);
-  const [modalStatusHtml, setModalStatusHtml] = useState<{ hasCreds: boolean; hasSheet: boolean; connOk: boolean | null; connError: string } | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [result, setResult] = useState<{ message: string; ok: boolean } | null>(null);
-
   const currentCardIdRef = useRef<string | null>(null);
-  const processRef = useRef<any>(null);
-
-  const testConnection = useCallback(async () => {
-    try {
-      const data = await api("/api/sheets/test");
-      return data.ok === true;
-    } catch {
-      return false;
-    }
-  }, []);
+  const registeringRef = useRef<string | null>(null);
 
   const updateIndicator = useCallback(async () => {
     try {
-      const status = await api("/api/sheets/status");
-      const hasCreds = status.credentialsExists === true;
-      const hasSheet = status.spreadsheetIdExists === true;
-      if (!hasCreds) {
+      const status = await api("/api/cards/status");
+      if (!status.configured) {
         setIndicator("error");
-        setStatusText("Disconnected");
+        setStatusText("DB not configured");
         return;
       }
-      if (!hasSheet) {
-        setIndicator("partial");
-        setStatusText("Disconnected");
-        return;
-      }
-      const connected = await testConnection();
-      if (connected) {
+      const test = await api("/api/cards/test");
+      if (test.ok) {
         setIndicator("connected");
-        setStatusText("Connected");
+        setStatusText("DB connected");
       } else {
         setIndicator("error");
-        setStatusText("Invalid");
+        setStatusText("DB error");
       }
     } catch {
       setIndicator("error");
-      setStatusText("Error");
+      setStatusText("DB error");
     }
-  }, [testConnection]);
+  }, []);
 
   const refreshProcess = useCallback(
     async (cardName?: string) => {
       try {
-        const data = await api("/api/sheets/process/current");
-        processRef.current = data.currentProcess;
-        if (data.currentProcess) {
-          setStatus(`Google Sheet: ${data.currentProcess.sheetName} (${data.currentProcess.cards.length} cards)`, "ok");
-        } else {
-          setStatus("No active sheet process", "error");
-        }
-        if (cardName && data.currentProcess) {
-          // Card names are unique; paths are shared across cards.
-          const found = data.currentProcess.cards.find((c: any) => c.cardName === cardName);
-          currentCardIdRef.current = found ? found.cardName : null;
+        const data = await api("/api/cards/today");
+        const cards = data.cards || [];
+        setStatus(`Today: ${cards.length} card${cards.length === 1 ? "" : "s"}`, "ok");
+        if (cardName) {
+          const found = cards.find(
+            (c: any) => String(c.cardName || c.card_name || "").toLowerCase() === cardName.toLowerCase(),
+          );
+          currentCardIdRef.current = found ? found.cardName || found.card_name : null;
         }
         return data;
       } catch (error: any) {
@@ -76,156 +52,95 @@ export function useSheetsIntegration(setStatus: (msg: string, kind?: "" | "ok" |
     [setStatus],
   );
 
-
-  const addCardToSheets = useCallback(
+  const addCard = useCallback(
     async (cardPath: string, cardName: string) => {
-      if (!cardPath) return;
+      if (!cardPath || !cardName) return;
+      const key = `${cardName}::${cardPath}`;
+      if (registeringRef.current === key) return;
+      registeringRef.current = key;
       try {
-        const data = await api("/api/sheets/process/card", {
+        setStatus(`Saving card "${cardName}" to database…`);
+        const data = await api("/api/cards/register", {
           method: "POST",
           body: JSON.stringify({ cardPath, cardName }),
         });
+        currentCardIdRef.current = data.card?.card_name || data.card?.cardName || cardName;
         if (data.already_exists) {
-          currentCardIdRef.current = data.card.card_name;
-          setStatus(`Card "${data.card.card_name}" already in sheet`, "ok");
+          setStatus(`Card "${cardName}" already tracked today`, "ok");
         } else {
-          currentCardIdRef.current = data.card.card_name;
+          setStatus(`Card "${cardName}" saved to database`, "ok");
         }
         await refreshProcess(cardName);
-
-        setStatus(`Card "${cardName}" added to sheet (row ${data.sheetRowIndex})`, "ok");
       } catch (error: any) {
-        setStatus(`Failed to add card to sheet: ${error.message}`, "error");
+        setStatus(`Failed to save card: ${error.message}`, "error");
+      } finally {
+        if (registeringRef.current === key) registeringRef.current = null;
       }
     },
     [refreshProcess, setStatus],
   );
 
-  const finishCurrentCard = useCallback(async () => {
-    if (!currentCardIdRef.current) {
-      setStatus("No active card to finish", "error");
-      return;
-    }
-    try {
-      await Promise.all([
-        api("/api/sheets/process/card/finish", {
-          method: "POST",
-          body: JSON.stringify({ cardName: currentCardIdRef.current, finalDuration: 0, usedSpaceAfterLabelingGb: 0 }),
-        }),
-        updateSummary(),
-      ])
-      await refreshProcess();
-      currentCardIdRef.current = null;
-      setStatus("Card finished and updated in sheet", "ok");
-    } catch (error: any) {
-      setStatus(`Failed to finish card: ${error.message}`, "error");
-      if (String(error.message).includes("removed from the sheet")) {
-        setStatus("Card was deleted from the sheet – refreshing...", "error");
-        await refreshProcess();
+  const finishCurrentCard = useCallback(
+    async (cardName?: string) => {
+      const name = (cardName || currentCardIdRef.current || "").trim();
+      if (!name) {
+        setStatus("No active card to finish", "error");
+        return false;
       }
-    }
-  }, [refreshProcess, setStatus]);
+      try {
+        setStatus(`Finishing card "${name}" in database…`);
+        await api("/api/cards/finish", {
+          method: "POST",
+          body: JSON.stringify({ cardName: name }),
+        });
+        await refreshProcess();
+        if (currentCardIdRef.current === name) currentCardIdRef.current = null;
+        setStatus(`Card "${name}" finished and summary updated`, "ok");
+        return true;
+      } catch (error: any) {
+        setStatus(`Failed to finish card: ${error.message}`, "error");
+        return false;
+      }
+    },
+    [refreshProcess, setStatus],
+  );
 
   const pushCardData = useCallback(async () => {
-    if (!currentCardIdRef.current) {
+    const name = currentCardIdRef.current;
+    if (!name) {
       setStatus("No card is currently selected", "error");
       return;
     }
     if (typeof window !== "undefined") {
-      const ok = window.confirm(`Finish card ${currentCardIdRef.current}? This will update the sheet.`);
+      const ok = window.confirm(
+        `Finish card ${name}? This will update the database and daily summary.`,
+      );
       if (!ok) return;
     }
-    await finishCurrentCard();
+    await finishCurrentCard(name);
   }, [finishCurrentCard, setStatus]);
-
-  const openModal = useCallback(async () => {
-    setModalOpen(true);
-    setResult(null);
-    setModalStatusHtml(null);
-    try {
-      const status = await api("/api/sheets/status");
-      const hasCreds = status.credentialsExists === true;
-      const hasSheet = status.spreadsheetIdExists === true;
-      let connOk: boolean | null = null;
-      let connError = "";
-      if (hasCreds && hasSheet) {
-        try {
-          const test = await api("/api/sheets/test");
-          connOk = Boolean(test.ok);
-          if (!connOk) connError = test.error || "unknown error";
-        } catch (error: any) {
-          connOk = false;
-          connError = error.message;
-        }
-      }
-      setModalStatusHtml({ hasCreds, hasSheet, connOk, connError });
-    } catch {
-      /* ignore */
-    }
-    updateIndicator();
-  }, [updateIndicator]);
-
-  const closeModal = useCallback(() => {
-    setModalOpen(false);
-    setResult(null);
-  }, []);
-
-
-  const updateSummary = async () => {
-    try {
-      const res = await fetch(host + "/api/sheets/process/summary", { method: "POST", body: JSON.stringify({}) });
-      if (res.ok) {
-
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  const submitSetup = useCallback(
-    async (formData: FormData) => {
-      setSubmitting(true);
-      setResult({ message: "Connecting...", ok: true });
-      try {
-        const response = await fetch(host + "/api/sheets/setup", { method: "POST", body: formData });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Setup failed");
-        setResult({ message: `✅ Connected! Spreadsheet ID: ${data.spreadsheetId}`, ok: true });
-        await updateIndicator();
-        if (typeof window !== "undefined") {
-          setTimeout(() => window.location.reload(), 1500);
-        }
-      } catch (error: any) {
-        setResult({ message: `❌ ${error.message}`, ok: false });
-      } finally {
-        setSubmitting(false);
-      }
-    },
-    [updateIndicator],
-  );
 
   useEffect(() => {
     updateIndicator();
-    refreshProcess().catch(() => { });
-    updateSummary();
+    // Ensures today's empty daily summary exists even with no SD card.
+    refreshProcess().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return {
     indicator,
     statusText,
-    modalOpen,
-    modalStatusHtml,
-    submitting,
-    result,
-    openModal,
-    closeModal,
-    submitSetup,
-    addCardToSheets,
+    addCard,
     refreshProcess,
+    finishCurrentCard,
     pushCardData,
     currentCardIdRef,
   };
 }
 
-export type SheetsIntegration = ReturnType<typeof useSheetsIntegration>;
+export type CardTracking = ReturnType<typeof useCardTracking>;
+
+/** @deprecated Use useCardTracking */
+export const useSheetsIntegration = useCardTracking;
+export type SheetsIntegration = CardTracking;
+export type SheetsIndicatorState = CardsIndicatorState;

@@ -167,6 +167,8 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify(preview_status(Path(raw_path), start=start))
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"status": "error", "error": str(exc)}), 200
 
     @eager.post("/api/eager/preview/cancel")
     def eager_preview_cancel():
@@ -178,19 +180,6 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
             return jsonify({"error": "path is required"}), 400
         cancel_preview(Path(raw_path))
         return jsonify({"ok": True})
-
-    @eager.get("/api/eager/preview")
-    def eager_preview():
-        raw_path = request.args.get("path", "").strip()
-        if not raw_path:
-            return jsonify({"error": "path is required"}), 400
-        try:
-            path = resolve_preview(Path(raw_path))
-        except FileNotFoundError:
-            return jsonify({"error": "File not found"}), 404
-        except RuntimeError as exc:
-            return jsonify({"error": str(exc)}), 409
-        return send_file(path, mimetype="video/mp4", conditional=True)
 
     @eager.get("/api/eager/stream")
     def eager_stream():
@@ -205,7 +194,41 @@ def create_eager_blueprint(template_folder: str, version: str = "1.0.0") -> Blue
         if path.suffix.upper() != ".MP4":
             return jsonify({"error": "Only MP4 streaming is supported"}), 400
         mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
-        return send_file(path, mimetype=mime, conditional=True)
+        # conditional=True enables HTTP Range / 206 responses so the browser can
+        # seek large originals without downloading the whole 4–8 GB file.
+        response = send_file(
+            path,
+            mimetype=mime,
+            conditional=True,
+            etag=True,
+            max_age=0,
+            last_modified=True,
+        )
+        response.headers["Accept-Ranges"] = "bytes"
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    @eager.get("/api/eager/preview")
+    def eager_preview():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            path = resolve_preview(Path(raw_path))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        response = send_file(
+            path,
+            mimetype="video/mp4",
+            conditional=True,
+            etag=True,
+            max_age=3600,
+            last_modified=True,
+        )
+        response.headers["Accept-Ranges"] = "bytes"
+        return response
 
     @eager.post("/api/eager/trim")
     def eager_trim():

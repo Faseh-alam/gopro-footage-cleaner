@@ -30,6 +30,7 @@ const state = {
   recentTasks: [],
   busy: false,
   previewToken: 0,
+  previewPollTimer: null,
   seekTimer: null,
   pendingSeek: null,
   lastVideoPath: "",
@@ -396,9 +397,8 @@ function currentVideo() {
 }
 
 function selectedTask() {
-  const picked = el.taskSelect.value.trim();
-  if (picked) return picked;
-  return el.taskSearch.value.trim();
+  // Filter text must never become a task name — only an explicit list selection.
+  return el.taskSelect.value.trim();
 }
 
 const RECENT_TASKS_KEY = "gopro_eager_recent_tasks";
@@ -1453,11 +1453,11 @@ function focusTaskSearch() {
   setStatus(
     currentPendingWork()
       ? last
-        ? `Enter = ${last} · ↑↓ recent tasks · type to filter or create`
-        : "Pick a recent task or type to create — Enter assigns"
+        ? `Enter = ${last} · ↑↓ filter matches · type to filter`
+        : "Pick a task from the list — Enter assigns"
       : last
-        ? `Enter selects ${last} · ↑↓ recent tasks · type to filter or create`
-        : "Pick a recent task or type to create",
+        ? `Enter selects ${last} · ↑↓ filter matches · type to filter`
+        : "Pick a task from the list or add via New task",
     "ok",
   );
 }
@@ -1503,10 +1503,18 @@ function updatePlaybackRateUi() {
 }
 
 function setPlaybackRate(rate, { announce = true } = {}) {
-  const clamped = Math.min(
+  let clamped = Math.min(
     PLAYBACK_RATE_MAX,
     Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
   );
+  const onOriginal = String(el.player?.src || "").includes("/api/eager/stream?");
+  if (onOriginal && clamped > 2) {
+    clamped = 2;
+    if (announce) {
+      setStatus("Speed capped at 2× on original — wait for 720p preview for 5–8×", "ok");
+      announce = false;
+    }
+  }
   el.player.playbackRate = clamped;
   updatePlaybackRateUi();
   if (announce) {
@@ -1603,6 +1611,69 @@ async function cancelPreviewJob(path) {
   }
 }
 
+function stopPreviewPoll() {
+  if (state.previewPollTimer) {
+    clearInterval(state.previewPollTimer);
+    state.previewPollTimer = null;
+  }
+}
+
+function swapToPreview(path, token) {
+  if (!el.player || token !== state.previewToken) return;
+  if (String(el.player.src || "").includes("/api/eager/preview?")) return;
+  const t = Number.isFinite(el.player.currentTime) ? el.player.currentTime : state.scrubTime || 0;
+  const resume = !el.player.paused;
+  const rate = Number(el.player.playbackRate) || 1;
+  const onReady = () => {
+    if (token !== state.previewToken) return;
+    try {
+      el.player.currentTime = t;
+      el.player.playbackRate = rate;
+    } catch {
+      /* ignore */
+    }
+    state.scrubTime = t;
+    if (el.previewStatus) el.previewStatus.textContent = "720p preview";
+    updateScrubUi();
+    setStatus(`Switched to 720p preview — smooth ${rate.toFixed(1)}× scrubbing`, "ok");
+    if (resume) el.player.play().catch(() => {});
+  };
+  el.player.addEventListener("loadedmetadata", onReady, { once: true });
+  el.player.src = `/api/eager/preview?path=${encodeURIComponent(path)}`;
+  el.player.load();
+}
+
+function pollPreviewReady(path, token) {
+  stopPreviewPoll();
+  state.previewPollTimer = setInterval(async () => {
+    if (token !== state.previewToken) {
+      stopPreviewPoll();
+      return;
+    }
+    try {
+      // start=1 is idempotent: keeps a running job, restarts a lost one.
+      const st = await api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`);
+      if (token !== state.previewToken) return;
+      if (st.status === "running") {
+        const pct = Number(st.progress) || 0;
+        if (el.previewStatus) el.previewStatus.textContent = pct >= 99 ? "Finalizing preview…" : `Building preview ${pct}%`;
+        return;
+      }
+      if (st.status === "ready") {
+        stopPreviewPoll();
+        swapToPreview(path, token);
+        return;
+      }
+      if (st.status === "error" || st.status === "skipped") {
+        stopPreviewPoll();
+        if (el.previewStatus) el.previewStatus.textContent = "Original file";
+      }
+    } catch {
+      /* ignore */
+    }
+  }, 1500);
+}
+
 async function loadVideo(index) {
   if (index < 0 || index >= state.videos.length) return;
 
@@ -1615,6 +1686,7 @@ async function loadVideo(index) {
   state.index = index;
   restoreClipState(state.videos[index]?.path);
   stopTrimPolling();
+  stopPreviewPoll();
   state.pendingSeek = null;
   state.scrubTime = 0;
   state.activeClipKey = "";
@@ -1632,7 +1704,7 @@ async function loadVideo(index) {
   setTaskSelectionMode(Boolean(currentPendingWork()));
 
   el.currentName.textContent = video.name;
-  el.previewStatus.textContent = "";
+  if (el.previewStatus) el.previewStatus.textContent = "";
   el.playerWrap.classList.add("loading");
   setStatus(`Loading ${video.name}...`);
   if (state.phase === "clean") {
@@ -1646,7 +1718,26 @@ async function loadVideo(index) {
   updateCoverageMeta();
   renderMarkTints();
 
-  el.player.src = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
+  let playUrl = `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
+  let usingPreview = false;
+  try {
+    const st = await api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`);
+    if (token !== state.previewToken) return;
+    if (st.status === "ready") {
+      playUrl = `/api/eager/preview?path=${encodeURIComponent(video.path)}`;
+      usingPreview = true;
+      if (el.previewStatus) el.previewStatus.textContent = "720p preview";
+    } else if (st.status === "running" || st.status === "idle") {
+      if (el.previewStatus) el.previewStatus.textContent = `Building preview ${Number(st.progress) || 0}%`;
+      pollPreviewReady(video.path, token);
+    } else if (el.previewStatus) {
+      el.previewStatus.textContent = "Original file";
+    }
+  } catch {
+    if (el.previewStatus) el.previewStatus.textContent = "Original file";
+  }
+
+  el.player.src = playUrl;
   el.player.load();
 
   const onReady = async () => {
@@ -1668,10 +1759,11 @@ async function loadVideo(index) {
       startTrimPolling();
     }
     updateContextHint();
+    const mode = usingPreview ? "720p preview" : "original (proxy building)";
     setStatus(
       startAt > 0
-        ? `Ready — ${video.name} at ${formatTime(startAt)} (Space to play, ← → speed)`
-        : `Ready — ${video.name} (Space to play, ← → speed)`,
+        ? `Ready — ${video.name} at ${formatTime(startAt)} · ${mode}`
+        : `Ready — ${video.name} · ${mode}`,
       "ok",
     );
   };
@@ -1682,6 +1774,7 @@ async function loadVideo(index) {
     () => {
       if (token !== state.previewToken) return;
       el.playerWrap.classList.remove("loading");
+      hideLoading();
       setStatus("Could not load video", "error");
     },
     { once: true },
@@ -1726,7 +1819,10 @@ function applySelectedPath(scanPath, { label = "", manual = false } = {}) {
   state.labelRoot = scanPath;
 
   const cardLabel = selectedSdCardLabel() || label || "Card";
-  addCardToSheets(scanPath, cardLabel);
+  // Only register real detected SD cards (C####) — never manual "Open footage" folders.
+  if (!manual && /^C\d{4}$/i.test(String(cardLabel).trim())) {
+    addCardToSheets(scanPath, cardLabel);
+  }
 
   ensureWorkTimerRunning(scanPath);
   const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
@@ -2154,23 +2250,19 @@ async function assignPendingWork() {
     return;
   }
 
-  let task = selectedTask();
+  let task = selectedTask() || (state.lastLabelTask || "").trim();
   if (!task) {
     setStatus("Choose a task first", "error");
     focusTaskSearch();
     return;
   }
-  if (!state.tasks.some((item) => item.toLowerCase() === task.toLowerCase())) {
-    const data = await api("/api/eager/tasks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: task,
-        label_root: state.labelRoot || state.scanRoot || scanTargetPath(),
-      }),
-    });
-    state.tasks = data.tasks || [];
+  const existing = state.tasks.find((item) => item.toLowerCase() === task.toLowerCase());
+  if (!existing) {
+    setStatus("Unknown task — pick from the list or add via New task", "error");
+    focusTaskSearch();
+    return;
   }
+  task = existing;
 
   await api("/api/eager/annotations/append", {
     method: "POST",
@@ -2327,20 +2419,29 @@ el.taskSearch.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
 
-    // Check if the user is trying to create a brand new task
+    // Filter field only filters — never invent a task from typed text.
     const query = el.taskSearch.value.trim();
-    const exactMatch = [...el.taskSelect.options].find(
-      opt => opt.value.toLowerCase() === query.toLowerCase()
+    const options = [...el.taskSelect.options];
+    const exactMatch = options.find(
+      (opt) => opt.value.toLowerCase() === query.toLowerCase(),
     );
 
     if (exactMatch) {
       el.taskSelect.value = exactMatch.value;
     } else if (query) {
-      el.taskSelect.value = ""; // Forces selectedTask() to pull from the search string
+      const current = el.taskSelect.value;
+      const stillVisible = options.some((opt) => opt.value === current);
+      if (!stillVisible || !current) {
+        setStatus("No matching task — pick from the list or add via New task", "error");
+        return;
+      }
+    } else if (!el.taskSelect.value && state.lastLabelTask) {
+      const lastOpt = options.find((opt) => opt.value === state.lastLabelTask);
+      if (lastOpt) el.taskSelect.value = lastOpt.value;
     }
 
     if (currentPendingWork()) {
-      labelCurrentClip(); // This will automatically create the task if it doesn't exist yet
+      labelCurrentClip();
     } else {
       leaveTaskSearch({ clear: false });
     }

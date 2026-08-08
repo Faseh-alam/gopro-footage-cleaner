@@ -47,8 +47,8 @@
         </div>
         <button type="button" id="finish-card-btn" class="finish-btn">Finish Card</button>
         <button type="button" id="push-card-data-btn" class="push-card-btn">Push Card Data</button>
-        <button type="button" id="sheets-setup-btn" class="sheets-btn" title="Connect Google Sheets">
-          <span id="sheets-indicator" class="sheets-indicator" title="Google Sheets connection status"></span>
+        <button type="button" id="sheets-setup-btn" class="sheets-btn" title="Database connection status">
+          <span id="sheets-indicator" class="sheets-indicator" title="Database connection status"></span>
           <span id="setup-status-text">Connecting...</span>
         </button>
         <button type="button" id="queue-clips-btn" class="update-btn" title="Queue selected clips for processing">Queue
@@ -234,27 +234,14 @@ batch-1,Factory A,C1235,stereo,ST-02"></textarea>
   <div id="sheets-modal" class="sheets-modal hidden">
     <div class="sheets-modal-content">
       <div class="sheets-modal-header">
-        <h2>Google Sheets Setup</h2>
+        <h2>Database Status</h2>
         <button type="button" id="sheets-modal-close" class="sheets-modal-close">&times;</button>
       </div>
       <div id="sheets-status" class="sheets-status"></div>
-      <form id="sheets-form" enctype="multipart/form-data">
-        <div class="form-group">
-          <label for="sheets-credentials">Credentials File (JSON)</label>
-          <input type="file" id="sheets-credentials" name="credentials" accept=".json" required />
-          <span class="hint">Service account key file from Google Cloud Console</span>
-        </div>
-        <div class="form-group">
-          <label for="sheets-spreadsheet-id">Spreadsheet ID (optional)</label>
-          <input type="text" id="sheets-spreadsheet-id" name="spreadsheetId"
-            placeholder="Leave empty to create a new sheet" />
-          <span class="hint">If empty, a new spreadsheet will be created</span>
-        </div>
-        <div class="sheets-form-actions">
-          <button type="submit" class="primary">Connect</button>
-          <button type="button" id="sheets-modal-cancel" class="secondary">Cancel</button>
-        </div>
-      </form>
+      <p class="hint">Card data is stored in Supabase. Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the project .env file.</p>
+      <div class="sheets-form-actions">
+        <button type="button" id="sheets-modal-cancel" class="secondary">Close</button>
+      </div>
       <div id="sheets-result" class="sheets-result"></div>
     </div>
   </div>

@@ -16,7 +16,7 @@ from .core.sheet_import import parse_sheet, preview_to_dict, queue_import
 from .core.timestamps import format_timestamp, parse_clip_lines
 from .core.trimmer import job_store, move_to_trash
 from .core.volumes import list_volume_roots
-from .core.routes_sheets import create_sheets_blueprint
+from .core.routes_cards import create_cards_blueprint
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
@@ -24,6 +24,10 @@ APP_VERSION = "2.18.2-testing"
 
 
 def create_app() -> Flask:
+    from .core.supabase_db import _load_env
+
+    _load_env()
+
     app = Flask(
         __name__,
         template_folder=str(APP_ROOT / "templates"),
@@ -33,7 +37,7 @@ def create_app() -> Flask:
     CORS(app)
 
     app.register_blueprint(create_eager_blueprint(str(APP_ROOT / "templates"), APP_VERSION))
-    app.register_blueprint(create_sheets_blueprint());
+    app.register_blueprint(create_cards_blueprint())
 
     @app.get("/")
     def index():

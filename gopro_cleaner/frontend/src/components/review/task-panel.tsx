@@ -43,7 +43,7 @@ export function TaskPanel({ c }: { c: ReviewController }) {
       />
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Recent tasks pinned · T then Enter repeats last task · G = garbage
+        Filter only · pick a listed task · New task below to create · T then Enter repeats last · G = garbage
       </p>
 
       <div className="max-h-56 overflow-auto rounded-sm border border-border p-1">
