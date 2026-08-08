@@ -8,10 +8,18 @@ The app has two parts:
 
 | Part | Role |
 |------|------|
-| **React UI** (Vite dev server) | All screens — browse, review, queue trims |
-| **Flask API** (`127.0.0.1:8765`) | Video probing, trimming, annotations, SD cards, optional Supabase card tracking |
+| **React UI** (`gopro_cleaner/web`) | Built SPA — browse, review, queue trims |
+| **Flask** (`127.0.0.1:8765`) | Serves the UI **and** the API (probe, trim, annotations, cards, optional Supabase) |
 
-There is no legacy HTML frontend. Use the Vite URLs below, not the Flask port alone, for the UI.
+Production (`run.bat` / `run.sh`) only needs Python and the committed build in `gopro_cleaner/web` — colleagues do **not** need Node. Maintainers rebuild and commit that folder before pushing:
+
+```bash
+cd gopro_cleaner/frontend
+npm install
+npm run build:flask
+```
+
+UI hot-reload development uses `run.dev.bat` / `run.dev.sh`.
 
 ---
 
@@ -19,8 +27,11 @@ There is no legacy HTML frontend. Use the Vite URLs below, not the Flask port al
 
 - **Windows 10/11** or **macOS**
 - **Python 3.10+** ([python.org](https://www.python.org/downloads/) — on Windows, check “Add python.exe to PATH”)
-- **Node.js 18+** and **npm** ([nodejs.org](https://nodejs.org/) or `brew install node` on Mac)
 - **FFmpeg** — installed automatically on first run via the `static-ffmpeg` Python package (a system FFmpeg on `PATH` also works)
+
+For UI development only:
+
+- **Node.js 18+** and **npm**, plus a local copy of `gopro_cleaner/frontend`
 
 Optional:
 
@@ -40,12 +51,10 @@ Optional:
 
 - Create `.venv` and install Python dependencies from `requirements.txt`
 - Download FFmpeg if needed
-- Run `npm install` in `gopro_cleaner/frontend` on first run
-- Start the **Vite** frontend in a separate window
-- Start the **Flask** API on port **8765** in the main window
-- Open your browser to **`http://localhost:<vite-port>/review`** (port is detected automatically; often `5173` or `8081`)
+- Start **Flask** on port **8765**, serving both the API and the built UI from `gopro_cleaner/web`
+- Open **`http://127.0.0.1:8765/review`**
 
-If Node.js is missing, `run.bat` may try to install it via `winget`. After that, **close the terminal and run `run.bat` again** so `node` is on your PATH.
+No Node.js is required for this path. If the window closes with an error, the script pauses so you can read the message.
 
 ### macOS / Linux
 
@@ -55,17 +64,17 @@ chmod +x run.sh
 ./run.sh
 ```
 
-Install Node.js first if the script reports it missing (`brew install node`).
-
-Both servers run in the background; press **Ctrl+C** in that terminal to stop Flask and Vite.
+Press **Ctrl+C** to stop the server.
 
 ### Change the API port
 
-Set environment variable **`GOPRO_CLEANER_PORT`** before starting (default `8765`). The React app calls `http://127.0.0.1:8765/` for API requests (`gopro_cleaner/frontend/src/lib/api.ts`).
+Set environment variable **`GOPRO_CLEANER_PORT`** before starting (default `8765`). In production the UI uses same-origin `/api/...` URLs. In Vite dev, the UI calls `http://127.0.0.1:8765`.
 
-### Manual development setup
+### UI development (Vite)
 
-Use this if you prefer two terminals instead of `run.bat` / `run.sh`:
+Use **`run.dev.bat`** (Windows) or **`run.dev.sh`** (macOS/Linux) for hot reload. Before you push UI changes, run `npm run build:flask` and commit the updated `gopro_cleaner/web` so `run.bat` users get the new UI without installing Node.
+
+Manual two-terminal setup:
 
 **Terminal 1 — API**
 
@@ -80,7 +89,7 @@ export GOPRO_LITE_MODE=1
 python -m gopro_cleaner
 ```
 
-**Terminal 2 — UI**
+**Terminal 2 — UI (dev)**
 
 ```bash
 cd gopro_cleaner/frontend

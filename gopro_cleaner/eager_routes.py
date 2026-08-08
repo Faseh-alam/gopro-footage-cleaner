@@ -23,14 +23,14 @@ from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
 from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
-from .core.share_clip import build_share_clip, download_filename
+from .core.share_clip import prepare_share_download, take_prepared_download
 from .core.trimmer import move_to_trash
 from .core.work_log import append_work_session, list_work_sessions
 from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
 
 
 def create_eager_blueprint() -> Blueprint:
-    """API-only blueprint — the React/Vite app owns / and /review UI routes."""
+    """API-only blueprint — UI is served from gopro_cleaner/web (or Vite in dev)."""
     eager = Blueprint("eager", __name__)
 
     @eager.get("/api/eager/config")
@@ -268,15 +268,14 @@ def create_eager_blueprint() -> Blueprint:
         )
 
     @eager.post("/api/eager/share-clip")
-    def eager_share_clip():
-        """Encode a marked in→out range as a WhatsApp-friendly MP4 download.
+    def eager_share_clip_prepare():
+        """Encode a share clip and return a short-lived GET download URL.
 
         Body: {"path": "...mp4", "start": 12.5, "end": 28.0, "quality": "1080p"}
-        ``quality`` is ``720p`` or ``1080p`` (default). Returns the encoded file
-        as an attachment (not stored with work clips).
-        """
-        from flask import after_this_request
 
+        Two-step flow so download managers (IDM) can re-GET the same URL. POST
+        only returns JSON; the MP4 is served by GET /api/eager/share-clip/<token>.
+        """
         payload = request.get_json(silent=True) or {}
         raw_source = str(payload.get("path", "")).strip()
         quality = str(payload.get("quality") or "1080p").strip()
@@ -290,7 +289,7 @@ def create_eager_blueprint() -> Blueprint:
 
         try:
             source = Path(raw_source).expanduser().resolve(strict=True)
-            temp = build_share_clip(source, start, end, quality=quality)
+            prepared = prepare_share_download(source, start, end, quality=quality)
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
         except ValueError as exc:
@@ -298,23 +297,29 @@ def create_eager_blueprint() -> Blueprint:
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 500
 
-        path_to_delete = temp
+        return jsonify({"ok": True, **prepared})
 
-        @after_this_request
-        def _cleanup(response):  # type: ignore[misc]
-            try:
-                path_to_delete.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return response
+    @eager.get("/api/eager/share-clip/<token>")
+    def eager_share_clip_download(token: str):
+        """Serve a previously encoded share clip (IDM-safe; may be fetched twice)."""
+        try:
+            path, filename = take_prepared_download(token)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
 
-        return send_file(
-            temp,
+        response = send_file(
+            path,
             mimetype="video/mp4",
             as_attachment=True,
-            download_name=download_filename(source, start, end, quality=quality),
+            download_name=filename,
             max_age=0,
+            conditional=True,
         )
+        # Help cross-origin download managers / browser saves from Vite origin.
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Disposition, Content-Length"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @eager.post("/api/eager/trim/queue-work")
     def eager_trim_queue_work():

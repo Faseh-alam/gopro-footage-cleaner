@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { api, downloadApi, formatClock, host } from "@/lib/api";
+import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
 import type {
   Annotation,
   BatchDetail,
@@ -165,6 +165,7 @@ export function useReviewController() {
 
   const previewTokenRef = useRef(0);
   const previewPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prefetchedPreviewRef = useRef<string>("");
   const seekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
   const trimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -653,6 +654,26 @@ export function useReviewController() {
     }
   }, []);
 
+  // Once the current video's proxy is ready, warm the next one in the queue so
+  // stepping forward opens the 720p preview directly instead of the original.
+  const prefetchNextPreview = useCallback(
+    (fromIndex: number) => {
+      const s = stateRef.current;
+      let next = nextIncompleteIndex(fromIndex + 1);
+      if (next === fromIndex) next = -1;
+      if (next < 0 && fromIndex + 1 < s.videos.length) next = fromIndex + 1;
+      if (next < 0 || next === fromIndex) return;
+      const path = s.videos[next]?.path;
+      if (!path || path === s.videos[fromIndex]?.path) return;
+      if (prefetchedPreviewRef.current === path) return;
+      prefetchedPreviewRef.current = path;
+      api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`).catch(() => {
+        /* best-effort warmup */
+      });
+    },
+    [nextIncompleteIndex],
+  );
+
   const swapToPreview = useCallback(
     (path: string, token: number) => {
       const v = videoRef.current;
@@ -675,12 +696,13 @@ export function useReviewController() {
         setPreviewNote("720p preview");
         setStatus(`Switched to 720p preview — smooth ${rate.toFixed(1)}× scrubbing`, "ok");
         if (resume) safePlay();
+        prefetchNextPreview(stateRef.current.index);
       };
       v.addEventListener("loadedmetadata", onReady, { once: true });
       v.src = previewUrl;
       v.load();
     },
-    [safePlay, setStatus],
+    [prefetchNextPreview, safePlay, setStatus],
   );
 
   const pollPreviewReady = useCallback(
@@ -729,6 +751,15 @@ export function useReviewController() {
       if (previous?.path && previous.path !== video.path) {
         await cancelPreviewJob(previous.path);
       }
+      // A stale warmed-up build (user jumped elsewhere) shouldn't keep encoding.
+      if (
+        prefetchedPreviewRef.current &&
+        prefetchedPreviewRef.current !== video.path &&
+        prefetchedPreviewRef.current !== previous?.path
+      ) {
+        cancelPreviewJob(prefetchedPreviewRef.current);
+      }
+      prefetchedPreviewRef.current = "";
 
       setIndex(i);
       setScrubTime(0);
@@ -769,6 +800,7 @@ export function useReviewController() {
           playUrl = host + `/api/eager/preview?path=${encodeURIComponent(video.path)}`;
           usingPreview = true;
           setPreviewNote("720p preview");
+          prefetchNextPreview(i);
         } else if (st.status === "running") {
           setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
           pollPreviewReady(video.path, token);
@@ -818,6 +850,7 @@ export function useReviewController() {
       cancelPreviewJob,
       loadAnnotationForPath,
       pollPreviewReady,
+      prefetchNextPreview,
       resumeTimeForPath,
       setPlaybackRate,
       setStatus,
@@ -1500,20 +1533,26 @@ export function useReviewController() {
     setShareClipBusy(true);
     setStatus(`Encoding WhatsApp clip (${shareClipQuality})…`, "ok");
     try {
-      await downloadApi(
-        "/api/eager/share-clip",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            path: video.path,
-            start: shareClipIn,
-            end: shareClipOut,
-            quality: shareClipQuality,
-          }),
-        },
-        `${video.name.replace(/\.[^.]+$/, "")}_share_${shareClipQuality}.mp4`,
-      );
-      setStatus(`WhatsApp clip downloaded (${shareClipQuality})`, "ok");
+      // POST encodes + returns a short-lived GET URL. Opening that GET lets
+      // IDM/browser download managers re-request the same file (POST body cannot).
+      const prepared = await api<{
+        download_url: string;
+        filename?: string;
+        quality?: string;
+      }>("/api/eager/share-clip", {
+        method: "POST",
+        body: JSON.stringify({
+          path: video.path,
+          start: shareClipIn,
+          end: shareClipOut,
+          quality: shareClipQuality,
+        }),
+      });
+      if (!prepared?.download_url) {
+        throw new Error("Encode succeeded but no download URL was returned");
+      }
+      openDownloadUrl(prepared.download_url);
+      setStatus(`WhatsApp clip ready (${prepared.quality || shareClipQuality})`, "ok");
     } catch (error: any) {
       setStatus(error.message || "Share clip failed", "error");
     } finally {

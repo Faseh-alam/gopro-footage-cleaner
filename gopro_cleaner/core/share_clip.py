@@ -2,6 +2,9 @@
 
 Fast encode + bitrate caps keep files small enough to share while staying sharp
 enough to show camera-angle issues. Quality presets: 720p or 1080p (default).
+
+Downloads are two-step so IDM / browser download managers can re-GET the file:
+POST encodes and returns a short-lived token; GET serves that temp MP4.
 """
 
 from __future__ import annotations
@@ -10,7 +13,9 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 
 from .ffmpeg_tools import ffmpeg_bin
@@ -19,6 +24,8 @@ from .probe import probe_media
 # Practical upper bound for a "share this issue" clip.
 MAX_SHARE_SECONDS = 300.0
 MIN_SHARE_SECONDS = 0.25
+# Prepared downloads expire if never fetched (or after one successful GET).
+DOWNLOAD_TTL_SECONDS = 300.0
 
 # height, crf, maxrate, bufsize, audio bitrate
 QUALITY_PRESETS: dict[str, tuple[int, int, str, str, str]] = {
@@ -26,6 +33,9 @@ QUALITY_PRESETS: dict[str, tuple[int, int, str, str, str]] = {
     "1080p": (1080, 23, "4000k", "8000k", "128k"),
 }
 DEFAULT_QUALITY = "1080p"
+
+_download_lock = threading.Lock()
+_prepared_downloads: dict[str, dict] = {}
 
 
 def _safe_stem(name: str) -> str:
@@ -170,3 +180,71 @@ def download_filename(
     b = int(max(0, end_seconds))
     q = normalize_quality(quality)
     return f"{stem}_share_{q}_{a}-{b}.mp4"
+
+
+def _purge_expired_downloads_unlocked() -> None:
+    now = time.time()
+    expired = [
+        token
+        for token, meta in _prepared_downloads.items()
+        if float(meta.get("expires_at", 0)) <= now
+    ]
+    for token in expired:
+        meta = _prepared_downloads.pop(token, None) or {}
+        path = Path(str(meta.get("path") or ""))
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def prepare_share_download(
+    source: Path,
+    start_seconds: float,
+    end_seconds: float,
+    *,
+    quality: str = DEFAULT_QUALITY,
+) -> dict:
+    """Encode the clip and register a one-time/short-lived GET download token."""
+    quality = normalize_quality(quality)
+    temp = build_share_clip(source, start_seconds, end_seconds, quality=quality)
+    filename = download_filename(source, start_seconds, end_seconds, quality=quality)
+    token = uuid.uuid4().hex
+    with _download_lock:
+        _purge_expired_downloads_unlocked()
+        _prepared_downloads[token] = {
+            "path": str(temp),
+            "filename": filename,
+            "quality": quality,
+            "expires_at": time.time() + DOWNLOAD_TTL_SECONDS,
+            "size_bytes": temp.stat().st_size if temp.is_file() else 0,
+        }
+    return {
+        "token": token,
+        "filename": filename,
+        "quality": quality,
+        "size_bytes": temp.stat().st_size if temp.is_file() else 0,
+        "download_url": f"/api/eager/share-clip/{token}",
+        "expires_in": int(DOWNLOAD_TTL_SECONDS),
+    }
+
+
+def take_prepared_download(token: str) -> tuple[Path, str]:
+    """Return ``(path, filename)`` for ``token`` without deleting it.
+
+    The same token can be fetched more than once (IDM often GETs twice) until
+    TTL expiry; expired entries are purged on access.
+    """
+    key = (token or "").strip()
+    with _download_lock:
+        _purge_expired_downloads_unlocked()
+        meta = _prepared_downloads.get(key)
+        if not meta:
+            raise FileNotFoundError("Share clip expired or not found — encode again")
+        path = Path(str(meta["path"]))
+        filename = str(meta.get("filename") or "share.mp4")
+        if not path.is_file():
+            _prepared_downloads.pop(key, None)
+            raise FileNotFoundError("Share clip file missing — encode again")
+        return path, filename

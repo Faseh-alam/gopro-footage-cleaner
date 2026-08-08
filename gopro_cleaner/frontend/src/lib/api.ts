@@ -1,9 +1,28 @@
 const JSON_HEADERS = { "Content-Type": "application/json" };
-export const host = "http://127.0.0.1:8765/";
+
+/**
+ * API origin.
+ * - Dev (Vite on another port): call Flask on 8765.
+ * - Production (Flask serves the SPA): same origin — empty host / relative URLs.
+ * - Override anytime with VITE_API_ORIGIN.
+ */
+function resolveApiHost(): string {
+  const fromEnv = String(import.meta.env.VITE_API_ORIGIN || "").replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  if (import.meta.env.DEV) return "http://127.0.0.1:8765";
+  return "";
+}
+
+export const host = resolveApiHost();
+
+export function apiUrl(path: string): string {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return host ? `${host}${p}` : p;
+}
 
 export async function api<T = any>(url: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData;
-  const response = await fetch(host + url, {
+  const response = await fetch(apiUrl(url), {
     ...options,
     headers: isForm ? (options.headers ?? {}) : { ...JSON_HEADERS, ...(options.headers || {}) },
   });
@@ -25,14 +44,30 @@ export async function api<T = any>(url: string, options: RequestInit = {}): Prom
   return payload as T;
 }
 
-/** Fetch a binary attachment and trigger a browser download. */
+/**
+ * Trigger a browser / IDM download via a plain GET navigation.
+ * Prefer this over fetch+blob — download managers can re-request the same URL.
+ */
+export function openDownloadUrl(url: string): void {
+  const href = url.startsWith("http") ? url : apiUrl(url);
+  const a = document.createElement("a");
+  a.href = href;
+  a.rel = "noopener";
+  // Keep it in the same tab context so IDM can intercept the real GET.
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/** Fetch a binary attachment and trigger a browser download (blob). */
 export async function downloadApi(
   url: string,
   options: RequestInit = {},
   fallbackName = "download.bin",
 ): Promise<void> {
   const isForm = options.body instanceof FormData;
-  const response = await fetch(host + url, {
+  const response = await fetch(apiUrl(url), {
     ...options,
     headers: isForm ? (options.headers ?? {}) : { ...JSON_HEADERS, ...(options.headers || {}) },
   });

@@ -2,16 +2,17 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-:: ==========================================
-:: 1. FLASK BACKEND SETUP
-:: ==========================================
+:: Production launcher: Flask serves API + built UI from gopro_cleaner\web
+:: (no Vite / Node required). For local UI development use run.dev.bat.
+
 set "PORT=8765"
 if defined GOPRO_CLEANER_PORT set "PORT=%GOPRO_CLEANER_PORT%"
 
 set "VENV_PY=%CD%\.venv\Scripts\python.exe"
-set "VENV_PIP=%CD%\.venv\Scripts\pip.exe"
+set "WEB_DIR=%CD%\gopro_cleaner\web"
+set "FRONTEND_DIR=%CD%\gopro_cleaner\frontend"
+set "APP_URL=http://127.0.0.1:%PORT%/review"
 
-rem Pick a system Python only for creating the venv (not for running the app).
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (
   set "SYS_PY=py -3"
@@ -53,75 +54,63 @@ if errorlevel 1 (
   exit /b 1
 )
 
-:: Kill any existing process on the Flask port
+:: Prefer committed build; optionally rebuild if frontend source + Node are present.
+if exist "%WEB_DIR%\index.html" goto :have_web
+if exist "%WEB_DIR%\_shell.html" goto :have_web
+
+if not exist "%FRONTEND_DIR%\package.json" (
+  echo.
+  echo ERROR: No UI build found at gopro_cleaner\web
+  echo Ask a teammate for the built web folder, or restore frontend source and run:
+  echo   cd gopro_cleaner\frontend
+  echo   npm install
+  echo   npm run build:flask
+  pause
+  exit /b 1
+)
+
+where node >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo ERROR: UI build missing and Node.js is not installed to build it.
+  echo Install Node.js from https://nodejs.org/ or copy gopro_cleaner\web from the repo.
+  pause
+  exit /b 1
+)
+
+echo Building UI for Flask ^(npm run build:flask^)...
+cd /d "%FRONTEND_DIR%"
+if not exist "node_modules\" call npm install
+if errorlevel 1 (
+  echo Failed npm install.
+  cd /d "%~dp0"
+  pause
+  exit /b 1
+)
+call npm run build:flask
+if errorlevel 1 (
+  echo Failed to build UI.
+  cd /d "%~dp0"
+  pause
+  exit /b 1
+)
+cd /d "%~dp0"
+
+:have_web
+echo Using UI from gopro_cleaner\web
+
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT% ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
 
-
-:: ==========================================
-:: 2. NODE.JS & VITE FRONTEND SETUP
-:: ==========================================
-echo Checking if Node.js is installed...
-where node >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo Node.js is not found. Attempting to install via winget...
-    winget install OpenJS.NodeJS -e --silent
-    if errorlevel 1 (
-        echo Failed to install Node.js automatically.
-        echo Please manually install it from https://nodejs.org/ and re-run this script.
-        pause
-        exit /b 1
-    )
-    echo.
-    echo Node.js installed successfully! 
-    echo IMPORTANT: You must close this command window and re-run run.bat so the system recognizes the 'node' command.
-    pause
-    exit /b 0
-)
-
-:: Absolute path to your Vite frontend subfolder
-set "FRONTEND_DIR=%~dp0gopro_cleaner\frontend"
-
-if not exist "%FRONTEND_DIR%" (
-    echo.
-    echo ERROR: Could not find frontend folder at: %FRONTEND_DIR%
-    pause
-    exit /b 1
-)
-
-:: Check if node_modules exists inside gopro_cleaner\frontend
-if not exist "%FRONTEND_DIR%\node_modules\" (
-    echo.
-    echo Installing Vite dependencies ^(npm install^)...
-    cd /d "%FRONTEND_DIR%"
-    call npm install
-    cd /d "%~dp0"
-    if errorlevel 1 (
-        echo Failed to install npm dependencies. Check your internet connection.
-        pause
-        exit /b 1
-    )
-) else (
-    echo node_modules already exists. Skipping npm install...
-)
-
-
-:: ==========================================
-:: 3. STARTING BOTH SERVERS & BROWSER
-:: ==========================================
 echo.
-echo Starting React (Vite) Frontend in a new window...
-:: Spawns Vite in a separate, persistent window
-start "React Frontend" /D "%FRONTEND_DIR%" cmd /k "npm run dev"
+echo Opening %APP_URL%
+start "" "%APP_URL%"
 
-echo Waiting for Vite to become ready (auto-detect port)...
-start /MIN "Open Vite Review" "%VENV_PY%" "%CD%\scripts\wait_open_vite.py"
-
-echo Starting Flask Backend on port %PORT%...
-:: Runs Flask in the MAIN window (just like your original script)
+echo Starting Flask ^(API + UI^) on port %PORT%...
 "%VENV_PY%" -m gopro_cleaner
 
 if errorlevel 1 (
-    echo.
-    echo Server exited with an error.
+  echo.
+  echo Server exited with an error.
 )
 pause
+exit /b %ERRORLEVEL%

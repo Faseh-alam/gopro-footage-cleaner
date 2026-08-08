@@ -7,9 +7,15 @@
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
+  // Skip Nitro/Cloudflare packaging so Vite writes dist/client + dist/server.
+  // That layout is required for TanStack SPA shell prerender, which Flask hosts.
+  nitro: false,
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
-    // nitro/vite builds from this
     server: { entry: "server" },
+    // Client shell for Flask production hosting (no Node/Vite required at runtime).
+    spa: {
+      enabled: true,
+    },
   },
 });

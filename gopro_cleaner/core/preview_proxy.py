@@ -67,6 +67,56 @@ def _probe_duration_seconds(source: Path) -> float:
         return 0.0
 
 
+_SOFTWARE_ENCODER_ARGS = [
+    # ultrafast + moderate CRF: small proxy, quick encode, still scrubbable at 8×
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-tune",
+    "fastdecode",
+    "-crf",
+    "28",
+    "-threads",
+    "0",
+]
+
+_WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
+    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "1400k", "-maxrate", "1800k", "-bufsize", "2800k"]),
+    ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1400k"]),
+    ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "1400k"]),
+]
+
+# Probed once per process: hardware encode is 3–10× faster than x264 on big files.
+_win_encoder_args: list[str] | None = None
+
+
+def _encoder_works(encoder_args: list[str]) -> bool:
+    """Tiny null-sink test encode — proves the encoder exists AND the GPU accepts it."""
+    from .ffmpeg_tools import ffmpeg_bin
+
+    command = [
+        ffmpeg_bin(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:s=256x256:d=0.2:r=12",
+        *encoder_args,
+        "-frames:v",
+        "3",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        return subprocess.run(command, capture_output=True, timeout=20, check=False).returncode == 0
+    except Exception:
+        return False
+
+
 def _preview_encoder_args() -> list[str]:
     """Prefer hardware encode when available; otherwise fast software x264."""
     system = platform.system()
@@ -82,26 +132,20 @@ def _preview_encoder_args() -> list[str]:
             "3000k",
         ]
     if system == "Windows":
-        # NVENC is much faster on big GoPro files when a GPU is present.
-        # Fall back path is selected at build time if this encoder is missing.
+        global _win_encoder_args
         prefer = (os.environ.get("GOPRO_PREVIEW_ENCODER") or "auto").strip().lower()
-        if prefer in {"nvenc", "h264_nvenc"}:
-            return ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "1400k", "-maxrate", "1800k", "-bufsize", "2800k"]
-        if prefer in {"qsv", "h264_qsv"}:
-            return ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1400k"]
-    # ultrafast + moderate CRF: small proxy, quick encode, still scrubbable at 8×
-    return [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "fastdecode",
-        "-crf",
-        "28",
-        "-threads",
-        "0",
-    ]
+        if prefer in {"x264", "libx264", "software", "cpu"}:
+            return list(_SOFTWARE_ENCODER_ARGS)
+        for name, args in _WINDOWS_HW_CANDIDATES:
+            if prefer in {name, f"h264_{name}"}:
+                return list(args)
+        if _win_encoder_args is None:
+            _win_encoder_args = next(
+                (args for _, args in _WINDOWS_HW_CANDIDATES if _encoder_works(args)),
+                list(_SOFTWARE_ENCODER_ARGS),
+            )
+        return list(_win_encoder_args)
+    return list(_SOFTWARE_ENCODER_ARGS)
 
 
 def _hwaccel_input_args() -> list[str]:
@@ -132,8 +176,9 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
-        "-movflags",
-        "+faststart",
+        # No +faststart: it re-writes the entire file in a second pass after the
+        # encode ("Finalizing preview" stall). We serve previews with HTTP Range
+        # support, so browsers fetch the trailing moov atom directly instead.
         "-g",
         "12",
         "-keyint_min",
@@ -175,10 +220,13 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
             if not job or job.get("status") != "running":
                 process.terminate()
                 break
-        if line.startswith("out_time_ms=") and duration > 0:
+        # NOTE: ffmpeg's out_time_ms is misnamed — the value is MICROseconds
+        # (same as out_time_us). Treating it as ms made progress hit the 99%
+        # cap ~1000× early, so the UI sat on "Finalizing" for the whole build.
+        if line.startswith(("out_time_us=", "out_time_ms=")) and duration > 0:
             try:
-                out_ms = int(line.split("=", 1)[1].strip() or 0)
-                pct = min(99, int((out_ms / 1000.0) / duration * 100))
+                out_us = int(line.split("=", 1)[1].strip() or 0)
+                pct = min(99, int((out_us / 1_000_000.0) / duration * 100))
             except ValueError:
                 continue
             with _lock:
@@ -201,8 +249,9 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         except OSError:
             pass
     if code != 0:
-        # Auto-fallback: if NVENC/QSV unavailable, retry once with libx264.
-        if "nvenc" in " ".join(command) or "qsv" in " ".join(command):
+        # Auto-fallback: if the HW encoder failed mid-run, retry once with libx264.
+        joined = " ".join(command)
+        if any(hw in joined for hw in ("nvenc", "qsv", "amf")):
             soft = [
                 ffmpeg_bin(),
                 "-hide_banner",
@@ -214,20 +263,9 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
                 "-an",
                 "-vf",
                 "scale='min(720,iw)':-2:flags=fast_bilinear,fps=12",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "fastdecode",
-                "-crf",
-                "28",
-                "-threads",
-                "0",
+                *_SOFTWARE_ENCODER_ARGS,
                 "-pix_fmt",
                 "yuv420p",
-                "-movflags",
-                "+faststart",
                 "-g",
                 "12",
                 "-keyint_min",

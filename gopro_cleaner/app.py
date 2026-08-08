@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 from .eager_routes import create_eager_blueprint
@@ -20,6 +20,7 @@ from .core.routes_cards import create_cards_blueprint
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
+WEB_DIR = APP_ROOT / "web"
 APP_VERSION = "2.18.2-testing"
 
 
@@ -28,7 +29,7 @@ def create_app() -> Flask:
 
     _load_env()
 
-    # UI is served by the React/Vite app; Flask is API-only (no templates/static).
+    # API + production SPA from gopro_cleaner/web (built via npm run build:flask).
     app = Flask(__name__, static_folder=None)
 
     CORS(app)
@@ -262,8 +263,61 @@ def create_app() -> Flask:
             return jsonify(result)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
-        
-    return app;
+
+    _register_spa_routes(app)
+    return app
+
+
+def _register_spa_routes(app: Flask) -> None:
+    """Serve the built React SPA from gopro_cleaner/web (never shadows /api/*)."""
+
+    def _index_name() -> str | None:
+        if (WEB_DIR / "index.html").is_file():
+            return "index.html"
+        if (WEB_DIR / "_shell.html").is_file():
+            return "_shell.html"
+        return None
+
+    @app.get("/")
+    def spa_root():
+        name = _index_name()
+        if not WEB_DIR.is_dir() or not name:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "UI build missing. Production needs gopro_cleaner/web "
+                            "(run npm run build:flask in gopro_cleaner/frontend), "
+                            "or use run.dev.bat / run.dev.sh for Vite."
+                        ),
+                        "api": "/api/health",
+                    }
+                ),
+                503,
+            )
+        return send_from_directory(WEB_DIR, name)
+
+    @app.get("/<path:asset_path>")
+    def spa_asset(asset_path: str):
+        # Registered after API routes; still guard against accidental API capture.
+        if asset_path == "api" or asset_path.startswith("api/"):
+            return jsonify({"error": "Not found"}), 404
+
+        name = _index_name()
+        if not WEB_DIR.is_dir() or not name:
+            return jsonify({"error": "UI build missing"}), 503
+
+        candidate = (WEB_DIR / asset_path).resolve()
+        try:
+            candidate.relative_to(WEB_DIR.resolve())
+        except ValueError:
+            return jsonify({"error": "Not found"}), 404
+
+        if candidate.is_file():
+            return send_from_directory(WEB_DIR, asset_path)
+
+        # Client-side routes (e.g. /review)
+        return send_from_directory(WEB_DIR, name)
 
 
 def _read_sheet_upload() -> tuple[str, str, str, bool]:

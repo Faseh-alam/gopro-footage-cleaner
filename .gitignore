@@ -11,9 +11,16 @@ recovery/
 eager_tasks.json
 work_sessions.json
 state/
-gopro_cleaner/frontend/node_modules
 credentials.json
 db.json
+
+# Frontend tooling / build caches. Source stays in git; commit gopro_cleaner/web after
+# `npm run build:flask` so colleagues can use run.bat without Node.
+gopro_cleaner/frontend/node_modules/
+gopro_cleaner/frontend/.vite/
+gopro_cleaner/frontend/.output/
+gopro_cleaner/frontend/dist/
+gopro_cleaner/frontend/.wrangler/
 
 # Optional local binaries (add your platform build if needed)
 bin/udtacopy
