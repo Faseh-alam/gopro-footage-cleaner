@@ -16,27 +16,56 @@ C1234/
       ...
 ```
 
-Onto SSD:
+Onto SSD — all cards flat into the batch folder (no per-card subfolder):
 
 ```text
-<SSD>/Batches/batch 6/C1234/GX010001.MP4          ← segments JSON also EMBEDDED inside
-<SSD>/Batches/batch 6/C1234/GX010001.segments.json
+<SSD>/Batches/batch 6/GX010001.MP4          ← segments JSON also EMBEDDED inside
+<SSD>/Batches/batch 6/GX010001.segments.json
+<SSD>/Batches/batch 6/GX010001__C5678.MP4   ← same filename from another card → auto-suffixed
+<SSD>/Batches/batch 6/GX010001__C5678.segments.json
 ```
+
+GoPro numbering repeats across cards (every card has a `GX010001.MP4`), so
+when a name is already taken in the batch, the incoming pair is renamed with
+the card id — nothing is ever overwritten.
 
 While copying, each MP4's segments JSON is **embedded into the SSD copy of the
 MP4 itself** (an ignorable `skip` box appended at the end — video, audio and
 GPMF/IMU tracks are untouched, players and GoPro tools are unaffected). So
 even if a sidecar file gets separated from its video on S3, the tasks +
-timestamps travel inside the MP4. Read it back with:
+timestamps + camera serial / device id travel inside the MP4. If a sidecar is
+missing key fields (complete flag, device id, camera serial, recorded-at, IMU
+sensor list) a warning shows in the transfer log. Read embedded data back with:
 
 ```bash
 python scripts/read_embedded_segments.py "E:\Batches\batch 6"            # summary
 python scripts/read_embedded_segments.py --json GX010001.MP4             # full payload
-python scripts/read_embedded_segments.py --ffmpeg "E:\Batches\batch 6"   # print cut commands
 ```
 
 Legacy `DCIM/100GOPRO/<task-folder>/*.MP4` layouts (pre-trimmed clips) are
 still transferred as before. Skips `.LRV`, `.THM`, and other non-MP4 junk.
+
+## Rebuilding work footage on AWS
+
+After the batch is synced to S3, run `scripts/aws_trim_batch.py` on the AWS
+server (single file, needs only Python 3.9+ and ffmpeg). It reads each MP4's
+embedded segments and cuts **only the work segments** into task-name folders:
+
+```bash
+aws s3 sync "s3://your-bucket/footage/batch 6" "/data/batch 6"
+python aws_trim_batch.py "/data/batch 6" --output "/data/batch 6 trimmed"
+```
+
+```text
+/data/batch 6 trimmed/
+  pipe-welding/GX010001_01.mp4     ← stream copy: video + audio + GPMF/IMU kept
+  cable-pulling/GX010002_01.mp4
+```
+
+Garbage segments are never cut. Videos not marked complete are skipped
+(`--include-incomplete` to override); `--dry-run` prints the plan. Every clip
+gets its own embedded identity (source file, task, start/end, camera serial,
+device id) readable with `read_embedded_segments.py`.
 
 ## Quick start
 

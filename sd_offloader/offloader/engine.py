@@ -348,7 +348,8 @@ def _start_card_job(
 
     try:
         ssd_path, _ = space.pick_ssd_for_bytes(ssd1=ssd1, ssd2=ssd2, needed_bytes=total)
-        dest = space.card_dest(ssd_path, batch, card_id)
+        # All cards dump straight into the batch folder (no per-card subfolder).
+        dest = space.batch_root(ssd_path, batch)
         dest.mkdir(parents=True, exist_ok=True)
     except Exception as exc:  # noqa: BLE001
         _log_line(f"{card_id}: {exc}", kind="error")
@@ -423,6 +424,69 @@ def _update_card(card_id: str, **kwargs) -> None:
     _save_snapshot(force=False)
 
 
+_SIDECAR_SUFFIX = ".segments.json"
+
+
+def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str) -> None:
+    """Assign collision-safe destination names into the flat batch folder.
+
+    GoPro numbering repeats across cards (every card has a GX010001.MP4), so
+    when another card already parked the same name in this batch the incoming
+    pair (MP4 + .segments.json) is renamed to ``<stem>__<CARDID><ext>``.
+    Names are remembered in the card's progress file so resume stays stable.
+    """
+    entries = prog.get("files") or {}
+    stem_map: dict[str, str] = {}  # source MP4 stem -> final stem
+
+    for item in files:
+        rel = item["rel"]
+        if item.get("task"):
+            item["dest_rel"] = rel  # legacy task folders keep their layout
+            continue
+
+        recorded = (entries.get(rel) or {}).get("dest_rel")
+        is_sidecar = rel.lower().endswith(_SIDECAR_SUFFIX)
+        base = rel[: -len(_SIDECAR_SUFFIX)] if is_sidecar else Path(rel).stem
+
+        if is_sidecar:
+            # Sidecars follow their video's (possibly renamed) stem.
+            final_base = stem_map.get(base, base)
+            item["dest_rel"] = (
+                recorded if recorded else f"{final_base}{_SIDECAR_SUFFIX}"
+            )
+            continue
+
+        if recorded:
+            item["dest_rel"] = recorded
+            stem_map[base] = Path(recorded).stem
+            continue
+
+        if (dest / rel).exists():
+            # Same filename from a different card — suffix this card's pair.
+            final_base = f"{base}__{card_id.upper()}"
+            item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
+            stem_map[base] = final_base
+        else:
+            item["dest_rel"] = rel
+            stem_map[base] = base
+
+
+_META_CHECKS = (
+    ("complete labeling", lambda p: p.get("complete") is True),
+    ("segments", lambda p: bool(p.get("segments"))),
+    ("device_id", lambda p: bool(p.get("device_id"))),
+    ("device_type", lambda p: bool(p.get("device_type"))),
+    ("camera_serial", lambda p: bool((p.get("media_meta") or {}).get("camera_serial"))),
+    ("recorded_at", lambda p: bool((p.get("media_meta") or {}).get("recorded_at"))),
+    ("IMU sensor list", lambda p: bool((p.get("media_meta") or {}).get("sensors"))),
+)
+
+
+def _missing_metadata(payload: dict) -> list[str]:
+    """Names of expected sidecar fields that are absent/empty (for log warnings)."""
+    return [name for name, present in _META_CHECKS if not present(payload)]
+
+
 def _copy_card_worker(
     card_root: Path,
     card_id: str,
@@ -451,6 +515,7 @@ def _copy_card_worker(
     files_done = 0
     task_names = sorted({f["task"] for f in files if f.get("task")})
     root_rels = sorted(f["rel"] for f in files if not f.get("task"))
+    _resolve_dest_names(files, dest, prog, card_id)
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
@@ -493,7 +558,12 @@ def _copy_card_worker(
             rel = item["rel"]
             src = Path(item["source"])
             size = int(item["size"])
-            dest_file = dest / rel
+            dest_rel = item.get("dest_rel") or rel
+            dest_file = dest / dest_rel
+            if dest_rel != rel and not (prog.get("files") or {}).get(rel):
+                _log_line(
+                    f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}"
+                )
             if progress.is_file_done(prog, rel, size, dest_file):
                 try:
                     item["dest_size"] = dest_file.stat().st_size
@@ -510,7 +580,7 @@ def _copy_card_worker(
 
             _publish(0, message=f"Copying {rel} → {dest_file}", force=True)
 
-            def on_progress(written: int, _rel: str = rel, _dest_file: Path = dest_file) -> None:
+            def on_progress(written: int, _rel: str = dest_rel, _dest_file: Path = dest_file) -> None:
                 nonlocal saw_disk_write
                 partial = _dest_file.with_suffix(_dest_file.suffix + ".partial")
                 if written > 0 and (partial.exists() or _dest_file.exists()):
@@ -534,9 +604,16 @@ def _copy_card_worker(
                     payload = json.loads(
                         Path(sidecar_path).read_text(encoding="utf-8")
                     )
+                    missing = _missing_metadata(payload)
+                    if missing:
+                        _log_line(
+                            f"{card_id}: {rel} sidecar is missing "
+                            f"{', '.join(missing)} — re-check in GoPro Cleaner",
+                            kind="error",
+                        )
                     embed_meta.embed_segments_json(dest_file, payload)
                     dest_size = dest_file.stat().st_size
-                    _log_line(f"{card_id}: embedded segments into {rel}")
+                    _log_line(f"{card_id}: embedded segments into {dest_rel}")
                 except Exception as embed_exc:  # noqa: BLE001
                     _log_line(
                         f"{card_id}: could not embed segments into {rel} — {embed_exc}",
@@ -544,7 +621,9 @@ def _copy_card_worker(
                     )
             item["dest_size"] = dest_size
 
-            progress.mark_file_done(card_root, prog, rel, size, dest_size=dest_size)
+            progress.mark_file_done(
+                card_root, prog, rel, size, dest_size=dest_size, dest_rel=dest_rel
+            )
             done_bytes += size
             files_done += 1
             _publish(0, message=f"Copied {rel}", force=True)
@@ -556,7 +635,7 @@ def _copy_card_worker(
 
         _update_card(card_id, status="verifying", message=f"Verifying {dest}…", dest=str(dest))
         for item in files:
-            dest_file = dest / item["rel"]
+            dest_file = dest / (item.get("dest_rel") or item["rel"])
             expected = int(item.get("dest_size") or item["size"])
             if not dest_file.exists() or dest_file.stat().st_size != expected:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")

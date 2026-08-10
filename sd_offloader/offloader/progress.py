@@ -42,13 +42,22 @@ def save_progress(card_root: Path, data: dict) -> None:
 
 
 def mark_file_done(
-    card_root: Path, data: dict, rel: str, size: int, *, dest_size: int | None = None
+    card_root: Path,
+    data: dict,
+    rel: str,
+    size: int,
+    *,
+    dest_size: int | None = None,
+    dest_rel: str | None = None,
 ) -> dict:
     files = data.setdefault("files", {})
     entry = {"size": size, "status": "done"}
     # Embedded segments grow the SSD copy — remember its real size for resume.
     if dest_size is not None and int(dest_size) != int(size):
         entry["dest_size"] = int(dest_size)
+    # Collision-renamed destination (flat batch folder) — resume must reuse it.
+    if dest_rel and dest_rel != rel:
+        entry["dest_rel"] = dest_rel
     files[rel] = entry
     save_progress(card_root, data)
     return data
@@ -84,7 +93,7 @@ def dest_looks_complete(data: dict | None, dest_root: Path) -> bool:
     for rel, entry in files.items():
         if not isinstance(entry, dict) or entry.get("status") != "done":
             continue
-        path = dest_root / rel
+        path = dest_root / str(entry.get("dest_rel") or rel)
         expected = int(entry.get("dest_size") or entry.get("size") or 0)
         try:
             if path.is_file() and path.stat().st_size == expected:

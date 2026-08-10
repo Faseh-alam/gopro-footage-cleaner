@@ -12,10 +12,6 @@ def batch_root(ssd_path: str | Path, batch_name: str) -> Path:
     return Path(ssd_path).expanduser().resolve() / BATCHES_SUBDIR / batch_name.strip()
 
 
-def card_dest(ssd_path: str | Path, batch_name: str, card_id: str) -> Path:
-    return batch_root(ssd_path, batch_name) / card_id.upper()
-
-
 def pick_ssd_for_bytes(
     *,
     ssd1: str,
