@@ -41,9 +41,15 @@ def save_progress(card_root: Path, data: dict) -> None:
     _mirror_local(data)
 
 
-def mark_file_done(card_root: Path, data: dict, rel: str, size: int) -> dict:
+def mark_file_done(
+    card_root: Path, data: dict, rel: str, size: int, *, dest_size: int | None = None
+) -> dict:
     files = data.setdefault("files", {})
-    files[rel] = {"size": size, "status": "done"}
+    entry = {"size": size, "status": "done"}
+    # Embedded segments grow the SSD copy — remember its real size for resume.
+    if dest_size is not None and int(dest_size) != int(size):
+        entry["dest_size"] = int(dest_size)
+    files[rel] = entry
     save_progress(card_root, data)
     return data
 
@@ -56,8 +62,9 @@ def is_file_done(data: dict | None, rel: str, size: int, dest_file: Path) -> boo
         return False
     if int(entry.get("size") or 0) != int(size):
         return False
+    expected = int(entry.get("dest_size") or size)
     try:
-        return dest_file.exists() and dest_file.stat().st_size == size
+        return dest_file.exists() and dest_file.stat().st_size == expected
     except OSError:
         return False
 
@@ -78,8 +85,9 @@ def dest_looks_complete(data: dict | None, dest_root: Path) -> bool:
         if not isinstance(entry, dict) or entry.get("status") != "done":
             continue
         path = dest_root / rel
+        expected = int(entry.get("dest_size") or entry.get("size") or 0)
         try:
-            if path.is_file() and path.stat().st_size == int(entry.get("size") or 0):
+            if path.is_file() and path.stat().st_size == expected:
                 ok += 1
         except OSError:
             continue

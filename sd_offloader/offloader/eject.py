@@ -11,7 +11,10 @@ from .detect import _find_gopro_root
 from .progress import clear_progress
 
 
-def wipe_transferred_tasks(card_root: Path, task_names: list[str]) -> None:
+def wipe_transferred_tasks(
+    card_root: Path, task_names: list[str], root_files: list[str] | None = None
+) -> None:
+    """Delete transferred legacy task folders and/or verified root files."""
     gopro = _find_gopro_root(card_root)
     if gopro is None:
         return
@@ -19,6 +22,14 @@ def wipe_transferred_tasks(card_root: Path, task_names: list[str]) -> None:
         folder = gopro / name
         if folder.is_dir():
             shutil.rmtree(folder, ignore_errors=True)
+    # Raw MP4s + .segments.json sidecars copied from the GOPRO root.
+    for rel in root_files or []:
+        target = gopro / rel
+        if target.is_file():
+            try:
+                target.unlink()
+            except OSError:
+                pass
     clear_progress(card_root)
 
 

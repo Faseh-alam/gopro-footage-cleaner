@@ -212,18 +212,20 @@ def _card_id_for(root: Path, label: str) -> str | None:
 
 
 def _looks_like_sd_card(root: Path, label: str) -> bool:
-    if not _find_gopro_root(root):
-        return False
-    if CARD_LABEL_RE.match(label.strip()):
-        return True
     gopro = _find_gopro_root(root)
     if gopro is None:
         return False
+    if CARD_LABEL_RE.match(label.strip()):
+        return True
     try:
-        for folder in gopro.iterdir():
-            if not folder.is_dir():
+        for entry in gopro.iterdir():
+            # Raw labeled MP4s directly in DCIM/###GOPRO (label-only workflow)
+            if entry.is_file() and entry.suffix.upper() == ".MP4":
+                return True
+            if not entry.is_dir():
                 continue
-            for item in folder.iterdir():
+            # Legacy pre-trimmed task folders
+            for item in entry.iterdir():
                 if item.is_file() and item.suffix.upper() == ".MP4":
                     return True
     except OSError:

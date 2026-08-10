@@ -1,25 +1,42 @@
 # SD Card Offloader
 
-24/7 server tool: plug labeled GoPro SD cards → copy task folders to dual removable SSDs → optional AWS S3 sync. Multi-card parallel transfers with live progress and resume.
+24/7 server tool: plug labeled GoPro SD cards → copy raw MP4s + their `.segments.json` label files into a batch folder on dual removable SSDs → optional AWS S3 sync. Multi-card parallel transfers with live progress and resume.
 
 ## What it copies
 
-From each card:
+From each card (labeled with GoPro Cleaner — videos stay untrimmed on the card):
 
 ```text
 C1234/
   DCIM/
     100GOPRO/
-      <task-folder>/*.MP4
+      GX010001.MP4
+      GX010001.segments.json   ← tasks + timestamps + camera/IMU metadata
+      GX010002.MP4
+      ...
 ```
 
 Onto SSD:
 
 ```text
-<SSD>/Batches/batch 6/C1234/<task-folder>/*.MP4
+<SSD>/Batches/batch 6/C1234/GX010001.MP4          ← segments JSON also EMBEDDED inside
+<SSD>/Batches/batch 6/C1234/GX010001.segments.json
 ```
 
-Skips `.LRV`, `.THM`, and other non-MP4 junk.
+While copying, each MP4's segments JSON is **embedded into the SSD copy of the
+MP4 itself** (an ignorable `skip` box appended at the end — video, audio and
+GPMF/IMU tracks are untouched, players and GoPro tools are unaffected). So
+even if a sidecar file gets separated from its video on S3, the tasks +
+timestamps travel inside the MP4. Read it back with:
+
+```bash
+python scripts/read_embedded_segments.py "E:\Batches\batch 6"            # summary
+python scripts/read_embedded_segments.py --json GX010001.MP4             # full payload
+python scripts/read_embedded_segments.py --ffmpeg "E:\Batches\batch 6"   # print cut commands
+```
+
+Legacy `DCIM/100GOPRO/<task-folder>/*.MP4` layouts (pre-trimmed clips) are
+still transferred as before. Skips `.LRV`, `.THM`, and other non-MP4 junk.
 
 ## Quick start
 
@@ -49,7 +66,7 @@ chmod +x run.sh
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
 7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
 8. **Upload this batch to AWS (CMD)** — opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
-9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, task folders wiped, ejected
+9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, transferred files wiped, ejected
 
 ### Office resume example (batch 3 dumped at home, no internet)
 
@@ -124,6 +141,6 @@ Override: `SD_OFFLOADER_PORT=8899`
 ## Safety notes
 
 - Wipe/eject happens only after size verification  
-- Only transferred task folders under `DCIM/…GOPRO` are deleted on the card  
+- Only transferred, size-verified MP4s / sidecars / task folders under `DCIM/…GOPRO` are deleted on the card  
 - After upload the UI compares local vs S3 sizes; **Delete local** is optional and only enabled when verified
 - Config: `s5cmd_numworkers` (default 20 — used only after plain sync fails), `aws_upload_retries` (default 5) in `config.json`

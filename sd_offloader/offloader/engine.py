@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, inventory, progress, space
+from . import aws_upload, eject, embed_meta, inventory, progress, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -331,13 +331,13 @@ def _start_card_job(
             if existing and existing.get("status") == "completed":
                 # Empty after wipe/eject — keep DONE, never downgrade to ERROR.
                 return
-        _log_line(f"{card_id}: no task MP4 folders under DCIM/…GOPRO", kind="error")
+        _log_line(f"{card_id}: no MP4s under DCIM/…GOPRO", kind="error")
         with _lock:
             _cards[card_id] = {
                 "card_id": card_id,
                 "mount": str(card_root),
                 "status": "error",
-                "message": "No labeled task folders with MP4s found",
+                "message": "No MP4s (or task folders) found under DCIM/…GOPRO",
                 "bytes_done": 0,
                 "bytes_total": 0,
                 "speed_mbps": 0,
@@ -449,7 +449,8 @@ def _copy_card_worker(
     started = time.time()
     done_bytes = 0
     files_done = 0
-    task_names = sorted({f["task"] for f in files})
+    task_names = sorted({f["task"] for f in files if f.get("task")})
+    root_rels = sorted(f["rel"] for f in files if not f.get("task"))
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
@@ -494,6 +495,10 @@ def _copy_card_worker(
             size = int(item["size"])
             dest_file = dest / rel
             if progress.is_file_done(prog, rel, size, dest_file):
+                try:
+                    item["dest_size"] = dest_file.stat().st_size
+                except OSError:
+                    item["dest_size"] = size
                 done_bytes += size
                 files_done += 1
                 saw_disk_write = True
@@ -518,7 +523,28 @@ def _copy_card_worker(
                     f"Copy did not land on SSD: expected {dest_file} ({size} bytes)"
                 )
             saw_disk_write = True
-            progress.mark_file_done(card_root, prog, rel, size)
+
+            # Embed the GoPro Cleaner segments JSON inside the SSD copy so the
+            # MP4 itself carries task names + timestamps (sidecar still copied
+            # alongside). Card original is never modified.
+            dest_size = size
+            sidecar_path = item.get("embed_json") or ""
+            if sidecar_path:
+                try:
+                    payload = json.loads(
+                        Path(sidecar_path).read_text(encoding="utf-8")
+                    )
+                    embed_meta.embed_segments_json(dest_file, payload)
+                    dest_size = dest_file.stat().st_size
+                    _log_line(f"{card_id}: embedded segments into {rel}")
+                except Exception as embed_exc:  # noqa: BLE001
+                    _log_line(
+                        f"{card_id}: could not embed segments into {rel} — {embed_exc}",
+                        kind="error",
+                    )
+            item["dest_size"] = dest_size
+
+            progress.mark_file_done(card_root, prog, rel, size, dest_size=dest_size)
             done_bytes += size
             files_done += 1
             _publish(0, message=f"Copied {rel}", force=True)
@@ -531,7 +557,8 @@ def _copy_card_worker(
         _update_card(card_id, status="verifying", message=f"Verifying {dest}…", dest=str(dest))
         for item in files:
             dest_file = dest / item["rel"]
-            if not dest_file.exists() or dest_file.stat().st_size != int(item["size"]):
+            expected = int(item.get("dest_size") or item["size"])
+            if not dest_file.exists() or dest_file.stat().st_size != expected:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
 
         prog["status"] = "complete"
@@ -549,9 +576,9 @@ def _copy_card_worker(
         )
 
         try:
-            _update_card(card_id, status="wiping", message="Wiping transferred folders on card…")
+            _update_card(card_id, status="wiping", message="Wiping transferred files on card…")
             # Keep completed semantics if wipe/eject races the watcher.
-            eject.wipe_transferred_tasks(card_root, task_names)
+            eject.wipe_transferred_tasks(card_root, task_names, root_rels)
         except Exception as wipe_exc:  # noqa: BLE001
             _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
 

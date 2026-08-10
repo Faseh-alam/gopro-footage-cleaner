@@ -159,7 +159,7 @@ function renderCards(cards) {
   el.cards.innerHTML = "";
   if (!cards.length) {
     el.cards.innerHTML =
-      '<div class="hint">Waiting for Cxxxx cards with DCIM/100GOPRO/task folders…</div>';
+      '<div class="hint">Waiting for Cxxxx cards with labeled MP4s under DCIM/100GOPRO…</div>';
     el.cardsSummary.textContent = "No cards yet";
     return;
   }
