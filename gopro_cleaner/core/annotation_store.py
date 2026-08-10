@@ -256,6 +256,40 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
         if gap_or_overlap:
             raise ValueError("; ".join(gap_or_overlap))
 
+    # Camera / IMU metadata (timestamp, serial, model, firmware, sensors).
+    # Cached per file, so this is only expensive the first time. A manual
+    # timestamp override (recorded_at_manual) always survives re-extraction;
+    # the camera's own value is kept as recorded_at_camera.
+    incoming_meta = annotation.get("media_meta") if isinstance(annotation.get("media_meta"), dict) else {}
+    prior_meta = (load_annotation(video) or {}).get("media_meta") or {}
+    # Incoming key is authoritative (empty string = explicit clear); otherwise
+    # keep whatever override is already stored in the sidecar.
+    if "recorded_at_manual" in incoming_meta:
+        manual_ts = str(incoming_meta.get("recorded_at_manual") or "").strip()
+    else:
+        manual_ts = str(prior_meta.get("recorded_at_manual") or "").strip()
+
+    media_meta = dict(incoming_meta)
+    try:
+        from .gopro_meta import get_media_meta
+
+        media_meta = {**media_meta, **(get_media_meta(video) or {})}
+    except Exception:  # noqa: BLE001
+        pass
+
+    if manual_ts:
+        camera_ts = media_meta.get("recorded_at") or prior_meta.get("recorded_at_camera")
+        if camera_ts and camera_ts != manual_ts:
+            media_meta["recorded_at_camera"] = camera_ts
+        media_meta["recorded_at_manual"] = manual_ts
+        media_meta["recorded_at"] = manual_ts
+    else:
+        # Override cleared — fall back to whatever the camera wrote.
+        media_meta.pop("recorded_at_manual", None)
+        if media_meta.get("recorded_at_camera"):
+            media_meta.setdefault("recorded_at", media_meta["recorded_at_camera"])
+        media_meta.pop("recorded_at_camera", None)
+
     payload = {
         "version": 1,
         "source": video.name,
@@ -267,6 +301,7 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
         "card_badge": str(annotation.get("card_badge") or ""),
         "device_type": str(annotation.get("device_type") or ""),
         "device_id": str(annotation.get("device_id") or ""),
+        "media_meta": media_meta or {},
         "segments": segments,
         "updated_at": _now_iso(),
     }
@@ -277,6 +312,7 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
         _atomic_write(sidecar_path_for(video), payload)
         # Human-readable companion
         txt = sidecar_path_for(video).with_suffix("").with_suffix(".segments.txt")
+        meta = payload.get("media_meta") or {}
         lines = [
             f"source: {payload['source']}",
             f"duration: {payload.get('duration')}",
@@ -284,6 +320,10 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
             f"factory: {payload.get('factory')}",
             f"card: {payload.get('card_badge')}",
             f"device: {payload.get('device_type')} / {payload.get('device_id')}",
+            f"recorded: {meta.get('recorded_at') or 'unknown'}",
+            f"camera: {meta.get('camera_model') or 'unknown'} (SN {meta.get('camera_serial') or '?'})",
+            f"firmware: {meta.get('firmware') or 'unknown'}",
+            f"sensors: {', '.join(meta.get('sensors') or []) or 'none detected'}",
             f"complete: {payload['complete']}",
             "",
         ]

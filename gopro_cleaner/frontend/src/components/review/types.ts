@@ -21,12 +21,34 @@ export interface PendingWork {
   end: number;
 }
 
+/** Camera / IMU metadata extracted from the GoPro file (GPMF + ffprobe). */
+export interface MediaMeta {
+  recorded_at?: string | null;
+  /** Set when the user manually overrides the timestamp from the UI. */
+  recorded_at_manual?: string | null;
+  /** Original camera timestamp, preserved while an override is active. */
+  recorded_at_camera?: string | null;
+  camera_model?: string | null;
+  camera_serial?: string | null;
+  firmware?: string | null;
+  media_uid?: string | null;
+  lens_serial?: string | null;
+  location?: string | null;
+  width?: number | null;
+  height?: number | null;
+  fps?: number | null;
+  video_codec?: string | null;
+  has_gpmf?: boolean;
+  sensors?: string[];
+}
+
 export interface Annotation {
   segments: Segment[];
   duration: number | null;
   complete: boolean;
   pendingWork: PendingWork | null;
   summary?: any;
+  mediaMeta?: MediaMeta | null;
 }
 
 export interface TrimJob {

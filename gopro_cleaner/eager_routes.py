@@ -738,8 +738,53 @@ def create_eager_blueprint() -> Blueprint:
                 annotation["duration"] = probe_media(path).duration
             except Exception:  # noqa: BLE001
                 pass
+        # Camera / IMU metadata: cached per file, shown in the UI even before
+        # the first segment is saved to the sidecar.
+        if not annotation.get("media_meta"):
+            try:
+                from .core.gopro_meta import get_media_meta
+
+                annotation["media_meta"] = get_media_meta(path)
+            except Exception:  # noqa: BLE001
+                annotation["media_meta"] = {}
         summary = annotation_store.coverage_summary(annotation)
         return jsonify({"ok": True, "annotation": annotation, "summary": summary, "path": str(path)})
+
+    @eager.post("/api/eager/media-meta/recorded-at")
+    def eager_media_meta_recorded_at():
+        """Manually set (or clear with empty value) the recording timestamp."""
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        raw_ts = str(payload.get("recorded_at") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            path = Path(raw_path).expanduser().resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+
+        value = ""
+        if raw_ts:
+            from datetime import datetime
+
+            try:
+                value = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).isoformat()
+            except ValueError:
+                return jsonify({"error": "recorded_at must be an ISO date-time"}), 400
+
+        annotation = annotation_store.load_annotation(path) or annotation_store.empty_annotation(
+            source=path.name
+        )
+        meta = dict(annotation.get("media_meta") or {})
+        # Empty string is an explicit clear — save_annotation treats key
+        # presence as authoritative over the stored sidecar value.
+        meta["recorded_at_manual"] = value
+        annotation["media_meta"] = meta
+        try:
+            result = annotation_store.save_annotation(path, annotation)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
 
     @eager.post("/api/eager/annotations")
     def eager_annotations_save():

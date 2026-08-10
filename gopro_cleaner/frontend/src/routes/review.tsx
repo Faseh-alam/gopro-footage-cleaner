@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
+import { MetadataCard } from "@/components/review/metadata-card";
 import { TaskPanel } from "@/components/review/task-panel";
 import { FootageList } from "@/components/review/footage-list";
 import { TrimDock } from "@/components/review/trim-dock";
@@ -289,6 +290,7 @@ function ReviewPage() {
       <main className="grid min-h-0 flex-1 gap-4 p-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)]">
         <div className="grid min-h-0 content-start gap-4">
           <PlayerPanel c={c} />
+          <MetadataCard c={c} />
           <BatchPanel c={c} />
         </div>
 

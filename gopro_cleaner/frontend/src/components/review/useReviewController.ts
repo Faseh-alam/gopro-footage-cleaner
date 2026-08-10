@@ -253,6 +253,7 @@ export function useReviewController() {
           complete,
           pendingWork: keepPending ? prevAnn?.pendingWork || null : null,
           summary,
+          mediaMeta: annotation.media_meta || prevAnn?.mediaMeta || null,
         };
         anchorByPathRef.current[path] = computeAnchor(segments);
         return { ...prev, [path]: next };
@@ -997,6 +998,26 @@ export function useReviewController() {
     if (stateRef.current.annotationsByPath[video.path]?.complete) await finishCleaningFile();
   }, [annotationContext, annotationFor, currentAnnotation, currentScrubTime, currentVideo, finishCleaningFile, loadAnnotationForPath, setStatus]);
 
+  // Manually set (ISO string) or clear ("") the recording timestamp; the
+  // camera's own value is preserved server-side and restored on clear.
+  const updateRecordedAt = useCallback(
+    async (value: string) => {
+      const video = currentVideo();
+      if (!video) return;
+      try {
+        const data = await api("/api/eager/media-meta/recorded-at", {
+          method: "POST",
+          body: JSON.stringify({ path: video.path, recorded_at: value }),
+        });
+        applyAnnotationPayload(video.path, data, { keepPending: true });
+        setStatus(value ? "Recording timestamp updated" : "Timestamp reset to camera value", "ok");
+      } catch (error: any) {
+        setStatus(error.message || "Could not update timestamp", "error");
+      }
+    },
+    [applyAnnotationPayload, currentVideo, setStatus],
+  );
+
   const deleteSegmentAt = useCallback(
     async (index: number) => {
       const video = currentVideo();
@@ -1725,6 +1746,7 @@ export function useReviewController() {
     clearShareClip,
     downloadShareClip,
     deleteSegmentAt,
+    updateRecordedAt,
     appVersion,
     currentVideo,
     currentAnnotation,
