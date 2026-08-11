@@ -39,8 +39,8 @@ export const Route = createFileRoute("/review")({
 
 const KEYS: [string, string][] = [
   ["Space", "Play / pause (resets to 1×)"],
-  ["← →", "−1s / +1s (stops at end)"],
-  ["[ ]", "Speed −0.5× / +0.5× (max 2× on original, 8× on 720p)"],
+  ["← →", "Speed −0.5× / +0.5× (max 2× on original, 8× on 720p)"],
+  ["[ ]", "Speed −0.5× / +0.5×"],
   [", .", "−1s / +1s (stops at end)"],
   ["I / O", "Mark share-clip in / out"],
   ["T", "End work segment + select task"],
@@ -211,10 +211,8 @@ function ReviewPage() {
       const key = event.key.toLowerCase();
       let handled = true;
 
-      if (event.key === "ArrowLeft") c.fineTune(-1);
-      else if (event.key === "ArrowRight") c.fineTune(1);
-      else if (event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
-      else if (event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
+      if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
+      else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
       else if (event.key === ",") c.fineTune(-1);
       else if (event.key === ".") c.fineTune(1);
       else if (key === "i") c.markShareIn();
