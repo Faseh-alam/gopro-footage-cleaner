@@ -1282,14 +1282,11 @@ export function useReviewController() {
     touchRecentTask,
   ]);
 
-  const markGarbage = useCallback(async () => {
+  const markGarbage = useCallback(() => {
     const video = currentVideo();
     if (!video) return;
-    let ann = currentAnnotation();
-    if (!ann) {
-      await loadAnnotationForPath(video.path);
-      ann = stateRef.current.annotationsByPath[video.path];
-    }
+    // Never block G on a network round-trip — use in-memory annotation only.
+    const ann = currentAnnotation() || stateRef.current.annotationsByPath[video.path] || null;
     if (ann?.pendingWork) {
       setStatus("Assign task first", "error");
       return;
@@ -1303,7 +1300,6 @@ export function useReviewController() {
       return;
     }
 
-    // Instant UI for garbage marks too.
     const optimistic: Segment = {
       id: `local-${Date.now()}`,
       start: anchor,
@@ -1318,17 +1314,20 @@ export function useReviewController() {
     });
     setStatus(`Marked garbage ${formatTime(anchor)} → ${formatTime(end)}`, "ok");
 
-    try {
-      const data = await api("/api/eager/annotations/append", {
-        method: "POST",
-        body: JSON.stringify({ path: video.path, kind: "garbage", end, ...annotationContext() }),
-      });
-      applyAnnotationPayload(video.path, data, { keepPending: false });
-      if (stateRef.current.annotationsByPath[video.path]?.complete) void finishCleaningFile();
-    } catch (error: any) {
-      setStatus(error?.message || "Could not save garbage mark", "error");
-      await loadAnnotationForPath(video.path);
-    }
+    const ctx = annotationContext();
+    void (async () => {
+      try {
+        const data = await api("/api/eager/annotations/append", {
+          method: "POST",
+          body: JSON.stringify({ path: video.path, kind: "garbage", end, ...ctx }),
+        });
+        applyAnnotationPayload(video.path, data, { keepPending: false });
+        if (stateRef.current.annotationsByPath[video.path]?.complete) void finishCleaningFile();
+      } catch (error: any) {
+        setStatus(error?.message || "Could not save garbage mark", "error");
+        void loadAnnotationForPath(video.path);
+      }
+    })();
   }, [
     annotationContext,
     annotationFor,
