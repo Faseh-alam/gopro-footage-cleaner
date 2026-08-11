@@ -98,6 +98,40 @@ function ReviewPage() {
     }
   };
 
+  // On reload: if GitHub has newer commits than this checkout, offer Update.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const check = await api<{
+          behind?: boolean;
+          local?: string;
+          remote?: string;
+          branch?: string;
+          version?: string;
+        }>("/api/update/check");
+        if (cancelled || !check?.behind) return;
+        toast.message("New version available", {
+          description: `${check.branch || "branch"} ${check.local} → ${check.remote}`,
+          duration: 12_000,
+          action: {
+            label: "Update",
+            onClick: () => {
+              void runUpdate();
+            },
+          },
+        });
+      } catch {
+        /* offline / no git — ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Intentionally once per page load.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // First encounter today → register card in DB (server derives C#### from camera serial).
   const addedCardRef = useRef<string | null>(null);
   useEffect(() => {

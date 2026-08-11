@@ -22,7 +22,7 @@ from .core.routes_cards import create_cards_blueprint
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
 WEB_DIR = APP_ROOT / "web"
-APP_VERSION = "2.18.2-testing"
+APP_VERSION = "2.19.0-testing"
 
 
 def create_app() -> Flask:
@@ -42,18 +42,29 @@ def create_app() -> Flask:
     @app.get("/api/health")
     def health():
         from .core.ffmpeg_tools import ffmpeg_available
+        from .core.self_update import current_git_sha
 
         tools = ffmpeg_available()
         return jsonify(
             {
                 "ok": True,
                 "version": APP_VERSION,
+                "git_sha": current_git_sha(),
                 "ffmpeg_ok": tools["ok"],
                 "ffmpeg": tools.get("ffmpeg"),
                 "ffprobe": tools.get("ffprobe"),
                 "ffmpeg_hint": tools.get("hint") or "",
             }
         )
+
+    @app.get("/api/update/check")
+    def update_check():
+        """Return whether origin has commits the local checkout does not."""
+        from .core.self_update import check_for_updates
+
+        result = check_for_updates()
+        result["version"] = APP_VERSION
+        return jsonify(result)
 
     @app.post("/api/update")
     def self_update():

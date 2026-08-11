@@ -113,6 +113,45 @@ def pull_latest_main() -> dict:
     return pull_latest_current_branch()
 
 
+def check_for_updates() -> dict:
+    """Compare local HEAD to origin/<branch> after a quiet fetch."""
+    if not shutil.which("git") or not (PROJECT_ROOT / ".git").exists():
+        return {"ok": False, "behind": False, "error": "git unavailable"}
+    try:
+        branch = current_branch()
+        local = _git("rev-parse", "HEAD")
+        try:
+            _git("fetch", "origin", branch)
+        except RuntimeError:
+            # Offline / no remote — still report local sha.
+            return {
+                "ok": True,
+                "behind": False,
+                "branch": branch,
+                "local": local[:7],
+                "remote": local[:7],
+                "offline": True,
+            }
+        remote = _git("rev-parse", f"origin/{branch}")
+        return {
+            "ok": True,
+            "behind": local != remote,
+            "branch": branch,
+            "local": local[:7],
+            "remote": remote[:7],
+            "offline": False,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "behind": False, "error": str(exc)}
+
+
+def current_git_sha() -> str:
+    try:
+        return _git("rev-parse", "--short", "HEAD")
+    except Exception:
+        return ""
+
+
 def relaunch_and_exit(delay_seconds: float = 1.5) -> None:
     """Spawn a detached relauncher (run.bat / run.sh), then exit this process.
 

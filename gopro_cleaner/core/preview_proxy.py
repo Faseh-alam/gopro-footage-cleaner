@@ -19,7 +19,7 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v8-fast-720p"
+_PREVIEW_VERSION = "v9-instant-720p"
 
 _PLAYLIST_NAME = "index.m3u8"
 # Playable as soon as the first segment exists (~1s of video).
@@ -72,6 +72,7 @@ def _playlist_state(playlist: Path) -> tuple[int, bool]:
 
 
 def _probe_duration_seconds(source: Path) -> float:
+    """Best-effort duration for progress % — keep it short so it never stalls work."""
     try:
         from .ffmpeg_tools import ffprobe_bin
 
@@ -89,7 +90,7 @@ def _probe_duration_seconds(source: Path) -> float:
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=2,
         )
         return max(0.0, float((result.stdout or "").strip() or 0))
     except Exception:
@@ -97,15 +98,15 @@ def _probe_duration_seconds(source: Path) -> float:
 
 
 _SOFTWARE_ENCODER_ARGS = [
-    # ultrafast + higher CRF: prioritize encode speed for review proxies.
+    # ultrafast + zerolatency: minimize time-to-first HLS segment.
     "-c:v",
     "libx264",
     "-preset",
     "ultrafast",
     "-tune",
-    "fastdecode",
+    "zerolatency",
     "-crf",
-    "32",
+    "34",
     "-threads",
     "0",
 ]
@@ -118,6 +119,14 @@ _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
 
 # Probed once per process: hardware encode is 3–10× faster than x264 on big files.
 _win_encoder_args: list[str] | None = None
+
+
+def _warm_encoder_probe() -> None:
+    """Run HW encoder detection in the background so the first preview isn't delayed."""
+    try:
+        _preview_encoder_args()
+    except Exception:
+        pass
 
 
 def _encoder_works(encoder_args: list[str]) -> bool:
@@ -208,27 +217,42 @@ def _hls_output_args(dest_dir: Path) -> list[str]:
 def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: list) -> None:
     from .ffmpeg_tools import ffmpeg_bin
 
-    duration = _probe_duration_seconds(source)
+    # Don't block ffmpeg start on a slow probe of multi‑GB GoPro files.
+    duration = 0.0
+    probe_holder: list[float] = [0.0]
+
+    def _probe_async() -> None:
+        probe_holder[0] = _probe_duration_seconds(source)
+
+    threading.Thread(target=_probe_async, daemon=True, name="preview-probe").start()
+
     command = [
         ffmpeg_bin(),
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        # Fast open on huge MP4s — skip deep analyze before first frames.
+        "-fflags",
+        "+genpts+fastseek",
+        "-probesize",
+        "32k",
+        "-analyzeduration",
+        "0",
         *_hwaccel_input_args(),
         "-i",
         str(source),
         "-an",
         "-vf",
-        # 720p @ 10fps — ultrafast CRF; playable after first 1s HLS segment.
-        "scale='min(720,iw)':-2:flags=fast_bilinear,fps=10",
+        # 720p @ 8fps — first HLS segment as soon as possible.
+        "scale='min(720,iw)':-2:flags=neighbor,fps=8",
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
         "-g",
-        "10",
+        "8",
         "-keyint_min",
-        "10",
+        "8",
         "-sc_threshold",
         "0",
         "-progress",
@@ -236,8 +260,10 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         "-nostats",
         *_hls_output_args(dest_dir),
     ]
-    # Normal priority — preview encode should finish as fast as the machine allows.
+    # Prefer the preview encode over background work so the first segment lands fast.
     popen_kwargs: dict = {}
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0x00008000)
     stderr_log = dest_dir / "stderr.log"
     stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(
@@ -263,7 +289,10 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         # NOTE: ffmpeg's out_time_ms is misnamed — the value is MICROseconds
         # (same as out_time_us). Treating it as ms made progress hit the 99%
         # cap ~1000× early, so the UI sat on "Finalizing" for the whole build.
-        if line.startswith(("out_time_us=", "out_time_ms=")) and duration > 0:
+        if line.startswith(("out_time_us=", "out_time_ms=")):
+            duration = probe_holder[0] or duration
+            if duration <= 0:
+                continue
             try:
                 out_us = int(line.split("=", 1)[1].strip() or 0)
                 pct = min(99, int((out_us / 1_000_000.0) / duration * 100))
@@ -491,3 +520,7 @@ def resolve_preview(source: Path) -> Path:
     if status.get("status") == "ready":
         return Path(status["path"])
     raise RuntimeError(status.get("error") or "Preview not ready")
+
+
+# Detect NVENC/QSV/AMF once at import so the first review open isn't paying that cost.
+threading.Thread(target=_warm_encoder_probe, daemon=True, name="preview-encoder-warm").start()

@@ -16,9 +16,49 @@ import type {
 
 const RECENT_TASKS_KEY = "gopro_eager_recent_tasks";
 const RECENT_TASKS_MAX = 10;
+const SESSION_KEY = "gopro_eager_review_session";
+const SEEN_GIT_SHA_KEY = "gopro_eager_seen_git_sha";
 const PLAYBACK_RATE_MIN = 0.5;
 const PLAYBACK_RATE_MAX = 8;
 const PLAYBACK_RATE_STEP = 0.5;
+
+type ReviewSession = {
+  path: string;
+  scrubTime: number;
+  scanRoot?: string;
+  updatedAt: number;
+};
+
+function loadReviewSession(): ReviewSession | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.path !== "string") return null;
+    return {
+      path: parsed.path,
+      scrubTime: Number(parsed.scrubTime) || 0,
+      scanRoot: typeof parsed.scanRoot === "string" ? parsed.scanRoot : undefined,
+      updatedAt: Number(parsed.updatedAt) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveReviewSession(session: { path: string; scrubTime: number; scanRoot?: string }) {
+  try {
+    const payload: ReviewSession = {
+      path: session.path,
+      scrubTime: Math.max(0, Number(session.scrubTime) || 0),
+      scanRoot: session.scanRoot || undefined,
+      updatedAt: Date.now(),
+    };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+  } catch {
+    /* ignore */
+  }
+}
 
 function formatTime(seconds: number) {
   return formatClock(seconds);
@@ -670,12 +710,19 @@ export function useReviewController() {
   );
 
   const resumeTimeForPath = useCallback((path: string) => {
+    // Prefer the last playhead from this browser session (survives reload).
+    const saved = loadReviewSession();
+    const savedT = saved?.path === path && Number.isFinite(saved.scrubTime) ? Math.max(0, saved.scrubTime) : 0;
     const ann = stateRef.current.annotationsByPath[path];
-    if (!ann || ann.complete) return 0;
+    if (!ann) return savedT;
+    if (ann.complete) return savedT;
     const segments = ann.segments || [];
-    if (!segments.length) return 0;
-    const anchor = anchorByPathRef.current[path] ?? computeAnchor(segments);
-    return Number.isFinite(anchor) && anchor > 0 ? anchor : 0;
+    const anchor = segments.length
+      ? anchorByPathRef.current[path] ?? computeAnchor(segments)
+      : 0;
+    const anchorT = Number.isFinite(anchor) && anchor > 0 ? anchor : 0;
+    // Never resume earlier than the labelling anchor, but keep the last scrub if further.
+    return Math.max(savedT, anchorT);
   }, []);
 
   // ---------------------------------------------------------------------
@@ -713,8 +760,8 @@ export function useReviewController() {
     [nextIncompleteIndex],
   );
 
-  // Warm the next clip's 720p encode while the current one plays — critical for
-  // snappy N / auto-advance. Safe to call repeatedly (idempotent start=1).
+  // Warm the next clip's 720p encode — call only after the current preview is
+  // playable so two ffmpeg jobs don't fight for the first segment.
   const prefetchNextPreview = useCallback(
     (fromIndex: number) => {
       const s = stateRef.current;
@@ -861,9 +908,11 @@ export function useReviewController() {
             // for the whole encode before smooth 5–8× playback.
             if (!onPreview && st.playable && st.hls) {
               swapToPreview(path, token, String(st.hls), true);
+              // Current is playable — only now warm the next clip.
+              prefetchNextPreview(stateRef.current.index);
+            } else if (onPreview) {
+              prefetchNextPreview(stateRef.current.index);
             }
-            // While current encodes/plays, keep the next 720p job alive.
-            prefetchNextPreview(stateRef.current.index);
             setPreviewNote(
               hlsUrlRef.current ? `720p preview · encoding ${pct}%` : `Building preview ${pct}%`,
             );
@@ -924,7 +973,6 @@ export function useReviewController() {
 
       setLoadingVideo(true);
       setIndex(i);
-      setScrubTime(0);
       setShareClipIn(null);
       setShareClipOut(null);
       setPreviewNote("Starting 720p preview…");
@@ -936,11 +984,9 @@ export function useReviewController() {
       pendingSeekRef.current = null;
 
       const token = ++previewTokenRef.current;
+      const earlyResume = resumeTimeForPath(video.path);
+      setScrubTime(earlyResume);
       setStatus(`Loading ${video.name}...`);
-
-      // CRITICAL: kick current + next 720p encodes immediately (don't wait on UI).
-      void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
-      prefetchNextPreview(i);
 
       const v = videoRef.current;
       if (!v) {
@@ -954,48 +1000,11 @@ export function useReviewController() {
 
       const streamUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
 
-      // Annotation + preview status in parallel so switching feels instant.
-      const [, previewSt] = await Promise.all([
-        loadAnnotationForPath(video.path, { keepPending: true }),
-        api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null),
-      ]);
-      if (token !== previewTokenRef.current) return;
-
-      // Keep the lookahead encode warm while this clip is reviewed.
-      prefetchNextPreview(i);
-
-      const resumeTime = resumeTimeForPath(video.path);
-      setScrubTime(resumeTime);
-      setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
-
+      // Instant paint: stream the original immediately while 720p builds.
+      // Do NOT start the next encode yet — that steals CPU from the first segment.
+      destroyHls();
       let usingPreview = false;
-      let initialHls = "";
-      try {
-        const st = previewSt;
-        if (st?.status === "ready" && st.hls) {
-          initialHls = String(st.hls);
-          usingPreview = true;
-          setPreviewNote("720p preview");
-        } else if (st?.status === "running") {
-          if (st.playable && st.hls) {
-            initialHls = String(st.hls);
-            usingPreview = true;
-            setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
-          } else {
-            setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
-          }
-          pollPreviewReady(video.path, token);
-        } else if (st?.status === "skipped") {
-          setPreviewNote("Original file");
-        } else {
-          setPreviewNote("Building preview…");
-          pollPreviewReady(video.path, token);
-        }
-      } catch {
-        setPreviewNote("Original file");
-      }
-
-      const onReady = () => {
+      const applyResume = () => {
         if (token !== previewTokenRef.current) return;
         setLoadingVideo(false);
         v.pause();
@@ -1008,8 +1017,6 @@ export function useReviewController() {
         }
         setPlaybackRate(1, false);
         updateScrubUiFromEl();
-        // Current is on screen — ensure next encode is already running.
-        prefetchNextPreview(i);
         const mode = usingPreview ? "720p preview" : "original (proxy building)";
         setStatus(
           startAt > 0
@@ -1023,17 +1030,52 @@ export function useReviewController() {
         setLoadingVideo(false);
         setStatus("Could not load video", "error");
       };
-      v.addEventListener("loadedmetadata", onReady, { once: true });
+      v.addEventListener("loadedmetadata", applyResume, { once: true });
       v.addEventListener("error", onError, { once: true });
-      if (!initialHls || !attachHlsMedia(v, video.path, initialHls, resumeTime, token)) {
-        usingPreview = false;
-        destroyHls();
-        v.src = streamUrl;
-        v.load();
+      v.src = streamUrl;
+      v.load();
+
+      // Kick current 720p encode in the background (next waits until playable).
+      void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
+
+      const [, previewSt] = await Promise.all([
+        loadAnnotationForPath(video.path, { keepPending: true }),
+        api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null),
+      ]);
+      if (token !== previewTokenRef.current) return;
+
+      const resumeTime = resumeTimeForPath(video.path);
+      setScrubTime(resumeTime);
+      setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
+
+      try {
+        const st = previewSt;
+        if (st?.status === "ready" && st.hls) {
+          usingPreview = true;
+          setPreviewNote("720p preview");
+          swapToPreview(video.path, token, String(st.hls), false);
+          prefetchNextPreview(i);
+        } else if (st?.status === "running") {
+          if (st.playable && st.hls) {
+            usingPreview = true;
+            setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
+            swapToPreview(video.path, token, String(st.hls), true);
+            prefetchNextPreview(i);
+          } else {
+            setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
+          }
+          pollPreviewReady(video.path, token);
+        } else if (st?.status === "skipped") {
+          setPreviewNote("Original file");
+        } else {
+          setPreviewNote("Building preview…");
+          pollPreviewReady(video.path, token);
+        }
+      } catch {
+        setPreviewNote("Original file");
       }
     },
     [
-      attachHlsMedia,
       cancelPreviewJob,
       destroyHls,
       isVideoFullyDone,
@@ -1045,6 +1087,7 @@ export function useReviewController() {
       setPlaybackRate,
       setStatus,
       stopPreviewPoll,
+      swapToPreview,
       updateScrubUiFromEl,
     ],
   );
@@ -1379,30 +1422,29 @@ export function useReviewController() {
       setVideos(freshVideos);
       setIndex(-1);
 
-      // Start 720p for the first two files while annotations load — biggest win.
-      for (const v of freshVideos.slice(0, 2)) {
-        if (v?.path) {
-          void api(`/api/eager/preview/status?path=${encodeURIComponent(v.path)}&start=1`).catch(() => null);
-        }
-      }
-
       await Promise.all(freshVideos.map((v) => loadAnnotationForPath(v.path)));
       setIdentityFromSelectedCard();
 
+      const session = loadReviewSession();
+      const savedIdx =
+        session?.path != null ? freshVideos.findIndex((v) => v.path === session.path) : -1;
       const first = freshVideos.findIndex((v) => !stateRef.current.annotationsByPath[v.path]?.complete);
       if (first >= 0 || freshVideos.length) {
-        const openAt = first >= 0 ? first : 0;
-        // Warm openAt + openAt+1 explicitly in case the first incomplete isn't index 0.
-        for (const v of [freshVideos[openAt], freshVideos[openAt + 1]]) {
-          if (v?.path) {
-            void api(`/api/eager/preview/status?path=${encodeURIComponent(v.path)}&start=1`).catch(() => null);
-          }
+        // Resume the video we were on (and its scrub time) after reload when possible.
+        const openAt = savedIdx >= 0 ? savedIdx : first >= 0 ? first : 0;
+        // Only warm the clip we're about to open — next waits until playable.
+        const openPath = freshVideos[openAt]?.path;
+        if (openPath) {
+          void api(`/api/eager/preview/status?path=${encodeURIComponent(openPath)}&start=1`).catch(() => null);
         }
         await loadVideo(openAt, { force: true });
+        const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
         setStatus(
-          first >= 0
-            ? `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`
-            : `All ${freshVideos.length} files complete`,
+          resumed
+            ? `Resumed ${freshVideos[openAt]?.name} at ${formatTime(session!.scrubTime)}`
+            : first >= 0
+              ? `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`
+              : `All ${freshVideos.length} files complete`,
           "ok",
         );
       } else {
@@ -1794,6 +1836,35 @@ export function useReviewController() {
     }
   }, [currentVideo, setStatus, shareClipIn, shareClipOut, shareClipQuality]);
 
+  // Persist playhead so reload resumes at the same timeline position.
+  useEffect(() => {
+    if (loadingVideo) return;
+    const video = currentVideo();
+    if (!video?.path) return;
+    const handle = window.setTimeout(() => {
+      saveReviewSession({
+        path: video.path,
+        scrubTime: stateRef.current.scrubTime || 0,
+        scanRoot: stateRef.current.scanRoot || undefined,
+      });
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [scrubTime, index, loadingVideo, currentVideo]);
+
+  useEffect(() => {
+    const flush = () => {
+      const video = stateRef.current.videos[stateRef.current.index];
+      if (!video?.path) return;
+      saveReviewSession({
+        path: video.path,
+        scrubTime: stateRef.current.scrubTime || 0,
+        scanRoot: stateRef.current.scanRoot || undefined,
+      });
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, []);
+
   // Init on mount.
   useEffect(() => {
     setRecentTasks(loadRecentTasks());
@@ -1813,6 +1884,15 @@ export function useReviewController() {
         if (cancelled) return;
         setAppVersion(health.version || "");
         setPerf((prev) => ({ ...prev, ...perfData }));
+        // After an Update/restart, celebrate the new build once.
+        const sha = String(health.git_sha || "").trim();
+        if (sha) {
+          const prev = localStorage.getItem(SEEN_GIT_SHA_KEY) || "";
+          if (prev && prev !== sha) {
+            toast.success(`Updated to v${health.version || "?"} (${sha})`);
+          }
+          localStorage.setItem(SEEN_GIT_SHA_KEY, sha);
+        }
         const open = (batches?.batches || []).find((b: any) => b.status !== "complete") || null;
         if (open?.id) {
           setBatchId(open.id);
