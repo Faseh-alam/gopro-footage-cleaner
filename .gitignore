@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 *.swp
-.env
+# .env is committed on purpose for employee machines (private repo).
 recovery/
 *.log
 *.zip
