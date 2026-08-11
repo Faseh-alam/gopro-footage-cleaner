@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 _lock = threading.Lock()
@@ -74,7 +75,7 @@ def _playlist_state(playlist: Path) -> tuple[int, bool]:
     return segments, "#EXT-X-ENDLIST" in text
 
 
-def _probe_duration_seconds(source: Path) -> float:
+def _probe_duration_seconds(source: Path, timeout: float = 4.0) -> float:
     """Best-effort duration for progress % — keep it short so it never stalls work."""
     try:
         from .ffmpeg_tools import ffprobe_bin
@@ -93,7 +94,7 @@ def _probe_duration_seconds(source: Path) -> float:
             capture_output=True,
             text=True,
             check=False,
-            timeout=2,
+            timeout=timeout,
         )
         return max(0.0, float((result.stdout or "").strip() or 0))
     except Exception:
@@ -232,7 +233,14 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
     probe_holder: list[float] = [0.0]
 
     def _probe_async() -> None:
-        probe_holder[0] = _probe_duration_seconds(source)
+        # SD cards under encode load make the first probe time out — retry a
+        # few times so the progress % doesn't sit at 0 for the whole build.
+        for _ in range(4):
+            value = _probe_duration_seconds(source)
+            if value > 0:
+                probe_holder[0] = value
+                return
+            time.sleep(2.0)
 
     threading.Thread(target=_probe_async, daemon=True, name="preview-probe").start()
 
@@ -487,6 +495,9 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
         dest_dir = playlist.parent
         process_holder: list = []
         # Serialize encodes — two concurrent ffmpeg jobs melt laptops.
+        with _lock:
+            if _jobs.get(key, {}).get("status") == "running":
+                _jobs[key]["message"] = "Queued — waiting for the current encode to finish…"
         acquired = _encode_slots.acquire(timeout=3600)
         if not acquired:
             with _lock:
@@ -503,6 +514,7 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
             with _lock:
                 if _jobs.get(key, {}).get("status") != "running":
                     return
+                _jobs[key]["message"] = "Encoding 720p preview…"
             # Interrupted/stale builds leave a playlist without ENDLIST — rebuild.
             _clear_dir_contents(dest_dir)
             _build_preview(source, dest_dir, key, process_holder)

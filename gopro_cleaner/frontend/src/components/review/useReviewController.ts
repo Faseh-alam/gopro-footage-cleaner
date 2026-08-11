@@ -271,6 +271,12 @@ export function useReviewController() {
   const beginFrontierWaitRef = useRef<() => void>(() => {});
   /** Fatal-HLS fallbacks for the current video — stop retrying the preview after 2. */
   const hlsFallbackCountRef = useRef(0);
+  /** Consecutive polls where the encoder is behind the playhead (SD contention). */
+  const encodeBehindTicksRef = useRef(0);
+  /** Auto-cap to 1× fired for this video (never fight the user twice). */
+  const autoCappedRef = useRef(false);
+  /** Rate the user wanted before the auto-cap — restored on preview swap. */
+  const preCapRateRef = useRef(0);
   const trimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const globalTrimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [previewNote, setPreviewNote] = useState("");
@@ -948,6 +954,7 @@ export function useReviewController() {
       if (next < 0) return;
       const path = s.videos[next]?.path;
       if (!path || path === s.videos[fromIndex]?.path) return;
+      if (prefetchedPreviewRef.current === path) return; // already queued
       prefetchedPreviewRef.current = path;
       api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`).catch(() => {
         /* best-effort warmup */
@@ -1089,7 +1096,11 @@ export function useReviewController() {
       const saved = resumeTimeForPath(path);
       const t = Math.max(live > 0.05 ? live : 0, scrub, saved);
       const resume = wantPlayingRef.current || !v.paused;
-      const rate = Math.min(PLAYBACK_RATE_MAX_PREVIEW, playbackRateRef.current || 1);
+      // If we auto-capped to 1× while the encoder caught up, restore the
+      // speed the user actually wanted now that the preview can handle it.
+      const wantedRate = Math.max(playbackRateRef.current || 1, preCapRateRef.current || 1);
+      preCapRateRef.current = 0;
+      const rate = Math.min(PLAYBACK_RATE_MAX_PREVIEW, wantedRate);
 
       // Freeze the last original frame over the player while the source
       // remounts — the swap reads as a quality change, never a restart.
@@ -1175,12 +1186,16 @@ export function useReviewController() {
           // re-swapping into a broken stream would loop hitches forever.
           const previewGivenUp = hlsFallbackCountRef.current >= 2;
           if (st.status === "running") {
-            const pct = Number(st.progress) || 0;
             const onPreview = Boolean(hlsUrlRef.current);
             // Segments are 1s each, so count ≈ encoded seconds. Only swap once
             // the encoder is PAST the playhead — otherwise the seek would clamp
             // to the encode edge and yank the playhead backwards.
             const encodedSec = Number(st.segments) || 0;
+            // Honest progress even when the SD-card duration probe failed
+            // (that used to pin the label at 0% for the whole build).
+            const fullDur = knownDurationSec();
+            const segPct = fullDur > 1 ? Math.min(99, Math.round((encodedSec / fullDur) * 100)) : 0;
+            const pct = Math.max(Number(st.progress) || 0, segPct);
             const playhead = Math.max(
               Number(stateRef.current.scrubTime) || 0,
               Number(videoRef.current?.currentTime) || 0,
@@ -1193,13 +1208,40 @@ export function useReviewController() {
               encodedSec > playhead + 3
             ) {
               swapToPreview(path, token, String(st.hls), true);
+            } else if (!onPreview && !previewGivenUp && wantPlayingRef.current) {
+              // SD cards: streaming the original at 2× can starve the encoder
+              // so it NEVER passes the playhead. Hold 1× briefly — the encode
+              // races ahead, the 720p swap lands, and 4× unlocks.
+              const behind = encodedSec < playhead + 3;
+              encodeBehindTicksRef.current = behind ? encodeBehindTicksRef.current + 1 : 0;
+              if (
+                behind &&
+                encodeBehindTicksRef.current >= 4 &&
+                !autoCappedRef.current &&
+                (playbackRateRef.current || 1) > 1
+              ) {
+                autoCappedRef.current = true;
+                preCapRateRef.current = playbackRateRef.current || 1;
+                setPlaybackRate(1, false);
+                setStatus(
+                  "Holding 1× so the 720p preview can catch up — full speed unlocks when it swaps in",
+                  "ok",
+                );
+              }
+            }
+            if (onPreview) {
+              // Current video is watchable — queue the next encode NOW so it
+              // starts the second the encoder slot frees up.
+              prefetchNextPreview(stateRef.current.index);
             }
             setPreviewNote(
               hlsUrlRef.current
                 ? `720p preview · encoding ${pct}%`
                 : previewGivenUp
                   ? "Original file · max 2×"
-                  : `Original · building preview ${pct}%`,
+                  : encodedSec <= 0 && st.message
+                    ? `Original · ${st.message}`
+                    : `Original · building preview ${pct}%`,
             );
             return;
           }
@@ -1231,7 +1273,7 @@ export function useReviewController() {
       // when the preview is already usable.
       void tick();
     },
-    [prefetchNextPreview, stopPreviewPoll, swapToPreview],
+    [knownDurationSec, prefetchNextPreview, setPlaybackRate, stopPreviewPoll, swapToPreview],
   );
 
   const loadVideo = useCallback(
@@ -1271,6 +1313,9 @@ export function useReviewController() {
       stopPreviewPoll();
       stopFrontierWait();
       hlsFallbackCountRef.current = 0;
+      encodeBehindTicksRef.current = 0;
+      autoCappedRef.current = false;
+      preCapRateRef.current = 0;
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
         seekTimerRef.current = null;
