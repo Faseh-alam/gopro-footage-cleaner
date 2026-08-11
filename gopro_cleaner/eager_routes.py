@@ -748,12 +748,22 @@ def create_eager_blueprint() -> Blueprint:
         annotation = annotation_store.load_annotation(path)
         if annotation is None:
             annotation = annotation_store.empty_annotation(source=path.name)
-            try:
-                from .core.probe import probe_media
-
-                annotation["duration"] = probe_media(path).duration
-            except Exception:  # noqa: BLE001
-                pass
+        # Always resolve duration from the source MP4 — heals sidecars that
+        # stored a short HLS/player duration while the preview was encoding.
+        try:
+            true_dur = annotation_store.resolve_media_duration(path, annotation.get("duration"))
+            if true_dur is not None:
+                prev = annotation.get("duration")
+                annotation["duration"] = true_dur
+                # Rewrite sidecar when we heal a meaningfully short duration.
+                if prev is None or float(prev or 0) + 0.5 < true_dur:
+                    try:
+                        annotation_store.save_annotation(path, annotation)
+                        annotation = annotation_store.load_annotation(path) or annotation
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
         # Camera / IMU metadata: cached per file, shown in the UI even before
         # the first segment is saved to the sidecar.
         if not annotation.get("media_meta"):

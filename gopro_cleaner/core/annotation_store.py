@@ -42,6 +42,39 @@ def normalize_boundary(t: float, duration: float | None) -> float:
     return min(value, duration)
 
 
+def resolve_media_duration(video: Path, claimed: float | None = None) -> float | None:
+    """Authoritative clip length from ffprobe — never trust the browser/HLS clock.
+
+    Growing 720p previews expose a short ``<video>.duration`` while encoding.
+    That value used to be written into the sidecar and broke coverage / complete.
+    Always prefer a fresh probe; only fall back to ``claimed`` if probing fails.
+    If both exist and probe is meaningfully longer, probe wins (heals bad sidecars).
+    """
+    probed: float | None = None
+    try:
+        from .probe import probe_media
+
+        raw = probe_media(Path(video)).duration
+        if raw is not None and float(raw) > 0:
+            probed = float(raw)
+    except Exception:  # noqa: BLE001
+        probed = None
+
+    claimed_f: float | None = None
+    try:
+        if claimed is not None and float(claimed) > 0:
+            claimed_f = float(claimed)
+    except (TypeError, ValueError):
+        claimed_f = None
+
+    if probed is not None and claimed_f is not None:
+        # Heal short/partial durations (HLS frontier); keep probe if close.
+        if probed > claimed_f + 0.5:
+            return probed
+        return max(probed, claimed_f)
+    return probed if probed is not None else claimed_f
+
+
 def empty_annotation(
     *,
     source: str,
@@ -204,14 +237,8 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
     if not video.is_file():
         raise FileNotFoundError(f"Video not found: {video}")
 
-    duration = annotation.get("duration")
-    if duration is None:
-        try:
-            from .probe import probe_media
-
-            duration = probe_media(video).duration
-        except Exception:  # noqa: BLE001
-            duration = None
+    # Never persist player/HLS duration — probe the source MP4.
+    duration = resolve_media_duration(video, annotation.get("duration"))
 
     segments = []
     for raw in annotation.get("segments") or []:
@@ -370,19 +397,17 @@ def append_segment(
     video = Path(video).expanduser().resolve()
     existing = load_annotation(video) or empty_annotation(source=video.name)
     if context:
-        for key in ("batch_name", "factory", "card_badge", "device_type", "device_id", "duration"):
+        # Duration is resolved from ffprobe below — never take the client clock.
+        for key in ("batch_name", "factory", "card_badge", "device_type", "device_id"):
             if context.get(key) not in (None, ""):
                 existing[key] = context[key]
 
-    duration = existing.get("duration")
-    if duration is None:
-        try:
-            from .probe import probe_media
-
-            duration = probe_media(video).duration
-            existing["duration"] = duration
-        except Exception:  # noqa: BLE001
-            pass
+    claimed = existing.get("duration")
+    if context and context.get("duration") not in (None, ""):
+        claimed = context.get("duration")
+    duration = resolve_media_duration(video, claimed)
+    if duration is not None:
+        existing["duration"] = duration
 
     end = normalize_boundary(end, duration)
     _, _, covered = validate_segments(

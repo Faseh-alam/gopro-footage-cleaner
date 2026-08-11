@@ -395,7 +395,10 @@ export function useReviewController() {
     const id = stateRef.current.cardIdentity as CardIdentity;
     const batch = stateRef.current.batchDetail as BatchDetail | null;
     const video = currentVideo();
-    const dur = videoRef.current?.duration || video?.duration || annotationFor(video?.path)?.duration || undefined;
+    // Never send <video>.duration — while 720p HLS is still encoding that
+    // value is only the encode frontier and used to corrupt the sidecar.
+    // Prefer scan/sidecar duration; the server always re-probes with ffprobe.
+    const dur = video?.duration || annotationFor(video?.path)?.duration || undefined;
     return {
       batch_name: batch?.batch_name || "",
       factory: id.factory || "",
