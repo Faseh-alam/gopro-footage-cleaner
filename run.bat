@@ -102,8 +102,12 @@ echo Using UI from gopro_cleaner\web
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT% ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
 
 echo.
-echo Opening %APP_URL%
-start "" "%APP_URL%"
+if defined GOPRO_NO_BROWSER (
+  echo Skipping browser launch — the open tab reloads itself after an update.
+) else (
+  echo Opening %APP_URL%
+  start "" "%APP_URL%"
+)
 
 echo Starting Flask ^(API + UI^) on port %PORT%...
 "%VENV_PY%" -m gopro_cleaner

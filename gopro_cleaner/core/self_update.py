@@ -123,6 +123,9 @@ def relaunch_and_exit(delay_seconds: float = 1.5) -> None:
 
     def _go() -> None:
         time.sleep(0.3)
+        # The already-open tab reloads itself once the server is back — the
+        # relaunched run script must not open a second browser tab.
+        env = {**os.environ, "GOPRO_NO_BROWSER": "1"}
         try:
             if platform.system() == "Windows":
                 script = PROJECT_ROOT / "run.bat"
@@ -131,6 +134,7 @@ def relaunch_and_exit(delay_seconds: float = 1.5) -> None:
                     cwd=str(PROJECT_ROOT),
                     creationflags=subprocess.CREATE_NEW_CONSOLE,  # type: ignore[attr-defined]
                     close_fds=True,
+                    env=env,
                 )
             else:
                 script = PROJECT_ROOT / "run.sh"
@@ -139,6 +143,7 @@ def relaunch_and_exit(delay_seconds: float = 1.5) -> None:
                     cwd=str(PROJECT_ROOT),
                     start_new_session=True,
                     close_fds=True,
+                    env=env,
                 )
         finally:
             time.sleep(delay_seconds)

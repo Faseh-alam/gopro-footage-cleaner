@@ -62,8 +62,10 @@ def create_app() -> Flask:
             result = pull_latest_current_branch()
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
-        relaunch_and_exit()
-        return jsonify({"ok": True, "restarting": True, **result})
+        # Nothing new — keep the server (and any running jobs) alive.
+        if result.get("changed"):
+            relaunch_and_exit()
+        return jsonify({"ok": True, "restarting": bool(result.get("changed")), **result})
 
     @app.get("/api/volumes")
     def volumes():

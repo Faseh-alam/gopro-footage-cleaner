@@ -1,7 +1,8 @@
 import { Logo } from "@/components/wc/logo";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useRef } from "react";
-import { ArrowUpRight } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowUpRight, RefreshCw } from "lucide-react";
+import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
@@ -49,6 +50,45 @@ const KEYS: [string, string][] = [
 function ReviewPage() {
   const c = useReviewController();
   const cards = useCardTracking(c.setStatus);
+  const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
+
+  // One-click updater: pull the checked-out branch from GitHub, let the backend
+  // relaunch itself (run.bat / run.sh), then reload once it's back.
+  const runUpdate = async () => {
+    if (updateState !== "idle") return;
+    if (!window.confirm("Pull the latest version from GitHub and restart the app?")) return;
+    setUpdateState("pulling");
+    c.setStatus("Checking GitHub for updates…");
+    try {
+      const res = await api("/api/update", { method: "POST" });
+      if (!res.restarting) {
+        setUpdateState("idle");
+        c.setStatus(`Already up to date (${res.branch} @ ${res.after})`, "ok");
+        return;
+      }
+      setUpdateState("restarting");
+      c.setStatus(`Updated ${res.branch}: ${res.before} → ${res.after} — restarting server…`, "ok");
+      // The server exits shortly after replying and run.bat/run.sh relaunches
+      // it (deps reinstall included). Poll until it's back, then hard-reload
+      // so the browser picks up the new UI bundle.
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        try {
+          await api("/api/health");
+          window.location.reload();
+          return;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+      }
+      setUpdateState("idle");
+      c.setStatus("Server did not come back — start it with run.bat, then reload this page", "error");
+    } catch (error: any) {
+      setUpdateState("idle");
+      c.setStatus(error?.message || "Update failed", "error");
+    }
+  };
 
   // First encounter today → register card in DB (server skips if already saved today).
   const addedCardRef = useRef<string | null>(null);
@@ -193,19 +233,16 @@ function ReviewPage() {
           <Button
             size="sm"
             variant="outline"
-            onClick={async () => {
-              const path = c.sdCardValue;
-              const card = c.sdCards.find((x: any) => (x.scan_path || x.path) === path);
-              const name =
-                String(card?.id || card?.label || cards.currentCardIdRef.current || "").trim();
-              await c.finishCard();
-              if (name) await cards.finishCurrentCard(name);
-            }}
+            onClick={runUpdate}
+            disabled={updateState !== "idle"}
+            title="Pull the latest version from GitHub and restart the app"
           >
-            Finish card
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => cards.pushCardData()}>
-            Save card data
+            <RefreshCw className={cn("size-3.5", updateState !== "idle" && "animate-spin")} />
+            {updateState === "idle"
+              ? "Update"
+              : updateState === "pulling"
+                ? "Updating…"
+                : "Restarting…"}
           </Button>
           <Button size="sm" variant="ghost" disabled>
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />

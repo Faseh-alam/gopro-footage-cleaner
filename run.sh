@@ -89,10 +89,12 @@ if ! curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-if command -v open >/dev/null 2>&1; then
-  open "${APP_URL}" || true
-elif command -v xdg-open >/dev/null 2>&1; then
-  xdg-open "${APP_URL}" || true
+if [[ -z "${GOPRO_NO_BROWSER:-}" ]]; then
+  if command -v open >/dev/null 2>&1; then
+    open "${APP_URL}" || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "${APP_URL}" || true
+  fi
 fi
 
 echo ""
