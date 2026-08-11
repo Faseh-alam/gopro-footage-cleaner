@@ -137,7 +137,11 @@ def signup(email: str, password: str, full_name: str = "") -> dict[str, Any]:
             if "already" in msg or "registered" in msg:
                 raise ValueError("An account with this email already exists") from exc
             if "rate limit" in msg:
-                raise ValueError("Too many signup attempts — wait a minute and try again") from exc
+                raise ValueError(
+                    "Supabase email signup is rate-limited (usually after a few tries per hour). "
+                    "Wait ~30–60 minutes, or add SUPABASE_SERVICE_ROLE_KEY to .env and restart — "
+                    "that creates accounts without sending confirmation emails."
+                ) from exc
             raise RuntimeError(str(exc)) from exc
         user = getattr(result, "user", None)
         session = getattr(result, "session", None)
