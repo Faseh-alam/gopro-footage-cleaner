@@ -860,8 +860,14 @@ export function useReviewController() {
 
       const onReady = () => {
         if (token !== previewTokenRef.current) return;
+        setLoadingVideo(false);
         try {
           v.playbackRate = rate;
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (Number.isFinite(t) && t > 0) v.currentTime = t;
         } catch {
           /* ignore */
         }
@@ -878,9 +884,14 @@ export function useReviewController() {
         prefetchNextPreview(stateRef.current.index);
       };
       v.addEventListener("loadedmetadata", onReady, { once: true });
+      // Never leave the spinner up if HLS metadata is slow/missing.
+      window.setTimeout(() => {
+        if (token === previewTokenRef.current) setLoadingVideo(false);
+      }, 600);
       if (!attachHlsMedia(v, path, hlsUrl, t, token)) {
         v.removeEventListener("loadedmetadata", onReady);
         setPreviewNote("Original file");
+        setLoadingVideo(false);
       }
     },
     [attachHlsMedia, prefetchNextPreview, safePlay, setStatus],
@@ -937,7 +948,7 @@ export function useReviewController() {
         } catch {
           /* ignore transient poll errors */
         }
-      }, 400);
+      }, 200);
     },
     [prefetchNextPreview, stopPreviewPoll, swapToPreview],
   );
@@ -975,7 +986,7 @@ export function useReviewController() {
       setIndex(i);
       setShareClipIn(null);
       setShareClipOut(null);
-      setPreviewNote("Starting 720p preview…");
+      setPreviewNote("Building 720p preview…");
       stopPreviewPoll();
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
@@ -984,8 +995,13 @@ export function useReviewController() {
       pendingSeekRef.current = null;
 
       const token = ++previewTokenRef.current;
-      const earlyResume = resumeTimeForPath(video.path);
-      setScrubTime(earlyResume);
+      // Known duration from scan/annotation — don't wait for browser metadata.
+      const knownDur =
+        Number(video.duration) ||
+        Number(s.annotationsByPath[video.path]?.duration) ||
+        0;
+      if (knownDur > 0) setDuration(knownDur);
+
       setStatus(`Loading ${video.name}...`);
 
       const v = videoRef.current;
@@ -997,82 +1013,118 @@ export function useReviewController() {
       wantPlayingRef.current = false;
       playGenerationRef.current += 1;
       playPromiseRef.current = null;
+      destroyHls();
+      // Detach any previous source so we don't block on multi‑GB original moov atoms.
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        /* ignore */
+      }
 
       const streamUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
-
-      // Instant paint: stream the original immediately while 720p builds.
-      // Do NOT start the next encode yet — that steals CPU from the first segment.
-      destroyHls();
-      let usingPreview = false;
-      const applyResume = () => {
-        if (token !== previewTokenRef.current) return;
-        setLoadingVideo(false);
-        v.pause();
-        const startAt = resumeTimeForPath(video.path);
-        setScrubTime(startAt);
-        try {
-          v.currentTime = startAt;
-        } catch {
-          /* ignore */
-        }
-        setPlaybackRate(1, false);
-        updateScrubUiFromEl();
-        const mode = usingPreview ? "720p preview" : "original (proxy building)";
-        setStatus(
-          startAt > 0
-            ? `Ready — ${video.name} at ${formatTime(startAt)} · ${mode}`
-            : `Ready — ${video.name} · ${mode}`,
-          "ok",
-        );
+      const clearLoader = () => {
+        if (token === previewTokenRef.current) setLoadingVideo(false);
       };
-      const onError = () => {
-        if (token !== previewTokenRef.current) return;
-        setLoadingVideo(false);
-        setStatus("Could not load video", "error");
-      };
-      v.addEventListener("loadedmetadata", applyResume, { once: true });
-      v.addEventListener("error", onError, { once: true });
-      v.src = streamUrl;
-      v.load();
+      // Hard cap: never leave the spinner up more than ~1s (was 1–2 minutes on originals).
+      const loaderCap = window.setTimeout(clearLoader, 1000);
 
-      // Kick current 720p encode in the background (next waits until playable).
+      // Kick 720p encode immediately — this is the path we want to play.
       void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
 
-      const [, previewSt] = await Promise.all([
-        loadAnnotationForPath(video.path, { keepPending: true }),
-        api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null),
-      ]);
+      await loadAnnotationForPath(video.path, { keepPending: true });
       if (token !== previewTokenRef.current) return;
 
       const resumeTime = resumeTimeForPath(video.path);
       setScrubTime(resumeTime);
       setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
+      const annDur = Number(stateRef.current.annotationsByPath[video.path]?.duration) || 0;
+      if (annDur > 0) setDuration(annDur);
 
-      try {
-        const st = previewSt;
+      const attachOriginalFallback = () => {
+        if (token !== previewTokenRef.current) return;
+        destroyHls();
+        setPreviewNote("Original file (preview still building)");
+        const onMeta = () => {
+          if (token !== previewTokenRef.current) return;
+          window.clearTimeout(loaderCap);
+          clearLoader();
+          v.pause();
+          const startAt = resumeTimeForPath(video.path);
+          setScrubTime(startAt);
+          try {
+            v.currentTime = startAt;
+          } catch {
+            /* ignore */
+          }
+          setPlaybackRate(1, false);
+          updateScrubUiFromEl();
+          setStatus(
+            startAt > 0
+              ? `Ready — ${video.name} at ${formatTime(startAt)} · original`
+              : `Ready — ${video.name} · original`,
+            "ok",
+          );
+        };
+        v.addEventListener("loadedmetadata", onMeta, { once: true });
+        v.addEventListener(
+          "error",
+          () => {
+            if (token !== previewTokenRef.current) return;
+            window.clearTimeout(loaderCap);
+            clearLoader();
+            setStatus("Could not load video", "error");
+          },
+          { once: true },
+        );
+        // Don't wait forever on moov-at-end originals.
+        window.setTimeout(clearLoader, 800);
+        v.src = streamUrl;
+        v.load();
+        pollPreviewReady(video.path, token);
+      };
+
+      // Poll for the first HLS segment (usually a few seconds) instead of
+      // streaming the multi‑GB original, which can block metadata for minutes.
+      const deadline = Date.now() + 12_000;
+      let attached = false;
+      while (token === previewTokenRef.current && Date.now() < deadline) {
+        let st: any = null;
+        try {
+          st = await api(
+            `/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`,
+          );
+        } catch {
+          st = null;
+        }
+        if (token !== previewTokenRef.current) return;
         if (st?.status === "ready" && st.hls) {
-          usingPreview = true;
+          window.clearTimeout(loaderCap);
           setPreviewNote("720p preview");
           swapToPreview(video.path, token, String(st.hls), false);
           prefetchNextPreview(i);
-        } else if (st?.status === "running") {
-          if (st.playable && st.hls) {
-            usingPreview = true;
-            setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
-            swapToPreview(video.path, token, String(st.hls), true);
-            prefetchNextPreview(i);
-          } else {
-            setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
-          }
-          pollPreviewReady(video.path, token);
-        } else if (st?.status === "skipped") {
-          setPreviewNote("Original file");
-        } else {
-          setPreviewNote("Building preview…");
-          pollPreviewReady(video.path, token);
+          attached = true;
+          break;
         }
-      } catch {
-        setPreviewNote("Original file");
+        if (st?.status === "running" && st.playable && st.hls) {
+          window.clearTimeout(loaderCap);
+          setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
+          swapToPreview(video.path, token, String(st.hls), true);
+          prefetchNextPreview(i);
+          pollPreviewReady(video.path, token);
+          attached = true;
+          break;
+        }
+        if (st?.status === "skipped" || st?.status === "error") {
+          break;
+        }
+        const pct = Number(st?.progress) || 0;
+        if (pct > 0) setPreviewNote(`Building preview ${pct}%`);
+        await new Promise((r) => setTimeout(r, 200));
+      }
+
+      if (!attached && token === previewTokenRef.current) {
+        attachOriginalFallback();
       }
     },
     [
@@ -1421,35 +1473,51 @@ export function useReviewController() {
       const freshVideos: VideoItem[] = data.videos || [];
       setVideos(freshVideos);
       setIndex(-1);
-
-      await Promise.all(freshVideos.map((v) => loadAnnotationForPath(v.path)));
       setIdentityFromSelectedCard();
+
+      if (!freshVideos.length) {
+        setStatus("No footage found", "error");
+        return;
+      }
 
       const session = loadReviewSession();
       const savedIdx =
         session?.path != null ? freshVideos.findIndex((v) => v.path === session.path) : -1;
-      const first = freshVideos.findIndex((v) => !stateRef.current.annotationsByPath[v.path]?.complete);
-      if (first >= 0 || freshVideos.length) {
-        // Resume the video we were on (and its scrub time) after reload when possible.
-        const openAt = savedIdx >= 0 ? savedIdx : first >= 0 ? first : 0;
-        // Only warm the clip we're about to open — next waits until playable.
-        const openPath = freshVideos[openAt]?.path;
-        if (openPath) {
-          void api(`/api/eager/preview/status?path=${encodeURIComponent(openPath)}&start=1`).catch(() => null);
+
+      // Open ASAP — do NOT wait to load every sidecar (that was 1–2 min on big cards).
+      let openAt = savedIdx;
+      if (openAt < 0) {
+        openAt = 0;
+        for (let i = 0; i < freshVideos.length; i += 1) {
+          await loadAnnotationForPath(freshVideos[i].path);
+          if (!stateRef.current.annotationsByPath[freshVideos[i].path]?.complete) {
+            openAt = i;
+            break;
+          }
+          openAt = i;
         }
-        await loadVideo(openAt, { force: true });
-        const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
-        setStatus(
-          resumed
-            ? `Resumed ${freshVideos[openAt]?.name} at ${formatTime(session!.scrubTime)}`
-            : first >= 0
-              ? `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`
-              : `All ${freshVideos.length} files complete`,
-          "ok",
-        );
       } else {
-        setStatus("No footage found", "error");
+        await loadAnnotationForPath(freshVideos[openAt].path);
       }
+
+      const openPath = freshVideos[openAt]?.path;
+      if (openPath) {
+        void api(`/api/eager/preview/status?path=${encodeURIComponent(openPath)}&start=1`).catch(() => null);
+      }
+
+      // Remaining labels load in the background while the player starts.
+      void Promise.all(
+        freshVideos.map((v, idx) => (idx === openAt ? Promise.resolve() : loadAnnotationForPath(v.path))),
+      );
+
+      await loadVideo(openAt, { force: true });
+      const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
+      setStatus(
+        resumed
+          ? `Resumed ${freshVideos[openAt]?.name} at ${formatTime(session!.scrubTime)}`
+          : `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`,
+        "ok",
+      );
     } catch (error: any) {
       setStatus(error.message, "error");
     } finally {

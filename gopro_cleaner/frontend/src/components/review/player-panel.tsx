@@ -111,7 +111,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
             <div className="flex flex-col items-center gap-2 rounded-md border border-border/60 bg-background/90 px-4 py-3 shadow-lg">
               <Loader2 className="size-5 animate-spin text-accent" />
               <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-                Loading video…
+                {c.previewNote || "Loading video…"}
               </span>
             </div>
           </div>
