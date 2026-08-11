@@ -64,13 +64,19 @@ export function useCardTracking(setStatus: (msg: string, kind?: "" | "ok" | "err
           method: "POST",
           body: JSON.stringify({ cardPath, cardName }),
         });
-        currentCardIdRef.current = data.card?.card_name || data.card?.cardName || cardName;
+        const savedName = data.card_id || data.card?.card_name || data.card?.cardName || cardName;
+        currentCardIdRef.current = savedName;
         if (data.already_exists) {
-          setStatus(`Card "${cardName}" already tracked today`, "ok");
+          setStatus(`Card "${savedName}" already tracked today`, "ok");
         } else {
-          setStatus(`Card "${cardName}" saved to database`, "ok");
+          setStatus(
+            data.camera_serial
+              ? `Card "${savedName}" saved (camera …${String(data.camera_serial).slice(-4)})`
+              : `Card "${savedName}" saved to database`,
+            "ok",
+          );
         }
-        await refreshProcess(cardName);
+        await refreshProcess(savedName);
       } catch (error: any) {
         setStatus(`Failed to save card: ${error.message}`, "error");
       } finally {

@@ -7,6 +7,7 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
+import { formatMetricsSummary, useAuth } from "@/components/auth/AuthProvider";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
@@ -51,7 +52,9 @@ const KEYS: [string, string][] = [
 function ReviewPage() {
   const c = useReviewController();
   const cards = useCardTracking(c.setStatus);
+  const { user, today, logout, refreshToday } = useAuth();
   const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // One-click updater: pull the checked-out branch from GitHub, let the backend
   // relaunch itself (run.bat / run.sh), then reload once it's back.
@@ -93,19 +96,22 @@ function ReviewPage() {
     }
   };
 
-  // First encounter today → register card in DB (server skips if already saved today).
+  // First encounter today → register card in DB (server derives C#### from camera serial).
   const addedCardRef = useRef<string | null>(null);
   useEffect(() => {
     const path = c.sdCardValue;
     if (!path) return;
     const card = c.sdCards.find((x: any) => (x.scan_path || x.path) === path);
     const name = String(card?.id || card?.label || "").trim();
-    // Only register detected SD cards (C####), never folder picks / empty selection.
-    if (!name || !/^C\d{4}$/i.test(name)) return;
-    if (addedCardRef.current === name) return;
-    addedCardRef.current = name;
-    cards.addCard(path, name);
-  }, [c.sdCardValue, c.sdCards, cards.addCard]);
+    // sdCards only contains detector hits (DCIM/###GOPRO) — never folder picks.
+    if (!name || !card) return;
+    if (addedCardRef.current === path) return;
+    addedCardRef.current = path;
+    (async () => {
+      await cards.addCard(path, name);
+      refreshToday().catch(() => undefined);
+    })();
+  }, [c.sdCardValue, c.sdCards, cards.addCard, refreshToday]);
 
 
   // Global review shortcuts — mirror the original keyboard model.
@@ -251,6 +257,33 @@ function ReviewPage() {
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
             {cards.statusText}
           </Button>
+          {user && (
+            <div className="ml-1 flex items-center gap-2 border-l border-border pl-3">
+              <div className="hidden min-w-0 text-right sm:block">
+                <div className="truncate text-xs font-medium text-foreground">
+                  {user.full_name || user.email}
+                </div>
+                <div className="truncate font-mono text-[10px] text-muted-foreground">
+                  {formatMetricsSummary(today) || "Today’s metrics"}
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={loggingOut}
+                onClick={async () => {
+                  setLoggingOut(true);
+                  try {
+                    await logout();
+                  } finally {
+                    setLoggingOut(false);
+                  }
+                }}
+              >
+                {loggingOut ? "…" : "Log out"}
+              </Button>
+            </div>
+          )}
           <Link
             to="/metadata"
             className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"

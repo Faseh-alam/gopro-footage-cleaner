@@ -46,12 +46,19 @@ def _card_public(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fill_insert_durations(card_id: str, card_path: str, work_date: str) -> None:
+def _fill_insert_durations(
+    card_row_id: str,
+    card_path: str,
+    work_date: str,
+    *,
+    employee_id: str | None = None,
+    card_name: str | None = None,
+) -> None:
     """Probe video durations after a fast insert; then refresh today's summary."""
     try:
         stats = card_stats(card_path, probe_durations=True)
         supabase_db.update_card(
-            card_id,
+            card_row_id,
             {
                 "original_duration": stats["original_duration"],
                 "original_duration_before_labeling": stats["original_duration"],
@@ -62,8 +69,21 @@ def _fill_insert_durations(card_id: str, card_path: str, work_date: str) -> None
             },
         )
         supabase_db.upsert_daily_summary(work_date)
+        if employee_id and card_name:
+            try:
+                from . import employee_metrics
+
+                employee_metrics.update_sd_card_footage(
+                    employee_id,
+                    card_name,
+                    footage_seconds=float(stats["original_duration"] or 0),
+                    video_count=int(stats["total_mp4_videos"] or 0),
+                    work_date=work_date,
+                )
+            except Exception:
+                log.exception("Failed to update employee footage for %s", card_name)
     except Exception:
-        log.exception("Failed to fill durations for card %s", card_id)
+        log.exception("Failed to fill durations for card %s", card_row_id)
 
 
 def create_cards_blueprint() -> Blueprint:
@@ -152,15 +172,48 @@ def create_cards_blueprint() -> Blueprint:
             }), 400
         # Prefer the detector's paths so clients can't register arbitrary folders.
         card_path = str(connected.get("scan_path") or connected.get("path") or card_path).strip()
-        card_name = str(connected.get("id") or card_name).strip()
+        fallback_name = str(connected.get("id") or card_name).strip()
+
+        # Canonical id = C + last 4 digits of the GoPro camera serial on the card.
+        from .card_identity import resolve_card_identity
+
+        identity = resolve_card_identity(card_path, fallback_name)
+        card_name = identity.get("card_id") or fallback_name
+        camera_serial = identity.get("camera_serial")
+
+        employee_id = None
+        try:
+            from . import auth_service
+
+            employee_id = auth_service.require_employee()["user"]["id"]
+        except PermissionError:
+            employee_id = None
+        except Exception:
+            employee_id = None
 
         try:
             existing = supabase_db.find_card_today(card_name)
             if existing:
+                if employee_id:
+                    try:
+                        from . import employee_metrics
+
+                        employee_metrics.record_sd_card_connected(
+                            employee_id,
+                            card_id=card_name,
+                            card_path=str(existing.get("card_path") or card_path),
+                            camera_serial=camera_serial or existing.get("camera_serial"),
+                            footage_seconds=float(existing.get("original_duration") or 0),
+                            video_count=int(existing.get("total_mp4_videos") or 0),
+                        )
+                    except Exception:
+                        log.exception("employee sd-card metrics (existing) failed")
                 return jsonify({
                     "ok": True,
                     "already_exists": True,
                     "card": _card_public(existing),
+                    "card_id": card_name,
+                    "camera_serial": camera_serial,
                     "message": f"Card '{card_name}' already exists for today",
                 }), 200
 
@@ -187,13 +240,34 @@ def create_cards_blueprint() -> Blueprint:
                 "used_space_after_labeling_gb": None,
                 "original_duration_before_labeling": 0.0,
                 "original_duration_after_labeling": None,
+                "camera_serial": camera_serial,
+                "employee_id": employee_id,
             }
             inserted = supabase_db.insert_card(row)
             summary = supabase_db.upsert_daily_summary(day)
 
+            if employee_id:
+                try:
+                    from . import employee_metrics
+
+                    employee_metrics.record_sd_card_connected(
+                        employee_id,
+                        card_id=card_name,
+                        card_path=resolved_path,
+                        camera_serial=camera_serial,
+                        footage_seconds=0.0,
+                        video_count=int(stats["total_mp4_videos"] or 0),
+                    )
+                except Exception:
+                    log.exception("employee sd-card metrics failed")
+
             threading.Thread(
                 target=_fill_insert_durations,
                 args=(str(inserted["id"]), resolved_path, day),
+                kwargs={
+                    "employee_id": employee_id,
+                    "card_name": card_name,
+                },
                 daemon=True,
                 name=f"card-duration-{card_name}",
             ).start()
@@ -202,6 +276,8 @@ def create_cards_blueprint() -> Blueprint:
                 "ok": True,
                 "already_exists": False,
                 "card": _card_public(inserted),
+                "card_id": card_name,
+                "camera_serial": camera_serial,
                 "summary": summary,
             })
         except Exception as e:

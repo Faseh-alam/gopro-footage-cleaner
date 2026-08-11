@@ -16,6 +16,7 @@ from .core.sheet_import import parse_sheet, preview_to_dict, queue_import
 from .core.timestamps import format_timestamp, parse_clip_lines
 from .core.trimmer import job_store, move_to_trash
 from .core.volumes import list_storage_targets, list_volume_roots
+from .core.routes_auth import create_auth_blueprint
 from .core.routes_cards import create_cards_blueprint
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -36,6 +37,7 @@ def create_app() -> Flask:
 
     app.register_blueprint(create_eager_blueprint())
     app.register_blueprint(create_cards_blueprint())
+    app.register_blueprint(create_auth_blueprint())
 
     @app.get("/api/health")
     def health():

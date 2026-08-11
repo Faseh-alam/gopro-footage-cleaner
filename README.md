@@ -101,12 +101,32 @@ Open the URL Vite prints (e.g. `http://localhost:5173/review`).
 
 ---
 
+## Authentication & employee metrics (Supabase)
+
+Employees sign up / log in at **`/login`**. The app gates Review, Cleaner, and Metadata behind that session.
+
+Per logged-in employee, Supabase stores daily metrics:
+
+| Metric | When |
+|--------|------|
+| **Start time** | First login of the day |
+| **End time** | Logout |
+| **SD cards connected** | Unique `C####` cards registered that day |
+| **Footage processed** | Sum of probed video duration on those cards |
+
+Card id rule: `C` + last 4 digits of the GoPro **camera serial** on the card (not the volume label).
+
+1. Create a Supabase project.
+2. Run the SQL in **`supabase/schema.sql`** (or use the applied migrations): `employees`, work sessions, daily metrics, SD card events, plus `cards` / `daily_summaries`.
+3. Auth → Providers → Email: for a local lab tool, disable **Confirm email** (or set `SUPABASE_SERVICE_ROLE_KEY` so signup can auto-confirm).
+4. Copy `.env.example` → `.env` with `SUPABASE_URL` + `SUPABASE_KEY` (service role recommended).
+
 ## Card tracking (Supabase)
 
 Card registration and daily summaries are stored in **Supabase** (Postgres), not Google Sheets.
 
 1. Create a Supabase project.
-2. Run the SQL in **`supabase/schema.sql`** in the Supabase SQL editor (creates `cards` and `daily_summaries` tables).
+2. Run the SQL in **`supabase/schema.sql`** in the Supabase SQL editor (creates `cards`, `daily_summaries`, and employee metric tables).
 3. Copy **`.env.example`** to **`.env`** in the repo root and set:
 
    ```env
@@ -118,7 +138,7 @@ Card registration and daily summaries are stored in **Supabase** (Postgres), not
 
 **Behavior**
 
-- When a real SD card is connected (name like `C1234`) and you open Review, the app registers it **once per day** if it is not already in the database.
+- When a real SD card is connected and you open Review while logged in, the app registers it **once per day** (id from camera serial → `C####`) and attributes it to that employee.
 - **Finish card** writes final stats (durations, used space, finish time) and refreshes the **daily summary**.
 - Summaries update when a card is first registered or when a card is finished — not on every keystroke.
 - If Supabase is not configured, review and trimming still work; the header shows **DB not configured**.

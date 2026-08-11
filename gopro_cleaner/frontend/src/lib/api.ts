@@ -1,3 +1,5 @@
+import { getAccessToken } from "@/lib/auth";
+
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
 /**
@@ -7,7 +9,7 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
  * - Override anytime with VITE_API_ORIGIN.
  */
 function resolveApiHost(): string {
-  const fromEnv = String(import.meta.env.VITE_API_ORIGIN || "").replace(/\/$/, "");
+  const fromEnv = String(import.meta.env["VITE_API_ORIGIN"] || "").replace(/\/$/, "");
   if (fromEnv) return fromEnv;
   if (import.meta.env.DEV) return "http://127.0.0.1:8765";
   return "";
@@ -20,11 +22,19 @@ export function apiUrl(path: string): string {
   return host ? `${host}${p}` : p;
 }
 
+function withAuthHeaders(headers: HeadersInit | undefined, isForm: boolean): HeadersInit {
+  const token = getAccessToken();
+  const base: Record<string, string> = {};
+  if (!isForm) Object.assign(base, JSON_HEADERS);
+  if (token) base.Authorization = `Bearer ${token}`;
+  return { ...base, ...(headers || {}) };
+}
+
 export async function api<T = any>(url: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData;
   const response = await fetch(apiUrl(url), {
     ...options,
-    headers: isForm ? (options.headers ?? {}) : { ...JSON_HEADERS, ...(options.headers || {}) },
+    headers: withAuthHeaders(options.headers, isForm),
   });
   const text = await response.text();
   let payload: any = {};
