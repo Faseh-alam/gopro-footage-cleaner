@@ -41,6 +41,8 @@ function formatClock(iso?: string | null) {
   }
 }
 
+export { formatClock };
+
 export function formatMetricsSummary(today: TodayMetrics | null) {
   if (!today?.metrics) return "";
   const cards = today.metrics.sd_cards_connected ?? 0;

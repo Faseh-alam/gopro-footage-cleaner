@@ -7,7 +7,8 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
-import { formatMetricsSummary, useAuth } from "@/components/auth/AuthProvider";
+import { useAuth } from "@/components/auth/AuthProvider";
+import { UserAccountMenu } from "@/components/auth/UserAccountMenu";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
@@ -52,9 +53,8 @@ const KEYS: [string, string][] = [
 function ReviewPage() {
   const c = useReviewController();
   const cards = useCardTracking(c.setStatus);
-  const { user, today, logout, refreshToday } = useAuth();
+  const { refreshToday } = useAuth();
   const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
-  const [loggingOut, setLoggingOut] = useState(false);
 
   // One-click updater: pull the checked-out branch from GitHub, let the backend
   // relaunch itself (run.bat / run.sh), then reload once it's back.
@@ -258,33 +258,9 @@ function ReviewPage() {
               </Button>
             </div>
 
-            {user && (
-              <div className="flex items-center gap-2 border-l border-border pl-3">
-                <div className="hidden min-w-0 text-right sm:block">
-                  <div className="truncate text-xs font-medium text-foreground">
-                    {user.full_name || user.email}
-                  </div>
-                  <div className="truncate font-mono text-[10px] text-muted-foreground">
-                    {formatMetricsSummary(today) || "Today’s metrics"}
-                  </div>
-                </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={loggingOut}
-                  onClick={async () => {
-                    setLoggingOut(true);
-                    try {
-                      await logout();
-                    } finally {
-                      setLoggingOut(false);
-                    }
-                  }}
-                >
-                  {loggingOut ? "…" : "Log out"}
-                </Button>
-              </div>
-            )}
+            <div className="flex items-center gap-2 border-l border-border pl-3">
+              <UserAccountMenu />
+            </div>
 
             <nav className="flex items-center gap-3 border-l border-border pl-3 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72]">
               <Link to="/metadata" className="inline-flex items-center gap-1 transition-opacity hover:opacity-75">
