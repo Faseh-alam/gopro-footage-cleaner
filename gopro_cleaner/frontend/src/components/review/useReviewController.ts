@@ -19,7 +19,9 @@ const RECENT_TASKS_MAX = 10;
 const SESSION_KEY = "gopro_eager_review_session";
 const SEEN_GIT_SHA_KEY = "gopro_eager_seen_git_sha";
 const PLAYBACK_RATE_MIN = 0.5;
-const PLAYBACK_RATE_MAX = 8;
+const PLAYBACK_RATE_MAX_PREVIEW = 8;
+/** While playing the multi‑GB original, cap speed so decode doesn't freeze the PC. */
+const PLAYBACK_RATE_MAX_ORIGINAL = 2;
 const PLAYBACK_RATE_STEP = 0.5;
 
 type ReviewSession = {
@@ -530,9 +532,10 @@ export function useReviewController() {
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
-    // Allow full 0.5–8× even while the 720p preview is still building (original stream).
+    // Original stream: max 2×. 720p preview: up to 8×.
+    const max = hlsUrlRef.current ? PLAYBACK_RATE_MAX_PREVIEW : PLAYBACK_RATE_MAX_ORIGINAL;
     const clamped = Math.min(
-      PLAYBACK_RATE_MAX,
+      max,
       Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
     );
     playbackRateRef.current = clamped;
@@ -553,7 +556,10 @@ export function useReviewController() {
       }
     }
     setPlaybackRateState(clamped);
-    if (announce) setStatus(`Playback ${clamped.toFixed(1)}×`, "ok");
+    if (announce) {
+      const note = hlsUrlRef.current ? "" : " (max 2× on original)";
+      setStatus(`Playback ${clamped.toFixed(1)}×${note}`, "ok");
+    }
   }, [safePlay, setStatus]);
 
   const bumpPlaybackRate = useCallback(
@@ -848,7 +854,7 @@ export function useReviewController() {
     [destroyHls],
   );
 
-  /** Swap mid-session from the original stream to the (possibly still building) preview. */
+  /** Swap from original → 720p preview when the first segments are ready. */
   const swapToPreview = useCallback(
     (path: string, token: number, hlsUrl: string, building: boolean) => {
       const v = videoRef.current;
@@ -856,7 +862,8 @@ export function useReviewController() {
       if (hlsUrlRef.current === host + hlsUrl) return;
       const t = Number.isFinite(v.currentTime) ? v.currentTime : stateRef.current.scrubTime || 0;
       const resume = wantPlayingRef.current || !v.paused;
-      const rate = playbackRateRef.current || 1;
+      // Preview unlocks up to 8×; keep current rate (may have been capped at 2× on original).
+      const rate = Math.min(PLAYBACK_RATE_MAX_PREVIEW, playbackRateRef.current || 1);
 
       const onReady = () => {
         if (token !== previewTokenRef.current) return;
@@ -866,6 +873,8 @@ export function useReviewController() {
         } catch {
           /* ignore */
         }
+        playbackRateRef.current = rate;
+        setPlaybackRateState(rate);
         try {
           if (Number.isFinite(t) && t > 0) v.currentTime = t;
         } catch {
@@ -875,22 +884,21 @@ export function useReviewController() {
         setPreviewNote(building ? "720p preview · still encoding" : "720p preview");
         setStatus(
           building
-            ? `720p preview playing while it builds — smooth ${rate.toFixed(1)}× from here`
-            : `Switched to 720p preview — smooth ${rate.toFixed(1)}× scrubbing`,
+            ? `720p preview ready — up to 8× while it finishes encoding`
+            : `Switched to 720p preview — up to 8×`,
           "ok",
         );
         if (resume) safePlay();
-        // Current is playable — keep the next clip encoding in the background.
-        prefetchNextPreview(stateRef.current.index);
+        // Only warm the next clip once current preview is attached (one encode at a time).
+        if (!building) prefetchNextPreview(stateRef.current.index);
       };
       v.addEventListener("loadedmetadata", onReady, { once: true });
-      // Never leave the spinner up if HLS metadata is slow/missing.
       window.setTimeout(() => {
         if (token === previewTokenRef.current) setLoadingVideo(false);
       }, 600);
       if (!attachHlsMedia(v, path, hlsUrl, t, token)) {
         v.removeEventListener("loadedmetadata", onReady);
-        setPreviewNote("Original file");
+        setPreviewNote("Original file · max 2×");
         setLoadingVideo(false);
       }
     },
@@ -900,14 +908,13 @@ export function useReviewController() {
   const pollPreviewReady = useCallback(
     (path: string, token: number) => {
       stopPreviewPoll();
+      // Slow poll — keep CPU free for encode + UI.
       previewPollRef.current = setInterval(async () => {
         if (token !== previewTokenRef.current) {
           stopPreviewPoll();
           return;
         }
         try {
-          // start=1 is idempotent: keeps a running job, restarts a lost one
-          // (e.g. after a backend restart or a cancelled build).
           const st = await api(
             `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`,
           );
@@ -915,40 +922,36 @@ export function useReviewController() {
           if (st.status === "running") {
             const pct = Number(st.progress) || 0;
             const onPreview = Boolean(hlsUrlRef.current);
-            // Attach as soon as the first segments exist — no more waiting
-            // for the whole encode before smooth 5–8× playback.
             if (!onPreview && st.playable && st.hls) {
               swapToPreview(path, token, String(st.hls), true);
-              // Current is playable — only now warm the next clip.
-              prefetchNextPreview(stateRef.current.index);
-            } else if (onPreview) {
-              prefetchNextPreview(stateRef.current.index);
             }
             setPreviewNote(
-              hlsUrlRef.current ? `720p preview · encoding ${pct}%` : `Building preview ${pct}%`,
+              hlsUrlRef.current
+                ? `720p preview · encoding ${pct}%`
+                : `Original · building preview ${pct}%`,
             );
             return;
           }
           if (st.status === "ready") {
             stopPreviewPoll();
             if (hlsUrlRef.current && st.hls && hlsUrlRef.current === host + st.hls) {
-              // Already playing this preview — the playlist just gained its
-              // end marker; hls.js finishes it on its own.
               setPreviewNote("720p preview");
+              // Current encode finished — now start the next video's preview.
               prefetchNextPreview(stateRef.current.index);
             } else if (st.hls) {
               swapToPreview(path, token, String(st.hls), false);
+              prefetchNextPreview(stateRef.current.index);
             }
             return;
           }
           if (st.status === "error" || st.status === "skipped") {
             stopPreviewPoll();
-            setPreviewNote("Original file");
+            setPreviewNote("Original file · max 2×");
           }
         } catch {
           /* ignore transient poll errors */
         }
-      }, 200);
+      }, 1000);
     },
     [prefetchNextPreview, stopPreviewPoll, swapToPreview],
   );
@@ -969,8 +972,7 @@ export function useReviewController() {
       const upcomingIdx = nextPreviewTargetIndex(i);
       const upcomingPath = upcomingIdx >= 0 ? s.videos[upcomingIdx]?.path || "" : "";
 
-      // Free CPU from the video we left — never cancel the clip we're opening
-      // (it may already be mid-encode from prefetch) or the one we warm next.
+      // Cancel leftover encodes so only the current (then next) job runs.
       if (previous?.path && previous.path !== video.path && previous.path !== upcomingPath) {
         void cancelPreviewJob(previous.path);
       }
@@ -981,12 +983,13 @@ export function useReviewController() {
       ) {
         void cancelPreviewJob(prefetchedPreviewRef.current);
       }
+      prefetchedPreviewRef.current = "";
 
       setLoadingVideo(true);
       setIndex(i);
       setShareClipIn(null);
       setShareClipOut(null);
-      setPreviewNote("Building 720p preview…");
+      setPreviewNote("Original · building 720p…");
       stopPreviewPoll();
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
@@ -995,7 +998,6 @@ export function useReviewController() {
       pendingSeekRef.current = null;
 
       const token = ++previewTokenRef.current;
-      // Known duration from scan/annotation — don't wait for browser metadata.
       const knownDur =
         Number(video.duration) ||
         Number(s.annotationsByPath[video.path]?.duration) ||
@@ -1014,22 +1016,14 @@ export function useReviewController() {
       playGenerationRef.current += 1;
       playPromiseRef.current = null;
       destroyHls();
-      // Detach any previous source so we don't block on multi‑GB original moov atoms.
-      try {
-        v.removeAttribute("src");
-        v.load();
-      } catch {
-        /* ignore */
-      }
 
       const streamUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
       const clearLoader = () => {
         if (token === previewTokenRef.current) setLoadingVideo(false);
       };
-      // Hard cap: never leave the spinner up more than ~1s (was 1–2 minutes on originals).
       const loaderCap = window.setTimeout(clearLoader, 1000);
 
-      // Kick 720p encode immediately — this is the path we want to play.
+      // 1) Show original immediately (max 2×). 2) Encode 720p in background.
       void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
 
       await loadAnnotationForPath(video.path, { keepPending: true });
@@ -1041,91 +1035,69 @@ export function useReviewController() {
       const annDur = Number(stateRef.current.annotationsByPath[video.path]?.duration) || 0;
       if (annDur > 0) setDuration(annDur);
 
-      const attachOriginalFallback = () => {
+      // If a cached preview is already ready, use it; otherwise play original first.
+      let previewSt: any = null;
+      try {
+        previewSt = await api(
+          `/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`,
+        );
+      } catch {
+        previewSt = null;
+      }
+      if (token !== previewTokenRef.current) return;
+
+      if (previewSt?.status === "ready" && previewSt.hls) {
+        window.clearTimeout(loaderCap);
+        setPreviewNote("720p preview");
+        swapToPreview(video.path, token, String(previewSt.hls), false);
+        prefetchNextPreview(i);
+        return;
+      }
+      if (previewSt?.status === "running" && previewSt.playable && previewSt.hls) {
+        window.clearTimeout(loaderCap);
+        setPreviewNote(`720p preview · encoding ${Number(previewSt.progress) || 0}%`);
+        swapToPreview(video.path, token, String(previewSt.hls), true);
+        pollPreviewReady(video.path, token);
+        return;
+      }
+
+      // Default path: original now (2× cap), swap when preview becomes playable.
+      const onMeta = () => {
         if (token !== previewTokenRef.current) return;
-        destroyHls();
-        setPreviewNote("Original file (preview still building)");
-        const onMeta = () => {
+        window.clearTimeout(loaderCap);
+        clearLoader();
+        v.pause();
+        const startAt = resumeTimeForPath(video.path);
+        setScrubTime(startAt);
+        try {
+          v.currentTime = startAt;
+        } catch {
+          /* ignore */
+        }
+        setPlaybackRate(1, false);
+        updateScrubUiFromEl();
+        setStatus(
+          startAt > 0
+            ? `Ready — ${video.name} at ${formatTime(startAt)} · original (max 2×)`
+            : `Ready — ${video.name} · original (max 2×)`,
+          "ok",
+        );
+      };
+      v.addEventListener("loadedmetadata", onMeta, { once: true });
+      v.addEventListener(
+        "error",
+        () => {
           if (token !== previewTokenRef.current) return;
           window.clearTimeout(loaderCap);
           clearLoader();
-          v.pause();
-          const startAt = resumeTimeForPath(video.path);
-          setScrubTime(startAt);
-          try {
-            v.currentTime = startAt;
-          } catch {
-            /* ignore */
-          }
-          setPlaybackRate(1, false);
-          updateScrubUiFromEl();
-          setStatus(
-            startAt > 0
-              ? `Ready — ${video.name} at ${formatTime(startAt)} · original`
-              : `Ready — ${video.name} · original`,
-            "ok",
-          );
-        };
-        v.addEventListener("loadedmetadata", onMeta, { once: true });
-        v.addEventListener(
-          "error",
-          () => {
-            if (token !== previewTokenRef.current) return;
-            window.clearTimeout(loaderCap);
-            clearLoader();
-            setStatus("Could not load video", "error");
-          },
-          { once: true },
-        );
-        // Don't wait forever on moov-at-end originals.
-        window.setTimeout(clearLoader, 800);
-        v.src = streamUrl;
-        v.load();
-        pollPreviewReady(video.path, token);
-      };
-
-      // Poll for the first HLS segment (usually a few seconds) instead of
-      // streaming the multi‑GB original, which can block metadata for minutes.
-      const deadline = Date.now() + 12_000;
-      let attached = false;
-      while (token === previewTokenRef.current && Date.now() < deadline) {
-        let st: any = null;
-        try {
-          st = await api(
-            `/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`,
-          );
-        } catch {
-          st = null;
-        }
-        if (token !== previewTokenRef.current) return;
-        if (st?.status === "ready" && st.hls) {
-          window.clearTimeout(loaderCap);
-          setPreviewNote("720p preview");
-          swapToPreview(video.path, token, String(st.hls), false);
-          prefetchNextPreview(i);
-          attached = true;
-          break;
-        }
-        if (st?.status === "running" && st.playable && st.hls) {
-          window.clearTimeout(loaderCap);
-          setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
-          swapToPreview(video.path, token, String(st.hls), true);
-          prefetchNextPreview(i);
-          pollPreviewReady(video.path, token);
-          attached = true;
-          break;
-        }
-        if (st?.status === "skipped" || st?.status === "error") {
-          break;
-        }
-        const pct = Number(st?.progress) || 0;
-        if (pct > 0) setPreviewNote(`Building preview ${pct}%`);
-        await new Promise((r) => setTimeout(r, 200));
-      }
-
-      if (!attached && token === previewTokenRef.current) {
-        attachOriginalFallback();
-      }
+          setStatus("Could not load video", "error");
+        },
+        { once: true },
+      );
+      window.setTimeout(clearLoader, 800);
+      v.src = streamUrl;
+      v.load();
+      pollPreviewReady(video.path, token);
     },
     [
       cancelPreviewJob,

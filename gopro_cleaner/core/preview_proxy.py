@@ -19,11 +19,14 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v9-instant-720p"
+_PREVIEW_VERSION = "v10-lowcpu-720p"
 
 _PLAYLIST_NAME = "index.m3u8"
 # Playable as soon as the first segment exists (~1s of video).
 _MIN_PLAYABLE_SEGMENTS = 1
+
+# Only one ffmpeg preview encode at a time — prevents the machine from locking up.
+_encode_slots = threading.Semaphore(1)
 
 # Optional override: set GOPRO_PREVIEW_DISABLED=1 to force originals only.
 def _previews_disabled() -> bool:
@@ -98,17 +101,17 @@ def _probe_duration_seconds(source: Path) -> float:
 
 
 _SOFTWARE_ENCODER_ARGS = [
-    # ultrafast + zerolatency: minimize time-to-first HLS segment.
+    # Cap threads so preview encode can't pin every core and freeze the UI.
     "-c:v",
     "libx264",
     "-preset",
     "ultrafast",
     "-tune",
-    "zerolatency",
+    "fastdecode",
     "-crf",
     "34",
     "-threads",
-    "0",
+    "2",
 ]
 
 _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
@@ -244,15 +247,15 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         str(source),
         "-an",
         "-vf",
-        # 720p @ 8fps — first HLS segment as soon as possible.
-        "scale='min(720,iw)':-2:flags=neighbor,fps=8",
+        # 720p @ 6fps — light CPU while still scrubbable once ready.
+        "scale='min(720,iw)':-2:flags=neighbor,fps=6",
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
         "-g",
-        "8",
+        "6",
         "-keyint_min",
-        "8",
+        "6",
         "-sc_threshold",
         "0",
         "-progress",
@@ -260,10 +263,12 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         "-nostats",
         *_hls_output_args(dest_dir),
     ]
-    # Prefer the preview encode over background work so the first segment lands fast.
+    # Below-normal priority so the review UI stays responsive while encoding.
     popen_kwargs: dict = {}
     if platform.system() == "Windows":
-        popen_kwargs["creationflags"] = getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0x00008000)
+        popen_kwargs["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+    else:
+        popen_kwargs["preexec_fn"] = lambda: os.nice(10)  # noqa: PLW1509
     stderr_log = dest_dir / "stderr.log"
     stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(
@@ -471,7 +476,23 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
     def worker() -> None:
         dest_dir = playlist.parent
         process_holder: list = []
+        # Serialize encodes — two concurrent ffmpeg jobs melt laptops.
+        acquired = _encode_slots.acquire(timeout=3600)
+        if not acquired:
+            with _lock:
+                if _jobs.get(key, {}).get("status") == "running":
+                    _jobs[key] = {
+                        "status": "error",
+                        "error": "Preview encode timed out waiting for a free slot",
+                        "progress": 0,
+                        "process": None,
+                        "source_bytes": size,
+                    }
+            return
         try:
+            with _lock:
+                if _jobs.get(key, {}).get("status") != "running":
+                    return
             # Interrupted/stale builds leave a playlist without ENDLIST — rebuild.
             _clear_dir_contents(dest_dir)
             _build_preview(source, dest_dir, key, process_holder)
@@ -505,6 +526,8 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
                         "process": None,
                         "source_bytes": size,
                     }
+        finally:
+            _encode_slots.release()
 
     thread = threading.Thread(target=worker, daemon=True, name=f"preview-{source.name}")
     thread.start()

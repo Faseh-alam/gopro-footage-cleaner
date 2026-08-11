@@ -22,7 +22,7 @@ from .core.routes_cards import create_cards_blueprint
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
 WEB_DIR = APP_ROOT / "web"
-APP_VERSION = "2.19.1-testing"
+APP_VERSION = "2.19.2-testing"
 
 
 def create_app() -> Flask:
