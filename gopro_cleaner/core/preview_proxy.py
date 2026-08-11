@@ -1,7 +1,7 @@
 """Lightweight 720p preview proxies for reviewing large GoPro files.
 
 Originals stay untouched for trim/export. Previews are encoded as HLS (1-second
-segments + playlist) so the player can start smooth 8× playback within a couple
+segments + playlist) so the player can start smooth 4× playback within a couple
 of seconds instead of waiting for the whole file to finish transcoding.
 """
 
