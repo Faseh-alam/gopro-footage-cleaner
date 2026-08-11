@@ -19,7 +19,7 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v11-fast-720p"
+_PREVIEW_VERSION = "v12-smooth-720p"
 
 _PLAYLIST_NAME = "index.m3u8"
 # Playable as soon as the first segment exists (~1s of video).
@@ -122,9 +122,9 @@ def _software_encoder_args() -> list[str]:
     ]
 
 _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "900k", "-maxrate", "1200k", "-bufsize", "1800k"]),
-    ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "900k"]),
-    ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "900k"]),
+    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "1500k", "-maxrate", "2200k", "-bufsize", "3300k"]),
+    ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1500k"]),
+    ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "1500k"]),
 ]
 
 # Probed once per process: hardware encode is 3–10× faster than x264 on big files.
@@ -173,11 +173,11 @@ def _preview_encoder_args() -> list[str]:
             "-c:v",
             "h264_videotoolbox",
             "-b:v",
-            "900k",
+            "1500k",
             "-maxrate",
-            "1200k",
+            "2200k",
             "-bufsize",
-            "1800k",
+            "3300k",
         ]
     if system == "Windows":
         global _win_encoder_args
@@ -254,16 +254,18 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         str(source),
         "-an",
         "-vf",
-        # Drop to 6fps FIRST, then scale — scaling only the kept frames cuts
-        # filter work ~5× on 30fps sources, so the preview builds much faster.
-        "fps=6,scale='min(720,iw)':-2:flags=neighbor",
+        # Drop frames FIRST, then scale — scaling only the kept frames halves
+        # filter work on 30fps sources. 15fps keeps motion smooth at 1× and
+        # gives ~60 effective fps at 4× playback.
+        "fps=15,scale='min(720,iw)':-2:flags=fast_bilinear",
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
+        # 1s GOP to match 1s HLS segments — precise seeks, clean segment cuts.
         "-g",
-        "6",
+        "15",
         "-keyint_min",
-        "6",
+        "15",
         "-sc_threshold",
         "0",
         "-progress",
@@ -345,14 +347,14 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
                 str(source),
                 "-an",
                 "-vf",
-                "fps=12,scale='min(720,iw)':-2:flags=fast_bilinear",
+                "fps=15,scale='min(720,iw)':-2:flags=fast_bilinear",
                 *_software_encoder_args(),
                 "-pix_fmt",
                 "yuv420p",
                 "-g",
-                "12",
+                "15",
                 "-keyint_min",
-                "12",
+                "15",
                 "-sc_threshold",
                 "0",
                 *_hls_output_args(dest_dir),

@@ -983,8 +983,13 @@ export function useReviewController() {
           // Explicit start position — without it hls.js treats the growing
           // playlist as live TV and would start at the encode frontier.
           startPosition: Math.max(0, startAt),
+          // Transmux in a worker thread — keeps the main thread free so the
+          // UI never competes with demuxing during 4× playback.
+          enableWorker: true,
+          // Fetch the first fragment while the playlist is still parsing.
+          startFragPrefetch: true,
           // Deep forward buffer: 4× playback drains ~4s of media per wall
-          // second, and the 6fps/720p stream is tiny — buffer generously.
+          // second, and the 15fps/720p stream is tiny — buffer generously.
           maxBufferLength: 120,
           maxMaxBufferLength: 300,
           maxBufferSize: 120 * 1000 * 1000,
@@ -1156,7 +1161,7 @@ export function useReviewController() {
     (path: string, token: number) => {
       stopPreviewPoll();
       // Slow poll — keep CPU free for encode + UI.
-      previewPollRef.current = setInterval(async () => {
+      const tick = async () => {
         if (token !== previewTokenRef.current) {
           stopPreviewPoll();
           return;
@@ -1220,7 +1225,11 @@ export function useReviewController() {
         } catch {
           /* ignore transient poll errors */
         }
-      }, 1000);
+      };
+      previewPollRef.current = setInterval(tick, 1000);
+      // First check right away — don't sit on the original for an extra second
+      // when the preview is already usable.
+      void tick();
     },
     [prefetchNextPreview, stopPreviewPoll, swapToPreview],
   );
@@ -1305,9 +1314,34 @@ export function useReviewController() {
       };
       const loaderCap = window.setTimeout(clearLoader, 1000);
 
-      // Always open the ORIGINAL first at the last scrub time (max 2×).
-      // 720p encodes in the background and swaps in when ready.
-      void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
+      // INSTANT OPEN: one quick local status call (also kicks the encode).
+      // If a usable 720p preview exists — cached from before, or already
+      // encoded past the playhead — attach it directly and never load the
+      // multi-GB original at all.
+      let previewStatus: any = null;
+      try {
+        previewStatus = await Promise.race([
+          api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`),
+          new Promise((resolve) => window.setTimeout(() => resolve(null), 600)),
+        ]);
+      } catch {
+        previewStatus = null;
+      }
+      if (token !== previewTokenRef.current) return;
+
+      const encodedSec = Number(previewStatus?.segments) || 0;
+      const previewUsable = Boolean(
+        previewStatus?.hls &&
+          (previewStatus.status === "ready" ||
+            (previewStatus.status === "running" &&
+              previewStatus.playable &&
+              encodedSec > resumeTime + 3)),
+      );
+
+      let onPreviewDirect = false;
+      if (previewUsable) {
+        onPreviewDirect = attachHlsMedia(v, video.path, String(previewStatus.hls), resumeTime, token);
+      }
 
       const targetResume = () =>
         Math.max(resumeTargetRef.current, resumeTimeForPath(video.path));
@@ -1347,12 +1381,24 @@ export function useReviewController() {
             scanRoot: stateRef.current.scanRoot || undefined,
           });
         }
-        setStatus(
-          startAt > 0
-            ? `Ready — ${video.name} at ${formatTime(startAt)} · original (max 2×)`
-            : `Ready — ${video.name} · original (max 2×)`,
-          "ok",
-        );
+        if (onPreviewDirect) {
+          setPreviewNote(
+            previewStatus?.status === "ready" ? "720p preview" : "720p preview · still encoding",
+          );
+          setStatus(
+            startAt > 0
+              ? `Ready — ${video.name} at ${formatTime(startAt)} · 720p (up to 4×)`
+              : `Ready — ${video.name} · 720p (up to 4×)`,
+            "ok",
+          );
+        } else {
+          setStatus(
+            startAt > 0
+              ? `Ready — ${video.name} at ${formatTime(startAt)} · original (max 2×)`
+              : `Ready — ${video.name} · original (max 2×)`,
+            "ok",
+          );
+        }
       };
       v.addEventListener("loadedmetadata", onMeta, { once: true });
       v.addEventListener(
@@ -1366,14 +1412,16 @@ export function useReviewController() {
         { once: true },
       );
       window.setTimeout(clearLoader, 800);
-      // Buffer ahead aggressively — high-rate playback drains the buffer fast.
-      try {
-        v.preload = "auto";
-      } catch {
-        /* ignore */
+      if (!onPreviewDirect) {
+        // Buffer ahead aggressively — high-rate playback drains the buffer fast.
+        try {
+          v.preload = "auto";
+        } catch {
+          /* ignore */
+        }
+        v.src = streamUrl;
+        v.load();
       }
-      v.src = streamUrl;
-      v.load();
 
       await loadAnnotationForPath(video.path, { keepPending: true });
       if (token !== previewTokenRef.current) return;
@@ -1390,6 +1438,7 @@ export function useReviewController() {
       pollPreviewReady(video.path, token);
     },
     [
+      attachHlsMedia,
       cancelPreviewJob,
       destroyHls,
       isVideoFullyDone,
@@ -2391,9 +2440,10 @@ export function useReviewController() {
         lastGoodTimeRef.current = v.currentTime;
       }
       if (!v.paused && v.currentTime > 0) {
-        // Throttle React updates — high rates otherwise churn the whole review UI.
+        // Throttle React updates — every scrub tick re-renders the whole
+        // review tree, and that main-thread work competes with 4× playback.
         const now = performance.now();
-        if (now - lastUiTick < 80) return;
+        if (now - lastUiTick < 150) return;
         lastUiTick = now;
         setScrubTime(v.currentTime);
       }
