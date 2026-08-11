@@ -202,89 +202,99 @@ function ReviewPage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
-      <header className="flex flex-wrap items-end justify-between gap-4 border-b border-border px-6 py-5">
-        <div className="flex items-center gap-3">
-          <Logo className="size-7" />
-          <div>
-            <div className="eyebrow">World Context</div>
-            <h1 className="mt-1 text-lg font-bold tracking-tight">Review Station</h1>
+      <header className="border-b border-border px-6 py-4">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <Logo className="size-7 shrink-0" />
+            <div className="min-w-0">
+              <div className="eyebrow">World Context</div>
+              <h1 className="text-lg font-bold tracking-tight">Review Station</h1>
+            </div>
           </div>
-        </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <Dropdown
-            className="w-52"
-            size="sm"
-            value={c.sdCardValue}
-            onChange={(v) => c.setSdCardValue(v)}
-            options={c.sdCards.map((card: any) => ({
-              value: card.scan_path || card.path || "",
-              label: card.label || card.id || card.path || "Card",
-            }))}
-            placeholder="SD card…"
-          />
-          <Button size="sm" variant="ghost" onClick={() => c.refreshSdCards({ autoScan: true })}>
-            Detect
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => c.chooseFootageFolder()}>
-            Open footage
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => c.scanSource()}>
-            Scan
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={runUpdate}
-            disabled={updateState !== "idle"}
-            title="Pull the latest version from GitHub and restart the app"
-          >
-            <RefreshCw className={cn("size-3.5", updateState !== "idle" && "animate-spin")} />
-            {updateState === "idle"
-              ? "Update"
-              : updateState === "pulling"
-                ? "Updating…"
-                : "Restarting…"}
-          </Button>
-          {user && (
-            <div className="ml-1 flex items-center gap-2 border-l border-border pl-3">
-              <div className="hidden min-w-0 text-right sm:block">
-                <div className="truncate text-xs font-medium text-foreground">
-                  {user.full_name || user.email}
-                </div>
-                <div className="truncate font-mono text-[10px] text-muted-foreground">
-                  {formatMetricsSummary(today) || "Today’s metrics"}
-                </div>
-              </div>
+          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-3 gap-y-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Dropdown
+                className="w-44"
+                size="sm"
+                value={c.sdCardValue}
+                onChange={(v) => c.setSdCardValue(v)}
+                options={c.sdCards.map((card: any) => ({
+                  value: card.scan_path || card.path || "",
+                  label: card.label || card.id || card.path || "Card",
+                }))}
+                placeholder="SD card…"
+              />
               <Button
                 size="sm"
                 variant="outline"
-                disabled={loggingOut}
-                onClick={async () => {
-                  setLoggingOut(true);
-                  try {
-                    await logout();
-                  } finally {
-                    setLoggingOut(false);
-                  }
-                }}
+                disabled={c.detecting}
+                title="Detect connected SD cards and scan their footage"
+                onClick={() => c.refreshSdCards({ autoScan: true })}
               >
-                {loggingOut ? "…" : "Log out"}
+                {c.detecting ? "Scanning…" : "Scan"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => c.chooseFootageFolder()}
+                title="Open a folder on this computer or an external drive"
+              >
+                Open
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={runUpdate}
+                disabled={updateState !== "idle"}
+                title="Pull the latest version from GitHub and restart the app"
+              >
+                <RefreshCw className={cn("size-3.5", updateState !== "idle" && "animate-spin")} />
+                {updateState === "idle"
+                  ? "Update"
+                  : updateState === "pulling"
+                    ? "Updating…"
+                    : "Restarting…"}
               </Button>
             </div>
-          )}
-          <Link
-            to="/metadata"
-            className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
-          >
-            Metadata <ArrowUpRight className="size-3.5" />
-          </Link>
-          <Link
-            to="/"
-            className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
-          >
-            Cleaner <ArrowUpRight className="size-3.5" />
-          </Link>
+
+            {user && (
+              <div className="flex items-center gap-2 border-l border-border pl-3">
+                <div className="hidden min-w-0 text-right sm:block">
+                  <div className="truncate text-xs font-medium text-foreground">
+                    {user.full_name || user.email}
+                  </div>
+                  <div className="truncate font-mono text-[10px] text-muted-foreground">
+                    {formatMetricsSummary(today) || "Today’s metrics"}
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={loggingOut}
+                  onClick={async () => {
+                    setLoggingOut(true);
+                    try {
+                      await logout();
+                    } finally {
+                      setLoggingOut(false);
+                    }
+                  }}
+                >
+                  {loggingOut ? "…" : "Log out"}
+                </Button>
+              </div>
+            )}
+
+            <nav className="flex items-center gap-3 border-l border-border pl-3 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72]">
+              <Link to="/metadata" className="inline-flex items-center gap-1 transition-opacity hover:opacity-75">
+                Metadata <ArrowUpRight className="size-3" />
+              </Link>
+              <Link to="/" className="inline-flex items-center gap-1 transition-opacity hover:opacity-75">
+                Cleaner <ArrowUpRight className="size-3" />
+              </Link>
+            </nav>
+          </div>
         </div>
       </header>
 
