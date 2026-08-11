@@ -472,19 +472,11 @@ export function useReviewController() {
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
-    const onOriginal = Boolean(v?.src && v.src.includes("/api/eager/stream?"));
-    let clamped = Math.min(
+    // Allow full 0.5–8× even while the 720p preview is still building (original stream).
+    const clamped = Math.min(
       PLAYBACK_RATE_MAX,
       Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
     );
-    // Multi‑GB originals can't sustain 5–8×; soft-cap until 720p proxy is ready.
-    if (onOriginal && clamped > 2) {
-      clamped = 2;
-      if (announce) {
-        setStatus("Speed capped at 2× on original — wait for 720p preview for 5–8×", "ok");
-        announce = false;
-      }
-    }
     playbackRateRef.current = clamped;
     if (v) {
       const wasPlaying = wantPlayingRef.current || !v.paused;
