@@ -84,7 +84,8 @@ export function TaskPanel({ c }: { c: ReviewController }) {
 
       <div className="flex gap-2">
         <TextInput
-          placeholder="New task"
+          ref={c.newTaskInputRef}
+          placeholder="New task (A)"
           value={newTask}
           onChange={(e) => setNewTask(e.currentTarget.value)}
           onKeyDown={(e) => {

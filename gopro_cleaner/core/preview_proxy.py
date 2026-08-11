@@ -1,8 +1,8 @@
 """Lightweight 720p preview proxies for reviewing large GoPro files.
 
-Originals stay untouched for trim/export. Previews are encoded as HLS (2-second
-segments + playlist) so the player can start smooth 8× playback a few seconds
-into the build instead of waiting for the whole file to finish transcoding.
+Originals stay untouched for trim/export. Previews are encoded as HLS (1-second
+segments + playlist) so the player can start smooth 8× playback within a couple
+of seconds instead of waiting for the whole file to finish transcoding.
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v7-hls-720p"
+_PREVIEW_VERSION = "v8-fast-720p"
 
 _PLAYLIST_NAME = "index.m3u8"
-# Playable as soon as this many segments exist (~4s of video at 2s segments).
-_MIN_PLAYABLE_SEGMENTS = 2
+# Playable as soon as the first segment exists (~1s of video).
+_MIN_PLAYABLE_SEGMENTS = 1
 
 # Optional override: set GOPRO_PREVIEW_DISABLED=1 to force originals only.
 def _previews_disabled() -> bool:
@@ -97,7 +97,7 @@ def _probe_duration_seconds(source: Path) -> float:
 
 
 _SOFTWARE_ENCODER_ARGS = [
-    # ultrafast + moderate CRF: small proxy, quick encode, still scrubbable at 8×
+    # ultrafast + higher CRF: prioritize encode speed for review proxies.
     "-c:v",
     "libx264",
     "-preset",
@@ -105,15 +105,15 @@ _SOFTWARE_ENCODER_ARGS = [
     "-tune",
     "fastdecode",
     "-crf",
-    "28",
+    "32",
     "-threads",
     "0",
 ]
 
 _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "1400k", "-maxrate", "1800k", "-bufsize", "2800k"]),
-    ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1400k"]),
-    ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "1400k"]),
+    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "900k", "-maxrate", "1200k", "-bufsize", "1800k"]),
+    ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "900k"]),
+    ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "900k"]),
 ]
 
 # Probed once per process: hardware encode is 3–10× faster than x264 on big files.
@@ -154,11 +154,11 @@ def _preview_encoder_args() -> list[str]:
             "-c:v",
             "h264_videotoolbox",
             "-b:v",
-            "1200k",
+            "900k",
             "-maxrate",
-            "1500k",
+            "1200k",
             "-bufsize",
-            "3000k",
+            "1800k",
         ]
     if system == "Windows":
         global _win_encoder_args
@@ -186,19 +186,19 @@ def _hwaccel_input_args() -> list[str]:
 
 
 def _hls_output_args(dest_dir: Path) -> list[str]:
-    """Write the preview as 2s HLS segments — playable while still encoding."""
+    """Write the preview as 1s HLS segments — playable almost immediately."""
     return [
         "-f",
         "hls",
         "-hls_time",
-        "2",
+        "1",
         "-hls_list_size",
         "0",
         "-hls_playlist_type",
         "event",
         # temp_file: segments appear atomically, never half-written to the player.
         "-hls_flags",
-        "temp_file",
+        "temp_file+independent_segments",
         "-hls_segment_filename",
         str(dest_dir / "seg%05d.ts"),
         str(dest_dir / _PLAYLIST_NAME),
@@ -220,15 +220,15 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         str(source),
         "-an",
         "-vf",
-        # 720p, 12fps — tiny decode cost so 5–8× review feels smooth.
-        "scale='min(720,iw)':-2:flags=fast_bilinear,fps=12",
+        # 720p @ 10fps — ultrafast CRF; playable after first 1s HLS segment.
+        "scale='min(720,iw)':-2:flags=fast_bilinear,fps=10",
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
         "-g",
-        "12",
+        "10",
         "-keyint_min",
-        "12",
+        "10",
         "-sc_threshold",
         "0",
         "-progress",
@@ -236,14 +236,8 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         "-nostats",
         *_hls_output_args(dest_dir),
     ]
-    # Run below normal priority so the encode never starves live playback.
+    # Normal priority — preview encode should finish as fast as the machine allows.
     popen_kwargs: dict = {}
-    if platform.system() == "Windows":
-        popen_kwargs["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
-    else:
-        popen_kwargs["preexec_fn"] = lambda: os.nice(10)  # noqa: PLW1509
-    # stderr must go to a file, not a PIPE — an unread PIPE fills up and
-    # deadlocks ffmpeg mid-encode (build then hangs forever at N%).
     stderr_log = dest_dir / "stderr.log"
     stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(

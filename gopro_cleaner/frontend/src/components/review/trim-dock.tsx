@@ -39,7 +39,7 @@ export function TrimDock({ c }: { c: ReviewController }) {
       <button
         type="button"
         onClick={() => setMinimized(false)}
-        className="bg-background fixed bottom-4 right-4 z-50 flex items-center gap-2 rounded-full border border-border bg-surface-1 px-3 py-2 text-xs font-medium shadow-lg transition-colors hover:bg-surface-2"
+        className="bg-background fixed bottom-4 left-4 z-50 flex items-center gap-2 rounded-full border border-border bg-surface-1 px-3 py-2 text-xs font-medium shadow-lg transition-colors hover:bg-surface-2"
         title="Show background trims"
       >
         {active > 0 ? (
@@ -60,7 +60,7 @@ export function TrimDock({ c }: { c: ReviewController }) {
     .slice(0, 12);
 
   return (
-    <div className="bg-background fixed bottom-4 right-4 z-50 w-[22rem] max-w-[calc(100vw-2rem)] overflow-hidden rounded-lg border border-border bg-surface-1 shadow-2xl">
+    <div className="bg-background fixed bottom-4 left-4 z-50 w-[22rem] max-w-[calc(100vw-2rem)] overflow-hidden rounded-lg border border-border bg-surface-1 shadow-2xl">
       <header className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           {active > 0 ? (

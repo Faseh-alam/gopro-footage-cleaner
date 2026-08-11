@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/wc/panel";
 import { Button } from "@/components/ui/button";
@@ -73,12 +73,12 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           <h2 className="truncate text-sm font-semibold">{video?.name || "No file loaded"}</h2>
         </div>
         <div className="flex shrink-0 items-center gap-2 font-mono text-[11px] text-muted-foreground">
-          <Badge tone={coverage >= 100 ? "ok" : "muted"}>{coverage}% covered</Badge>
-          {c.previewNote ? <Badge tone="muted">{c.previewNote}</Badge> : null}
-          <span>{c.playbackRate.toFixed(1)}×</span>
-          <span>
+          <span className="text-foreground">
             {c.formatTime(c.scrubTime)} / {c.formatTime(duration)}
           </span>
+          <span>{c.playbackRate.toFixed(1)}×</span>
+          {c.previewNote ? <Badge tone="muted">{c.previewNote}</Badge> : null}
+          <Badge tone={coverage >= 100 ? "ok" : "muted"}>{coverage}% covered</Badge>
         </div>
       </header>
 
@@ -107,8 +107,13 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
         )}
 
         {c.loadingVideo && (
-          <div className="pointer-events-none absolute left-3 top-3 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-            Loading…
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-black/55 backdrop-blur-[1px]">
+            <div className="flex flex-col items-center gap-2 rounded-md border border-border/60 bg-background/90 px-4 py-3 shadow-lg">
+              <Loader2 className="size-5 animate-spin text-accent" />
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                Loading video…
+              </span>
+            </div>
           </div>
         )}
 

@@ -39,14 +39,16 @@ export const Route = createFileRoute("/review")({
 
 const KEYS: [string, string][] = [
   ["Space", "Play / pause (resets to 1×)"],
-  ["← →", "Speed −0.5× / +0.5×"],
-  [", .", "−1s / +1s"],
+  ["← →", "−1s / +1s (stops at end)"],
+  ["[ ]", "Speed −0.5× / +0.5×"],
+  [", .", "−1s / +1s (stops at end)"],
   ["I / O", "Mark share-clip in / out"],
   ["T", "End work segment + select task"],
   ["Enter", "Assign task to pending work"],
+  ["A", "Focus New task field"],
   ["G", "Mark garbage to playhead"],
   ["U", "Delete last markup"],
-  ["N", "Next unfinished video"],
+  ["N", "Next unfinished (current must be done)"],
   ["Home", "Jump to 0:00"],
 ];
 
@@ -175,8 +177,10 @@ function ReviewPage() {
       const key = event.key.toLowerCase();
       let handled = true;
 
-      if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
-      else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
+      if (event.key === "ArrowLeft") c.fineTune(-1);
+      else if (event.key === "ArrowRight") c.fineTune(1);
+      else if (event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
+      else if (event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
       else if (event.key === ",") c.fineTune(-1);
       else if (event.key === ".") c.fineTune(1);
       else if (key === "i") c.markShareIn();
@@ -184,6 +188,7 @@ function ReviewPage() {
       else if (key === "t") c.markWork();
       else if (key === "g") c.markGarbage();
       else if (key === "u") c.undoSegment();
+      else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
       else if (key === "n") c.finishCleaningFile();
       else if (event.key === " ") c.togglePlay();

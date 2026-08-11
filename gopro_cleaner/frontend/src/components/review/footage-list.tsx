@@ -21,26 +21,40 @@ export function FootageList({ c }: { c: ReviewController }) {
         )}
         {c.videos.map((v, i) => {
           const ann = c.annotationsByPath[v.path];
+          const openable = c.canOpenVideo(i);
           return (
             <button
               key={v.path}
               type="button"
-              onClick={() => c.loadVideo(i)}
+              disabled={!openable}
+              onClick={() => {
+                if (!openable) return;
+                void c.loadVideo(i);
+              }}
+              title={
+                openable
+                  ? v.name
+                  : "Finish the current video before opening unfinished footage"
+              }
               className={cn(
-                "flex w-full items-center justify-between gap-2 border-t border-border px-4 py-2 text-left text-xs transition-colors hover:bg-surface-2",
+                "flex w-full items-center justify-between gap-2 border-t border-border px-4 py-2 text-left text-xs transition-colors",
                 i === c.index && "bg-surface-2 text-foreground",
+                openable ? "hover:bg-surface-2" : "cursor-not-allowed opacity-45",
               )}
             >
               <span className="min-w-0 truncate">{v.name}</span>
               <span className="flex shrink-0 items-center gap-1.5">
-                {v.duration_label && (
-                  <span className="font-mono text-[10px] text-muted-foreground">{v.duration_label}</span>
-                )}
+                {/* Status badge before duration (swapped with time) */}
                 {ann?.complete ? (
                   <Badge tone="ok">done</Badge>
                 ) : ann?.segments?.length ? (
                   <Badge tone="warn">wip</Badge>
+                ) : i === c.index ? (
+                  <Badge tone="accent">now</Badge>
                 ) : null}
+                {v.duration_label && (
+                  <span className="font-mono text-[10px] text-muted-foreground">{v.duration_label}</span>
+                )}
               </span>
             </button>
           );
@@ -49,4 +63,3 @@ export function FootageList({ c }: { c: ReviewController }) {
     </div>
   );
 }
-

@@ -102,6 +102,7 @@ export function useReviewController() {
   const playbackRateRef = useRef(1);
   const playerWrapRef = useRef<HTMLDivElement | null>(null);
   const taskSearchRef = useRef<HTMLInputElement | null>(null);
+  const newTaskInputRef = useRef<HTMLInputElement | null>(null);
 
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [index, setIndex] = useState(-1);
@@ -311,8 +312,20 @@ export function useReviewController() {
     // While an HLS preview is still encoding, the element duration only covers
     // the segments built so far — keep the scrub bar at the known full length.
     const el = Number.isFinite(v.duration) ? v.duration : 0;
-    const known = currentVideo()?.duration || 0;
-    setDuration(Math.max(el, known) || 0);
+    const video = currentVideo();
+    const knownFile = Number(video?.duration) || 0;
+    const knownAnn = Number(stateRef.current.annotationsByPath[video?.path || ""]?.duration) || 0;
+    setDuration(Math.max(el, knownFile, knownAnn) || 0);
+  }, [currentVideo]);
+
+  /** Full clip length even when HLS only exposes partial duration. */
+  const knownDurationSec = useCallback(() => {
+    const v = videoRef.current;
+    const video = currentVideo();
+    const el = v && Number.isFinite(v.duration) ? v.duration : 0;
+    const knownFile = Number(video?.duration) || 0;
+    const knownAnn = Number(stateRef.current.annotationsByPath[video?.path || ""]?.duration) || 0;
+    return Math.max(el, knownFile, knownAnn) || 0;
   }, [currentVideo]);
 
   // Guard against "play() interrupted by pause()" and hung play() promises.
@@ -442,10 +455,10 @@ export function useReviewController() {
 
   const scheduleSeek = useCallback(
     (time: number, immediate = false) => {
-      const v = videoRef.current;
-      const dur = v?.duration || currentVideo()?.duration || 0;
+      const dur = knownDurationSec();
       if (!dur) return;
-      const clamped = Math.min(dur - 0.04, Math.max(0, time));
+      // Always stop at the true end — never past it, even when HLS duration is short.
+      const clamped = Math.min(Math.max(0, time), Math.max(0, dur - 0.04));
       setScrubTime(clamped);
       pendingSeekRef.current = clamped;
       if (immediate) {
@@ -458,17 +471,16 @@ export function useReviewController() {
         flushSeek();
       }, 120);
     },
-    [currentVideo, flushSeek],
+    [flushSeek, knownDurationSec],
   );
 
   const seekToFraction = useCallback(
     (fraction: number) => {
-      const v = videoRef.current;
-      const dur = v?.duration || currentVideo()?.duration || 0;
+      const dur = knownDurationSec();
       if (!dur) return;
       scheduleSeek(fraction * dur, true);
     },
-    [currentVideo, scheduleSeek],
+    [knownDurationSec, scheduleSeek],
   );
 
   const fineTune = useCallback(
@@ -605,10 +617,26 @@ export function useReviewController() {
     playerWrapRef.current?.focus?.();
   }, []);
 
+  const focusNewTask = useCallback(() => {
+    const el = newTaskInputRef.current;
+    if (!el) return;
+    el.focus();
+    el.select();
+    setStatus("Type a new task name, then Enter to add", "ok");
+  }, [setStatus]);
+
   // ---------------------------------------------------------------------
   // File list rendering helpers
   // ---------------------------------------------------------------------
   const isHandledPath = useCallback((path: string) => Boolean(annotationsByPath[path]?.complete), [annotationsByPath]);
+
+  /** Current video, or any video already marked complete. Blocks skipping ahead. */
+  const canOpenVideo = useCallback((i: number) => {
+    const s = stateRef.current;
+    if (i < 0 || i >= s.videos.length) return false;
+    if (i === s.index) return true;
+    return Boolean(s.annotationsByPath[s.videos[i].path]?.complete);
+  }, []);
 
   const nextIncompleteIndex = useCallback(
     (startAt?: number) => {
@@ -831,30 +859,38 @@ export function useReviewController() {
         } catch {
           /* ignore transient poll errors */
         }
-      }, 1000);
+      }, 400);
     },
     [prefetchNextPreview, stopPreviewPoll, swapToPreview],
   );
 
   const loadVideo = useCallback(
-    async (i: number) => {
+    async (i: number, opts: { force?: boolean } = {}) => {
       const s = stateRef.current;
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
-      const previous = s.index >= 0 ? s.videos[s.index] : null;
-      if (previous?.path && previous.path !== video.path) {
-        await cancelPreviewJob(previous.path);
+
+      // Block jumping to unfinished footage (except current / forced loads).
+      if (!opts.force && i !== s.index && !s.annotationsByPath[video.path]?.complete) {
+        setStatus("Finish the current video before opening unfinished footage", "error");
+        return;
       }
-      // A stale warmed-up build (user jumped elsewhere) shouldn't keep encoding.
+
+      const previous = s.index >= 0 ? s.videos[s.index] : null;
+      // Cancel previous encode in the background — don't block the switch.
+      if (previous?.path && previous.path !== video.path) {
+        void cancelPreviewJob(previous.path);
+      }
       if (
         prefetchedPreviewRef.current &&
         prefetchedPreviewRef.current !== video.path &&
         prefetchedPreviewRef.current !== previous?.path
       ) {
-        cancelPreviewJob(prefetchedPreviewRef.current);
+        void cancelPreviewJob(prefetchedPreviewRef.current);
       }
       prefetchedPreviewRef.current = "";
 
+      setLoadingVideo(true);
       setIndex(i);
       setScrubTime(0);
       setShareClipIn(null);
@@ -868,37 +904,42 @@ export function useReviewController() {
       pendingSeekRef.current = null;
 
       const token = ++previewTokenRef.current;
-      await loadAnnotationForPath(video.path, { keepPending: true });
-      const resumeTime = resumeTimeForPath(video.path);
-      setScrubTime(resumeTime);
-      setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
-
-      setLoadingVideo(true);
       setStatus(`Loading ${video.name}...`);
 
       const v = videoRef.current;
-      if (!v) return;
+      if (!v) {
+        setLoadingVideo(false);
+        return;
+      }
 
       wantPlayingRef.current = false;
       playGenerationRef.current += 1;
       playPromiseRef.current = null;
 
       const streamUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
+
+      // Annotation + preview status in parallel so switching feels instant.
+      const [, previewSt] = await Promise.all([
+        loadAnnotationForPath(video.path, { keepPending: true }),
+        api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null),
+      ]);
+      if (token !== previewTokenRef.current) return;
+
+      const resumeTime = resumeTimeForPath(video.path);
+      setScrubTime(resumeTime);
+      setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
+
       let usingPreview = false;
       let initialHls = "";
       try {
-        const st = await api(
-          `/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`,
-        );
-        if (token !== previewTokenRef.current) return;
-        if (st.status === "ready" && st.hls) {
+        const st = previewSt;
+        if (st?.status === "ready" && st.hls) {
           initialHls = String(st.hls);
           usingPreview = true;
           setPreviewNote("720p preview");
           prefetchNextPreview(i);
-        } else if (st.status === "running") {
+        } else if (st?.status === "running") {
           if (st.playable && st.hls) {
-            // A prefetched build is already far enough along — open it directly.
             initialHls = String(st.hls);
             usingPreview = true;
             setPreviewNote(`720p preview · encoding ${Number(st.progress) || 0}%`);
@@ -906,10 +947,9 @@ export function useReviewController() {
             setPreviewNote(`Building preview ${Number(st.progress) || 0}%`);
           }
           pollPreviewReady(video.path, token);
-        } else if (st.status === "skipped") {
+        } else if (st?.status === "skipped") {
           setPreviewNote("Original file");
         } else {
-          // idle → start was requested via start=1; poll until ready
           setPreviewNote("Building preview…");
           pollPreviewReady(video.path, token);
         }
@@ -969,9 +1009,14 @@ export function useReviewController() {
 
   const finishCleaningFile = useCallback(async () => {
     const s = stateRef.current;
+    const cur = s.index >= 0 ? s.videos[s.index] : null;
+    if (cur && !s.annotationsByPath[cur.path]?.complete) {
+      setStatus("Finish covering this video before moving to the next", "error");
+      return;
+    }
     const next = nextIncompleteIndex(s.index + 1);
     if (next >= 0 && next !== s.index) {
-      await loadVideo(next);
+      await loadVideo(next, { force: true });
       setStatus("Moved to next unfinished video", "ok");
       return;
     }
@@ -990,7 +1035,7 @@ export function useReviewController() {
       ann = stateRef.current.annotationsByPath[video.path];
     }
     const anchor = anchorByPathRef.current[video.path] ?? computeAnchor(ann?.segments || []);
-    const dur = videoRef.current?.duration || video.duration || annotationFor(video.path)?.duration || 0;
+    const dur = knownDurationSec() || video.duration || annotationFor(video.path)?.duration || 0;
     let end = Math.max(0, currentScrubTime());
     if (dur > 0 && end >= dur - 0.05) end = dur;
     if (end <= anchor + 0.05) {
@@ -1014,7 +1059,7 @@ export function useReviewController() {
       "ok",
     );
     focusTaskSearch();
-  }, [annotationFor, currentAnnotation, currentScrubTime, currentVideo, focusTaskSearch, loadAnnotationForPath, setStatus]);
+  }, [annotationFor, currentAnnotation, currentScrubTime, currentVideo, focusTaskSearch, knownDurationSec, loadAnnotationForPath, setStatus]);
 
   const assignPendingWork = useCallback(async (taskOverride?: string) => {
     const video = currentVideo();
@@ -1089,7 +1134,7 @@ export function useReviewController() {
       return;
     }
     const anchor = anchorByPathRef.current[video.path] ?? computeAnchor(ann?.segments || []);
-    const dur = videoRef.current?.duration || video.duration || annotationFor(video.path)?.duration || 0;
+    const dur = knownDurationSec() || video.duration || annotationFor(video.path)?.duration || 0;
     let end = Math.max(0, currentScrubTime());
     if (dur > 0 && end >= dur - 0.05) end = dur;
     if (end <= anchor + 0.05) {
@@ -1103,7 +1148,7 @@ export function useReviewController() {
     await loadAnnotationForPath(video.path);
     setStatus(`Marked garbage ${formatTime(anchor)} → ${formatTime(end)}`, "ok");
     if (stateRef.current.annotationsByPath[video.path]?.complete) await finishCleaningFile();
-  }, [annotationContext, annotationFor, currentAnnotation, currentScrubTime, currentVideo, finishCleaningFile, loadAnnotationForPath, setStatus]);
+  }, [annotationContext, annotationFor, currentAnnotation, currentScrubTime, currentVideo, finishCleaningFile, knownDurationSec, loadAnnotationForPath, setStatus]);
 
   // Manually set (ISO string) or clear ("") the recording timestamp; the
   // camera's own value is preserved server-side and restored on clear.
@@ -1213,7 +1258,7 @@ export function useReviewController() {
       setVideos(nextVideos);
       if (data.batch) setBatchDetail(data.batch);
       if (nextVideos.length) {
-        await loadVideo(Math.min(deletedIndex, nextVideos.length - 1));
+        await loadVideo(Math.min(deletedIndex, nextVideos.length - 1), { force: true });
       } else {
         setIndex(-1);
         destroyHls();
@@ -1296,7 +1341,7 @@ export function useReviewController() {
 
       const first = freshVideos.findIndex((v) => !stateRef.current.annotationsByPath[v.path]?.complete);
       if (first >= 0 || freshVideos.length) {
-        await loadVideo(first >= 0 ? first : 0);
+        await loadVideo(first >= 0 ? first : 0, { force: true });
         setStatus(
           first >= 0
             ? `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`
@@ -1810,6 +1855,7 @@ export function useReviewController() {
     videoRef,
     playerWrapRef,
     taskSearchRef,
+    newTaskInputRef,
     videos,
     index,
     scanRoot,
@@ -1865,6 +1911,7 @@ export function useReviewController() {
     orderedTaskGroups,
     selectedTask,
     focusTaskSearch,
+    focusNewTask,
     leaveTaskSearch,
     touchRecentTask,
     scheduleSeek,
@@ -1900,6 +1947,7 @@ export function useReviewController() {
     basenamePath,
     shortCardTitle,
     isHandledPath,
+    canOpenVideo,
   };
 }
 
