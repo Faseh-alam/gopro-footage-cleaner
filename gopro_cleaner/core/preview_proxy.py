@@ -1,7 +1,8 @@
 """Lightweight 720p preview proxies for reviewing large GoPro files.
 
-Originals stay untouched for trim/export. Review playback prefers the proxy once
-ready, and falls back to HTTP range streaming of the original while it builds.
+Originals stay untouched for trim/export. Previews are encoded as HLS (2-second
+segments + playlist) so the player can start smooth 8× playback a few seconds
+into the build instead of waiting for the whole file to finish transcoding.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -17,7 +19,11 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v6-review-720p"
+_PREVIEW_VERSION = "v7-hls-720p"
+
+_PLAYLIST_NAME = "index.m3u8"
+# Playable as soon as this many segments exist (~4s of video at 2s segments).
+_MIN_PLAYABLE_SEGMENTS = 2
 
 # Optional override: set GOPRO_PREVIEW_DISABLED=1 to force originals only.
 def _previews_disabled() -> bool:
@@ -30,6 +36,11 @@ def _cache_dir() -> Path:
     return path
 
 
+def preview_cache_root() -> Path:
+    """Public accessor for HTTP routes serving HLS assets."""
+    return _cache_dir()
+
+
 def _cache_key(source: Path) -> str:
     stat = source.stat()
     digest = hashlib.sha256(
@@ -38,8 +49,26 @@ def _cache_key(source: Path) -> str:
     return digest.hexdigest()[:20]
 
 
-def _cached_preview_path(source: Path) -> Path:
-    return _cache_dir() / f"{_cache_key(source)}.mp4"
+def _preview_dir(source: Path) -> Path:
+    return _cache_dir() / _cache_key(source)
+
+
+def _playlist_path(source: Path) -> Path:
+    return _preview_dir(source) / _PLAYLIST_NAME
+
+
+def _hls_url(source: Path) -> str:
+    return f"/api/eager/preview/hls/{_cache_key(source)}/{_PLAYLIST_NAME}"
+
+
+def _playlist_state(playlist: Path) -> tuple[int, bool]:
+    """Return (segment_count, finished) for a playlist file (0, False if absent)."""
+    try:
+        text = playlist.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0, False
+    segments = sum(1 for line in text.splitlines() if line.strip().endswith(".ts"))
+    return segments, "#EXT-X-ENDLIST" in text
 
 
 def _probe_duration_seconds(source: Path) -> float:
@@ -156,7 +185,27 @@ def _hwaccel_input_args() -> list[str]:
     return []
 
 
-def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list) -> None:
+def _hls_output_args(dest_dir: Path) -> list[str]:
+    """Write the preview as 2s HLS segments — playable while still encoding."""
+    return [
+        "-f",
+        "hls",
+        "-hls_time",
+        "2",
+        "-hls_list_size",
+        "0",
+        "-hls_playlist_type",
+        "event",
+        # temp_file: segments appear atomically, never half-written to the player.
+        "-hls_flags",
+        "temp_file",
+        "-hls_segment_filename",
+        str(dest_dir / "seg%05d.ts"),
+        str(dest_dir / _PLAYLIST_NAME),
+    ]
+
+
+def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: list) -> None:
     from .ffmpeg_tools import ffmpeg_bin
 
     duration = _probe_duration_seconds(source)
@@ -176,9 +225,6 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
-        # No +faststart: it re-writes the entire file in a second pass after the
-        # encode ("Finalizing preview" stall). We serve previews with HTTP Range
-        # support, so browsers fetch the trailing moov atom directly instead.
         "-g",
         "12",
         "-keyint_min",
@@ -188,7 +234,7 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         "-progress",
         "pipe:1",
         "-nostats",
-        str(dest),
+        *_hls_output_args(dest_dir),
     ]
     # Run below normal priority so the encode never starves live playback.
     popen_kwargs: dict = {}
@@ -198,7 +244,7 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         popen_kwargs["preexec_fn"] = lambda: os.nice(10)  # noqa: PLW1509
     # stderr must go to a file, not a PIPE — an unread PIPE fills up and
     # deadlocks ffmpeg mid-encode (build then hangs forever at N%).
-    stderr_log = dest.with_suffix(".stderr.log")
+    stderr_log = dest_dir / "stderr.log"
     stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(
         command,
@@ -252,6 +298,7 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
         # Auto-fallback: if the HW encoder failed mid-run, retry once with libx264.
         joined = " ".join(command)
         if any(hw in joined for hw in ("nvenc", "qsv", "amf")):
+            _clear_dir_contents(dest_dir)
             soft = [
                 ffmpeg_bin(),
                 "-hide_banner",
@@ -272,13 +319,23 @@ def _build_preview(source: Path, dest: Path, job_key: str, process_holder: list)
                 "12",
                 "-sc_threshold",
                 "0",
-                str(dest),
+                *_hls_output_args(dest_dir),
             ]
             retry = subprocess.run(soft, capture_output=True, text=True, check=False)
-            if retry.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+            segments, finished = _playlist_state(dest_dir / _PLAYLIST_NAME)
+            if retry.returncode == 0 and segments > 0 and finished:
                 return
             err = (retry.stderr or err or "").strip()
         raise RuntimeError(err.strip() or "ffmpeg failed while building preview")
+
+
+def _clear_dir_contents(directory: Path) -> None:
+    try:
+        if directory.is_dir():
+            shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
 
 def cancel_preview(source: Path) -> None:
@@ -300,13 +357,30 @@ def cancel_preview(source: Path) -> None:
                 except OSError:
                     pass
         _jobs.pop(key, None)
+    # Drop the half-built segment folder so a later start rebuilds cleanly.
+    try:
+        playlist = _playlist_path(source)
+        if not _playlist_state(playlist)[1]:
+            shutil.rmtree(playlist.parent, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def _public_job(job: dict, extra: dict | None = None) -> dict:
     """Only JSON-safe fields — the raw job dict holds Thread/Popen objects."""
     out = {
         key: job.get(key)
-        for key in ("status", "progress", "path", "cached", "error", "message", "source_bytes", "preview_bytes")
+        for key in (
+            "status",
+            "progress",
+            "path",
+            "hls",
+            "playable",
+            "cached",
+            "error",
+            "message",
+            "source_bytes",
+        )
         if job.get(key) is not None
     }
     if extra:
@@ -321,15 +395,18 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
 
     key = str(source)
     size = source.stat().st_size
-    cached = _cached_preview_path(source)
-    if cached.exists() and cached.stat().st_size > 0:
+    playlist = _playlist_path(source)
+    hls_url = _hls_url(source)
+    segments, finished = _playlist_state(playlist)
+    if finished and segments > 0:
         return {
             "status": "ready",
-            "path": str(cached),
+            "path": str(playlist),
+            "hls": hls_url,
+            "playable": True,
             "cached": True,
             "progress": 100,
             "source_bytes": size,
-            "preview_bytes": cached.stat().st_size,
         }
 
     if _previews_disabled():
@@ -342,10 +419,17 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
 
     with _lock:
         job = _jobs.get(key)
-        if job and job.get("status") == "ready" and Path(job["path"]).exists():
-            return _public_job(job)
         if job and job.get("status") == "running":
-            return _public_job(job, {"source_bytes": size})
+            # Playable a few seconds into the encode — the UI attaches HLS then.
+            return _public_job(
+                job,
+                {
+                    "source_bytes": size,
+                    "hls": hls_url,
+                    "segments": segments,
+                    "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                },
+            )
         if job and job.get("status") in {"error", "cancelled"}:
             _jobs.pop(key, None)
 
@@ -362,37 +446,33 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
         }
 
     def worker() -> None:
-        temp = cached.with_suffix(".part.mp4")
+        dest_dir = playlist.parent
         process_holder: list = []
         try:
-            if temp.exists():
-                temp.unlink()
-            _build_preview(source, temp, key, process_holder)
+            # Interrupted/stale builds leave a playlist without ENDLIST — rebuild.
+            _clear_dir_contents(dest_dir)
+            _build_preview(source, dest_dir, key, process_holder)
             with _lock:
                 if _jobs.get(key, {}).get("status") != "running":
-                    if temp.exists():
-                        temp.unlink()
+                    shutil.rmtree(dest_dir, ignore_errors=True)
                     return
-            if cached.exists():
-                cached.unlink()
-            temp.replace(cached)
+            seg_count, done = _playlist_state(playlist)
+            if seg_count <= 0 or not done:
+                raise RuntimeError("ffmpeg finished but the preview playlist is incomplete")
             with _lock:
                 _jobs[key] = {
                     "status": "ready",
-                    "path": str(cached),
+                    "path": str(playlist),
+                    "hls": hls_url,
+                    "playable": True,
                     "cached": False,
                     "progress": 100,
                     "process": None,
                     "source_bytes": size,
-                    "preview_bytes": cached.stat().st_size,
                     "message": "Preview ready",
                 }
         except Exception as exc:  # noqa: BLE001
-            if temp.exists():
-                try:
-                    temp.unlink()
-                except OSError:
-                    pass
+            shutil.rmtree(dest_dir, ignore_errors=True)
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":
                     _jobs[key] = {
@@ -412,6 +492,7 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
 
 
 def resolve_preview(source: Path) -> Path:
+    """Path to the finished preview playlist (raises while still building)."""
     status = preview_status(source, start=False)
     if status.get("status") == "ready":
         return Path(status["path"])

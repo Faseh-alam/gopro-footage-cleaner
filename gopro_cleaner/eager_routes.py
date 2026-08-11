@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import mimetypes
+import re
 from pathlib import Path
 
-from flask import Blueprint, Response, jsonify, request, send_file
+from flask import Blueprint, Response, jsonify, request, send_file, send_from_directory
 
 from .core import annotation_store, batch_registry
 from .core.eager import (
@@ -19,7 +20,7 @@ from .core.eager import (
 )
 from .core.eager_trim_queue import eager_trim_queue
 from .core.folder_picker import pick_folder
-from .core.preview_proxy import cancel_preview, preview_status, resolve_preview
+from .core.preview_proxy import cancel_preview, preview_cache_root, preview_status, resolve_preview
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
 from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
@@ -219,24 +220,39 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.get("/api/eager/preview")
     def eager_preview():
+        """Legacy endpoint — previews are HLS now; point callers at the playlist."""
         raw_path = request.args.get("path", "").strip()
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         try:
-            path = resolve_preview(Path(raw_path))
+            resolve_preview(Path(raw_path))
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
-        response = send_file(
-            path,
-            mimetype="video/mp4",
-            conditional=True,
-            etag=True,
-            max_age=3600,
-            last_modified=True,
-        )
-        response.headers["Accept-Ranges"] = "bytes"
+        st = preview_status(Path(raw_path), start=False)
+        return jsonify({"ok": True, "hls": st.get("hls"), "status": st.get("status")})
+
+    _HLS_KEY_RE = re.compile(r"^[0-9a-f]{20}$")
+    _HLS_NAME_RE = re.compile(r"^(index\.m3u8|seg\d{5}\.ts)$")
+
+    @eager.get("/api/eager/preview/hls/<key>/<name>")
+    def eager_preview_hls(key: str, name: str):
+        """Serve preview playlist/segments — playable while the encode runs."""
+        if not _HLS_KEY_RE.fullmatch(key) or not _HLS_NAME_RE.fullmatch(name):
+            return jsonify({"error": "Not found"}), 404
+        directory = preview_cache_root() / key
+        if not (directory / name).is_file():
+            return jsonify({"error": "Not found"}), 404
+        if name.endswith(".m3u8"):
+            # The playlist grows during the build — the player must re-fetch it.
+            response = send_from_directory(
+                directory, name, mimetype="application/vnd.apple.mpegurl", max_age=0
+            )
+            response.headers["Cache-Control"] = "no-store"
+        else:
+            # Segments are immutable once written (hls_flags temp_file).
+            response = send_from_directory(directory, name, mimetype="video/mp2t", max_age=86400)
         return response
 
     @eager.post("/api/eager/trim")

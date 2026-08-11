@@ -1,3 +1,21 @@
+# Updates — 11 August 2026
+
+## Instant 720p preview playback (HLS streaming)
+
+**Problem:** Even with the fast encoder settings, a long 4K file takes 1–2 minutes to transcode, and playback only switched to 720p when the whole build finished.
+
+**Change:** Previews are now encoded as **HLS** (2-second streaming segments + playlist) instead of one MP4. The player attaches to the preview a few seconds into the build — smooth 5–8× review starts almost immediately, while ffmpeg keeps encoding ahead in the background.
+
+- Backend (`preview_proxy.py`): ffmpeg writes `seg#####.ts` + `index.m3u8` into the preview cache (`hls_flags temp_file`, so segments appear atomically). Status now reports `hls` (playlist URL) and `playable` (≥2 segments exist).
+- New endpoint `GET /api/eager/preview/hls/<key>/<name>` serves the playlist (`no-store`, it grows during the build) and segments (cacheable). Key/name are whitelist-validated.
+- Frontend: **hls.js** attaches the growing playlist to the same `<video>`; on Safari it plays natively. Status pill shows `720p preview · encoding N%` while the tail is still building.
+- The scrub bar keeps the full known duration while the preview grows (element duration only covers encoded segments).
+- If the browser can't do HLS or the stream errors fatally, playback falls back to the original file as before.
+- Preview cache format bumped (`v7-hls-720p`) — old MP4 previews are ignored and rebuild once as HLS.
+- Verified by `scripts/_test_preview_hls.py`: playlist becomes playable **before** the encode finishes, ENDLIST lands at completion, Flask routes serve/deny correctly, finished previews survive a backend restart.
+
+---
+
 # Updates — 8 August 2026
 
 Summary of changes made in today’s work session on the `redesign` branch.
