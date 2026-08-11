@@ -34,7 +34,7 @@ export function FootageList({ c }: { c: ReviewController }) {
               title={
                 openable
                   ? v.name
-                  : "Finish the current video before opening unfinished footage"
+                  : "Label this video completely before you can open it from the list"
               }
               className={cn(
                 "flex w-full items-center justify-between gap-2 border-t border-border px-4 py-2 text-left text-xs transition-colors",

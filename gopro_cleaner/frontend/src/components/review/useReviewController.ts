@@ -630,11 +630,10 @@ export function useReviewController() {
   // ---------------------------------------------------------------------
   const isHandledPath = useCallback((path: string) => Boolean(annotationsByPath[path]?.complete), [annotationsByPath]);
 
-  /** Current video, or any video already marked complete. Blocks skipping ahead. */
+  /** List clicks only — unfinished footage is never openable by click. */
   const canOpenVideo = useCallback((i: number) => {
     const s = stateRef.current;
     if (i < 0 || i >= s.videos.length) return false;
-    if (i === s.index) return true;
     return Boolean(s.annotationsByPath[s.videos[i].path]?.complete);
   }, []);
 
@@ -684,24 +683,34 @@ export function useReviewController() {
     }
   }, []);
 
-  // Once the current video's proxy is ready, warm the next one in the queue so
-  // stepping forward opens the 720p preview directly instead of the original.
-  const prefetchNextPreview = useCallback(
+  /** Index of the video we should warm next (prefer next unfinished, else i+1). */
+  const nextPreviewTargetIndex = useCallback(
     (fromIndex: number) => {
       const s = stateRef.current;
       let next = nextIncompleteIndex(fromIndex + 1);
       if (next === fromIndex) next = -1;
       if (next < 0 && fromIndex + 1 < s.videos.length) next = fromIndex + 1;
-      if (next < 0 || next === fromIndex) return;
+      if (next < 0 || next === fromIndex) return -1;
+      return next;
+    },
+    [nextIncompleteIndex],
+  );
+
+  // Warm the next clip's 720p encode while the current one plays — critical for
+  // snappy N / auto-advance. Safe to call repeatedly (idempotent start=1).
+  const prefetchNextPreview = useCallback(
+    (fromIndex: number) => {
+      const s = stateRef.current;
+      const next = nextPreviewTargetIndex(fromIndex);
+      if (next < 0) return;
       const path = s.videos[next]?.path;
       if (!path || path === s.videos[fromIndex]?.path) return;
-      if (prefetchedPreviewRef.current === path) return;
       prefetchedPreviewRef.current = path;
       api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`).catch(() => {
         /* best-effort warmup */
       });
     },
-    [nextIncompleteIndex],
+    [nextPreviewTargetIndex],
   );
 
   const destroyHls = useCallback(() => {
@@ -801,7 +810,8 @@ export function useReviewController() {
           "ok",
         );
         if (resume) safePlay();
-        if (!building) prefetchNextPreview(stateRef.current.index);
+        // Current is playable — keep the next clip encoding in the background.
+        prefetchNextPreview(stateRef.current.index);
       };
       v.addEventListener("loadedmetadata", onReady, { once: true });
       if (!attachHlsMedia(v, path, hlsUrl, t, token)) {
@@ -835,6 +845,8 @@ export function useReviewController() {
             if (!onPreview && st.playable && st.hls) {
               swapToPreview(path, token, String(st.hls), true);
             }
+            // While current encodes/plays, keep the next 720p job alive.
+            prefetchNextPreview(stateRef.current.index);
             setPreviewNote(
               hlsUrlRef.current ? `720p preview · encoding ${pct}%` : `Building preview ${pct}%`,
             );
@@ -870,32 +882,35 @@ export function useReviewController() {
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
 
-      // Block jumping to unfinished footage (except current / forced loads).
-      if (!opts.force && i !== s.index && !s.annotationsByPath[video.path]?.complete) {
-        setStatus("Finish the current video before opening unfinished footage", "error");
+      // Click/nav without force: only already-labelled (complete) videos.
+      if (!opts.force && !s.annotationsByPath[video.path]?.complete) {
+        setStatus("Only finished videos can be opened — finish the current one first", "error");
         return;
       }
 
       const previous = s.index >= 0 ? s.videos[s.index] : null;
-      // Cancel previous encode in the background — don't block the switch.
-      if (previous?.path && previous.path !== video.path) {
+      const upcomingIdx = nextPreviewTargetIndex(i);
+      const upcomingPath = upcomingIdx >= 0 ? s.videos[upcomingIdx]?.path || "" : "";
+
+      // Free CPU from the video we left — never cancel the clip we're opening
+      // (it may already be mid-encode from prefetch) or the one we warm next.
+      if (previous?.path && previous.path !== video.path && previous.path !== upcomingPath) {
         void cancelPreviewJob(previous.path);
       }
       if (
         prefetchedPreviewRef.current &&
         prefetchedPreviewRef.current !== video.path &&
-        prefetchedPreviewRef.current !== previous?.path
+        prefetchedPreviewRef.current !== upcomingPath
       ) {
         void cancelPreviewJob(prefetchedPreviewRef.current);
       }
-      prefetchedPreviewRef.current = "";
 
       setLoadingVideo(true);
       setIndex(i);
       setScrubTime(0);
       setShareClipIn(null);
       setShareClipOut(null);
-      setPreviewNote("");
+      setPreviewNote("Starting 720p preview…");
       stopPreviewPoll();
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
@@ -905,6 +920,10 @@ export function useReviewController() {
 
       const token = ++previewTokenRef.current;
       setStatus(`Loading ${video.name}...`);
+
+      // CRITICAL: kick current + next 720p encodes immediately (don't wait on UI).
+      void api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`).catch(() => null);
+      prefetchNextPreview(i);
 
       const v = videoRef.current;
       if (!v) {
@@ -925,6 +944,9 @@ export function useReviewController() {
       ]);
       if (token !== previewTokenRef.current) return;
 
+      // Keep the lookahead encode warm while this clip is reviewed.
+      prefetchNextPreview(i);
+
       const resumeTime = resumeTimeForPath(video.path);
       setScrubTime(resumeTime);
       setTaskSelectionMode(Boolean(stateRef.current.annotationsByPath[video.path]?.pendingWork));
@@ -937,7 +959,6 @@ export function useReviewController() {
           initialHls = String(st.hls);
           usingPreview = true;
           setPreviewNote("720p preview");
-          prefetchNextPreview(i);
         } else if (st?.status === "running") {
           if (st.playable && st.hls) {
             initialHls = String(st.hls);
@@ -970,6 +991,8 @@ export function useReviewController() {
         }
         setPlaybackRate(1, false);
         updateScrubUiFromEl();
+        // Current is on screen — ensure next encode is already running.
+        prefetchNextPreview(i);
         const mode = usingPreview ? "720p preview" : "original (proxy building)";
         setStatus(
           startAt > 0
@@ -997,6 +1020,7 @@ export function useReviewController() {
       cancelPreviewJob,
       destroyHls,
       loadAnnotationForPath,
+      nextPreviewTargetIndex,
       pollPreviewReady,
       prefetchNextPreview,
       resumeTimeForPath,
@@ -1336,12 +1360,27 @@ export function useReviewController() {
       const freshVideos: VideoItem[] = data.videos || [];
       setVideos(freshVideos);
       setIndex(-1);
+
+      // Start 720p for the first two files while annotations load — biggest win.
+      for (const v of freshVideos.slice(0, 2)) {
+        if (v?.path) {
+          void api(`/api/eager/preview/status?path=${encodeURIComponent(v.path)}&start=1`).catch(() => null);
+        }
+      }
+
       await Promise.all(freshVideos.map((v) => loadAnnotationForPath(v.path)));
       setIdentityFromSelectedCard();
 
       const first = freshVideos.findIndex((v) => !stateRef.current.annotationsByPath[v.path]?.complete);
       if (first >= 0 || freshVideos.length) {
-        await loadVideo(first >= 0 ? first : 0, { force: true });
+        const openAt = first >= 0 ? first : 0;
+        // Warm openAt + openAt+1 explicitly in case the first incomplete isn't index 0.
+        for (const v of [freshVideos[openAt], freshVideos[openAt + 1]]) {
+          if (v?.path) {
+            void api(`/api/eager/preview/status?path=${encodeURIComponent(v.path)}&start=1`).catch(() => null);
+          }
+        }
+        await loadVideo(openAt, { force: true });
         setStatus(
           first >= 0
             ? `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`

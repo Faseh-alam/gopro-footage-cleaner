@@ -67,6 +67,8 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
+      <MediaMetaStrip meta={ann?.mediaMeta} />
+
       <header className="flex items-start justify-between gap-4 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <div className="eyebrow mb-0.5">Now reviewing</div>
@@ -81,8 +83,6 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           <Badge tone={coverage >= 100 ? "ok" : "muted"}>{coverage}% covered</Badge>
         </div>
       </header>
-
-      <MediaMetaStrip meta={ann?.mediaMeta} />
 
       <div
         ref={c.playerWrapRef}
@@ -117,13 +117,10 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           </div>
         )}
 
-        {/* Scrub track */}
+        {/* Scrub track — display only; seek with , . or ← → (no click jump). */}
         <div
-          className="relative h-8 cursor-pointer border-t border-border bg-surface-2"
-          onClick={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            c.seekToFraction((e.clientX - rect.left) / rect.width);
-          }}
+          className="relative h-8 cursor-default border-t border-border bg-surface-2"
+          title="Use , . or ← → to step through the timeline"
         >
           {segments.map((s, i) => (
             <div
