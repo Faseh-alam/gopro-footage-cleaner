@@ -2,6 +2,7 @@ import { Logo } from "@/components/wc/logo";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
@@ -63,7 +64,9 @@ function ReviewPage() {
       const res = await api("/api/update", { method: "POST" });
       if (!res.restarting) {
         setUpdateState("idle");
-        c.setStatus(`Already up to date (${res.branch} @ ${res.after})`, "ok");
+        const detail = `${res.branch} @ ${res.after}`;
+        c.setStatus(`Already up to date (${detail})`, "ok");
+        toast.success("Already up to date", { description: detail });
         return;
       }
       setUpdateState("restarting");
