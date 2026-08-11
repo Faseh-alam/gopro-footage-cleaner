@@ -200,13 +200,6 @@ function ReviewPage() {
     return () => document.removeEventListener("keydown", onKey, true);
   }, [c]);
 
-  const indicatorTone =
-    cards.indicator === "connected"
-      ? "bg-success"
-      : cards.indicator === "connecting"
-        ? "bg-muted-foreground"
-        : "bg-destructive";
-
   return (
     <div className="flex min-h-screen flex-col bg-background">
       <header className="flex flex-wrap items-end justify-between gap-4 border-b border-border px-6 py-5">
@@ -252,10 +245,6 @@ function ReviewPage() {
               : updateState === "pulling"
                 ? "Updating…"
                 : "Restarting…"}
-          </Button>
-          <Button size="sm" variant="ghost" disabled>
-            <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
-            {cards.statusText}
           </Button>
           {user && (
             <div className="ml-1 flex items-center gap-2 border-l border-border pl-3">
