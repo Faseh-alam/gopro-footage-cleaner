@@ -474,14 +474,11 @@ export function useReviewController() {
     [flushSeek, knownDurationSec],
   );
 
-  const seekToFraction = useCallback(
-    (fraction: number) => {
-      const dur = knownDurationSec();
-      if (!dur) return;
-      scheduleSeek(fraction * dur, true);
-    },
-    [knownDurationSec, scheduleSeek],
-  );
+  // Scrubber clicks are disabled in the UI — keep this as a no-op so nothing
+  // can jump the playhead by clicking the timeline.
+  const seekToFraction = useCallback((_fraction: number) => {
+    /* intentionally disabled */
+  }, []);
 
   const fineTune = useCallback(
     (seconds: number) => {
@@ -630,12 +627,32 @@ export function useReviewController() {
   // ---------------------------------------------------------------------
   const isHandledPath = useCallback((path: string) => Boolean(annotationsByPath[path]?.complete), [annotationsByPath]);
 
-  /** List clicks only — unfinished footage is never openable by click. */
-  const canOpenVideo = useCallback((i: number) => {
+  /** True when a clip is labelled end-to-end (100% covered / complete). */
+  const isVideoFullyDone = useCallback((path?: string | null) => {
+    if (!path) return false;
     const s = stateRef.current;
-    if (i < 0 || i >= s.videos.length) return false;
-    return Boolean(s.annotationsByPath[s.videos[i].path]?.complete);
+    const ann = s.annotationsByPath[path];
+    if (!ann) return false;
+    if (ann.complete) return true;
+    const dur = Number(ann.duration) || Number(s.videos.find((v: VideoItem) => v.path === path)?.duration) || 0;
+    if (dur <= 0) return false;
+    const covered = (ann.segments || []).reduce(
+      (acc: number, seg: Segment) => acc + Math.max(0, Number(seg.end) - Number(seg.start)),
+      0,
+    );
+    return covered >= dur - 0.05;
   }, []);
+
+  /** List: current clip, or any clip already done. Never open unfinished others. */
+  const canOpenVideo = useCallback(
+    (i: number) => {
+      const s = stateRef.current;
+      if (i < 0 || i >= s.videos.length) return false;
+      if (i === s.index) return true;
+      return isVideoFullyDone(s.videos[i].path);
+    },
+    [isVideoFullyDone],
+  );
 
   const nextIncompleteIndex = useCallback(
     (startAt?: number) => {
@@ -882,9 +899,9 @@ export function useReviewController() {
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
 
-      // Click/nav without force: only already-labelled (complete) videos.
-      if (!opts.force && !s.annotationsByPath[video.path]?.complete) {
-        setStatus("Only finished videos can be opened — finish the current one first", "error");
+      // Click/nav without force: current video, or fully labelled (100% covered) only.
+      if (!opts.force && i !== s.index && !isVideoFullyDone(video.path)) {
+        setStatus("Only finished (100% covered) videos can be opened from the list", "error");
         return;
       }
 
@@ -1019,6 +1036,7 @@ export function useReviewController() {
       attachHlsMedia,
       cancelPreviewJob,
       destroyHls,
+      isVideoFullyDone,
       loadAnnotationForPath,
       nextPreviewTargetIndex,
       pollPreviewReady,
@@ -1034,8 +1052,8 @@ export function useReviewController() {
   const finishCleaningFile = useCallback(async () => {
     const s = stateRef.current;
     const cur = s.index >= 0 ? s.videos[s.index] : null;
-    if (cur && !s.annotationsByPath[cur.path]?.complete) {
-      setStatus("Finish covering this video before moving to the next", "error");
+    if (cur && !isVideoFullyDone(cur.path)) {
+      setStatus("Cover this video 100% before pressing N for the next one", "error");
       return;
     }
     const next = nextIncompleteIndex(s.index + 1);
@@ -1045,7 +1063,7 @@ export function useReviewController() {
       return;
     }
     setStatus("All videos complete", "ok");
-  }, [loadVideo, nextIncompleteIndex, setStatus]);
+  }, [isVideoFullyDone, loadVideo, nextIncompleteIndex, setStatus]);
 
   // ---------------------------------------------------------------------
   // Mark work / garbage / undo / assign

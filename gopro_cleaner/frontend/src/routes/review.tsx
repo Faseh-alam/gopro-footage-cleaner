@@ -48,7 +48,7 @@ const KEYS: [string, string][] = [
   ["A", "Focus New task field"],
   ["G", "Mark garbage to playhead"],
   ["U", "Delete last markup"],
-  ["N", "Next unfinished (current must be done)"],
+  ["N", "Next unfinished (current must be 100% covered)"],
   ["Home", "Jump to 0:00"],
 ];
 

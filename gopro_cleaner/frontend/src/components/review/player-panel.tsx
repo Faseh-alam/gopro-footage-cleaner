@@ -117,9 +117,10 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           </div>
         )}
 
-        {/* Scrub track — display only; seek with , . or ← → (no click jump). */}
+        {/* Scrub track — display only; clicks never seek (use , . or ← →). */}
         <div
-          className="relative h-8 cursor-default border-t border-border bg-surface-2"
+          className="pointer-events-none relative h-8 select-none border-t border-border bg-surface-2"
+          aria-hidden
           title="Use , . or ← → to step through the timeline"
         >
           {segments.map((s, i) => (

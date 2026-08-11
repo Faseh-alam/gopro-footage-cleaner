@@ -34,7 +34,7 @@ export function FootageList({ c }: { c: ReviewController }) {
               title={
                 openable
                   ? v.name
-                  : "Label this video completely before you can open it from the list"
+                  : "Only the current video or 100% covered videos can be opened"
               }
               className={cn(
                 "flex w-full items-center justify-between gap-2 border-t border-border px-4 py-2 text-left text-xs transition-colors",
