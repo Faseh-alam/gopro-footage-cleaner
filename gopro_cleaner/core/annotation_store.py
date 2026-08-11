@@ -337,6 +337,24 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
         except OSError:
             pass
 
+        # Keep the MP4's embedded segments box in sync with the sidecar so
+        # offload / AWS can read start/end/kind/task (+ camera meta) from the
+        # video itself. Best-effort — sidecar write already succeeded.
+        try:
+            from .embed_meta import embed_segments_json
+
+            embed_segments_json(video, payload)
+            # File grew / mtime changed — refresh identity fields in the sidecar.
+            try:
+                st = video.stat()
+                payload["size_bytes"] = st.st_size
+                payload["mtime_ns"] = st.st_mtime_ns
+                _atomic_write(sidecar_path_for(video), payload)
+            except OSError:
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+
     return {"annotation": payload, "summary": summary}
 
 

@@ -15,7 +15,7 @@ from .reporting import (
     card_stats_light,
     _now_12h_time,
 )
-from .volumes import CARD_LABEL_RE, list_sd_cards
+from .volumes import list_sd_cards
 
 log = logging.getLogger(__name__)
 
@@ -125,12 +125,9 @@ def create_cards_blueprint() -> Blueprint:
         if not card_path or not card_name:
             return jsonify({"error": "cardPath and cardName are required"}), 400
 
-        # Only real detected GoPro SD cards (C####) may be registered — never
-        # arbitrary folders / debug paths.
-        if not CARD_LABEL_RE.match(card_name):
-            return jsonify({
-                "error": f"Invalid card name '{card_name}'. Expected a detected SD card like C1234.",
-            }), 400
+        # Only currently detected GoPro SD cards (DCIM/###GOPRO with MP4s) may
+        # be registered — never arbitrary folders / debug paths. Card names are
+        # no longer required to be C#### (new cards often have random labels).
         try:
             detected = list_sd_cards()
         except Exception as e:
@@ -139,15 +136,23 @@ def create_cards_blueprint() -> Blueprint:
             (
                 c for c in detected
                 if str(c.get("id") or "").upper() == card_name.upper()
+                or str(c.get("path") or "").rstrip("\\/").lower()
+                == card_path.rstrip("\\/").lower()
+                or str(c.get("scan_path") or "").rstrip("\\/").lower()
+                == card_path.rstrip("\\/").lower()
             ),
             None,
         )
         if not connected:
             return jsonify({
-                "error": f"SD card '{card_name}' is not currently connected.",
+                "error": (
+                    f"SD card '{card_name}' is not currently connected "
+                    "(no DCIM/###GOPRO with MP4s detected)."
+                ),
             }), 400
         # Prefer the detector's paths so clients can't register arbitrary folders.
         card_path = str(connected.get("scan_path") or connected.get("path") or card_path).strip()
+        card_name = str(connected.get("id") or card_name).strip()
 
         try:
             existing = supabase_db.find_card_today(card_name)

@@ -5,20 +5,6 @@ import { Button } from "@/components/ui/button";
 import type { MediaMeta } from "./types";
 import type { ReviewController } from "./useReviewController";
 
-function formatRecordedAt(value?: string | null) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
 const MOTION_SENSORS: [RegExp, string][] = [
   [/acceler/i, "Accel"],
   [/gyro/i, "Gyro"],
@@ -41,11 +27,8 @@ function MediaMetaStrip({ meta }: { meta?: MediaMeta | null }) {
   if (!meta) return null;
   const items: { label: string; value: string; title?: string }[] = [];
 
-  const recorded = formatRecordedAt(meta.recorded_at);
-  if (recorded) items.push({ label: "REC", value: recorded, title: meta.recorded_at || undefined });
   if (meta.camera_model) items.push({ label: "CAM", value: meta.camera_model });
   if (meta.camera_serial) items.push({ label: "SN", value: meta.camera_serial });
-  if (meta.firmware) items.push({ label: "FW", value: meta.firmware });
   if (meta.width && meta.height) {
     const fps = meta.fps ? ` ${Math.round(meta.fps)}fps` : "";
     items.push({ label: "VID", value: `${meta.width}×${meta.height}${fps}` });

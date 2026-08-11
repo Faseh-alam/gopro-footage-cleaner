@@ -203,18 +203,23 @@ def main() -> int:
             capture_output=True, text=True, timeout=300,
         )
         out_root = batch_dest / "_trimmed"
-        clip = out_root / "pipe-welding" / "GX010001_01.mp4"
+        # C + last 4 of serial C3501324500712 → C0712 / task / original name
+        clip = out_root / "C0712" / "pipe-welding" / "GX010001.MP4"
         check("script exits 0", result.returncode == 0,
               (result.stdout + result.stderr)[-300:])
-        check("work clip created in task folder", clip.is_file())
+        check("work clip at camera_id/task/original.mp4", clip.is_file(), str(clip))
+        check("camera id folder from serial last-4", (out_root / "C0712").is_dir())
         check("no garbage clips / folders",
-              sorted(p.name for p in out_root.iterdir()) == ["pipe-welding"])
+              sorted(p.name for p in (out_root / "C0712").iterdir()) == ["pipe-welding"]
+              if (out_root / "C0712").is_dir() else False)
         check("incomplete video skipped by default",
-              "GX010001__C5678.MP4" in result.stdout and not (out_root / "cable-pulling").exists())
+              "GX010001__C5678.MP4" in result.stdout
+              and not (out_root / "C5678" / "cable-pulling").exists())
         clip_meta = embed_meta.read_embedded_segments(clip) if clip.is_file() else None
         check("clip carries its own embedded identity",
               bool(clip_meta) and clip_meta.get("task") == "Pipe Welding"
               and clip_meta.get("clip_of") == "GX010001.MP4"
+              and clip_meta.get("camera_id") == "C0712"
               and clip_meta.get("media_meta", {}).get("camera_serial") == "C3501324500712")
         if clip.is_file():
             probe = subprocess.run(
@@ -224,14 +229,14 @@ def main() -> int:
             dur = float(json.loads(probe.stdout or "{}").get("format", {}).get("duration") or 0)
             check("clip playable, duration sane", probe.returncode == 0 and 0.2 <= dur <= 1.1,
                   f"duration={dur}")
-        # --include-incomplete picks up card B's video too
+        # --include-incomplete picks up card B (no serial → falls back to card_badge C5678)
         result2 = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "aws_trim_batch.py"), str(batch_dest),
              "--include-incomplete"],
             capture_output=True, text=True, timeout=300,
         )
         check("--include-incomplete cuts cable-pulling clip",
-              (out_root / "cable-pulling" / "GX010001__C5678_01.mp4").is_file(),
+              (out_root / "C5678" / "cable-pulling" / "GX010001__C5678.MP4").is_file(),
               (result2.stdout + result2.stderr)[-200:])
         shutil.rmtree(out_root, ignore_errors=True)
     else:

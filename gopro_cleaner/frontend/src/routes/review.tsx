@@ -1,23 +1,13 @@
 import { Logo } from "@/components/wc/logo";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
-import { ArrowUpRight, ChevronDown } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Switch } from "@/components/ui/switch";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
-import { MetadataCard } from "@/components/review/metadata-card";
 import { TaskPanel } from "@/components/review/task-panel";
 import { FootageList } from "@/components/review/footage-list";
 import { TrimDock } from "@/components/review/trim-dock";
@@ -221,59 +211,12 @@ function ReviewPage() {
             <span className={cn("size-1.5 rounded-full", indicatorTone)} aria-hidden />
             {cards.statusText}
           </Button>
-          <div className="flex items-center">
-            <Button
-              size="sm"
-              variant="default"
-              className="rounded-r-none"
-              onClick={() => c.queueClips()}
-              disabled={c.busy}
-              title="Trim all work segments of the current video"
-            >
-              Queue clips
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  size="sm"
-                  variant="default"
-                  className="rounded-l-none border-l border-background/30 px-1.5"
-                  disabled={c.busy}
-                  aria-label="More queue options"
-                >
-                  <ChevronDown className="size-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                <DropdownMenuItem
-                  onClick={() => c.queueAllClips()}
-                  title="Trim work segments from every annotated video"
-                >
-                  Queue all clips
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel className="font-normal">
-                  <label
-                    className="flex cursor-pointer items-center justify-between gap-3 py-0.5"
-                    onClick={(e) => e.stopPropagation()}
-                    onPointerDown={(e) => e.stopPropagation()}
-                  >
-                    <span className="text-xs font-medium text-foreground">
-                      Delete source
-                      <span className="mt-0.5 block text-[10px] font-normal text-muted-foreground">
-                        Trash raw footage after trims
-                      </span>
-                    </span>
-                    <Switch
-                      checked={c.deleteSourceAfterTrim}
-                      onCheckedChange={c.setDeleteSourceAfterTrim}
-                      aria-label="Delete source after trim"
-                    />
-                  </label>
-                </DropdownMenuLabel>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+          <Link
+            to="/metadata"
+            className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
+          >
+            Metadata <ArrowUpRight className="size-3.5" />
+          </Link>
           <Link
             to="/"
             className="inline-flex items-center gap-1.5 font-mono text-[12px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75 ml-2"
@@ -283,14 +226,9 @@ function ReviewPage() {
         </div>
       </header>
 
-      <p className="border-b border-border px-6 py-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-        Space play · ← → speed · , . scrub 1s · I/O share clip · T ends work · G garbage · Enter assigns
-      </p>
-
       <main className="grid min-h-0 flex-1 gap-4 p-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)]">
         <div className="grid min-h-0 content-start gap-4">
           <PlayerPanel c={c} />
-          <MetadataCard c={c} />
           <BatchPanel c={c} />
         </div>
 

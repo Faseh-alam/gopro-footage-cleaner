@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """Rebuild trimmed work footage from an offloaded batch — made for the AWS server.
 
-Feed it a batch folder (synced down from S3 by the SD Offloader). For every
-video it reads the labeling data embedded inside the MP4 by the offloader
-(WCSG ``skip`` box; falls back to the ``<name>.segments.json`` sidecar), then
-cuts ONLY the ``work`` segments into task-name folders:
+Reads each MP4's embedded segments (or ``.segments.json``), then cuts ONLY
+``work`` segments into:
 
     <output>/
-      pipe-welding/
-        GX010001_01.mp4        ← trimmed work clip (video + audio + GPMF/IMU)
-      cable-pulling/
-        GX010002_01.mp4
-        GX010002_02.mp4
+      C0712/                     ← C + last 4 digits of camera serial
+        pipe-welding/
+          GX010001.MP4           ← original filename
+        cable-pulling/
+          GX010001.MP4
 
-Cutting is a stream copy with the same mapping as GoPro Cleaner's local
-trimmer (video + audio + gpmd data track, ``-copy_unknown -tag:d gpmd``),
-so no re-encode and the IMU data survives in every clip. Each clip also gets
-its own metadata embedded (source file, task, start/end, camera serial,
-device id...), readable with scripts/read_embedded_segments.py.
+One source with several tasks → several task folders. Multiple work segments
+of the same task from one source get ``_01`` / ``_02`` suffixes.
 
-Only needs Python 3.9+ and ffmpeg/ffprobe on PATH (or set FFMPEG/FFPROBE).
+Stream-copy trim (video + audio + gpmd). Needs Python 3.9+ and ffmpeg/ffprobe.
 
 Usage:
-    python aws_trim_batch.py "/data/batch 6"                       # → /data/batch 6/_trimmed
+    python aws_trim_batch.py "/data/batch 6"
     python aws_trim_batch.py "/data/batch 6" --output /data/out
-    python aws_trim_batch.py "/data/batch 6" --dry-run             # plan only
-    python aws_trim_batch.py "/data/batch 6" --include-incomplete  # also not-fully-labeled videos
+    python aws_trim_batch.py "/data/batch 6" --dry-run
+    python aws_trim_batch.py "/data/batch 6" --include-incomplete
 """
 
 from __future__ import annotations
@@ -199,6 +194,31 @@ def task_slug(name: str) -> str:
     return slug or "unknown-task"
 
 
+def camera_id_from_payload(payload: dict) -> str:
+    """``C`` + last 4 digits of the camera serial (e.g. C3501…0712 → C0712).
+
+    Falls back to an existing ``C####`` card_badge, then ``C0000``.
+    """
+    meta = payload.get("media_meta") or {}
+    serial = str(meta.get("camera_serial") or "").strip()
+    digits = re.sub(r"\D", "", serial)
+    if len(digits) >= 4:
+        return f"C{digits[-4:]}"
+    badge = str(payload.get("card_badge") or "").strip().upper()
+    if re.fullmatch(r"C\d{4}", badge):
+        return badge
+    return "C0000"
+
+
+def clip_filename(source_name: str, task_index: int, task_count: int) -> str:
+    """Keep the original filename; suffix only when one task has multiple clips."""
+    path = Path(source_name)
+    stem, suffix = path.stem, path.suffix or ".MP4"
+    if task_count <= 1:
+        return f"{stem}{suffix}"
+    return f"{stem}_{task_index:02d}{suffix}"
+
+
 # ---------------------------------------------------------------------- main
 
 def collect_mp4s(root: Path) -> list[Path]:
@@ -255,18 +275,37 @@ def main() -> int:
             continue
 
         meta = payload.get("media_meta") or {}
-        print(f"\n{mp4.name}  [{origin}]  {len(work)} work segment(s)")
+        cam_id = camera_id_from_payload(payload)
+        # Count work segments per task so we only suffix when needed.
+        task_counts: dict[str, int] = {}
+        for seg in work:
+            task_counts[task_slug(seg.get("task") or "")] = (
+                task_counts.get(task_slug(seg.get("task") or ""), 0) + 1
+            )
+        task_seen: dict[str, int] = {}
+
+        print(
+            f"\n{mp4.name}  [{origin}]  camera={cam_id}  "
+            f"serial={meta.get('camera_serial') or '?'}  "
+            f"{len(work)} work segment(s)"
+        )
         streams = probe_streams(ffprobe, mp4) if not args.dry_run else {}
 
-        for idx, seg in enumerate(work, 1):
+        for seg in work:
             start = float(seg.get("start") or 0.0)
             end = float(seg.get("end") or 0.0)
             duration = max(0.0, end - start)
             if duration <= 0:
                 continue
-            folder = out_root / task_slug(seg.get("task") or "")
-            clip = folder / f"{mp4.stem}_{idx:02d}{mp4.suffix.lower()}"
-            print(f"  {seg.get('task') or 'unknown'}: {start:.2f}s → {end:.2f}s  ⇒  {clip.relative_to(out_root)}")
+            slug = task_slug(seg.get("task") or "")
+            task_seen[slug] = task_seen.get(slug, 0) + 1
+            folder = out_root / cam_id / slug
+            name = clip_filename(mp4.name, task_seen[slug], task_counts[slug])
+            clip = folder / name
+            print(
+                f"  {seg.get('task') or 'unknown'}: {start:.2f}s → {end:.2f}s  "
+                f"⇒  {clip.relative_to(out_root)}"
+            )
             if args.dry_run:
                 continue
 
@@ -280,7 +319,6 @@ def main() -> int:
                 continue
 
             try_udtacopy(mp4, clip)
-            # Give the clip its own identity for downstream tooling.
             embed_payload(clip, {
                 "version": 1,
                 "clip_of": mp4.name,
@@ -288,6 +326,7 @@ def main() -> int:
                 "kind": "work",
                 "start": start,
                 "end": end,
+                "camera_id": cam_id,
                 "batch_name": payload.get("batch_name") or "",
                 "factory": payload.get("factory") or "",
                 "card_badge": payload.get("card_badge") or "",

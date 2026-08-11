@@ -246,6 +246,12 @@ function Index() {
             <RefreshCw className="size-3.5" /> Refresh
           </Button>
           <Link
+            to="/metadata"
+            className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75"
+          >
+            Metadata <ArrowUpRight className="size-3.5" />
+          </Link>
+          <Link
             to="/review"
             className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75"
           >

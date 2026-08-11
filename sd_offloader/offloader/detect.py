@@ -200,6 +200,11 @@ def _find_gopro_root(root: Path) -> Path | None:
 
 
 def _card_id_for(root: Path, label: str) -> str | None:
+    """Prefer C####; else a stable display id from volume label / drive letter.
+
+    New cards often have blank or random names — detection is by
+    ``DCIM/###GOPRO`` + MP4 content, not by the volume label.
+    """
     if CARD_LABEL_RE.match(label.strip()):
         return label.strip().upper()
     try:
@@ -208,15 +213,23 @@ def _card_id_for(root: Path, label: str) -> str | None:
                 return child.name.upper()
     except OSError:
         pass
-    return None
+    cleaned = re.sub(r"\s+", " ", (label or "").strip())
+    if cleaned and cleaned.upper() not in {"", "NO NAME", "UNTITLED", "REMOVABLE DISK"}:
+        safe = re.sub(r'[<>:"/\\|?*]', "_", cleaned).strip(" ._")
+        if safe:
+            return safe[:48]
+    drive = root.drive.rstrip(":\\/") if root.drive else ""
+    if drive:
+        return f"CARD-{drive.upper()}"
+    name = root.name.strip()
+    return f"CARD-{name[:32]}" if name else None
 
 
 def _looks_like_sd_card(root: Path, label: str) -> bool:
+    """Any volume with DCIM/###GOPRO containing MP4s — name does not matter."""
     gopro = _find_gopro_root(root)
     if gopro is None:
         return False
-    if CARD_LABEL_RE.match(label.strip()):
-        return True
     try:
         for entry in gopro.iterdir():
             # Raw labeled MP4s directly in DCIM/###GOPRO (label-only workflow)

@@ -58,8 +58,9 @@ python aws_trim_batch.py "/data/batch 6" --output "/data/batch 6 trimmed"
 
 ```text
 /data/batch 6 trimmed/
-  pipe-welding/GX010001_01.mp4     ← stream copy: video + audio + GPMF/IMU kept
-  cable-pulling/GX010002_01.mp4
+  C0712/                           ← C + last 4 digits of camera serial
+    pipe-welding/GX010001.MP4      ← original filename; stream copy keeps IMU
+    cable-pulling/GX010001.MP4
 ```
 
 Garbage segments are never cut. Videos not marked complete are skipped

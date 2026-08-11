@@ -15,7 +15,7 @@ from .core.queue import trim_queue
 from .core.sheet_import import parse_sheet, preview_to_dict, queue_import
 from .core.timestamps import format_timestamp, parse_clip_lines
 from .core.trimmer import job_store, move_to_trash
-from .core.volumes import list_volume_roots
+from .core.volumes import list_storage_targets, list_volume_roots
 from .core.routes_cards import create_cards_blueprint
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -103,6 +103,18 @@ def create_app() -> Flask:
                 item["is_video"] = True
                 item["is_gopro"] = looks_like_gopro(child)
                 item["size_bytes"] = child.stat().st_size
+                # Cheap label presence (no ffprobe) for the metadata browser.
+                try:
+                    from .core.annotation_store import sidecar_path_for
+                    from .core.embed_meta import has_embedded_segments
+
+                    item["has_sidecar"] = sidecar_path_for(child).is_file()
+                    item["has_embedded"] = has_embedded_segments(child)
+                    item["has_labels"] = bool(item["has_sidecar"] or item["has_embedded"])
+                except Exception:  # noqa: BLE001
+                    item["has_sidecar"] = False
+                    item["has_embedded"] = False
+                    item["has_labels"] = False
             entries.append(item)
 
         return jsonify({"path": str(path), "parent": parent, "entries": entries})
@@ -122,6 +134,137 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
 
         return jsonify(media_info_to_dict(info))
+
+    @app.get("/api/meta/drives")
+    def meta_drives():
+        """System drives, external SSDs, and detected GoPro SD cards."""
+        try:
+            drives = list_storage_targets()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"drives": drives, "count": len(drives)})
+
+    @app.get("/api/meta/inspect")
+    def meta_inspect():
+        """Full camera / IMU / labeling metadata for one video."""
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "Missing path"}), 400
+        path = Path(raw_path).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        if not path.is_file():
+            return jsonify({"error": "Not a file"}), 400
+
+        from .core import annotation_store
+        from .core.embed_meta import read_embedded_segments
+        from .core.gopro_meta import get_media_meta
+
+        media_meta = {}
+        try:
+            media_meta = get_media_meta(path) or {}
+        except Exception:  # noqa: BLE001
+            media_meta = {}
+
+        sidecar = annotation_store.load_annotation(path)
+        embedded = None
+        try:
+            embedded = read_embedded_segments(path)
+        except Exception:  # noqa: BLE001
+            embedded = None
+
+        # Prefer sidecar for labeling (freshest), else embedded box.
+        labeling = sidecar or embedded
+        labeling_source = "sidecar" if sidecar else ("embedded" if embedded else "none")
+
+        # IMU presence is about the live file (gpmd track / probed sensors),
+        # not whatever was copied into a label snapshot.
+        live_sensors = list(media_meta.get("sensors") or [])
+        imu_detected = bool(media_meta.get("has_gpmf")) or bool(live_sensors)
+        sensors = list(live_sensors)
+        if labeling and isinstance(labeling.get("media_meta"), dict):
+            for s in labeling["media_meta"].get("sensors") or []:
+                if s not in sensors:
+                    sensors.append(s)
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            size_bytes = None
+
+        return jsonify(
+            {
+                "ok": True,
+                "path": str(path),
+                "name": path.name,
+                "size_bytes": size_bytes,
+                "imu_detected": imu_detected,
+                "has_gpmf": bool(media_meta.get("has_gpmf")),
+                "sensors": sensors,
+                "media_meta": media_meta,
+                "labeling_source": labeling_source,
+                "has_sidecar": sidecar is not None,
+                "has_embedded": embedded is not None,
+                "labeling": labeling,
+                "sidecar": sidecar,
+                "embedded": embedded,
+            }
+        )
+
+    @app.get("/api/meta/scan")
+    def meta_scan():
+        """Probe IMU presence for every video in a folder (non-recursive)."""
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "Missing path"}), 400
+        folder = Path(raw_path).expanduser()
+        try:
+            folder = folder.resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": "Path not found"}), 404
+        if not folder.is_dir():
+            return jsonify({"error": "Not a directory"}), 400
+
+        from .core.annotation_store import sidecar_path_for
+        from .core.embed_meta import has_embedded_segments
+        from .core.gopro_meta import get_media_meta
+
+        rows = []
+        try:
+            children = sorted(folder.iterdir(), key=lambda p: p.name.lower())
+        except PermissionError:
+            return jsonify({"error": "Permission denied"}), 403
+
+        for child in children:
+            if not child.is_file() or child.name.startswith(".") or not is_video_file(child):
+                continue
+            meta = {}
+            try:
+                meta = get_media_meta(child) or {}
+            except Exception:  # noqa: BLE001
+                meta = {}
+            sensors = list(meta.get("sensors") or [])
+            has_sidecar = sidecar_path_for(child).is_file()
+            try:
+                has_embedded = has_embedded_segments(child)
+            except Exception:  # noqa: BLE001
+                has_embedded = False
+            rows.append(
+                {
+                    "path": str(child),
+                    "name": child.name,
+                    "imu_detected": bool(meta.get("has_gpmf")) or bool(sensors),
+                    "has_gpmf": bool(meta.get("has_gpmf")),
+                    "sensors": sensors,
+                    "has_sidecar": has_sidecar,
+                    "has_embedded": has_embedded,
+                    "has_labels": has_sidecar or has_embedded,
+                    "camera_serial": meta.get("camera_serial"),
+                    "camera_model": meta.get("camera_model"),
+                }
+            )
+        return jsonify({"ok": True, "path": str(folder), "videos": rows, "count": len(rows)})
 
     @app.post("/api/batch")
     def submit_batch():
