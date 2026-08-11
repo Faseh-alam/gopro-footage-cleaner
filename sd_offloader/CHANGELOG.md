@@ -10,6 +10,7 @@ This document describes how the SD Offloader worked **before**, what it does **n
 |-------|----------|---------|
 | What gets copied | Pre-trimmed clips inside task-named folders | Raw `.MP4` files + `.segments.json` sidecars |
 | SSD layout | `Batches/<batch>/<card_id>/<task>/…` | `Batches/<batch>/…` (flat — no card folder) |
+| SSD+AWS sync | Per-card folder → `s3://…/<batch>/<card>/` (broke on flat layout) | Whole batch folder → `s3://…/<batch>/` (coalesced + follow-up resync) |
 | Where labels live | Folder names on the card | `.segments.json` (also **embedded inside each MP4**) |
 | When metadata is embedded | Only at SD offload (earlier) | **Every time** GoPro Cleaner saves/updates `.segments.json` (and again at offload) |
 | SD card detection (Cleaner) | Volume must be named `C####` | Any volume with `DCIM/###GOPRO` + `.MP4`s (any label) |

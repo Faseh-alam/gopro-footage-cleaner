@@ -32,11 +32,22 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
                 continue
             name = entry.name
             card_ids: list[str] = []
+            mp4_count = 0
             try:
                 for child in entry.iterdir():
+                    # Flat layout: count MP4s at the batch root.
+                    if child.is_file() and child.suffix.upper() == ".MP4":
+                        mp4_count += 1
+                        # Collision-renamed copies end with __C1234
+                        stem = child.stem.upper()
+                        if "__C" in stem:
+                            suffix = stem.rsplit("__", 1)[-1]
+                            if suffix.startswith("C") and suffix[1:].isdigit():
+                                card_ids.append(suffix)
+                        continue
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    # Card folders look like C1234
+                    # Legacy card folders look like C1234
                     child_name = child.name.upper()
                     if len(child_name) >= 5 and child_name[0] == "C" and child_name[1:5].isdigit():
                         card_ids.append(child_name)
@@ -50,6 +61,7 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
                     "name": name,
                     "card_ids": [],
                     "cards": 0,
+                    "files": 0,
                     "bytes": 0,
                     "paths": [],
                 }
@@ -58,6 +70,7 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
             merged = sorted(set(row["card_ids"]) | set(card_ids))
             row["card_ids"] = merged
             row["cards"] = len(merged)
+            row["files"] = int(row.get("files") or 0) + mp4_count
 
     rows = sorted(found.values(), key=lambda r: r["name"].lower())
     return rows

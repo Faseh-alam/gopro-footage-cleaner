@@ -668,11 +668,13 @@ def _copy_card_worker(
             _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
 
         if mode == "ssd_and_aws" and s3_uri:
-            _update_card(card_id, status="uploading", message="Queued for AWS upload…")
+            _update_card(card_id, status="uploading", message="Syncing batch folder to AWS…")
             with _lock:
                 ssd1 = _session.get("ssd1") or ""
                 ssd2 = _session.get("ssd2") or ""
             try:
+                # Flat batch layout: always sync whole Batches/<batch>/ (not a
+                # per-card subfolder). card_id is only a trigger label.
                 job = aws_upload.start_batch_upload(
                     s3_uri=s3_uri,
                     batch_name=batch,
@@ -681,10 +683,15 @@ def _copy_card_worker(
                     card_id=card_id,
                     show_console=True,
                 )
+                coalesced = bool(job.get("pending_resync")) or "resync" in str(job.get("message") or "").lower()
                 _update_card(
                     card_id,
                     status="completed",
-                    message=f"Ready — AWS upload live in UI ({job.get('id')})",
+                    message=(
+                        f"Ready — batch AWS upload already running; resync queued ({job.get('id')})"
+                        if coalesced
+                        else f"Ready — batch AWS upload live in UI ({job.get('id')})"
+                    ),
                     speed_mbps=0,
                     eta_seconds=0,
                     bytes_done=total_bytes,

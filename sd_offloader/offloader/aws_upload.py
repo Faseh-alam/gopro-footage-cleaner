@@ -193,6 +193,21 @@ def _dir_bytes(root: Path) -> int:
     return total
 
 
+def find_running_batch_job(batch_name: str, dest: str | None = None) -> dict | None:
+    """Return a running upload for this batch (same S3 dest when provided)."""
+    batch = batch_name.strip()
+    with _lock:
+        for job in _jobs.values():
+            if job.get("status") != "running":
+                continue
+            if str(job.get("batch") or "").strip() != batch:
+                continue
+            if dest and str(job.get("dest") or "").rstrip("/") != dest.rstrip("/"):
+                continue
+            return dict(job)
+    return None
+
+
 def start_batch_upload(
     *,
     s3_uri: str,
@@ -203,7 +218,13 @@ def start_batch_upload(
     external_window: bool = True,
     show_console: bool | None = None,
 ) -> dict:
-    """Start s5cmd/aws sync in an external console (survives server restart)."""
+    """Start s5cmd/aws sync in an external console (survives server restart).
+
+    Batches are stored flat on the SSD (``Batches/<batch>/*.MP4``), so we always
+    sync the whole batch folder(s) → ``s3://…/<batch>/``. ``card_id`` is only a
+    label for "triggered after this card finished" — it must not look for a
+    per-card subfolder (that was the old layout and broke SSD+AWS mode).
+    """
     del show_console  # always external + logged
     del external_window
     tool = preferred_uploader()
@@ -217,18 +238,38 @@ def start_batch_upload(
     if not roots:
         raise RuntimeError(f"No local batch folder found for {batch_name} on the selected SSDs")
 
-    sources: list[Path] = []
-    if card_id:
-        for root in roots:
-            card_path = root / card_id.upper()
-            if card_path.is_dir():
-                sources.append(card_path)
-        if not sources:
-            raise RuntimeError(f"Card folder {card_id} not found under batch {batch_name}")
-        dest = f"{prefix}{card_id.upper()}/"
-    else:
-        sources = roots
-        dest = prefix
+    # Flat layout: always sync the batch root(s). Legacy per-card folders
+    # (Batches/<batch>/C1234/) are still included because they live under root.
+    sources = roots
+    dest = prefix
+
+    # If an upload for this batch is already running, don't open a second CMD
+    # racing the same S3 prefix. Mark it to resync when the current job ends
+    # so files copied after the sync started still get uploaded.
+    running = find_running_batch_job(batch_name, dest)
+    if running:
+        with _lock:
+            job = _jobs.get(running["id"])
+            if job and job.get("status") == "running":
+                job["pending_resync"] = True
+                job["pending_resync_ssd1"] = ssd1
+                job["pending_resync_ssd2"] = ssd2
+                job["pending_resync_s3_uri"] = s3_uri
+                if card_id:
+                    job["pending_resync_card_id"] = card_id
+                job["message"] = (
+                    (job.get("message") or "Uploading")
+                    + f" · will resync after finish"
+                    + (f" (new files from {card_id})" if card_id else "")
+                )
+                _append_job_log(
+                    job,
+                    f"Coalesced: another upload requested"
+                    + (f" after {card_id}" if card_id else "")
+                    + " — queued pending_resync",
+                )
+        _persist_jobs()
+        return get_job(running["id"]) or running
 
     return _launch_upload_job(
         sources=sources,
@@ -999,6 +1040,45 @@ def _auto_verify_job(job_id: str) -> None:
         _persist_jobs()
 
 
+def _run_pending_resync(
+    *,
+    s3_uri: str,
+    batch_name: str,
+    ssd1: str,
+    ssd2: str,
+    card_id: str | None = None,
+) -> None:
+    """Start a follow-up full-batch sync after files arrived mid-upload."""
+    try:
+        # Brief pause so the just-finished CMD releases handles / S3 listings settle.
+        time.sleep(2)
+        # Fall back to configured SSDs if coalesce didn't stash paths.
+        if not ssd1 and not ssd2:
+            cfg = load_config()
+            ssd1 = str(cfg.get("ssd1") or "")
+            ssd2 = str(cfg.get("ssd2") or "")
+        job = start_batch_upload(
+            s3_uri=s3_uri,
+            batch_name=batch_name,
+            ssd1=ssd1,
+            ssd2=ssd2,
+            card_id=card_id,
+        )
+        with _lock:
+            # Keep a breadcrumb on the new job.
+            live = _jobs.get(job.get("id") or "")
+            if live:
+                _append_job_log(live, "Follow-up resync after mid-upload card dump")
+        _persist_jobs()
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            for job in _jobs.values():
+                if str(job.get("batch") or "") == batch_name.strip():
+                    _append_job_log(job, f"Pending resync failed to start: {exc}")
+                    break
+        _persist_jobs()
+
+
 def _discover_live_aws_processes() -> None:
     """Detect aws/s5cmd sync still running in CMD (including pre-log older uploads)."""
     if platform.system() != "Windows":
@@ -1400,12 +1480,28 @@ def _ingest_log_progress(job_id: str) -> bool:
                     job["message"] = f"Uploaded to {job.get('dest') or 'S3'} — verifying sizes…"
                     job["eta_seconds"] = 0
                     job["log_offset"] = new_offset
+                    need_resync = bool(job.get("pending_resync"))
+                    resync_args = {
+                        "s3_uri": str(job.get("pending_resync_s3_uri") or job.get("s3_uri") or ""),
+                        "batch_name": str(job.get("batch") or ""),
+                        "ssd1": str(job.get("pending_resync_ssd1") or ""),
+                        "ssd2": str(job.get("pending_resync_ssd2") or ""),
+                        "card_id": job.get("pending_resync_card_id"),
+                    }
+                    job["pending_resync"] = False
                     threading.Thread(
                         target=_auto_verify_job,
                         args=(job_id,),
                         daemon=True,
                         name=f"aws-verify-{job_id[-12:]}",
                     ).start()
+                    if need_resync and resync_args["s3_uri"] and resync_args["batch_name"]:
+                        threading.Thread(
+                            target=_run_pending_resync,
+                            kwargs=resync_args,
+                            daemon=True,
+                            name=f"aws-resync-{job_id[-12:]}",
+                        ).start()
                 else:
                     job["status"] = "error"
                     job["message"] = (
