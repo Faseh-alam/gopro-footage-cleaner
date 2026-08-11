@@ -1230,26 +1230,47 @@ export function useReviewController() {
     }
     task = existing;
 
-    await api("/api/eager/annotations/append", {
-      method: "POST",
-      body: JSON.stringify({
-        path: video.path,
-        kind: "work",
-        end: pending.end,
-        task,
-        ...annotationContext(),
-      }),
+    // Instant UI — don't wait on disk/API before clearing the task picker.
+    const optimistic: Segment = {
+      id: `local-${Date.now()}`,
+      start: pending.start,
+      end: pending.end,
+      kind: "work",
+      task,
+    };
+    setAnnotationsByPath((prev) => {
+      const cur = prev[video.path] || { segments: [], duration: null, complete: false, pendingWork: null };
+      const segments = [...(cur.segments || []), optimistic];
+      anchorByPathRef.current[video.path] = pending.end;
+      return { ...prev, [video.path]: { ...cur, segments, pendingWork: null } };
     });
     setLastLabelTask(task);
     touchRecentTask(task);
-    await loadAnnotationForPath(video.path);
     setTaskSelectionMode(false);
     leaveTaskSearch({ clear: true });
     setSelectedTaskValue("");
     setStatus(`Assigned work to ${task}`, "ok");
-    if (stateRef.current.annotationsByPath[video.path]?.complete) await finishCleaningFile();
+
+    try {
+      const data = await api("/api/eager/annotations/append", {
+        method: "POST",
+        body: JSON.stringify({
+          path: video.path,
+          kind: "work",
+          end: pending.end,
+          task,
+          ...annotationContext(),
+        }),
+      });
+      applyAnnotationPayload(video.path, data, { keepPending: false });
+      if (stateRef.current.annotationsByPath[video.path]?.complete) void finishCleaningFile();
+    } catch (error: any) {
+      setStatus(error?.message || "Could not save task assignment", "error");
+      await loadAnnotationForPath(video.path, { keepPending: true });
+    }
   }, [
     annotationContext,
+    applyAnnotationPayload,
     currentAnnotation,
     currentVideo,
     finishCleaningFile,
@@ -1281,14 +1302,45 @@ export function useReviewController() {
       setStatus(`Playhead must be after ${formatTime(anchor)} to mark garbage`, "error");
       return;
     }
-    await api("/api/eager/annotations/append", {
-      method: "POST",
-      body: JSON.stringify({ path: video.path, kind: "garbage", end, ...annotationContext() }),
+
+    // Instant UI for garbage marks too.
+    const optimistic: Segment = {
+      id: `local-${Date.now()}`,
+      start: anchor,
+      end,
+      kind: "garbage",
+    };
+    setAnnotationsByPath((prev) => {
+      const cur = prev[video.path] || { segments: [], duration: null, complete: false, pendingWork: null };
+      const segments = [...(cur.segments || []), optimistic];
+      anchorByPathRef.current[video.path] = end;
+      return { ...prev, [video.path]: { ...cur, segments, pendingWork: null } };
     });
-    await loadAnnotationForPath(video.path);
     setStatus(`Marked garbage ${formatTime(anchor)} → ${formatTime(end)}`, "ok");
-    if (stateRef.current.annotationsByPath[video.path]?.complete) await finishCleaningFile();
-  }, [annotationContext, annotationFor, currentAnnotation, currentScrubTime, currentVideo, finishCleaningFile, knownDurationSec, loadAnnotationForPath, setStatus]);
+
+    try {
+      const data = await api("/api/eager/annotations/append", {
+        method: "POST",
+        body: JSON.stringify({ path: video.path, kind: "garbage", end, ...annotationContext() }),
+      });
+      applyAnnotationPayload(video.path, data, { keepPending: false });
+      if (stateRef.current.annotationsByPath[video.path]?.complete) void finishCleaningFile();
+    } catch (error: any) {
+      setStatus(error?.message || "Could not save garbage mark", "error");
+      await loadAnnotationForPath(video.path);
+    }
+  }, [
+    annotationContext,
+    annotationFor,
+    applyAnnotationPayload,
+    currentAnnotation,
+    currentScrubTime,
+    currentVideo,
+    finishCleaningFile,
+    knownDurationSec,
+    loadAnnotationForPath,
+    setStatus,
+  ]);
 
   // Manually set (ISO string) or clear ("") the recording timestamp; the
   // camera's own value is preserved server-side and restored on clear.
@@ -1684,16 +1736,31 @@ export function useReviewController() {
         setStatus("Type a task name first", "error");
         return;
       }
+      const already = stateRef.current.tasks.some((t) => t.toLowerCase() === trimmed.toLowerCase());
+      if (already) {
+        setSelectedTaskValue(
+          stateRef.current.tasks.find((t) => t.toLowerCase() === trimmed.toLowerCase()) || trimmed,
+        );
+        setStatus(`Task already exists: ${trimmed}`, "ok");
+        return;
+      }
+      // Show in the list immediately; persist in the background.
+      setTasks((prev) => [trimmed, ...prev.filter((t) => t.toLowerCase() !== trimmed.toLowerCase())]);
+      setSelectedTaskValue(trimmed);
+      setTaskSearch("");
+      setStatus(`Task added: ${trimmed}`, "ok");
       try {
         const data = await api("/api/eager/tasks", {
           method: "POST",
-          body: JSON.stringify({ name: trimmed, label_root: stateRef.current.labelRoot || stateRef.current.scanRoot || scanTargetPath() }),
+          body: JSON.stringify({
+            name: trimmed,
+            label_root: stateRef.current.labelRoot || stateRef.current.scanRoot || scanTargetPath(),
+          }),
         });
         setTasks(data.tasks || []);
         setDefaultTasks(data.default_tasks || defaultTasks);
-        setTaskSearch("");
-        setStatus(`Task added: ${trimmed}`, "ok");
       } catch (error: any) {
+        setTasks((prev) => prev.filter((t) => t.toLowerCase() !== trimmed.toLowerCase()));
         setStatus(error.message, "error");
       }
     },
