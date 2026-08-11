@@ -19,7 +19,7 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v10-lowcpu-720p"
+_PREVIEW_VERSION = "v11-fast-720p"
 
 _PLAYLIST_NAME = "index.m3u8"
 # Playable as soon as the first segment exists (~1s of video).
@@ -100,19 +100,26 @@ def _probe_duration_seconds(source: Path) -> float:
         return 0.0
 
 
-_SOFTWARE_ENCODER_ARGS = [
-    # Cap threads so preview encode can't pin every core and freeze the UI.
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-tune",
-    "fastdecode",
-    "-crf",
-    "34",
-    "-threads",
-    "2",
-]
+def _software_threads() -> int:
+    """Half the cores (clamped 2–6): builds fast, and below-normal process
+    priority keeps the UI responsive even when those threads are busy."""
+    cores = os.cpu_count() or 4
+    return max(2, min(6, cores // 2))
+
+
+def _software_encoder_args() -> list[str]:
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "fastdecode",
+        "-crf",
+        "34",
+        "-threads",
+        str(_software_threads()),
+    ]
 
 _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
     ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "900k", "-maxrate", "1200k", "-bufsize", "1800k"]),
@@ -176,17 +183,17 @@ def _preview_encoder_args() -> list[str]:
         global _win_encoder_args
         prefer = (os.environ.get("GOPRO_PREVIEW_ENCODER") or "auto").strip().lower()
         if prefer in {"x264", "libx264", "software", "cpu"}:
-            return list(_SOFTWARE_ENCODER_ARGS)
+            return _software_encoder_args()
         for name, args in _WINDOWS_HW_CANDIDATES:
             if prefer in {name, f"h264_{name}"}:
                 return list(args)
         if _win_encoder_args is None:
             _win_encoder_args = next(
                 (args for _, args in _WINDOWS_HW_CANDIDATES if _encoder_works(args)),
-                list(_SOFTWARE_ENCODER_ARGS),
+                _software_encoder_args(),
             )
         return list(_win_encoder_args)
-    return list(_SOFTWARE_ENCODER_ARGS)
+    return _software_encoder_args()
 
 
 def _hwaccel_input_args() -> list[str]:
@@ -247,8 +254,9 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         str(source),
         "-an",
         "-vf",
-        # 720p @ 6fps — light CPU while still scrubbable once ready.
-        "scale='min(720,iw)':-2:flags=neighbor,fps=6",
+        # Drop to 6fps FIRST, then scale — scaling only the kept frames cuts
+        # filter work ~5× on 30fps sources, so the preview builds much faster.
+        "fps=6,scale='min(720,iw)':-2:flags=neighbor",
         *_preview_encoder_args(),
         "-pix_fmt",
         "yuv420p",
@@ -337,8 +345,8 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
                 str(source),
                 "-an",
                 "-vf",
-                "scale='min(720,iw)':-2:flags=fast_bilinear,fps=12",
-                *_SOFTWARE_ENCODER_ARGS,
+                "fps=12,scale='min(720,iw)':-2:flags=fast_bilinear",
+                *_software_encoder_args(),
                 "-pix_fmt",
                 "yuv420p",
                 "-g",

@@ -102,6 +102,14 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           className="aspect-video w-full bg-black object-contain"
         />
 
+        {/* Freeze-frame shown while the source swaps original → 720p. */}
+        <canvas
+          ref={c.swapCanvasRef}
+          aria-hidden
+          style={{ display: "none" }}
+          className="pointer-events-none absolute left-0 top-0 aspect-video w-full bg-black object-contain"
+        />
+
         {c.taskSelectionMode && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center gap-1 bg-background/70 text-center backdrop-blur-[2px]">
             <strong className="text-sm">Select task</strong>
