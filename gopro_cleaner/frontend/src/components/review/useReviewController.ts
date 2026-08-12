@@ -938,6 +938,26 @@ export function useReviewController() {
     }
   }, []);
 
+  /** Stop every other preview encode so the watched clip gets the ffmpeg slot. */
+  const cancelOtherPreviewJobs = useCallback(async (keepPath: string) => {
+    try {
+      await api("/api/eager/preview/cancel", {
+        method: "POST",
+        body: JSON.stringify({ path: keepPath || "", others: true }),
+      });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /** Start/ensure 720p encode for the video currently on screen (highest priority). */
+  const startForegroundPreview = useCallback((path: string) => {
+    if (!path) return Promise.resolve(null);
+    return api(
+      `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=1`,
+    ).catch(() => null);
+  }, []);
+
   /** Index of the video we should warm next (prefer next unfinished, else i+1). */
   const nextPreviewTargetIndex = useCallback(
     (fromIndex: number) => {
@@ -962,8 +982,8 @@ export function useReviewController() {
       if (!path || path === s.videos[fromIndex]?.path) return;
       if (prefetchedPreviewRef.current === path) return; // already queued
       prefetchedPreviewRef.current = path;
-      api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`).catch(() => {
-        /* best-effort warmup */
+      api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=0`).catch(() => {
+        /* best-effort warmup — never steals the current video's encode slot */
       });
     },
     [nextPreviewTargetIndex],
@@ -1188,7 +1208,7 @@ export function useReviewController() {
         }
         try {
           const st = await api(
-            `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1`,
+            `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=1`,
           );
           if (token !== previewTokenRef.current) return;
           // After two fatal HLS failures on this video, stay on the original —
@@ -1288,6 +1308,9 @@ export function useReviewController() {
       const upcomingPath = upcomingIdx >= 0 ? s.videos[upcomingIdx]?.path || "" : "";
 
       // Cancel leftover encodes so only the current (then next) job runs.
+      // Always clear *all* other jobs — after reload, video #1 often still holds
+      // the encode slot even though we resumed on video #4.
+      await cancelOtherPreviewJobs(video.path);
       if (previous?.path && previous.path !== video.path && previous.path !== upcomingPath) {
         void cancelPreviewJob(previous.path);
       }
@@ -1361,7 +1384,7 @@ export function useReviewController() {
       let previewStatus: any = null;
       try {
         previewStatus = await Promise.race([
-          api(`/api/eager/preview/status?path=${encodeURIComponent(video.path)}&start=1`),
+          startForegroundPreview(video.path),
           new Promise((resolve) => window.setTimeout(() => resolve(null), 600)),
         ]);
       } catch {
@@ -1479,6 +1502,7 @@ export function useReviewController() {
     },
     [
       attachHlsMedia,
+      cancelOtherPreviewJobs,
       cancelPreviewJob,
       destroyHls,
       isVideoFullyDone,
@@ -1488,6 +1512,7 @@ export function useReviewController() {
       resumeTimeForPath,
       setPlaybackRate,
       setStatus,
+      startForegroundPreview,
       stopFrontierWait,
       stopPreviewPoll,
       updateScrubUiFromEl,
@@ -1885,7 +1910,8 @@ export function useReviewController() {
       const savedIdx =
         session != null ? freshVideos.findIndex((v) => sessionMatchesPath(session, v.path)) : -1;
 
-      // Open ASAP — do NOT wait to load every sidecar (that was 1–2 min on big cards).
+      // Prefer the last watched clip after reload — never jump back to video #1
+      // just because earlier files are still incomplete.
       let openAt = savedIdx;
       if (openAt < 0) {
         openAt = 0;
@@ -1903,7 +1929,8 @@ export function useReviewController() {
 
       const openPath = freshVideos[openAt]?.path;
       if (openPath) {
-        void api(`/api/eager/preview/status?path=${encodeURIComponent(openPath)}&start=1`).catch(() => null);
+        // Highest priority: cancel other encodes and build THIS video's 720p first.
+        void startForegroundPreview(openPath);
       }
 
       // Remaining labels load in the background while the player starts.
@@ -1912,10 +1939,12 @@ export function useReviewController() {
       );
 
       await loadVideo(openAt, { force: true });
-      const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
+      const resumed = savedIdx >= 0;
       setStatus(
         resumed
-          ? `Resumed ${freshVideos[openAt]?.name} at ${formatTime(session!.scrubTime)}`
+          ? `Resumed ${freshVideos[openAt]?.name}${
+              (session?.scrubTime || 0) > 0 ? ` at ${formatTime(session!.scrubTime)}` : ""
+            } — building 720p for this clip first`
           : `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`,
         "ok",
       );
@@ -1924,7 +1953,15 @@ export function useReviewController() {
     } finally {
       setScanning(false);
     }
-  }, [loadAnnotationForPath, loadVideo, scanTargetPath, selectedSdCardLabel, setIdentityFromSelectedCard, setStatus]);
+  }, [
+    loadAnnotationForPath,
+    loadVideo,
+    scanTargetPath,
+    selectedSdCardLabel,
+    setIdentityFromSelectedCard,
+    setStatus,
+    startForegroundPreview,
+  ]);
 
   const applySelectedPath = useCallback(
     (path: string) => {

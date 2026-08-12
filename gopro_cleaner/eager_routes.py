@@ -20,7 +20,13 @@ from .core.eager import (
 )
 from .core.eager_trim_queue import eager_trim_queue
 from .core.folder_picker import pick_folder
-from .core.preview_proxy import cancel_preview, preview_cache_root, preview_status, resolve_preview
+from .core.preview_proxy import (
+    cancel_other_previews,
+    cancel_preview,
+    preview_cache_root,
+    preview_status,
+    resolve_preview,
+)
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
 from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
@@ -173,8 +179,10 @@ def create_eager_blueprint() -> Blueprint:
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        # Foreground = video currently being reviewed — cancels other encodes.
+        preempt = request.args.get("preempt", "0").strip().lower() in {"1", "true", "yes"}
         try:
-            return jsonify(preview_status(Path(raw_path), start=start))
+            return jsonify(preview_status(Path(raw_path), start=start, preempt=preempt))
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
         except Exception as exc:  # noqa: BLE001
@@ -182,10 +190,11 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.post("/api/eager/preview/cancel")
     def eager_preview_cancel():
-        raw_path = request.args.get("path", "").strip()
-        if not raw_path:
-            payload = request.get_json(silent=True) or {}
-            raw_path = str(payload.get("path", "")).strip()
+        payload = request.get_json(silent=True) or {}
+        raw_path = request.args.get("path", "").strip() or str(payload.get("path", "")).strip()
+        if payload.get("others"):
+            cancelled = cancel_other_previews(Path(raw_path) if raw_path else None)
+            return jsonify({"ok": True, "cancelled": cancelled})
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         cancel_preview(Path(raw_path))

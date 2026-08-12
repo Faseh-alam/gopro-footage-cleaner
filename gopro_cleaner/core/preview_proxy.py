@@ -412,6 +412,30 @@ def cancel_preview(source: Path) -> None:
         pass
 
 
+def cancel_other_previews(keep: Path | None = None) -> int:
+    """Cancel every preview encode except ``keep`` (the video currently watched).
+
+    Returns how many jobs were cancelled. Used so resume/reload always gives the
+    encode slot to the active clip instead of finishing an older/first-file job.
+    """
+    keep_key = ""
+    if keep is not None:
+        try:
+            keep_key = str(keep.expanduser().resolve())
+        except OSError:
+            keep_key = str(keep)
+    with _lock:
+        keys = [k for k in list(_jobs.keys()) if k != keep_key]
+    cancelled = 0
+    for key in keys:
+        try:
+            cancel_preview(Path(key))
+            cancelled += 1
+        except OSError:
+            continue
+    return cancelled
+
+
 def _public_job(job: dict, extra: dict | None = None) -> dict:
     """Only JSON-safe fields — the raw job dict holds Thread/Popen objects."""
     out = {
@@ -434,7 +458,7 @@ def _public_job(job: dict, extra: dict | None = None) -> dict:
     return out
 
 
-def preview_status(source: Path, *, start: bool = False) -> dict:
+def preview_status(source: Path, *, start: bool = False, preempt: bool = False) -> dict:
     source = source.expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
@@ -466,9 +490,46 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
     with _lock:
         job = _jobs.get(key)
         if job and job.get("status") == "running":
-            # Playable a few seconds into the encode — the UI attaches HLS then.
+            # Already encoding this file — optionally clear others so it keeps the slot.
+            if preempt:
+                pass  # fall through after releasing lock to cancel others
+            else:
+                return _public_job(
+                    job,
+                    {
+                        "source_bytes": size,
+                        "hls": hls_url,
+                        "segments": segments,
+                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                    },
+                )
+        if job and job.get("status") in {"error", "cancelled"}:
+            _jobs.pop(key, None)
+
+    # Watched clip wins: stop leftover encodes (often video #1 after reload).
+    if start and preempt:
+        cancel_other_previews(source)
+        with _lock:
+            job = _jobs.get(key)
+            if job and job.get("status") == "running":
+                return _public_job(
+                    job,
+                    {
+                        "source_bytes": size,
+                        "hls": hls_url,
+                        "segments": segments,
+                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                    },
+                )
+
+    if not start:
+        return {"status": "idle", "progress": 0, "source_bytes": size}
+
+    with _lock:
+        existing = _jobs.get(key)
+        if existing and existing.get("status") == "running":
             return _public_job(
-                job,
+                existing,
                 {
                     "source_bytes": size,
                     "hls": hls_url,
@@ -476,19 +537,13 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
                     "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
                 },
             )
-        if job and job.get("status") in {"error", "cancelled"}:
-            _jobs.pop(key, None)
-
-    if not start:
-        return {"status": "idle", "progress": 0, "source_bytes": size}
-
-    with _lock:
         _jobs[key] = {
             "status": "running",
             "progress": 0,
             "process": None,
             "source_bytes": size,
             "message": "Building 720p preview for smooth review…",
+            "preempt": bool(preempt),
         }
 
     def worker() -> None:
