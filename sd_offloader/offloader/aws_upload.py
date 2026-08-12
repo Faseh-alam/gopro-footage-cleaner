@@ -49,9 +49,16 @@ _S5CMD_CP_RE = re.compile(
     r"^(?:cp|mv)\s+(.+?)\s+s3://",
     re.IGNORECASE,
 )
-_BATCH_IN_PATH_RE = re.compile(r"[\\/]Batches[\\/]([^\\\"'\s/]+)", re.IGNORECASE)
+# Batch folder names may contain spaces (e.g. "batch 1") — do not stop at \s.
+_BATCH_IN_PATH_RE = re.compile(
+    r"[\\/]Batches[\\/]([^\\\"'/]+?)(?=[\\/]|$)",
+    re.IGNORECASE,
+)
+# Match double-quoted, single-quoted, or bare args (spaces only work when quoted).
 _SYNC_ARGS_RE = re.compile(
-    r"(?:s3\s+sync|sync)\s+(?:\"([^\"]+)\"|(\S+))\s+(?:\"(s3://[^\"]+)\"|(s3://\S+))",
+    r"(?:s3\s+sync|sync)\s+"
+    r"(?:\"([^\"]+)\"|'([^']+)'|(\S+))\s+"
+    r"(?:\"(s3://[^\"]+)\"|'(s3://[^']+)'|(s3://\S+))",
     re.IGNORECASE,
 )
 _TOTAL_SIZE_RE = re.compile(r"Total Size:\s*(\d+)", re.IGNORECASE)
@@ -164,8 +171,30 @@ def normalize_s3_uri(uri: str) -> str:
 
 
 def batch_s3_prefix(s3_uri: str, batch_name: str) -> str:
+    """Build ``s3://bucket/footage/<batch>/`` for a flat batch upload.
+
+    Local layout is ``Batches/<batch>/*.MP4`` (no card subfolder), so S3 is the
+    same flat prefix. If ``s3_uri`` already ends with the batch folder name,
+    do not nest it again (avoids ``…/batch 1/batch 1/``).
+    """
     base = normalize_s3_uri(s3_uri)
-    return f"{base}{batch_name.strip().strip('/')}/"
+    name = batch_name.strip().strip("/")
+    if not name:
+        raise ValueError("Batch name is required")
+    last = base.rstrip("/").rsplit("/", 1)[-1]
+    if last.lower() == name.lower():
+        return base.rstrip("/") + "/"
+    return f"{base}{name}/"
+
+
+def _sync_local_arg(path: Path) -> str:
+    """Local folder for aws/s5cmd sync — trailing slash syncs folder *contents*."""
+    text = str(path)
+    # Forward slashes are accepted by aws CLI and s5cmd on Windows.
+    text = text.replace("\\", "/")
+    if not text.endswith("/"):
+        text += "/"
+    return text
 
 
 def list_local_batch_roots(ssd1: str, ssd2: str, batch_name: str) -> list[Path]:
@@ -299,6 +328,11 @@ def restart_job(job_id: str) -> dict:
         raise RuntimeError("Local source folder missing — pick the SSD batch and Upload again")
     if not dest.startswith("s3://"):
         raise RuntimeError("Job is missing an S3 destination")
+
+    # Heal legacy per-card destinations (…/<batch>/C1234/) and any double-nested
+    # batch prefix back to the flat …/<batch>/ path.
+    if s3_uri and batch_name:
+        dest = batch_s3_prefix(s3_uri, batch_name)
 
     tool = preferred_uploader()
     if not tool:
@@ -556,9 +590,10 @@ def _write_external_script(
             "echo.",
         ]
         log_ps = str(log_path).replace("'", "''")
+        dest_norm = dest if dest.endswith("/") else dest + "/"
         for idx, src in enumerate(sources):
-            src_ps = str(src).replace("'", "''")
-            dest_ps = dest.replace("'", "''")
+            src_ps = _sync_local_arg(src).replace("'", "''")
+            dest_ps = dest_norm.replace("'", "''")
             if tool == "s5cmd":
                 sync_default = f"s5cmd sync '{src_ps}' '{dest_ps}'"
                 sync_workers = (
@@ -567,7 +602,7 @@ def _write_external_script(
             else:
                 sync_default = f"aws s3 sync '{src_ps}' '{dest_ps}'"
                 sync_workers = sync_default
-            lines.append(f'echo Syncing "{src}"')
+            lines.append(f'echo Syncing "{src}" → {dest_norm}')
             lines.append(f"set MAX_TRIES={retries}")
             lines.append("set TRY=1")
             lines.append(f":retry_loop_{idx}")
@@ -629,14 +664,18 @@ def _write_external_script(
             'echo "============================================"',
             "echo",
         ]
+        dest_norm = dest if dest.endswith("/") else dest + "/"
         for src in sources:
+            src_arg = _sync_local_arg(src)
             if tool == "s5cmd":
-                sync_default = f's5cmd sync "{src}" "{dest}"'
-                sync_workers = f's5cmd --numworkers {numworkers} sync "{src}" "{dest}"'
+                sync_default = f's5cmd sync "{src_arg}" "{dest_norm}"'
+                sync_workers = (
+                    f's5cmd --numworkers {numworkers} sync "{src_arg}" "{dest_norm}"'
+                )
             else:
-                sync_default = f'aws s3 sync "{src}" "{dest}"'
+                sync_default = f'aws s3 sync "{src_arg}" "{dest_norm}"'
                 sync_workers = sync_default
-            lines.append(f'echo "Syncing {src}"')
+            lines.append(f'echo "Syncing {src} → {dest_norm}"')
             lines.append(f"MAX_TRIES={retries}")
             lines.append("TRY=1")
             lines.append("while true; do")
@@ -919,19 +958,19 @@ def _discover_orphan_logs() -> None:
 
 
 def _parse_sync_cmdline(cmd: str) -> tuple[str | None, str | None, str | None]:
-    """Return (local_source, s3_dest, batch_name) from an aws s3 sync command line."""
+    """Return (local_source, s3_dest, batch_name) from an aws/s5cmd sync command line."""
     match = _SYNC_ARGS_RE.search(cmd or "")
     if not match:
         return None, None, None
-    src = (match.group(1) or match.group(2) or "").strip().rstrip("\\/")
-    dest = (match.group(3) or match.group(4) or "").strip()
+    src = (match.group(1) or match.group(2) or match.group(3) or "").strip().rstrip("\\/")
+    dest = (match.group(4) or match.group(5) or match.group(6) or "").strip()
     if dest and not dest.endswith("/"):
         dest += "/"
     batch = None
     if src:
         bm = _BATCH_IN_PATH_RE.search(src)
         if bm:
-            batch = bm.group(1).strip()
+            batch = bm.group(1).strip().rstrip("\\/")
     if not batch and dest:
         parts = [p for p in dest.rstrip("/").split("/") if p]
         if parts:
