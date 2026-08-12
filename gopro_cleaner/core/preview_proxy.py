@@ -495,10 +495,13 @@ def preview_status(source: Path, *, start: bool = False) -> dict:
         dest_dir = playlist.parent
         process_holder: list = []
         # Serialize encodes — two concurrent ffmpeg jobs melt laptops.
-        with _lock:
-            if _jobs.get(key, {}).get("status") == "running":
-                _jobs[key]["message"] = "Queued — waiting for the current encode to finish…"
-        acquired = _encode_slots.acquire(timeout=3600)
+        # Only show "queued" when another encode actually holds the slot.
+        acquired = _encode_slots.acquire(blocking=False)
+        if not acquired:
+            with _lock:
+                if _jobs.get(key, {}).get("status") == "running":
+                    _jobs[key]["message"] = "Queued — waiting for the current encode to finish…"
+            acquired = _encode_slots.acquire(timeout=3600)
         if not acquired:
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":

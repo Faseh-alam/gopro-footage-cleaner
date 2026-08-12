@@ -39,7 +39,7 @@ export const Route = createFileRoute("/review")({
 
 const KEYS: [string, string][] = [
   ["Space", "Play / pause (resets to 1×)"],
-  ["← →", "Speed −0.5× / +0.5× (min −4×, max 4× on 720p / 2× on original)"],
+  ["← →", "Speed −0.5× / +0.5× (min −4×, max 4× on original and 720p)"],
   ["[ ]", "Speed −0.5× / +0.5× (same range)"],
   [", .", "−1s / +1s (stops at end)"],
   ["I / O", "Mark share-clip in / out"],

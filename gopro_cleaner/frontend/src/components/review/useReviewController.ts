@@ -19,9 +19,8 @@ const RECENT_TASKS_MAX = 10;
 const SESSION_KEY = "gopro_eager_review_session";
 const SEEN_GIT_SHA_KEY = "gopro_eager_seen_git_sha";
 const PLAYBACK_RATE_MIN = -4;
-const PLAYBACK_RATE_MAX_PREVIEW = 4;
-/** While playing the multi‑GB original, cap speed so decode doesn't freeze the PC. */
-const PLAYBACK_RATE_MAX_ORIGINAL = 2;
+/** Same speed range for original and 720p preview (−4× … 4×). */
+const PLAYBACK_RATE_MAX = 4;
 const PLAYBACK_RATE_STEP = 0.5;
 
 type ReviewSession = {
@@ -695,8 +694,8 @@ export function useReviewController() {
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
-    // Original stream: max 2×. 720p preview: up to 4×. Floor is −4× either way.
-    const max = hlsUrlRef.current ? PLAYBACK_RATE_MAX_PREVIEW : PLAYBACK_RATE_MAX_ORIGINAL;
+    // Original and 720p preview both allow −4× … 4×.
+    const max = PLAYBACK_RATE_MAX;
     let clamped = Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP;
     clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
     // Skip 0× — stepping ←/→ through zero continues into reverse / forward.
@@ -725,8 +724,7 @@ export function useReviewController() {
     }
     setPlaybackRateState(clamped);
     if (announce) {
-      const note = hlsUrlRef.current ? "" : " (max 2× on original)";
-      setStatus(`Playback ${clamped.toFixed(1)}×${note}`, "ok");
+      setStatus(`Playback ${clamped.toFixed(1)}×`, "ok");
     }
   }, [safePlay, setStatus]);
 
@@ -1047,7 +1045,7 @@ export function useReviewController() {
             },
             { once: true },
           );
-          setPreviewNote("Original file · max 2×");
+          setPreviewNote("Original · up to 4×");
         };
         hls.on(Hls.Events.ERROR, (_evt, data) => {
           if (!data?.fatal || token !== previewTokenRef.current || hlsRef.current !== hls) return;
@@ -1111,10 +1109,7 @@ export function useReviewController() {
       const wantedRate =
         preCap !== 0 && Math.abs(preCap) >= Math.abs(current) ? preCap : current;
       preCapRateRef.current = 0;
-      const rate = Math.min(
-        PLAYBACK_RATE_MAX_PREVIEW,
-        Math.max(PLAYBACK_RATE_MIN, wantedRate),
-      );
+      const rate = Math.min(PLAYBACK_RATE_MAX, Math.max(PLAYBACK_RATE_MIN, wantedRate));
 
       // Freeze the last original frame over the player while the source
       // remounts — the swap reads as a quality change, never a restart.
@@ -1175,7 +1170,7 @@ export function useReviewController() {
       if (!attachHlsMedia(v, path, hlsUrl, t, token)) {
         v.removeEventListener("loadedmetadata", onReady);
         unmask();
-        setPreviewNote("Original file · max 2×");
+        setPreviewNote("Original · up to 4×");
         setLoadingVideo(false);
       }
     },
@@ -1222,40 +1217,26 @@ export function useReviewController() {
               encodedSec > playhead + 3
             ) {
               swapToPreview(path, token, String(st.hls), true);
-            } else if (!onPreview && !previewGivenUp && wantPlayingRef.current) {
-              // SD cards: streaming the original at 2× can starve the encoder
-              // so it NEVER passes the playhead. Hold 1× briefly — the encode
-              // races ahead, the 720p swap lands, and 4× unlocks.
-              const behind = encodedSec < playhead + 3;
-              encodeBehindTicksRef.current = behind ? encodeBehindTicksRef.current + 1 : 0;
-              if (
-                behind &&
-                encodeBehindTicksRef.current >= 4 &&
-                !autoCappedRef.current &&
-                (playbackRateRef.current || 1) > 1
-              ) {
-                autoCappedRef.current = true;
-                preCapRateRef.current = playbackRateRef.current || 1;
-                setPlaybackRate(1, false);
-                setStatus(
-                  "Holding 1× so the 720p preview can catch up — full speed unlocks when it swaps in",
-                  "ok",
-                );
-              }
             }
+            // Do not auto-cap original speed — operators can use up to 4× on
+            // the original while the optional 720p encode builds in the background.
             if (onPreview) {
               // Current video is watchable — queue the next encode NOW so it
               // starts the second the encoder slot frees up.
               prefetchNextPreview(stateRef.current.index);
             }
+            const queued =
+              typeof st.message === "string" && /queued/i.test(st.message) && encodedSec <= 0;
             setPreviewNote(
               hlsUrlRef.current
                 ? `720p preview · encoding ${pct}%`
                 : previewGivenUp
-                  ? "Original file · max 2×"
-                  : encodedSec <= 0 && st.message
-                    ? `Original · ${st.message}`
-                    : `Original · building preview ${pct}%`,
+                  ? "Original · up to 4×"
+                  : queued
+                    ? "Original · up to 4× · 720p waiting"
+                    : encodedSec <= 0
+                      ? "Original · up to 4× · building 720p…"
+                      : `Original · up to 4× · building preview ${pct}%`,
             );
             return;
           }
@@ -1269,14 +1250,14 @@ export function useReviewController() {
               swapToPreview(path, token, String(st.hls), false);
               prefetchNextPreview(stateRef.current.index);
             } else {
-              setPreviewNote("Original file · max 2×");
+              setPreviewNote("Original · up to 4×");
               prefetchNextPreview(stateRef.current.index);
             }
             return;
           }
           if (st.status === "error" || st.status === "skipped") {
             stopPreviewPoll();
-            setPreviewNote("Original file · max 2×");
+            setPreviewNote("Original · up to 4×");
           }
         } catch {
           /* ignore transient poll errors */
@@ -1287,7 +1268,7 @@ export function useReviewController() {
       // when the preview is already usable.
       void tick();
     },
-    [knownDurationSec, prefetchNextPreview, setPlaybackRate, stopPreviewPoll, swapToPreview],
+    [knownDurationSec, prefetchNextPreview, stopPreviewPoll, swapToPreview],
   );
 
   const loadVideo = useCallback(
@@ -1323,7 +1304,7 @@ export function useReviewController() {
       setIndex(i);
       setShareClipIn(null);
       setShareClipOut(null);
-      setPreviewNote("Original · building 720p…");
+      setPreviewNote("Original · up to 4×");
       stopPreviewPoll();
       stopFrontierWait();
       hlsFallbackCountRef.current = 0;
@@ -1453,8 +1434,8 @@ export function useReviewController() {
         } else {
           setStatus(
             startAt > 0
-              ? `Ready — ${video.name} at ${formatTime(startAt)} · original (max 2×)`
-              : `Ready — ${video.name} · original (max 2×)`,
+              ? `Ready — ${video.name} at ${formatTime(startAt)} · original (up to 4×)`
+              : `Ready — ${video.name} · original (up to 4×)`,
             "ok",
           );
         }
