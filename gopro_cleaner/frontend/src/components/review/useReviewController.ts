@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import Hls from "hls.js";
 import { toast } from "sonner";
 import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
 import type {
@@ -19,9 +18,17 @@ const RECENT_TASKS_MAX = 10;
 const SESSION_KEY = "gopro_eager_review_session";
 const SEEN_GIT_SHA_KEY = "gopro_eager_seen_git_sha";
 const PLAYBACK_RATE_MIN = -4;
-/** Same speed range for original and 720p preview (−4× … 4×). */
-const PLAYBACK_RATE_MAX = 4;
+/** Up to 5× on every source — playback never waits on an encode. */
+const PLAYBACK_RATE_MAX = 5;
 const PLAYBACK_RATE_STEP = 0.5;
+
+/**
+ * Review sources are all 1:1 with the original timeline (no overspeed baking),
+ * so annotations / resume / share marks are always original seconds:
+ *  - `fast`     GoPro LRV proxy or an SSD copy (zero encode, smooth at 5×)
+ *  - `original` the untouched file streamed directly
+ */
+type ActiveSource = "original" | "fast";
 
 type ReviewSession = {
   path: string;
@@ -247,13 +254,14 @@ export function useReviewController() {
   const [appVersion, setAppVersion] = useState("");
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
 
+  /** Bumped per video open — stale async work checks this before touching the player. */
   const previewTokenRef = useRef(0);
-  const previewPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prefetchedPreviewRef = useRef<string>("");
-  // hls.js instance + the playlist URL it is playing (previews stream as HLS
-  // so playback can start a few seconds into the build).
-  const hlsRef = useRef<Hls | null>(null);
-  const hlsUrlRef = useRef<string>("");
+  const fastPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** Paths whose fast source we already asked the backend to warm. */
+  const warmedFastRef = useRef<Set<string>>(new Set());
+  /** Media URL currently attached (absolute) + which ladder rung it is. */
+  const mediaUrlRef = useRef<string>("");
+  const activeSourceRef = useRef<ActiveSource>("original");
   const seekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
   /** Hold this scrub target after load so timeupdate/seek races can't snap back to 0. */
@@ -263,19 +271,8 @@ export function useReviewController() {
   const lastGoodTimeRef = useRef(0);
   const loadingVideoRef = useRef(false);
   loadingVideoRef.current = loadingVideo;
-  /** Freeze-frame canvas shown during the original→720p source swap. */
+  /** Freeze-frame canvas shown while the media element swaps sources. */
   const swapCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  /** Waiting at the still-encoding edge of the preview — resume when there's runway. */
-  const frontierWaitRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const beginFrontierWaitRef = useRef<() => void>(() => {});
-  /** Fatal-HLS fallbacks for the current video — stop retrying the preview after 2. */
-  const hlsFallbackCountRef = useRef(0);
-  /** Consecutive polls where the encoder is behind the playhead (SD contention). */
-  const encodeBehindTicksRef = useRef(0);
-  /** Auto-cap to 1× fired for this video (never fight the user twice). */
-  const autoCappedRef = useRef(false);
-  /** Rate the user wanted before the auto-cap — restored on preview swap. */
-  const preCapRateRef = useRef(0);
   const trimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const globalTrimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [previewNote, setPreviewNote] = useState("");
@@ -313,6 +310,33 @@ export function useReviewController() {
   const currentVideo = useCallback((): VideoItem | null => {
     const s = stateRef.current;
     return s.index >= 0 ? s.videos[s.index] || null : null;
+  }, []);
+
+  /** Every source shares the original timeline, so times need no conversion. */
+  const readOriginalTime = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || !Number.isFinite(v.currentTime)) return Number(stateRef.current.scrubTime) || 0;
+    return v.currentTime;
+  }, []);
+
+  const seekMediaToOriginal = useCallback((originalTime: number) => {
+    const v = videoRef.current;
+    if (!v || !Number.isFinite(originalTime)) return;
+    try {
+      v.currentTime = Math.max(0, originalTime);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const applyMediaRate = useCallback((uiRate: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    try {
+      v.playbackRate = uiRate;
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   const annotationFor = useCallback(
@@ -414,8 +438,6 @@ export function useReviewController() {
   const updateScrubUiFromEl = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    // While an HLS preview is still encoding, the element duration only covers
-    // the segments built so far — keep the scrub bar at the known full length.
     const el = Number.isFinite(v.duration) ? v.duration : 0;
     const video = currentVideo();
     const knownFile = Number(video?.duration) || 0;
@@ -423,7 +445,7 @@ export function useReviewController() {
     setDuration(Math.max(el, knownFile, knownAnn) || 0);
   }, [currentVideo]);
 
-  /** Full clip length even when HLS only exposes partial duration. */
+  /** Clip length in original seconds — sidecar/scan wins over element metadata. */
   const knownDurationSec = useCallback(() => {
     const v = videoRef.current;
     const video = currentVideo();
@@ -450,7 +472,7 @@ export function useReviewController() {
     }
   }, []);
 
-  /** Full clip length from sidecar/scan — not the (often short) growing HLS duration. */
+  /** Full clip length from sidecar/scan, falling back to element metadata. */
   const fullClipDuration = useCallback(() => {
     const el = videoRef.current;
     const video = stateRef.current.videos[stateRef.current.index];
@@ -471,45 +493,30 @@ export function useReviewController() {
       const el = videoRef.current;
       if (!el) return;
 
-      let holdAtFrontier = false;
       try {
         const t = Number.isFinite(el.currentTime) ? el.currentTime : 0;
         const good = Math.max(lastGoodTimeRef.current, Number(stateRef.current.scrubTime) || 0);
         const fullDur = fullClipDuration();
-        const elDur = Number.isFinite(el.duration) ? el.duration : 0;
-        // Only restart from 0 at the TRUE end of the clip. Growing HLS / progressive
-        // underruns often report a short duration or spurious `ended` mid-file — that
-        // used to snap fast playback back to 00:00 after a lag.
+        // Only restart from 0 at the TRUE end of the clip. Progressive underruns
+        // can report a short duration or spurious `ended` mid-file — that used to
+        // snap fast playback back to 00:00 after a lag.
         const atTrueEnd = fullDur > 1 && t >= fullDur - 0.2;
         if (atTrueEnd) {
-          el.currentTime = 0;
+          seekMediaToOriginal(0);
           lastGoodTimeRef.current = 0;
         } else if (el.ended || (t < 0.35 && good > 1)) {
           // Unstick false-ended / snapped-to-zero without restarting the review.
           const recover = Math.max(good, t > 0.05 ? t : 0);
           if (recover > 0.05) {
-            el.currentTime = recover;
+            seekMediaToOriginal(recover);
             lastGoodTimeRef.current = recover;
           }
-        } else if (elDur > 1 && fullDur > elDur + 1 && t >= elDur - 0.3) {
-          // Hit the encode frontier — don't bang play() into an empty buffer.
-          // Hold just behind the edge and auto-resume once more video exists.
-          el.currentTime = Math.max(0, elDur - 0.4);
-          holdAtFrontier = true;
         }
       } catch {
         /* ignore */
       }
-      if (holdAtFrontier) {
-        beginFrontierWaitRef.current();
-        return;
-      }
 
-      try {
-        el.playbackRate = playbackRateRef.current || 1;
-      } catch {
-        /* ignore */
-      }
+      applyMediaRate(playbackRateRef.current || 1);
 
       let p: Promise<void> | undefined;
       try {
@@ -527,13 +534,7 @@ export function useReviewController() {
         .then(() => {
           if (generation !== playGenerationRef.current) return;
           const cur = videoRef.current;
-          if (cur) {
-            try {
-              cur.playbackRate = playbackRateRef.current || 1;
-            } catch {
-              /* ignore */
-            }
-          }
+          if (cur) applyMediaRate(playbackRateRef.current || 1);
         })
         .catch(() => {
           if (generation !== playGenerationRef.current || !wantPlayingRef.current) return;
@@ -544,9 +545,9 @@ export function useReviewController() {
           try {
             const live = Number.isFinite(cur.currentTime) ? cur.currentTime : 0;
             const good = Math.max(lastGoodTimeRef.current, Number(stateRef.current.scrubTime) || 0);
-            const t = live < 0.35 && good > 1 ? good : Math.max(live, good);
+            const recover = live < 0.35 && good > 1 ? good : Math.max(live, good);
             cur.pause();
-            cur.currentTime = Math.max(0, t);
+            seekMediaToOriginal(Math.max(0, recover));
           } catch {
             /* ignore */
           }
@@ -568,46 +569,11 @@ export function useReviewController() {
     };
 
     attempt(false);
-  }, [fullClipDuration]);
-
-  const stopFrontierWait = useCallback(() => {
-    if (frontierWaitRef.current) {
-      clearInterval(frontierWaitRef.current);
-      frontierWaitRef.current = null;
-    }
-  }, []);
-
-  /**
-   * Playhead caught up with the still-encoding preview. Instead of a stutter
-   * loop (play 200ms → stall → nudge), wait until the encoder is a few seconds
-   * ahead again, then resume automatically.
-   */
-  const beginFrontierWait = useCallback(() => {
-    if (frontierWaitRef.current) return;
-    setStatus("Caught up with the encoder — resuming as soon as more video is ready…", "ok");
-    frontierWaitRef.current = setInterval(() => {
-      const el = videoRef.current;
-      if (!el || !wantPlayingRef.current) {
-        stopFrontierWait();
-        return;
-      }
-      const elDur = Number.isFinite(el.duration) ? el.duration : 0;
-      const full = fullClipDuration();
-      const live = Number.isFinite(el.currentTime) ? el.currentTime : 0;
-      const runway = elDur - live;
-      // Resume with headroom (or when the encode finished) so playback is
-      // smooth bursts instead of frame-by-frame stalls at the frontier.
-      if ((full > 1 && elDur >= full - 0.5) || runway > 4) {
-        stopFrontierWait();
-        safePlay();
-      }
-    }, 700);
-  }, [fullClipDuration, safePlay, setStatus, stopFrontierWait]);
-  beginFrontierWaitRef.current = beginFrontierWait;
+  }, [applyMediaRate, fullClipDuration, seekMediaToOriginal]);
 
   /**
    * Freeze the current frame over the player while the media source switches
-   * (original → 720p). The swap then reads as a quality change, not a restart.
+   * (card original → SSD copy). The swap reads as a quality change, not a restart.
    * Returns a function that removes the freeze-frame.
    */
   const showSwapMask = useCallback(() => {
@@ -640,15 +606,11 @@ export function useReviewController() {
       const v = videoRef.current;
       if (v) {
         safePause();
-        try {
-          v.currentTime = target;
-        } catch {
-          /* ignore */
-        }
+        seekMediaToOriginal(target);
       }
       pendingSeekRef.current = null;
     }
-  }, [safePause]);
+  }, [safePause, seekMediaToOriginal]);
 
   const currentScrubTime = useCallback(() => {
     flushSeek();
@@ -659,7 +621,7 @@ export function useReviewController() {
     (time: number, immediate = false) => {
       const dur = knownDurationSec();
       if (!dur) return;
-      // Always stop at the true end — never past it, even when HLS duration is short.
+      // Always stop at the true end — never past it.
       const clamped = Math.min(Math.max(0, time), Math.max(0, dur - 0.04));
       setScrubTime(clamped);
       if (clamped <= 0.05) lastGoodTimeRef.current = 0;
@@ -694,7 +656,6 @@ export function useReviewController() {
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
-    // Original and 720p preview both allow −4× … 4×.
     const max = PLAYBACK_RATE_MAX;
     let clamped = Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP;
     clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
@@ -706,35 +667,24 @@ export function useReviewController() {
       clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
     }
     playbackRateRef.current = clamped;
+    setPlaybackRateState(clamped);
     if (v) {
       const wasPlaying = wantPlayingRef.current || !v.paused;
-      try {
-        v.playbackRate = clamped;
-      } catch {
-        /* ignore */
-      }
+      applyMediaRate(clamped);
       if (wasPlaying && v.paused) safePlay();
-      else if (wasPlaying) {
-        try {
-          v.playbackRate = clamped;
-        } catch {
-          /* ignore */
-        }
-      }
     }
-    setPlaybackRateState(clamped);
     if (announce) {
       setStatus(`Playback ${clamped.toFixed(1)}×`, "ok");
     }
-  }, [safePlay, setStatus]);
+  }, [applyMediaRate, safePlay, setStatus]);
 
   const bumpPlaybackRate = useCallback(
     (delta: number) => {
       if (!currentVideo()) return;
+      // Bump the UI rate; the media element follows 1:1.
+      setPlaybackRate((playbackRateRef.current || 1) + delta);
       const v = videoRef.current;
-      setPlaybackRate((v?.playbackRate || playbackRateRef.current || 1) + delta);
       if (v?.paused || !wantPlayingRef.current) {
-        // Speeding up while paused/stalled means "skim ahead".
         safePlay();
       }
     },
@@ -917,45 +867,25 @@ export function useReviewController() {
   }, []);
 
   // ---------------------------------------------------------------------
-  // Load video (prefer 720p proxy; stream original while proxy builds)
+  // Load video — zero-encode source ladder (LRV proxy → SSD copy → original)
   // ---------------------------------------------------------------------
-  const stopPreviewPoll = useCallback(() => {
-    if (previewPollRef.current) {
-      clearInterval(previewPollRef.current);
-      previewPollRef.current = null;
+  const stopFastPoll = useCallback(() => {
+    if (fastPollRef.current) {
+      clearInterval(fastPollRef.current);
+      fastPollRef.current = null;
     }
   }, []);
 
-  const cancelPreviewJob = useCallback(async (path: string) => {
+  const cancelFastJob = useCallback(async (path: string) => {
     if (!path) return;
     try {
-      await api("/api/eager/preview/cancel", {
+      await api("/api/eager/fast/cancel", {
         method: "POST",
         body: JSON.stringify({ path }),
       });
     } catch {
       /* ignore */
     }
-  }, []);
-
-  /** Stop every other preview encode so the watched clip gets the ffmpeg slot. */
-  const cancelOtherPreviewJobs = useCallback(async (keepPath: string) => {
-    try {
-      await api("/api/eager/preview/cancel", {
-        method: "POST",
-        body: JSON.stringify({ path: keepPath || "", others: true }),
-      });
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  /** Start/ensure 720p encode for the video currently on screen (highest priority). */
-  const startForegroundPreview = useCallback((path: string) => {
-    if (!path) return Promise.resolve(null);
-    return api(
-      `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=1`,
-    ).catch(() => null);
   }, []);
 
   /** Index of the video we should warm next (prefer next unfinished, else i+1). */
@@ -971,168 +901,81 @@ export function useReviewController() {
     [nextIncompleteIndex],
   );
 
-  // Warm the next clip's 720p encode — call only after the current preview is
-  // playable so two ffmpeg jobs don't fight for the first segment.
-  const prefetchNextPreview = useCallback(
-    (fromIndex: number) => {
-      const s = stateRef.current;
-      const next = nextPreviewTargetIndex(fromIndex);
-      if (next < 0) return;
-      const path = s.videos[next]?.path;
-      if (!path || path === s.videos[fromIndex]?.path) return;
-      if (prefetchedPreviewRef.current === path) return; // already queued
-      prefetchedPreviewRef.current = path;
-      api(`/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=0`).catch(() => {
-        /* best-effort warmup — never steals the current video's encode slot */
-      });
-    },
-    [nextPreviewTargetIndex],
-  );
-
-  const destroyHls = useCallback(() => {
-    hlsUrlRef.current = "";
-    if (hlsRef.current) {
-      try {
-        hlsRef.current.destroy();
-      } catch {
-        /* ignore */
-      }
-      hlsRef.current = null;
+  /**
+   * Ask the backend to have the fast source ready for the next few files.
+   * Cheap and idempotent: LRV footage needs no work at all, and SSD copies are
+   * plain file copies that run while the operator labels the current clip.
+   */
+  const warmFastSources = useCallback((fromIndex: number, list?: VideoItem[], count = 3) => {
+    const videos: VideoItem[] = list || stateRef.current.videos || [];
+    if (fromIndex < 0 || !videos.length) return;
+    let queued = 0;
+    for (let i = fromIndex; i < videos.length && queued < count; i += 1) {
+      const path = videos[i]?.path;
+      if (!path) continue;
+      if (i !== fromIndex && stateRef.current.annotationsByPath[path]?.complete) continue;
+      queued += 1;
+      if (warmedFastRef.current.has(path)) continue;
+      warmedFastRef.current.add(path);
+      void api(`/api/eager/fast/status?path=${encodeURIComponent(path)}&start=1`).catch(() => null);
     }
   }, []);
 
+  const sourceLabel = useCallback((kind: string, cached?: boolean) => {
+    if (kind === "lrv") return cached ? "GoPro proxy (SSD) · 5× ready" : "GoPro proxy · 5× ready";
+    if (kind === "ssd_copy") return "SSD copy · 5× ready";
+    return "Original file";
+  }, []);
+
   /**
-   * Point the player at a preview playlist (via hls.js, or natively on Safari).
-   * Works both for finished previews and ones still being encoded — the
-   * playlist keeps growing and hls.js re-polls it until the encode ends.
-   * Returns false when the browser can't play HLS at all.
+   * Attach a review source at an original-timeline position. Every rung of the
+   * ladder is 1:1 with the original, so there is no time remapping.
    */
-  const attachHlsMedia = useCallback(
-    (v: HTMLVideoElement, sourcePath: string, hlsUrl: string, startAt: number, token: number) => {
-      destroyHls();
-      const absolute = host + hlsUrl;
-      if (Hls.isSupported()) {
-        const hls = new Hls({
-          // Explicit start position — without it hls.js treats the growing
-          // playlist as live TV and would start at the encode frontier.
-          startPosition: Math.max(0, startAt),
-          // Transmux in a worker thread — keeps the main thread free so the
-          // UI never competes with demuxing during 4× playback.
-          enableWorker: true,
-          // Fetch the first fragment while the playlist is still parsing.
-          startFragPrefetch: true,
-          // Deep forward buffer: 4× playback drains ~4s of media per wall
-          // second, and the 15fps/720p stream is tiny — buffer generously.
-          maxBufferLength: 120,
-          maxMaxBufferLength: 300,
-          maxBufferSize: 120 * 1000 * 1000,
-          backBufferLength: 30,
-          // EVENT playlists grow while encoding — never chase a "live" edge.
-          liveSyncDurationCount: 3,
-          liveMaxLatencyDurationCount: Infinity,
-        });
-        hlsRef.current = hls;
-        hlsUrlRef.current = absolute;
-        // Most fatal errors while the encoder is appending segments are
-        // transient — recover in place first, fall back to the original last.
-        let netRetries = 0;
-        let mediaRetries = 0;
-        const fallbackToOriginal = () => {
-          hlsFallbackCountRef.current += 1;
-          destroyHls();
-          const el = videoRef.current;
-          if (!el) return;
-          const live = Number.isFinite(el.currentTime) ? el.currentTime : 0;
-          const t = Math.max(
-            live > 0.05 ? live : 0,
-            lastGoodTimeRef.current,
-            Number(stateRef.current.scrubTime) || 0,
-            startAt,
-          );
-          el.src = host + `/api/eager/stream?path=${encodeURIComponent(sourcePath)}`;
-          el.load();
-          el.addEventListener(
-            "loadedmetadata",
-            () => {
-              if (token !== previewTokenRef.current) return;
-              try {
-                if (t > 0.05) el.currentTime = t;
-              } catch {
-                /* ignore */
-              }
-              setScrubTime(t);
-              if (wantPlayingRef.current) safePlay();
-            },
-            { once: true },
-          );
-          setPreviewNote("Original · up to 4×");
-        };
-        hls.on(Hls.Events.ERROR, (_evt, data) => {
-          if (!data?.fatal || token !== previewTokenRef.current || hlsRef.current !== hls) return;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && netRetries < 3) {
-            // Playlist/segment fetch hiccup (encoder mid-write, server busy).
-            netRetries += 1;
-            window.setTimeout(() => {
-              if (token === previewTokenRef.current && hlsRef.current === hls) {
-                try {
-                  hls.startLoad();
-                } catch {
-                  /* ignore */
-                }
-              }
-            }, 350 * netRetries);
-            return;
+  const attachFastMedia = useCallback(
+    (v: HTMLVideoElement, url: string, kind: string, startAt: number, token: number) => {
+      const absolute = url.startsWith("http") ? url : host + url;
+      mediaUrlRef.current = absolute;
+      activeSourceRef.current = kind === "original" ? "original" : "fast";
+      v.src = absolute;
+      v.load();
+      v.addEventListener(
+        "loadedmetadata",
+        () => {
+          if (token !== previewTokenRef.current) return;
+          try {
+            if (startAt > 0.05) v.currentTime = startAt;
+          } catch {
+            /* ignore */
           }
-          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 2) {
-            mediaRetries += 1;
-            try {
-              hls.recoverMediaError();
-              return;
-            } catch {
-              /* fall through to original */
-            }
-          }
-          fallbackToOriginal();
-        });
-        v.removeAttribute("src");
-        hls.loadSource(absolute);
-        hls.attachMedia(v);
-        return true;
-      }
-      if (v.canPlayType("application/vnd.apple.mpegurl")) {
-        hlsUrlRef.current = absolute;
-        v.src = absolute;
-        v.load();
-        return true;
-      }
-      return false;
+          applyMediaRate(playbackRateRef.current || 1);
+        },
+        { once: true },
+      );
     },
-    [destroyHls, safePlay],
+    [applyMediaRate],
   );
 
-  /** Swap from original → 720p preview when the first segments are ready. */
-  const swapToPreview = useCallback(
-    (path: string, token: number, hlsUrl: string, building: boolean) => {
+  /**
+   * Hot-swap onto a better source (card original → finished SSD copy) without a
+   * visible restart: freeze the frame, re-attach, resume at the same second and
+   * the same rate.
+   */
+  const swapToFast = useCallback(
+    (path: string, token: number, url: string, kind: string, cached?: boolean) => {
       const v = videoRef.current;
-      if (!v || token !== previewTokenRef.current || !hlsUrl) return;
-      if (hlsUrlRef.current === host + hlsUrl) return;
-      // Prefer live playhead, then scrub state, then saved/anchor resume — never drop to 0 by accident.
-      const live = Number.isFinite(v.currentTime) ? v.currentTime : 0;
-      const scrub = Number(stateRef.current.scrubTime) || 0;
-      const saved = resumeTimeForPath(path);
-      const t = Math.max(live > 0.05 ? live : 0, scrub, saved);
-      const resume = wantPlayingRef.current || !v.paused;
-      // If we auto-capped to 1× while the encoder caught up, restore the
-      // speed the user actually wanted now that the preview can handle it.
-      const current = playbackRateRef.current || 1;
-      const preCap = preCapRateRef.current || 0;
-      const wantedRate =
-        preCap !== 0 && Math.abs(preCap) >= Math.abs(current) ? preCap : current;
-      preCapRateRef.current = 0;
-      const rate = Math.min(PLAYBACK_RATE_MAX, Math.max(PLAYBACK_RATE_MIN, wantedRate));
+      if (!v || token !== previewTokenRef.current || !url) return;
+      const absolute = url.startsWith("http") ? url : host + url;
+      if (mediaUrlRef.current === absolute) return;
 
-      // Freeze the last original frame over the player while the source
-      // remounts — the swap reads as a quality change, never a restart.
+      const live = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+      const t = Math.max(
+        live > 0.05 ? live : 0,
+        Number(stateRef.current.scrubTime) || 0,
+        lastGoodTimeRef.current,
+      );
+      const resume = wantPlayingRef.current || !v.paused;
+      const rate = playbackRateRef.current || 1;
+
       const hideMask = showSwapMask();
       const unmask = () => {
         hideMask();
@@ -1141,154 +984,91 @@ export function useReviewController() {
       };
       v.addEventListener("playing", unmask);
       v.addEventListener("seeked", unmask);
-      window.setTimeout(unmask, 3500);
+      window.setTimeout(unmask, 3000);
 
-      const onReady = () => {
-        if (token !== previewTokenRef.current) return;
-        setLoadingVideo(false);
-        try {
-          v.playbackRate = rate;
-        } catch {
-          /* ignore */
-        }
-        playbackRateRef.current = rate;
-        setPlaybackRateState(rate);
-        try {
-          if (t > 0.05) v.currentTime = t;
-        } catch {
-          /* ignore */
-        }
-        setScrubTime(t);
-        saveReviewSession({
-          path,
-          name: mediaBasename(path),
-          scrubTime: t,
-          scanRoot: stateRef.current.scanRoot || undefined,
-        });
-        setPreviewNote(building ? "720p preview · still encoding" : "720p preview");
-        setStatus(
-          building
-            ? `720p preview ready — up to 4× while it finishes encoding`
-            : `Switched to 720p preview — up to 4×`,
-          "ok",
-        );
-        if (resume) {
-          // Wait until media at the target position is actually buffered —
-          // playing earlier guarantees an immediate rebuffer stall.
-          const go = () => {
-            if (token === previewTokenRef.current) safePlay();
-          };
-          if (v.readyState >= 3) go();
-          else v.addEventListener("canplay", go, { once: true });
-        }
-        if (!building) prefetchNextPreview(stateRef.current.index);
-      };
-      v.addEventListener("loadedmetadata", onReady, { once: true });
-      window.setTimeout(() => {
-        if (token === previewTokenRef.current) setLoadingVideo(false);
-      }, 600);
-      if (!attachHlsMedia(v, path, hlsUrl, t, token)) {
-        v.removeEventListener("loadedmetadata", onReady);
-        unmask();
-        setPreviewNote("Original · up to 4×");
-        setLoadingVideo(false);
-      }
+      v.addEventListener(
+        "loadedmetadata",
+        () => {
+          if (token !== previewTokenRef.current) return;
+          setLoadingVideo(false);
+          applyMediaRate(rate);
+          try {
+            if (t > 0.05) v.currentTime = t;
+          } catch {
+            /* ignore */
+          }
+          setScrubTime(t);
+          lastGoodTimeRef.current = t;
+          setPreviewNote(sourceLabel(kind, cached));
+          saveReviewSession({
+            path,
+            name: mediaBasename(path),
+            scrubTime: t,
+            scanRoot: stateRef.current.scanRoot || undefined,
+          });
+          if (resume) {
+            const go = () => {
+              if (token === previewTokenRef.current) safePlay();
+            };
+            if (v.readyState >= 3) go();
+            else v.addEventListener("canplay", go, { once: true });
+          }
+        },
+        { once: true },
+      );
+      attachFastMedia(v, url, kind, t, token);
     },
-    [attachHlsMedia, prefetchNextPreview, resumeTimeForPath, safePlay, setStatus, showSwapMask],
+    [applyMediaRate, attachFastMedia, safePlay, showSwapMask, sourceLabel],
   );
 
-  const pollPreviewReady = useCallback(
+  /**
+   * Keep the player on the best zero-encode source. LRV footage is already
+   * final on the first response; when a background SSD copy lands we hot-swap
+   * to it. Playback never waits for any of this.
+   */
+  const pollFastReady = useCallback(
     (path: string, token: number) => {
-      stopPreviewPoll();
-      // Slow poll — keep CPU free for encode + UI.
+      stopFastPoll();
       const tick = async () => {
         if (token !== previewTokenRef.current) {
-          stopPreviewPoll();
+          stopFastPoll();
           return;
         }
         try {
-          const st = await api(
-            `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=1`,
-          );
+          const st = await api(`/api/eager/fast/status?path=${encodeURIComponent(path)}&start=1`);
           if (token !== previewTokenRef.current) return;
-          // After two fatal HLS failures on this video, stay on the original —
-          // re-swapping into a broken stream would loop hitches forever.
-          const previewGivenUp = hlsFallbackCountRef.current >= 2;
-          if (st.status === "running") {
-            const onPreview = Boolean(hlsUrlRef.current);
-            // Segments are 1s each, so count ≈ encoded seconds. Only swap once
-            // the encoder is PAST the playhead — otherwise the seek would clamp
-            // to the encode edge and yank the playhead backwards.
-            const encodedSec = Number(st.segments) || 0;
-            // Honest progress even when the SD-card duration probe failed
-            // (that used to pin the label at 0% for the whole build).
-            const fullDur = knownDurationSec();
-            const segPct = fullDur > 1 ? Math.min(99, Math.round((encodedSec / fullDur) * 100)) : 0;
-            const pct = Math.max(Number(st.progress) || 0, segPct);
-            const playhead = Math.max(
-              Number(stateRef.current.scrubTime) || 0,
-              Number(videoRef.current?.currentTime) || 0,
-            );
-            if (
-              !onPreview &&
-              st.playable &&
-              st.hls &&
-              !previewGivenUp &&
-              encodedSec > playhead + 3
-            ) {
-              swapToPreview(path, token, String(st.hls), true);
-            }
-            // Do not auto-cap original speed — operators can use up to 4× on
-            // the original while the optional 720p encode builds in the background.
-            if (onPreview) {
-              // Current video is watchable — queue the next encode NOW so it
-              // starts the second the encoder slot frees up.
-              prefetchNextPreview(stateRef.current.index);
-            }
-            const queued =
-              typeof st.message === "string" && /queued/i.test(st.message) && encodedSec <= 0;
-            setPreviewNote(
-              hlsUrlRef.current
-                ? `720p preview · encoding ${pct}%`
-                : previewGivenUp
-                  ? "Original · up to 4×"
-                  : queued
-                    ? "Original · up to 4× · 720p waiting"
-                    : encodedSec <= 0
-                      ? "Original · up to 4× · building 720p…"
-                      : `Original · up to 4× · building preview ${pct}%`,
-            );
-            return;
-          }
-          if (st.status === "ready") {
-            stopPreviewPoll();
-            if (hlsUrlRef.current && st.hls && hlsUrlRef.current === host + st.hls) {
-              setPreviewNote("720p preview");
-              // Current encode finished — now start the next video's preview.
-              prefetchNextPreview(stateRef.current.index);
-            } else if (st.hls && !previewGivenUp) {
-              swapToPreview(path, token, String(st.hls), false);
-              prefetchNextPreview(stateRef.current.index);
+          const kind = String(st?.kind || "original");
+          const url = st?.url ? String(st.url) : "";
+          if (st?.ready && url) {
+            stopFastPoll();
+            const absolute = url.startsWith("http") ? url : host + url;
+            if (mediaUrlRef.current === absolute) {
+              setPreviewNote(sourceLabel(kind, Boolean(st.cached)));
             } else {
-              setPreviewNote("Original · up to 4×");
-              prefetchNextPreview(stateRef.current.index);
+              swapToFast(path, token, url, kind, Boolean(st.cached));
             }
+            warmFastSources(stateRef.current.index + 1);
             return;
           }
-          if (st.status === "error" || st.status === "skipped") {
-            stopPreviewPoll();
-            setPreviewNote("Original · up to 4×");
+          if (st?.status === "copying") {
+            const pct = Number(st.progress) || 0;
+            setPreviewNote(
+              pct > 0 ? `Original file · SSD copy ${pct}%` : "Original file · copying to SSD",
+            );
+            return;
+          }
+          if (st?.status === "error") {
+            stopFastPoll();
+            setPreviewNote(sourceLabel("original"));
           }
         } catch {
           /* ignore transient poll errors */
         }
       };
-      previewPollRef.current = setInterval(tick, 1000);
-      // First check right away — don't sit on the original for an extra second
-      // when the preview is already usable.
+      fastPollRef.current = setInterval(tick, 1500);
       void tick();
     },
-    [knownDurationSec, prefetchNextPreview, stopPreviewPoll, swapToPreview],
+    [sourceLabel, stopFastPoll, swapToFast, warmFastSources],
   );
 
   const loadVideo = useCallback(
@@ -1307,33 +1087,19 @@ export function useReviewController() {
       const upcomingIdx = nextPreviewTargetIndex(i);
       const upcomingPath = upcomingIdx >= 0 ? s.videos[upcomingIdx]?.path || "" : "";
 
-      // Cancel leftover encodes so only the current (then next) job runs.
-      // Always clear *all* other jobs — after reload, video #1 often still holds
-      // the encode slot even though we resumed on video #4.
-      await cancelOtherPreviewJobs(video.path);
+      // Free the copy slot from a clip we've moved away from (finished caches stay).
       if (previous?.path && previous.path !== video.path && previous.path !== upcomingPath) {
-        void cancelPreviewJob(previous.path);
+        void cancelFastJob(previous.path);
       }
-      if (
-        prefetchedPreviewRef.current &&
-        prefetchedPreviewRef.current !== video.path &&
-        prefetchedPreviewRef.current !== upcomingPath
-      ) {
-        void cancelPreviewJob(prefetchedPreviewRef.current);
-      }
-      prefetchedPreviewRef.current = "";
 
       setLoadingVideo(true);
       setIndex(i);
       setShareClipIn(null);
       setShareClipOut(null);
-      setPreviewNote("Original · up to 4×");
-      stopPreviewPoll();
-      stopFrontierWait();
-      hlsFallbackCountRef.current = 0;
-      encodeBehindTicksRef.current = 0;
-      autoCappedRef.current = false;
-      preCapRateRef.current = 0;
+      setPreviewNote("");
+      stopFastPoll();
+      mediaUrlRef.current = "";
+      activeSourceRef.current = "original";
       if (seekTimerRef.current) {
         clearTimeout(seekTimerRef.current);
         seekTimerRef.current = null;
@@ -1341,7 +1107,6 @@ export function useReviewController() {
       pendingSeekRef.current = null;
 
       const token = ++previewTokenRef.current;
-      // Capture resume once — later annotation load / path quirks must not drop it to 0.
       const resumeTime = resumeTimeForPath(video.path);
       resumeTargetRef.current = resumeTime;
       resumeHoldUntilRef.current = Date.now() + 5000;
@@ -1369,53 +1134,37 @@ export function useReviewController() {
       wantPlayingRef.current = false;
       playGenerationRef.current += 1;
       playPromiseRef.current = null;
-      destroyHls();
 
-      const streamUrl = host + `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
       const clearLoader = () => {
         if (token === previewTokenRef.current) setLoadingVideo(false);
       };
       const loaderCap = window.setTimeout(clearLoader, 1000);
 
-      // INSTANT OPEN: one quick local status call (also kicks the encode).
-      // If a usable 720p preview exists — cached from before, or already
-      // encoded past the playhead — attach it directly and never load the
-      // multi-GB original at all.
-      let previewStatus: any = null;
+      // Resolve the cheapest playable source. Nothing is encoded, so this is a
+      // stat() on the backend — but never block the open on it.
+      let fast: any = null;
       try {
-        previewStatus = await Promise.race([
-          startForegroundPreview(video.path),
-          new Promise((resolve) => window.setTimeout(() => resolve(null), 600)),
+        fast = await Promise.race([
+          api(`/api/eager/fast/status?path=${encodeURIComponent(video.path)}&start=1`),
+          new Promise((resolve) => window.setTimeout(() => resolve(null), 700)),
         ]);
       } catch {
-        previewStatus = null;
+        fast = null;
       }
       if (token !== previewTokenRef.current) return;
 
-      const encodedSec = Number(previewStatus?.segments) || 0;
-      const previewUsable = Boolean(
-        previewStatus?.hls &&
-          (previewStatus.status === "ready" ||
-            (previewStatus.status === "running" &&
-              previewStatus.playable &&
-              encodedSec > resumeTime + 3)),
-      );
-
-      let onPreviewDirect = false;
-      if (previewUsable) {
-        onPreviewDirect = attachHlsMedia(v, video.path, String(previewStatus.hls), resumeTime, token);
-      }
+      const sourceKind = String(fast?.kind || "original");
+      const sourceUrl = fast?.url
+        ? String(fast.url)
+        : `/api/eager/stream?path=${encodeURIComponent(video.path)}`;
+      const sourceCached = Boolean(fast?.cached);
 
       const targetResume = () =>
         Math.max(resumeTargetRef.current, resumeTimeForPath(video.path));
 
       const applyResumeSeek = (startAt: number) => {
         if (token !== previewTokenRef.current || startAt <= 0.05) return;
-        try {
-          v.currentTime = startAt;
-        } catch {
-          /* ignore */
-        }
+        seekMediaToOriginal(startAt);
         setScrubTime(startAt);
         resumeTargetRef.current = startAt;
       };
@@ -1427,7 +1176,6 @@ export function useReviewController() {
         v.pause();
         const startAt = targetResume();
         applyResumeSeek(startAt);
-        // Large originals often ignore the first seek — re-apply when data is ready.
         const reseek = () => applyResumeSeek(targetResume());
         v.addEventListener("loadeddata", reseek, { once: true });
         v.addEventListener("canplay", reseek, { once: true });
@@ -1444,24 +1192,14 @@ export function useReviewController() {
             scanRoot: stateRef.current.scanRoot || undefined,
           });
         }
-        if (onPreviewDirect) {
-          setPreviewNote(
-            previewStatus?.status === "ready" ? "720p preview" : "720p preview · still encoding",
-          );
-          setStatus(
-            startAt > 0
-              ? `Ready — ${video.name} at ${formatTime(startAt)} · 720p (up to 4×)`
-              : `Ready — ${video.name} · 720p (up to 4×)`,
-            "ok",
-          );
-        } else {
-          setStatus(
-            startAt > 0
-              ? `Ready — ${video.name} at ${formatTime(startAt)} · original (up to 4×)`
-              : `Ready — ${video.name} · original (up to 4×)`,
-            "ok",
-          );
-        }
+        const label = sourceLabel(sourceKind, sourceCached);
+        setPreviewNote(label);
+        setStatus(
+          startAt > 0
+            ? `Ready — ${video.name} at ${formatTime(startAt)} · ${label}`
+            : `Ready — ${video.name} · ${label}`,
+          "ok",
+        );
       };
       v.addEventListener("loadedmetadata", onMeta, { once: true });
       v.addEventListener(
@@ -1475,16 +1213,12 @@ export function useReviewController() {
         { once: true },
       );
       window.setTimeout(clearLoader, 800);
-      if (!onPreviewDirect) {
-        // Buffer ahead aggressively — high-rate playback drains the buffer fast.
-        try {
-          v.preload = "auto";
-        } catch {
-          /* ignore */
-        }
-        v.src = streamUrl;
-        v.load();
+      try {
+        v.preload = "auto";
+      } catch {
+        /* ignore */
       }
+      attachFastMedia(v, sourceUrl, sourceKind, resumeTime, token);
 
       await loadAnnotationForPath(video.path, { keepPending: true });
       if (token !== previewTokenRef.current) return;
@@ -1497,25 +1231,26 @@ export function useReviewController() {
       const annDur = Number(stateRef.current.annotationsByPath[video.path]?.duration) || 0;
       if (annDur > 0) setDuration(annDur);
 
-      // Keep polling — swap to 720p when ready, without skipping the original open.
-      pollPreviewReady(video.path, token);
+      // Upgrade to the SSD copy if one is still landing, and keep the next
+      // couple of clips warm so N never waits.
+      if (!fast?.ready) pollFastReady(video.path, token);
+      warmFastSources(i, undefined, 3);
     },
     [
-      attachHlsMedia,
-      cancelOtherPreviewJobs,
-      cancelPreviewJob,
-      destroyHls,
+      attachFastMedia,
+      cancelFastJob,
       isVideoFullyDone,
       loadAnnotationForPath,
       nextPreviewTargetIndex,
-      pollPreviewReady,
+      pollFastReady,
       resumeTimeForPath,
+      seekMediaToOriginal,
       setPlaybackRate,
       setStatus,
-      startForegroundPreview,
-      stopFrontierWait,
-      stopPreviewPoll,
+      sourceLabel,
+      stopFastPoll,
       updateScrubUiFromEl,
+      warmFastSources,
     ],
   );
 
@@ -1824,7 +1559,7 @@ export function useReviewController() {
         await loadVideo(Math.min(deletedIndex, nextVideos.length - 1), { force: true });
       } else {
         setIndex(-1);
-        destroyHls();
+        mediaUrlRef.current = "";
         if (videoRef.current) {
           videoRef.current.removeAttribute("src");
           videoRef.current.load();
@@ -1836,7 +1571,7 @@ export function useReviewController() {
     } finally {
       setBusy(false);
     }
-  }, [currentVideo, destroyHls, loadVideo, setStatus]);
+  }, [currentVideo, loadVideo, setStatus]);
 
   // ---------------------------------------------------------------------
   // Scan / workspace
@@ -1910,8 +1645,7 @@ export function useReviewController() {
       const savedIdx =
         session != null ? freshVideos.findIndex((v) => sessionMatchesPath(session, v.path)) : -1;
 
-      // Prefer the last watched clip after reload — never jump back to video #1
-      // just because earlier files are still incomplete.
+      // Open ASAP — do NOT wait to load every sidecar (that was 1–2 min on big cards).
       let openAt = savedIdx;
       if (openAt < 0) {
         openAt = 0;
@@ -1919,18 +1653,15 @@ export function useReviewController() {
           await loadAnnotationForPath(freshVideos[i].path);
           if (!stateRef.current.annotationsByPath[freshVideos[i].path]?.complete) {
             openAt = i;
+            // Warm SSD copies now — before remaining annotation IO / player open.
+            warmFastSources(i, freshVideos, 3);
             break;
           }
           openAt = i;
         }
       } else {
         await loadAnnotationForPath(freshVideos[openAt].path);
-      }
-
-      const openPath = freshVideos[openAt]?.path;
-      if (openPath) {
-        // Highest priority: cancel other encodes and build THIS video's 720p first.
-        void startForegroundPreview(openPath);
+        warmFastSources(openAt, freshVideos, 3);
       }
 
       // Remaining labels load in the background while the player starts.
@@ -1939,13 +1670,20 @@ export function useReviewController() {
       );
 
       await loadVideo(openAt, { force: true });
-      const resumed = savedIdx >= 0;
+      // Keep the next unfinished clips warm so N opens instantly.
+      warmFastSources(openAt, freshVideos, 3);
+      const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
+      const onRemovable = Boolean(
+        stateRef.current.sdCards.some(
+          (c: SdCard) => (c.scan_path || c.path) === path || path.startsWith(c.path || ""),
+        ),
+      );
       setStatus(
         resumed
-          ? `Resumed ${freshVideos[openAt]?.name}${
-              (session?.scrubTime || 0) > 0 ? ` at ${formatTime(session!.scrubTime)}` : ""
-            } — building 720p for this clip first`
-          : `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`,
+          ? `Resumed ${freshVideos[openAt]?.name} at ${formatTime(session!.scrubTime)}`
+          : onRemovable
+            ? `Found ${freshVideos.length} files — reviewing off the card (proxies stream direct, copies cached to SSD)`
+            : `Found ${freshVideos.length} files — T/G annotate, Enter assign, N next unfinished`,
         "ok",
       );
     } catch (error: any) {
@@ -1953,15 +1691,7 @@ export function useReviewController() {
     } finally {
       setScanning(false);
     }
-  }, [
-    loadAnnotationForPath,
-    loadVideo,
-    scanTargetPath,
-    selectedSdCardLabel,
-    setIdentityFromSelectedCard,
-    setStatus,
-    startForegroundPreview,
-  ]);
+  }, [loadAnnotationForPath, loadVideo, scanTargetPath, selectedSdCardLabel, setIdentityFromSelectedCard, setStatus, warmFastSources]);
 
   const applySelectedPath = useCallback(
     (path: string) => {
@@ -2088,9 +1818,7 @@ export function useReviewController() {
       if (globalTrimPollRef.current) clearInterval(globalTrimPollRef.current);
       if (trimPollRef.current) clearInterval(trimPollRef.current);
       if (seekTimerRef.current) clearTimeout(seekTimerRef.current);
-      if (previewPollRef.current) clearInterval(previewPollRef.current);
-      if (frontierWaitRef.current) clearInterval(frontierWaitRef.current);
-      destroyHls();
+      if (fastPollRef.current) clearInterval(fastPollRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2486,14 +2214,11 @@ export function useReviewController() {
     let lastUiTick = 0;
     const onTimeUpdate = () => {
       if (!Number.isFinite(v.currentTime)) return;
+      const originalT = v.currentTime;
       const target = resumeTargetRef.current;
       // While resuming, fight browsers that snap the playhead back to 0.
-      if (Date.now() < resumeHoldUntilRef.current && target > 0.5 && v.currentTime < 0.35) {
-        try {
-          v.currentTime = target;
-        } catch {
-          /* ignore */
-        }
+      if (Date.now() < resumeHoldUntilRef.current && target > 0.5 && originalT < 0.35) {
+        seekMediaToOriginal(target);
         setScrubTime(target);
         return;
       }
@@ -2501,39 +2226,31 @@ export function useReviewController() {
       if (
         !loadingVideoRef.current &&
         Date.now() >= resumeHoldUntilRef.current &&
-        v.currentTime < 0.35 &&
+        originalT < 0.35 &&
         lastGoodTimeRef.current > 1 &&
         wantPlayingRef.current
       ) {
-        try {
-          v.currentTime = lastGoodTimeRef.current;
-        } catch {
-          /* ignore */
-        }
+        seekMediaToOriginal(lastGoodTimeRef.current);
         setScrubTime(lastGoodTimeRef.current);
         return;
       }
-      if (v.currentTime > 0.5) {
-        lastGoodTimeRef.current = v.currentTime;
+      if (originalT > 0.5) {
+        lastGoodTimeRef.current = originalT;
       }
-      if (!v.paused && v.currentTime > 0) {
+      if (!v.paused && originalT > 0) {
         // Throttle React updates — every scrub tick re-renders the whole
-        // review tree, and that main-thread work competes with 4× playback.
+        // review tree, and that main-thread work competes with playback.
         const now = performance.now();
         if (now - lastUiTick < 150) return;
         lastUiTick = now;
-        setScrubTime(v.currentTime);
+        setScrubTime(originalT);
       }
     };
     const onLoadedMeta = () => updateScrubUiFromEl();
     const onPlay = () => {
       wantPlayingRef.current = true;
       setIsPlaying(true);
-      try {
-        v.playbackRate = playbackRateRef.current || 1;
-      } catch {
-        /* ignore */
-      }
+      applyMediaRate(playbackRateRef.current || 1);
     };
     const onPause = () => {
       // Ignore transient pauses while a play attempt is still intentional.
@@ -2547,37 +2264,19 @@ export function useReviewController() {
     };
     const onWaiting = () => {
       // Playback underflowed. Give the buffer 450ms to refill on its own,
-      // then either hold at the encode frontier or nudge the decoder.
+      // then nudge the decoder back onto the last good position.
       if (!wantPlayingRef.current) return;
       window.setTimeout(() => {
         const el = videoRef.current;
         if (!el || !wantPlayingRef.current) return;
         if (!el.paused && el.readyState >= 2) return;
         const live = Number.isFinite(el.currentTime) ? el.currentTime : 0;
-        const elDur = Number.isFinite(el.duration) ? el.duration : 0;
-        const full = fullClipDuration();
-        // Stalled at the edge of a still-encoding preview → wait for runway
-        // instead of a seek/play stutter loop.
-        if (elDur > 1 && full > elDur + 1 && live >= elDur - 1) {
-          beginFrontierWaitRef.current();
-          return;
-        }
         const good = Math.max(lastGoodTimeRef.current, Number(stateRef.current.scrubTime) || 0);
         const t = live < 0.35 && good > 1 ? good : Math.max(live, 0);
-        try {
-          el.currentTime = t;
-        } catch {
-          /* ignore */
-        }
+        seekMediaToOriginal(t);
         if (t > 0.5) lastGoodTimeRef.current = t;
-        if (el.paused) {
-          try {
-            el.playbackRate = playbackRateRef.current || 1;
-            void el.play();
-          } catch {
-            /* ignore */
-          }
-        }
+        applyMediaRate(playbackRateRef.current || 1);
+        safePlay();
       }, 450);
     };
 
@@ -2597,7 +2296,7 @@ export function useReviewController() {
       v.removeEventListener("waiting", onWaiting);
       v.removeEventListener("stalled", onWaiting);
     };
-  }, [fullClipDuration, safePlay, updateScrubUiFromEl]);
+  }, [applyMediaRate, safePlay, seekMediaToOriginal, updateScrubUiFromEl]);
 
   return {
     videoRef,

@@ -102,7 +102,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           className="aspect-video w-full bg-black object-contain"
         />
 
-        {/* Freeze-frame shown while the source swaps original → 720p. */}
+        {/* Freeze-frame shown while the source swaps (card original → SSD copy). */}
         <canvas
           ref={c.swapCanvasRef}
           aria-hidden
@@ -124,7 +124,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
             <div className="flex flex-col items-center gap-2 rounded-md border border-border/60 bg-background/90 px-4 py-3 shadow-lg">
               <Loader2 className="size-5 animate-spin text-accent" />
               <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-                {c.previewNote || "Loading video…"}
+                Loading video…
               </span>
             </div>
           </div>

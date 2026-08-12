@@ -27,6 +27,8 @@ from .core.preview_proxy import (
     preview_status,
     resolve_preview,
 )
+from .core.skim_proxy import cancel_skim, skim_cache_root, skim_status
+from .core.fast_proxy import cancel_fast, fast_cache_root, fast_status
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
 from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
@@ -200,6 +202,55 @@ def create_eager_blueprint() -> Blueprint:
         cancel_preview(Path(raw_path))
         return jsonify({"ok": True})
 
+    @eager.get("/api/eager/fast/status")
+    def eager_fast_status():
+        """Best zero-encode review source (LRV proxy / SSD copy / original)."""
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        try:
+            return jsonify(fast_status(Path(raw_path), start=start))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"status": "error", "error": str(exc), "ready": False}), 200
+
+    @eager.post("/api/eager/fast/cancel")
+    def eager_fast_cancel():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            payload = request.get_json(silent=True) or {}
+            raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        cancel_fast(Path(raw_path))
+        return jsonify({"ok": True})
+
+    @eager.get("/api/eager/skim/status")
+    def eager_skim_status():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        start = request.args.get("start", "0").strip().lower() in {"1", "true", "yes"}
+        try:
+            return jsonify(skim_status(Path(raw_path), start=start))
+        except FileNotFoundError:
+            return jsonify({"error": "File not found"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"status": "error", "error": str(exc), "ready": False}), 200
+
+    @eager.post("/api/eager/skim/cancel")
+    def eager_skim_cancel():
+        raw_path = request.args.get("path", "").strip()
+        if not raw_path:
+            payload = request.get_json(silent=True) or {}
+            raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        cancel_skim(Path(raw_path))
+        return jsonify({"ok": True})
+
     @eager.get("/api/eager/stream")
     def eager_stream():
         raw_path = request.args.get("path", "").strip()
@@ -210,9 +261,13 @@ def create_eager_blueprint() -> Blueprint:
             path = path.resolve(strict=True)
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 404
-        if path.suffix.upper() != ".MP4":
-            return jsonify({"error": "Only MP4 streaming is supported"}), 400
-        mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        # .LRV is GoPro's own low-res proxy — an MP4 container the player can
+        # stream as-is for smooth high-rate skim (no transcode anywhere).
+        if path.suffix.upper() not in {".MP4", ".LRV"}:
+            return jsonify({"error": "Only MP4/LRV streaming is supported"}), 400
+        mime = "video/mp4" if path.suffix.upper() == ".LRV" else (
+            mimetypes.guess_type(path.name)[0] or "video/mp4"
+        )
         # conditional=True enables HTTP Range / 206 responses so the browser can
         # seek large originals without downloading the whole 4–8 GB file.
         response = send_file(
@@ -244,6 +299,27 @@ def create_eager_blueprint() -> Blueprint:
 
     _HLS_KEY_RE = re.compile(r"^[0-9a-f]{20}$")
     _HLS_NAME_RE = re.compile(r"^(index\.m3u8|seg\d{5}\.ts)$")
+    _SKIM_NAME_RE = re.compile(r"^skim_5x\.mp4$")
+    _FAST_NAME_RE = re.compile(r"^(proxy|original)\.mp4$")
+
+    @eager.get("/api/eager/fast/<key>/<name>")
+    def eager_fast_file(key: str, name: str):
+        """Serve SSD-cached review media (LRV proxy or original copy) with Range."""
+        if not _HLS_KEY_RE.fullmatch(key) or not _FAST_NAME_RE.fullmatch(name):
+            return jsonify({"error": "Not found"}), 404
+        path = fast_cache_root() / key / name
+        if not path.is_file():
+            return jsonify({"error": "Not found"}), 404
+        response = send_file(
+            path,
+            mimetype="video/mp4",
+            conditional=True,
+            etag=True,
+            max_age=86400,
+            last_modified=True,
+        )
+        response.headers["Accept-Ranges"] = "bytes"
+        return response
 
     @eager.get("/api/eager/preview/hls/<key>/<name>")
     def eager_preview_hls(key: str, name: str):
@@ -262,6 +338,25 @@ def create_eager_blueprint() -> Blueprint:
         else:
             # Segments are immutable once written (hls_flags temp_file).
             response = send_from_directory(directory, name, mimetype="video/mp2t", max_age=86400)
+        return response
+
+    @eager.get("/api/eager/skim/<key>/<name>")
+    def eager_skim_file(key: str, name: str):
+        """Serve baked 5× skim MP4 with Range support for seeks."""
+        if not _HLS_KEY_RE.fullmatch(key) or not _SKIM_NAME_RE.fullmatch(name):
+            return jsonify({"error": "Not found"}), 404
+        path = skim_cache_root() / key / name
+        if not path.is_file():
+            return jsonify({"error": "Not found"}), 404
+        response = send_file(
+            path,
+            mimetype="video/mp4",
+            conditional=True,
+            etag=True,
+            max_age=86400,
+            last_modified=True,
+        )
+        response.headers["Accept-Ranges"] = "bytes"
         return response
 
     @eager.post("/api/eager/trim")
@@ -543,6 +638,8 @@ def create_eager_blueprint() -> Blueprint:
         try:
             source = Path(raw_path).expanduser().resolve(strict=True)
             cancel_preview(source)
+            cancel_skim(source)
+            cancel_fast(source)
             cancel_snapshots(source)
             move_to_trash(source)
 

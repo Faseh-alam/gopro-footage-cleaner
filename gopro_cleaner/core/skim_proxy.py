@@ -1,9 +1,8 @@
-"""Lightweight 720p preview proxies for reviewing large GoPro files.
+"""Baked 5× overspeed skim proxies for stutter-free high-rate review.
 
-Originals stay untouched for trim/export. Previews are encoded as HLS (1-second
-segments + playlist) for careful 1× review. High-rate skim (2×–5×) uses the
-separate skim_proxy baked overspeed MP4; both share one encode slot so skim
-builds first when both are needed.
+Originals stay untouched for trim/export/share. Skim files are short progressive
+MP4s (duration ≈ T/5) played near 1.0× so UI rates 2×–5× stay smooth. Annotation
+times always stay in original timeline seconds on the client.
 """
 
 from __future__ import annotations
@@ -23,56 +22,48 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 # Bump when encoder settings change so old caches are ignored.
-_PREVIEW_VERSION = "v12-smooth-720p"
+_SKIM_VERSION = "v1-skim5x-720"
+_SKIM_FACTOR = 5
+_SKIM_NAME = "skim_5x.mp4"
 
-_PLAYLIST_NAME = "index.m3u8"
-# Playable as soon as the first segment exists (~1s of video).
-_MIN_PLAYABLE_SEGMENTS = 1
 
-# Optional override: set GOPRO_PREVIEW_DISABLED=1 to force originals only.
-def _previews_disabled() -> bool:
-    return os.environ.get("GOPRO_PREVIEW_DISABLED", "").strip().lower() in {"1", "true", "yes"}
+def _skims_disabled() -> bool:
+    return os.environ.get("GOPRO_SKIM_DISABLED", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _cache_dir() -> Path:
-    path = Path.home() / ".cache" / "gopro-cleaner" / "previews"
+    path = Path.home() / ".cache" / "gopro-cleaner" / "skims"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def preview_cache_root() -> Path:
-    """Public accessor for HTTP routes serving HLS assets."""
+def skim_cache_root() -> Path:
+    """Public accessor for HTTP routes serving skim assets."""
     return _cache_dir()
+
+
+def skim_factor() -> int:
+    return _SKIM_FACTOR
 
 
 def _cache_key(source: Path) -> str:
     stat = source.stat()
     digest = hashlib.sha256(
-        f"{_PREVIEW_VERSION}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
+        f"{_SKIM_VERSION}:{source.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode()
     )
     return digest.hexdigest()[:20]
 
 
-def _preview_dir(source: Path) -> Path:
+def _skim_dir(source: Path) -> Path:
     return _cache_dir() / _cache_key(source)
 
 
-def _playlist_path(source: Path) -> Path:
-    return _preview_dir(source) / _PLAYLIST_NAME
+def _skim_path(source: Path) -> Path:
+    return _skim_dir(source) / _SKIM_NAME
 
 
-def _hls_url(source: Path) -> str:
-    return f"/api/eager/preview/hls/{_cache_key(source)}/{_PLAYLIST_NAME}"
-
-
-def _playlist_state(playlist: Path) -> tuple[int, bool]:
-    """Return (segment_count, finished) for a playlist file (0, False if absent)."""
-    try:
-        text = playlist.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return 0, False
-    segments = sum(1 for line in text.splitlines() if line.strip().endswith(".ts"))
-    return segments, "#EXT-X-ENDLIST" in text
+def _skim_url(source: Path) -> str:
+    return f"/api/eager/skim/{_cache_key(source)}/{_SKIM_NAME}"
 
 
 def _probe_duration_seconds(source: Path, timeout: float = 4.0) -> float:
@@ -102,8 +93,6 @@ def _probe_duration_seconds(source: Path, timeout: float = 4.0) -> float:
 
 
 def _software_threads() -> int:
-    """Half the cores (clamped 2–6): builds fast, and below-normal process
-    priority keeps the UI responsive even when those threads are busy."""
     cores = os.cpu_count() or 4
     return max(2, min(6, cores // 2))
 
@@ -122,26 +111,33 @@ def _software_encoder_args() -> list[str]:
         str(_software_threads()),
     ]
 
+
 _WINDOWS_HW_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "1500k", "-maxrate", "2200k", "-bufsize", "3300k"]),
+    (
+        "nvenc",
+        [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p1",
+            "-tune",
+            "ll",
+            "-b:v",
+            "1500k",
+            "-maxrate",
+            "2200k",
+            "-bufsize",
+            "3300k",
+        ],
+    ),
     ("qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "1500k"]),
     ("amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "1500k"]),
 ]
 
-# Probed once per process: hardware encode is 3–10× faster than x264 on big files.
 _win_encoder_args: list[str] | None = None
 
 
-def _warm_encoder_probe() -> None:
-    """Run HW encoder detection in the background so the first preview isn't delayed."""
-    try:
-        _preview_encoder_args()
-    except Exception:
-        pass
-
-
 def _encoder_works(encoder_args: list[str]) -> bool:
-    """Tiny null-sink test encode — proves the encoder exists AND the GPU accepts it."""
     from .ffmpeg_tools import ffmpeg_bin
 
     command = [
@@ -166,8 +162,16 @@ def _encoder_works(encoder_args: list[str]) -> bool:
         return False
 
 
-def _preview_encoder_args() -> list[str]:
+def _skim_encoder_args() -> list[str]:
     """Prefer hardware encode when available; otherwise fast software x264."""
+    # Reuse the same preference as careful preview when possible.
+    try:
+        from . import preview_proxy as preview
+
+        return list(preview._preview_encoder_args())
+    except Exception:
+        pass
+
     system = platform.system()
     if system == "Darwin":
         return [
@@ -205,36 +209,32 @@ def _hwaccel_input_args() -> list[str]:
     return []
 
 
-def _hls_output_args(dest_dir: Path) -> list[str]:
-    """Write the preview as 1s HLS segments — playable almost immediately."""
-    return [
-        "-f",
-        "hls",
-        "-hls_time",
-        "1",
-        "-hls_list_size",
-        "0",
-        "-hls_playlist_type",
-        "event",
-        # temp_file: segments appear atomically, never half-written to the player.
-        "-hls_flags",
-        "temp_file+independent_segments",
-        "-hls_segment_filename",
-        str(dest_dir / "seg%05d.ts"),
-        str(dest_dir / _PLAYLIST_NAME),
-    ]
+def _vf_filter() -> str:
+    # Speed timeline by 5× then emit 30fps — output duration ≈ T/5 regardless of
+    # source fps. Scale after the drop so we only resize kept frames.
+    return (
+        f"setpts=PTS/{_SKIM_FACTOR},"
+        "fps=30,"
+        "scale='min(720,iw)':-2:flags=fast_bilinear"
+    )
 
 
-def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: list) -> None:
+def _clear_dir_contents(directory: Path) -> None:
+    try:
+        if directory.is_dir():
+            shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _build_skim(source: Path, dest: Path, job_key: str, process_holder: list) -> None:
     from .ffmpeg_tools import ffmpeg_bin
 
-    # Don't block ffmpeg start on a slow probe of multi‑GB GoPro files.
     duration = 0.0
     probe_holder: list[float] = [0.0]
 
     def _probe_async() -> None:
-        # SD cards under encode load make the first probe time out — retry a
-        # few times so the progress % doesn't sit at 0 for the whole build.
         for _ in range(4):
             value = _probe_duration_seconds(source)
             if value > 0:
@@ -242,7 +242,15 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
                 return
             time.sleep(2.0)
 
-    threading.Thread(target=_probe_async, daemon=True, name="preview-probe").start()
+    threading.Thread(target=_probe_async, daemon=True, name="skim-probe").start()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".partial.mp4")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError:
+        pass
 
     command = [
         ffmpeg_bin(),
@@ -250,7 +258,6 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         "-loglevel",
         "error",
         "-y",
-        # Fast open on huge MP4s — skip deep analyze before first frames.
         "-fflags",
         "+genpts+fastseek",
         "-probesize",
@@ -262,32 +269,31 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         str(source),
         "-an",
         "-vf",
-        # Drop frames FIRST, then scale — scaling only the kept frames halves
-        # filter work on 30fps sources. 15fps keeps motion smooth at 1× and
-        # gives ~60 effective fps at 4× playback.
-        "fps=15,scale='min(720,iw)':-2:flags=fast_bilinear",
-        *_preview_encoder_args(),
+        _vf_filter(),
+        *_skim_encoder_args(),
         "-pix_fmt",
         "yuv420p",
-        # 1s GOP to match 1s HLS segments — precise seeks, clean segment cuts.
         "-g",
-        "15",
+        "30",
         "-keyint_min",
-        "15",
+        "30",
         "-sc_threshold",
         "0",
+        "-movflags",
+        "+faststart",
         "-progress",
         "pipe:1",
         "-nostats",
-        *_hls_output_args(dest_dir),
+        str(tmp),
     ]
-    # Below-normal priority so the review UI stays responsive while encoding.
+
     popen_kwargs: dict = {}
     if platform.system() == "Windows":
         popen_kwargs["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
     else:
         popen_kwargs["preexec_fn"] = lambda: os.nice(10)  # noqa: PLW1509
-    stderr_log = dest_dir / "stderr.log"
+
+    stderr_log = dest.parent / "stderr.log"
     stderr_handle = open(stderr_log, "w", encoding="utf-8", errors="replace")
     process = subprocess.Popen(
         command,
@@ -309,16 +315,17 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
             if not job or job.get("status") != "running":
                 process.terminate()
                 break
-        # NOTE: ffmpeg's out_time_ms is misnamed — the value is MICROseconds
-        # (same as out_time_us). Treating it as ms made progress hit the 99%
-        # cap ~1000× early, so the UI sat on "Finalizing" for the whole build.
+        # ffmpeg out_time_ms is actually microseconds (same as out_time_us).
         if line.startswith(("out_time_us=", "out_time_ms=")):
             duration = probe_holder[0] or duration
             if duration <= 0:
                 continue
             try:
                 out_us = int(line.split("=", 1)[1].strip() or 0)
-                pct = min(99, int((out_us / 1_000_000.0) / duration * 100))
+                # Progress clock is on the shortened output timeline (≈ T/5).
+                out_sec = out_us / 1_000_000.0
+                target = duration / float(_SKIM_FACTOR)
+                pct = min(99, int((out_sec / target) * 100)) if target > 0 else 0
             except ValueError:
                 continue
             with _lock:
@@ -340,11 +347,10 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
             stderr_log.unlink()
         except OSError:
             pass
+
     if code != 0:
-        # Auto-fallback: if the HW encoder failed mid-run, retry once with libx264.
         joined = " ".join(command)
         if any(hw in joined for hw in ("nvenc", "qsv", "amf")):
-            _clear_dir_contents(dest_dir)
             soft = [
                 ffmpeg_bin(),
                 "-hide_banner",
@@ -355,36 +361,38 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
                 str(source),
                 "-an",
                 "-vf",
-                "fps=15,scale='min(720,iw)':-2:flags=fast_bilinear",
+                _vf_filter(),
                 *_software_encoder_args(),
                 "-pix_fmt",
                 "yuv420p",
                 "-g",
-                "15",
+                "30",
                 "-keyint_min",
-                "15",
+                "30",
                 "-sc_threshold",
                 "0",
-                *_hls_output_args(dest_dir),
+                "-movflags",
+                "+faststart",
+                str(tmp),
             ]
             retry = subprocess.run(soft, capture_output=True, text=True, check=False)
-            segments, finished = _playlist_state(dest_dir / _PLAYLIST_NAME)
-            if retry.returncode == 0 and segments > 0 and finished:
+            if retry.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                tmp.replace(dest)
                 return
             err = (retry.stderr or err or "").strip()
-        raise RuntimeError(err.strip() or "ffmpeg failed while building preview")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(err.strip() or "ffmpeg failed while building 5× skim")
+
+    if not tmp.is_file() or tmp.stat().st_size <= 0:
+        raise RuntimeError("ffmpeg finished but skim file is missing or empty")
+    tmp.replace(dest)
 
 
-def _clear_dir_contents(directory: Path) -> None:
-    try:
-        if directory.is_dir():
-            shutil.rmtree(directory, ignore_errors=True)
-        directory.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-
-def cancel_preview(source: Path) -> None:
+def cancel_skim(source: Path) -> None:
     source = source.expanduser().resolve()
     key = str(source)
     with _lock:
@@ -403,53 +411,28 @@ def cancel_preview(source: Path) -> None:
                 except OSError:
                     pass
         _jobs.pop(key, None)
-    # Drop the half-built segment folder so a later start rebuilds cleanly.
     try:
-        playlist = _playlist_path(source)
-        if not _playlist_state(playlist)[1]:
-            shutil.rmtree(playlist.parent, ignore_errors=True)
+        dest = _skim_path(source)
+        if not dest.is_file():
+            shutil.rmtree(dest.parent, ignore_errors=True)
     except OSError:
         pass
 
 
-def cancel_other_previews(keep: Path | None = None) -> int:
-    """Cancel every preview encode except ``keep`` (the video currently watched).
-
-    Returns how many jobs were cancelled. Used so resume/reload always gives the
-    encode slot to the active clip instead of finishing an older/first-file job.
-    """
-    keep_key = ""
-    if keep is not None:
-        try:
-            keep_key = str(keep.expanduser().resolve())
-        except OSError:
-            keep_key = str(keep)
-    with _lock:
-        keys = [k for k in list(_jobs.keys()) if k != keep_key]
-    cancelled = 0
-    for key in keys:
-        try:
-            cancel_preview(Path(key))
-            cancelled += 1
-        except OSError:
-            continue
-    return cancelled
-
-
 def _public_job(job: dict, extra: dict | None = None) -> dict:
-    """Only JSON-safe fields — the raw job dict holds Thread/Popen objects."""
     out = {
         key: job.get(key)
         for key in (
             "status",
             "progress",
             "path",
-            "hls",
-            "playable",
+            "url",
+            "ready",
             "cached",
             "error",
             "message",
             "source_bytes",
+            "factor",
         )
         if job.get(key) is not None
     }
@@ -458,145 +441,137 @@ def _public_job(job: dict, extra: dict | None = None) -> dict:
     return out
 
 
-def preview_status(source: Path, *, start: bool = False, preempt: bool = False) -> dict:
+def skim_status(source: Path, *, start: bool = False) -> dict:
     source = source.expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
 
     key = str(source)
     size = source.stat().st_size
-    playlist = _playlist_path(source)
-    hls_url = _hls_url(source)
-    segments, finished = _playlist_state(playlist)
-    if finished and segments > 0:
+    dest = _skim_path(source)
+    url = _skim_url(source)
+
+    if dest.is_file() and dest.stat().st_size > 0:
         return {
             "status": "ready",
-            "path": str(playlist),
-            "hls": hls_url,
-            "playable": True,
+            "path": str(dest),
+            "url": url,
+            "ready": True,
             "cached": True,
             "progress": 100,
+            "factor": _SKIM_FACTOR,
             "source_bytes": size,
+            "message": "5× skim ready",
         }
 
-    if _previews_disabled():
+    if _skims_disabled():
         return {
             "status": "skipped",
             "reason": "disabled",
-            "message": "Preview proxies disabled (GOPRO_PREVIEW_DISABLED)",
+            "message": "Skim proxies disabled (GOPRO_SKIM_DISABLED)",
+            "factor": _SKIM_FACTOR,
             "source_bytes": size,
+            "ready": False,
         }
 
     with _lock:
         job = _jobs.get(key)
         if job and job.get("status") == "running":
-            # Already encoding this file — optionally clear others so it keeps the slot.
-            if preempt:
-                pass  # fall through after releasing lock to cancel others
-            else:
-                return _public_job(
-                    job,
-                    {
-                        "source_bytes": size,
-                        "hls": hls_url,
-                        "segments": segments,
-                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
-                    },
-                )
+            return _public_job(
+                job,
+                {
+                    "source_bytes": size,
+                    "url": url,
+                    "factor": _SKIM_FACTOR,
+                    "ready": False,
+                },
+            )
         if job and job.get("status") in {"error", "cancelled"}:
             _jobs.pop(key, None)
 
-    # Watched clip wins: stop leftover encodes (often video #1 after reload).
-    if start and preempt:
-        cancel_other_previews(source)
-        with _lock:
-            job = _jobs.get(key)
-            if job and job.get("status") == "running":
-                return _public_job(
-                    job,
-                    {
-                        "source_bytes": size,
-                        "hls": hls_url,
-                        "segments": segments,
-                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
-                    },
-                )
-
     if not start:
-        return {"status": "idle", "progress": 0, "source_bytes": size}
+        return {
+            "status": "missing",
+            "progress": 0,
+            "factor": _SKIM_FACTOR,
+            "source_bytes": size,
+            "ready": False,
+            "message": "5× skim not built yet",
+        }
+
+    # Prefer skim over careful HLS — cancel a competing preview for this source
+    # so the shared encode slot frees for the stutter-critical path.
+    try:
+        from .preview_proxy import cancel_preview
+
+        cancel_preview(source)
+    except Exception:
+        pass
 
     with _lock:
-        existing = _jobs.get(key)
-        if existing and existing.get("status") == "running":
-            return _public_job(
-                existing,
-                {
-                    "source_bytes": size,
-                    "hls": hls_url,
-                    "segments": segments,
-                    "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
-                },
-            )
         _jobs[key] = {
             "status": "running",
             "progress": 0,
             "process": None,
             "source_bytes": size,
-            "message": "Building 720p preview for smooth review…",
-            "preempt": bool(preempt),
+            "factor": _SKIM_FACTOR,
+            "url": url,
+            "ready": False,
+            "message": "Building 5× skim…",
         }
 
     def worker() -> None:
-        dest_dir = playlist.parent
         process_holder: list = []
-        # Serialize encodes with skim (shared slot) — two ffmpeg jobs melt laptops.
-        # Only show "queued" when another encode actually holds the slot.
         acquired = encode_slots.acquire(blocking=False)
         if not acquired:
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":
+                    _jobs[key]["status"] = "queued"
                     _jobs[key]["message"] = "Queued — waiting for the current encode to finish…"
             acquired = encode_slots.acquire(timeout=3600)
         if not acquired:
             with _lock:
-                if _jobs.get(key, {}).get("status") == "running":
+                if _jobs.get(key, {}).get("status") in {"running", "queued"}:
                     _jobs[key] = {
                         "status": "error",
-                        "error": "Preview encode timed out waiting for a free slot",
+                        "error": "Skim encode timed out waiting for a free slot",
                         "progress": 0,
                         "process": None,
                         "source_bytes": size,
+                        "factor": _SKIM_FACTOR,
+                        "ready": False,
                     }
             return
         try:
             with _lock:
-                if _jobs.get(key, {}).get("status") != "running":
+                job = _jobs.get(key)
+                if not job or job.get("status") not in {"running", "queued"}:
                     return
-                _jobs[key]["message"] = "Encoding 720p preview…"
-            # Interrupted/stale builds leave a playlist without ENDLIST — rebuild.
-            _clear_dir_contents(dest_dir)
-            _build_preview(source, dest_dir, key, process_holder)
+                _jobs[key]["status"] = "running"
+                _jobs[key]["message"] = "Encoding 5× skim…"
+            _clear_dir_contents(dest.parent)
+            _build_skim(source, dest, key, process_holder)
             with _lock:
                 if _jobs.get(key, {}).get("status") != "running":
-                    shutil.rmtree(dest_dir, ignore_errors=True)
+                    shutil.rmtree(dest.parent, ignore_errors=True)
                     return
-            seg_count, done = _playlist_state(playlist)
-            if seg_count <= 0 or not done:
-                raise RuntimeError("ffmpeg finished but the preview playlist is incomplete")
+            if not dest.is_file() or dest.stat().st_size <= 0:
+                raise RuntimeError("ffmpeg finished but skim file is missing")
             with _lock:
                 _jobs[key] = {
                     "status": "ready",
-                    "path": str(playlist),
-                    "hls": hls_url,
-                    "playable": True,
+                    "path": str(dest),
+                    "url": url,
+                    "ready": True,
                     "cached": False,
                     "progress": 100,
                     "process": None,
                     "source_bytes": size,
-                    "message": "Preview ready",
+                    "factor": _SKIM_FACTOR,
+                    "message": "5× skim ready",
                 }
         except Exception as exc:  # noqa: BLE001
-            shutil.rmtree(dest_dir, ignore_errors=True)
+            shutil.rmtree(dest.parent, ignore_errors=True)
             with _lock:
                 if _jobs.get(key, {}).get("status") == "running":
                     _jobs[key] = {
@@ -605,25 +580,35 @@ def preview_status(source: Path, *, start: bool = False, preempt: bool = False) 
                         "progress": 0,
                         "process": None,
                         "source_bytes": size,
+                        "factor": _SKIM_FACTOR,
+                        "ready": False,
                     }
         finally:
             encode_slots.release()
 
-    thread = threading.Thread(target=worker, daemon=True, name=f"preview-{source.name}")
+    thread = threading.Thread(target=worker, daemon=True, name=f"skim-{source.name}")
     thread.start()
     with _lock:
         if key in _jobs:
             _jobs[key]["thread"] = thread
-    return {"status": "running", "progress": 0, "source_bytes": size, "message": "Building 720p preview…"}
+    return {
+        "status": "running",
+        "progress": 0,
+        "factor": _SKIM_FACTOR,
+        "source_bytes": size,
+        "url": url,
+        "ready": False,
+        "message": "Building 5× skim…",
+    }
 
 
-def resolve_preview(source: Path) -> Path:
-    """Path to the finished preview playlist (raises while still building)."""
-    status = preview_status(source, start=False)
+def ensure_skim_5x(source: Path) -> dict:
+    """Enqueue a 5× skim encode (single-flight)."""
+    return skim_status(source, start=True)
+
+
+def resolve_skim(source: Path) -> Path:
+    status = skim_status(source, start=False)
     if status.get("status") == "ready":
         return Path(status["path"])
-    raise RuntimeError(status.get("error") or "Preview not ready")
-
-
-# Detect NVENC/QSV/AMF once at import so the first review open isn't paying that cost.
-threading.Thread(target=_warm_encoder_probe, daemon=True, name="preview-encoder-warm").start()
+    raise RuntimeError(status.get("error") or "Skim not ready")
