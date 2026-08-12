@@ -1,0 +1,15 @@
+{
+  "name": "GoPro Footage Cleaner",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "gopro-cleaner",
+      "command": "cd /workspace && PYTHONPATH=/workspace GOPRO_CLEANER_HOST=127.0.0.1 GOPRO_CLEANER_PORT=8765 /workspace/.venv/bin/python -m gopro_cleaner"
+    },
+    {
+      "name": "sd-offloader",
+      "command": "cd /workspace/sd_offloader && PYTHONPATH=/workspace/sd_offloader SD_OFFLOADER_HOST=127.0.0.1 SD_OFFLOADER_PORT=8877 SD_OFFLOADER_OPEN_BROWSER=0 /workspace/.venv/bin/python -m offloader"
+    }
+  ],
+  "ports": [8765, 8877]
+}
