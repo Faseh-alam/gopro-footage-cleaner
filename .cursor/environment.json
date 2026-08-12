@@ -11,5 +11,8 @@
       "command": "cd /workspace/sd_offloader && PYTHONPATH=/workspace/sd_offloader SD_OFFLOADER_HOST=127.0.0.1 SD_OFFLOADER_PORT=8877 SD_OFFLOADER_OPEN_BROWSER=0 /workspace/.venv/bin/python -m offloader"
     }
   ],
-  "ports": [8765, 8877]
+  "ports": [
+    { "name": "gopro-cleaner", "port": 8765 },
+    { "name": "sd-offloader", "port": 8877 }
+  ]
 }
