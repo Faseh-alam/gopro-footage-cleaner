@@ -1,0 +1,23 @@
+{
+  "name": "GoPro Footage Cleaner (redesign)",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "gopro-backend",
+      "command": "cd /workspace && PYTHONPATH=/workspace GOPRO_LITE_MODE=1 GOPRO_CLEANER_HOST=127.0.0.1 GOPRO_CLEANER_PORT=8765 /workspace/.venv/bin/python -m gopro_cleaner"
+    },
+    {
+      "name": "gopro-frontend",
+      "command": "export NVM_DIR=\"${HOME}/.nvm\"; [ -s \"${NVM_DIR}/nvm.sh\" ] && . \"${NVM_DIR}/nvm.sh\"; cd /workspace/gopro_cleaner/frontend && npm run dev"
+    },
+    {
+      "name": "sd-offloader",
+      "command": "cd /workspace/sd_offloader && PYTHONPATH=/workspace/sd_offloader SD_OFFLOADER_HOST=127.0.0.1 SD_OFFLOADER_PORT=8877 SD_OFFLOADER_OPEN_BROWSER=0 /workspace/.venv/bin/python -m offloader"
+    }
+  ],
+  "ports": [
+    { "name": "gopro-backend", "port": 8765 },
+    { "name": "gopro-frontend-vite", "port": 8080 },
+    { "name": "sd-offloader", "port": 8877 }
+  ]
+}
