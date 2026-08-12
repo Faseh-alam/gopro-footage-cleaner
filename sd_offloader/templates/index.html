@@ -12,7 +12,11 @@
         <div>
           <p class="eyebrow">Server ingest</p>
           <h1>SD Card Offloader</h1>
-          <p class="hint">Pick an existing batch on the SSDs or create a new one · SD→SSD parallel · AWS via s5cmd (preferred) or AWS CLI in CMD</p>
+          <p class="hint">
+            Detects GoPro cards by <strong>DCIM/xxxGOPRO + MP4 + JSON</strong> (any volume name) ·
+            up to <strong>3 cards in parallel</strong> · copy to dual SSDs ·
+            <strong>SSD + AWS</strong> after each card · target ~40×120&nbsp;GB / day
+          </p>
         </div>
         <div class="header-meta">
           <span id="aws-cli-status" class="pill">Uploader…</span>
@@ -44,8 +48,17 @@
           <label>
             Mode
             <select id="mode">
+              <option value="ssd_and_aws">SSD + AWS (auto upload after each card · recommended)</option>
               <option value="ssd_only">SSD only (upload to AWS later)</option>
-              <option value="ssd_and_aws">SSD + AWS (s5cmd in CMD · auto-retry · live UI)</option>
+            </select>
+          </label>
+          <label>
+            Max parallel SD cards
+            <select id="max-parallel">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3" selected>3 (recommended)</option>
+              <option value="4">4</option>
             </select>
           </label>
           <label class="full">
@@ -56,12 +69,13 @@
         <p id="batch-hint" class="hint">Existing batches appear after you pick SSD 1 / SSD 2.</p>
         <div class="row actions">
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
-          <button id="start-session" type="button" class="primary">Start SD → SSD for this batch</button>
-          <button id="stop-session" type="button" class="secondary">Stop watching</button>
+          <button id="start-session" type="button" class="primary">Start auto offload (SD → SSD → AWS)</button>
+          <button id="stop-session" type="button" class="secondary">Stop hotplug watching</button>
           <button id="upload-batch" type="button" class="primary" title="Opens CMD with s5cmd (or aws) sync — auto-retries; resumes files already on S3">Upload this batch to AWS (CMD)</button>
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
+        <div id="capacity-panel" class="capacity"></div>
       </section>
 
       <section class="panel">
@@ -69,7 +83,15 @@
           <h2>SD → SSD (cards)</h2>
           <span id="cards-summary" class="hint">No cards yet</span>
         </div>
-        <p class="hint">Live size, speed, and ETA for each card while it copies. Reopening this page keeps showing transfers while the server is running.</p>
+        <p class="hint">
+          After <strong>Start auto offload</strong>, keep the session running — new SD cards are
+          detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
+          and enter <strong>SD → SSD → AWS</strong> without starting again.
+          Plug up to your parallel limit at once; extras wait for a free slot.
+          Failures stay on screen with <strong>Retry</strong> (resumes; already-copied files are skipped).
+          Mid-copy removal marks the card interrupted (Retry after re-insert).
+          <strong>Cancel</strong> stops without wiping the card.
+        </p>
         <div id="cards" class="cards"></div>
       </section>
 
@@ -77,10 +99,10 @@
         <div>
           <h2>AWS uploads (batches)</h2>
           <p class="hint">
-            Prefers <strong>s5cmd sync</strong> (default workers, usually faster).
-            If that fails, retries with <strong>--numworkers 20</strong>. Falls back to aws CLI.
-            After upload, sizes are checked (local vs S3). Use <strong>Restart</strong> if needed,
-            then <strong>Delete local</strong> only when verified.
+            In <strong>SSD + AWS</strong> mode, each finished card triggers a batch sync to S3
+            (coalesced if one upload is already running). Prefers <strong>s5cmd</strong> with auto-retry.
+            Use <strong>Retry</strong> on errors (resume-safe), <strong>Verify sizes</strong>, then
+            <strong>Delete local</strong> only when verified.
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>

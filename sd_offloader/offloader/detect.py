@@ -1,4 +1,11 @@
-"""Volume detection for removable SSDs and GoPro SD cards."""
+"""Volume detection for removable SSDs and GoPro SD cards.
+
+SD cards are identified by file structure only:
+
+    DCIM / <3-digit>GOPRO / *.MP4 + matching *.JSON (or *.segments.json)
+
+Volume label / card name (C001, NO NAME, UNTITLED, …) is never required.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +15,6 @@ import string
 import threading
 from pathlib import Path
 
-CARD_LABEL_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
 GOPRO_DIR_RE = re.compile(r"^\d{3}GOPRO$", re.IGNORECASE)
 SKIP_VOLUME_NAMES = {
     "Macintosh HD",
@@ -65,9 +71,10 @@ def _windows_drives() -> list[dict]:
                 return None
             usage = shutil.disk_usage(f"{letter}:\\")
             label = _windows_volume_label(letter) or letter
-            gopro = _find_gopro_root(root)
-            is_card = _looks_like_sd_card(root, label) if gopro else False
-            card_id = _card_id_for(root, label)
+            serial = _windows_volume_serial(letter)
+            gopro_dirs = find_gopro_dirs(root)
+            is_card = looks_like_gopro_sd(root)
+            card_id = card_tracking_id(root, serial=serial, label=label)
             path = f"{letter}:\\"
             try:
                 path = str(root.resolve())
@@ -81,7 +88,9 @@ def _windows_drives() -> list[dict]:
                 "drive_type": "removable" if drive_type == 2 else "fixed",
                 "is_card_candidate": bool(is_card),
                 "card_id": card_id,
-                "gopro_root": str(gopro) if gopro else None,
+                "gopro_root": str(gopro_dirs[0]) if gopro_dirs else None,
+                "gopro_dirs": [str(p) for p in gopro_dirs],
+                "volume_serial": serial,
             }
 
         row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
@@ -107,6 +116,26 @@ def _windows_volume_label(letter: str) -> str:
     return buf.value.strip() if result else ""
 
 
+def _windows_volume_serial(letter: str) -> str:
+    """Stable media fingerprint so a new card on the same letter is detected."""
+    import ctypes
+
+    serial = ctypes.c_uint32(0)
+    result = ctypes.windll.kernel32.GetVolumeInformationW(
+        f"{letter}:\\",
+        None,
+        0,
+        ctypes.byref(serial),
+        None,
+        None,
+        None,
+        0,
+    )
+    if not result:
+        return ""
+    return f"{int(serial.value):08X}"
+
+
 def _mac_volumes() -> list[dict]:
     import shutil
 
@@ -124,16 +153,19 @@ def _mac_volumes() -> list[dict]:
             usage = shutil.disk_usage(path)
             resolved = path.resolve()
             label = path.name
-            gopro = _find_gopro_root(resolved)
+            serial = str(resolved)
+            gopro_dirs = find_gopro_dirs(resolved)
             return {
                 "path": str(resolved),
                 "label": label,
                 "free_bytes": usage.free,
                 "total_bytes": usage.total,
                 "drive_type": "removable",
-                "is_card_candidate": _looks_like_sd_card(resolved, label) if gopro else False,
-                "card_id": _card_id_for(resolved, label),
-                "gopro_root": str(gopro) if gopro else None,
+                "is_card_candidate": looks_like_gopro_sd(resolved),
+                "card_id": card_tracking_id(resolved, serial=serial, label=label),
+                "gopro_root": str(gopro_dirs[0]) if gopro_dirs else None,
+                "gopro_dirs": [str(p) for p in gopro_dirs],
+                "volume_serial": serial,
             }
 
         row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
@@ -164,16 +196,19 @@ def list_volumes() -> list[dict]:
                 def probe(path: Path = entry) -> dict | None:
                     usage = shutil.disk_usage(path)
                     label = path.name
-                    gopro = _find_gopro_root(path)
+                    serial = str(path)
+                    gopro_dirs = find_gopro_dirs(path)
                     return {
                         "path": str(path),
                         "label": label,
                         "free_bytes": usage.free,
                         "total_bytes": usage.total,
                         "drive_type": "removable",
-                        "is_card_candidate": _looks_like_sd_card(path, label) if gopro else False,
-                        "card_id": _card_id_for(path, label),
-                        "gopro_root": str(gopro) if gopro else None,
+                        "is_card_candidate": looks_like_gopro_sd(path),
+                        "card_id": card_tracking_id(path, serial=serial, label=label),
+                        "gopro_root": str(gopro_dirs[0]) if gopro_dirs else None,
+                        "gopro_dirs": [str(p) for p in gopro_dirs],
+                        "volume_serial": serial,
                     }
 
                 row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
@@ -182,68 +217,120 @@ def list_volumes() -> list[dict]:
     return volumes
 
 
-def _find_gopro_root(root: Path) -> Path | None:
+def find_gopro_dirs(root: Path) -> list[Path]:
+    """Return every ``DCIM/<3-digit>GOPRO`` folder (e.g. 100GOPRO, 999GOPRO)."""
     dcim = root / "DCIM"
     if not dcim.is_dir():
-        return None
+        return []
     candidates: list[Path] = []
     try:
         for child in dcim.iterdir():
             if child.is_dir() and GOPRO_DIR_RE.match(child.name):
                 candidates.append(child)
     except OSError:
+        return []
+    return sorted(candidates, key=lambda p: p.name.upper())
+
+
+def _find_gopro_root(root: Path) -> Path | None:
+    """First GoPro folder with media, else first ###GOPRO dir (compat helper)."""
+    dirs = find_gopro_dirs(root)
+    if not dirs:
         return None
-    if not candidates:
-        return None
-    preferred = [p for p in candidates if p.name.upper() == "100GOPRO"]
-    return preferred[0] if preferred else sorted(candidates, key=lambda p: p.name)[0]
+    for folder in dirs:
+        if _gopro_dir_has_media(folder):
+            return folder
+    return dirs[0]
 
 
-def _card_id_for(root: Path, label: str) -> str | None:
-    """Prefer C####; else a stable display id from volume label / drive letter.
+def is_json_sidecar(name: str) -> bool:
+    """True for ``*.segments.json`` or plain ``*.json`` (e.g. GH010001.JSON)."""
+    lower = name.lower()
+    return lower.endswith(".segments.json") or lower.endswith(".json")
 
-    New cards often have blank or random names — detection is by
-    ``DCIM/###GOPRO`` + MP4 content, not by the volume label.
-    """
-    if CARD_LABEL_RE.match(label.strip()):
-        return label.strip().upper()
+
+def _sidecar_paths_for_mp4(mp4: Path) -> list[Path]:
+    """Possible sidecar paths for a video (Cleaner + plain .JSON)."""
+    return [
+        mp4.with_name(f"{mp4.stem}.segments.json"),
+        mp4.with_name(f"{mp4.stem}.JSON"),
+        mp4.with_name(f"{mp4.stem}.json"),
+    ]
+
+
+def _gopro_dir_has_media(gopro: Path) -> bool:
+    """True when folder has ≥1 MP4 and a relevant JSON sidecar (or legacy task MP4s)."""
     try:
-        for child in root.iterdir():
-            if child.is_dir() and CARD_LABEL_RE.match(child.name):
-                return child.name.upper()
+        entries = list(gopro.iterdir())
     except OSError:
-        pass
-    cleaned = re.sub(r"\s+", " ", (label or "").strip())
-    if cleaned and cleaned.upper() not in {"", "NO NAME", "UNTITLED", "REMOVABLE DISK"}:
-        safe = re.sub(r'[<>:"/\\|?*]', "_", cleaned).strip(" ._")
-        if safe:
-            return safe[:48]
+        return False
+
+    mp4s = [
+        e
+        for e in entries
+        if e.is_file() and e.suffix.upper() == ".MP4" and not e.name.startswith("._")
+    ]
+    jsons = [e for e in entries if e.is_file() and is_json_sidecar(e.name)]
+
+    # Primary layout: MP4 + matching .JSON / .segments.json
+    for mp4 in mp4s:
+        for side in _sidecar_paths_for_mp4(mp4):
+            if side.is_file():
+                return True
+    if mp4s and jsons:
+        return True
+
+    # Legacy pre-trimmed task folders under ###GOPRO
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        try:
+            children = list(entry.iterdir())
+        except OSError:
+            continue
+        has_mp4 = any(
+            c.is_file() and c.suffix.upper() == ".MP4" and not c.name.startswith("._")
+            for c in children
+        )
+        if has_mp4:
+            return True
+    return False
+
+
+def looks_like_gopro_sd(root: Path) -> bool:
+    """Valid GoPro SD: DCIM → xxxGOPRO → MP4 + JSON. Name/label ignored."""
+    for folder in find_gopro_dirs(root):
+        if _gopro_dir_has_media(folder):
+            return True
+    return False
+
+
+def card_tracking_id(root: Path, *, serial: str = "", label: str = "") -> str:
+    """Stable UI/job id — never requires C####. Prefer volume serial."""
+    serial = (serial or "").strip().upper()
+    if serial:
+        # Short, readable, unique enough across readers.
+        return f"SD-{serial[-8:]}" if len(serial) >= 4 else f"SD-{serial}"
+
     drive = root.drive.rstrip(":\\/") if root.drive else ""
     if drive:
-        return f"CARD-{drive.upper()}"
+        return f"SD-{drive.upper()}"
+
     name = root.name.strip()
-    return f"CARD-{name[:32]}" if name else None
+    if name:
+        safe = re.sub(r'[<>:"/\\|?*\s]+', "-", name).strip("-_")
+        if safe:
+            return f"SD-{safe[:24].upper()}"
+    return "SD-CARD"
 
 
-def _looks_like_sd_card(root: Path, label: str) -> bool:
-    """Any volume with DCIM/###GOPRO containing MP4s — name does not matter."""
-    gopro = _find_gopro_root(root)
-    if gopro is None:
-        return False
-    try:
-        for entry in gopro.iterdir():
-            # Raw labeled MP4s directly in DCIM/###GOPRO (label-only workflow)
-            if entry.is_file() and entry.suffix.upper() == ".MP4":
-                return True
-            if not entry.is_dir():
-                continue
-            # Legacy pre-trimmed task folders
-            for item in entry.iterdir():
-                if item.is_file() and item.suffix.upper() == ".MP4":
-                    return True
-    except OSError:
-        return False
-    return False
+# Back-compat aliases used by inventory / eject / older callers
+def _looks_like_sd_card(root: Path, label: str = "") -> bool:  # noqa: ARG001
+    return looks_like_gopro_sd(root)
+
+
+def _card_id_for(root: Path, label: str, serial: str = "") -> str | None:
+    return card_tracking_id(root, serial=serial, label=label)
 
 
 def find_card_volumes(*, exclude_paths: set[str] | None = None) -> list[dict]:

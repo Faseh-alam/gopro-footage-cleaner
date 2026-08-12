@@ -19,6 +19,8 @@ const el = {
   log: document.getElementById("log"),
   awsCliStatus: document.getElementById("aws-cli-status"),
   appVersion: document.getElementById("app-version"),
+  maxParallel: document.getElementById("max-parallel"),
+  capacityPanel: document.getElementById("capacity-panel"),
 };
 
 async function api(url, options = {}) {
@@ -155,30 +157,73 @@ async function refreshVolumes() {
   return data.volumes || [];
 }
 
+function renderCapacity(cap, parallel) {
+  if (!el.capacityPanel) return;
+  if (!cap) {
+    el.capacityPanel.innerHTML = "";
+    return;
+  }
+  const slots = parallel
+    ? `${parallel.active || 0} active · ${parallel.waiting || 0} waiting · max ${parallel.max || 3}`
+    : `max ${cap.parallel_cards || 3} parallel`;
+  el.capacityPanel.innerHTML = `
+    <div class="capacity-title">40-card day plan (~${cap.total_tb} TB @ ${cap.gb_per_card} GB/card)</div>
+    <div class="capacity-grid">
+      <div><span class="k">SD→SSD wall</span><span class="v">~${cap.copy_hours_est} h</span><span class="s">${slots}</span></div>
+      <div><span class="k">AWS @ 1 GB/s</span><span class="v">~${cap.upload_hours_at_1_GBps} h</span><span class="s">gigabyte/s pipe</span></div>
+      <div><span class="k">AWS @ 1 Gbps</span><span class="v">~${cap.upload_hours_at_1_Gbps} h</span><span class="s">gigabit ≈ 125 MB/s</span></div>
+    </div>
+    <p class="hint">${escapeHtml(cap.note || "")}</p>
+  `;
+}
+
 function renderCards(cards) {
   el.cards.innerHTML = "";
   if (!cards.length) {
     el.cards.innerHTML =
-      '<div class="hint">Waiting for Cxxxx cards with labeled MP4s under DCIM/100GOPRO…</div>';
+      '<div class="hint">Waiting for GoPro SD cards with DCIM/xxxGOPRO + MP4 + JSON… Name/label does not matter. Plug cards anytime while hotplug is armed.</div>';
     el.cardsSummary.textContent = "No cards yet";
     return;
   }
   const active = cards.filter((c) =>
-    ["copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"].includes(
+    ["copying", "verifying", "wiping", "ejecting", "uploading", "queued", "waiting", "scanning", "cancelling"].includes(
       c.status,
     ),
   ).length;
   const done = cards.filter((c) => c.status === "completed").length;
-  el.cardsSummary.textContent = `${cards.length} seen · ${active} active · ${done} done`;
+  const removed = cards.filter((c) => c.status === "removed").length;
+  const failed = cards.filter((c) => ["error", "interrupted", "cancelled"].includes(c.status)).length;
+  el.cardsSummary.textContent = `${cards.length} seen · ${active} active · ${done} done${
+    removed ? ` · ${removed} removed` : ""
+  }${failed ? ` · ${failed} need Retry` : ""}`;
 
   for (const card of cards) {
     const pct = card.bytes_total ? Math.min(100, (card.bytes_done / card.bytes_total) * 100) : 0;
+    const canCancel = [
+      "queued",
+      "waiting",
+      "copying",
+      "verifying",
+      "wiping",
+      "ejecting",
+      "uploading",
+      "scanning",
+      "cancelling",
+    ].includes(card.status);
+    const canRetry = ["error", "interrupted", "cancelled"].includes(card.status);
+    const phaseLabel =
+      card.status === "removed"
+        ? "removed — insert next"
+        : card.status === "interrupted"
+          ? "interrupted — Retry"
+          : card.status || "";
     const div = document.createElement("div");
-    div.className = "card";
+    div.className =
+      "card" + (canRetry ? " card-error" : "") + (card.status === "removed" ? " card-removed" : "");
     div.innerHTML = `
       <div class="card-top">
         <span class="card-id">${card.card_id || "?"}</span>
-        <span class="phase ${card.status || ""}">${card.status || ""}</span>
+        <span class="phase ${card.status || ""}">${phaseLabel}</span>
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="meta">
@@ -188,11 +233,34 @@ function renderCards(cards) {
         <span>${card.files_done || 0}/${card.files_total || 0} files</span>
         <span>${pct.toFixed(0)}%</span>
       </div>
-      <div class="message">${card.message || ""}</div>
-      ${card.dest ? `<div class="hint">SSD dest: ${card.dest}</div>` : ""}
+      <div class="message">${escapeHtml(card.message || "")}</div>
+      ${card.dest ? `<div class="hint">SSD dest: ${escapeHtml(card.dest)}</div>` : ""}
+      <div class="job-actions">
+        ${
+          canRetry
+            ? `<button type="button" class="primary card-retry" data-card="${escapeHtml(
+                card.card_id || "",
+              )}">Retry</button>`
+            : ""
+        }
+        ${
+          canCancel
+            ? `<button type="button" class="danger card-cancel" data-card="${escapeHtml(
+                card.card_id || "",
+              )}">Cancel</button>`
+            : ""
+        }
+      </div>
     `;
     el.cards.appendChild(div);
   }
+
+  el.cards.querySelectorAll(".card-cancel").forEach((btn) => {
+    btn.addEventListener("click", () => cancelCardJob(btn.getAttribute("data-card")));
+  });
+  el.cards.querySelectorAll(".card-retry").forEach((btn) => {
+    btn.addEventListener("click", () => retryCardJob(btn.getAttribute("data-card")));
+  });
 }
 
 function renderAwsJobs(jobs) {
@@ -213,14 +281,29 @@ function renderAwsJobs(jobs) {
           ? "verified"
           : job.status === "mismatch"
             ? "size mismatch"
-            : job.status || "";
+            : job.status === "cancelled"
+              ? "cancelled"
+              : job.status === "cancelling"
+                ? "cancelling…"
+                : job.status || "";
     const recent = (job.log || []).slice(-4);
-    const canRestart = ["error", "interrupted", "mismatch", "completed", "verified"].includes(
-      job.status,
-    );
-    const canVerify = ["completed", "verified", "mismatch", "error", "interrupted"].includes(
-      job.status,
-    );
+    const canCancel = ["running", "checking", "cancelling"].includes(job.status);
+    const canRestart = [
+      "error",
+      "interrupted",
+      "mismatch",
+      "completed",
+      "verified",
+      "cancelled",
+    ].includes(job.status);
+    const canVerify = [
+      "completed",
+      "verified",
+      "mismatch",
+      "error",
+      "interrupted",
+      "cancelled",
+    ].includes(job.status);
     const canDelete = job.status === "verified" || job.verified;
     const sizeLine =
       job.local_bytes != null || job.s3_bytes != null
@@ -253,10 +336,21 @@ function renderAwsJobs(jobs) {
       ${sizeLine}
       <div class="job-actions">
         ${
-          canRestart
-            ? `<button type="button" class="secondary job-restart" data-job="${escapeHtml(
+          canCancel
+            ? `<button type="button" class="danger job-cancel" data-job="${escapeHtml(
                 job.id,
-              )}">Restart</button>`
+              )}">Cancel</button>`
+            : ""
+        }
+        ${
+          canRestart
+            ? `<button type="button" class="primary job-restart" data-job="${escapeHtml(
+                job.id,
+              )}">${
+                ["error", "interrupted", "mismatch", "cancelled"].includes(job.status)
+                  ? "Retry"
+                  : "Restart"
+              }</button>`
             : ""
         }
         ${
@@ -285,6 +379,9 @@ function renderAwsJobs(jobs) {
     el.awsJobs.appendChild(div);
   }
 
+  el.awsJobs.querySelectorAll(".job-cancel").forEach((btn) => {
+    btn.addEventListener("click", () => cancelAwsJob(btn.getAttribute("data-job")));
+  });
   el.awsJobs.querySelectorAll(".job-restart").forEach((btn) => {
     btn.addEventListener("click", () => restartAwsJob(btn.getAttribute("data-job")));
   });
@@ -296,10 +393,69 @@ function renderAwsJobs(jobs) {
   });
 }
 
+async function cancelCardJob(cardId) {
+  if (!cardId) return;
+  if (!window.confirm(`Cancel SD→SSD copy for ${cardId}?\n\nFiles already on the SSD are kept. Card will not be wiped.`)) {
+    return;
+  }
+  try {
+    setStatus(`Cancelling ${cardId}…`);
+    const data = await api("/api/card/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ card_id: cardId }),
+    });
+    setStatus(data.card?.message || `Cancelled ${cardId}`, "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
+async function retryCardJob(cardId) {
+  if (!cardId) return;
+  try {
+    setStatus(`Retrying ${cardId}…`);
+    const data = await api("/api/card/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ card_id: cardId }),
+    });
+    setStatus(data.card?.message || `Retry started for ${cardId}`, "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
+async function cancelAwsJob(jobId) {
+  if (!jobId) return;
+  if (
+    !window.confirm(
+      "Cancel this AWS upload?\n\nStops the CMD / s5cmd window. Partial objects may remain on S3 — Restart later to resume.",
+    )
+  ) {
+    return;
+  }
+  try {
+    setStatus("Cancelling AWS upload…");
+    const data = await api("/api/aws/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+      timeoutMs: 45000,
+    });
+    setStatus(data.job?.message || "Upload cancelled", "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
 async function restartAwsJob(jobId) {
   if (!jobId) return;
   try {
-    setStatus(`Restarting AWS upload…`);
+    setStatus(`Retrying AWS upload…`);
     const data = await api("/api/aws/restart", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -376,16 +532,18 @@ async function pollStatus() {
     const data = await api("/api/status");
     const session = data.session || {};
     if (session.active) {
+      const par = data.parallel || {};
       setStatus(
-        `Watching · batch "${session.batch}" · ${
-          session.mode === "ssd_and_aws" ? "SSD+AWS (CMD survives restart)" : "SSD only"
-        }`,
+        `Hotplug armed · batch "${session.batch}" · ${
+          session.mode === "ssd_and_aws" ? "SSD→AWS auto" : "SSD only"
+        } · insert/remove SDs anytime · ${par.active || 0}/${par.max || 3} SD slots`,
         "ok",
       );
     }
     renderCards(data.cards || []);
     renderAwsJobs(data.aws_jobs || []);
     renderLog(data.log || []);
+    renderCapacity(data.capacity, data.parallel);
   } catch {
     /* ignore transient */
   }
@@ -434,8 +592,11 @@ async function bootstrap() {
   let config = {};
   try {
     config = await api("/api/config", { timeoutMs: 5000 });
-    el.mode.value = config.mode || "ssd_only";
+    el.mode.value = config.mode || "ssd_and_aws";
     el.s3Uri.value = config.s3_uri || "";
+    if (el.maxParallel) {
+      el.maxParallel.value = String(config.max_parallel_cards || 3);
+    }
   } catch (error) {
     setStatus(`Config load failed: ${error.message}`, "error");
   }
@@ -451,7 +612,7 @@ async function bootstrap() {
       el.batchName.value = config.last_batch;
       onBatchSelectChange();
     }
-    setStatus("Ready — click Start SD → SSD when you want to watch cards", "ok");
+    setStatus("Ready — Start once, then keep inserting SD cards (hotplug auto SD→SSD→AWS)", "ok");
   } catch (error) {
     setStatus(`Drive list failed: ${error.message} — click Refresh drives`, "error");
   }
@@ -480,13 +641,34 @@ el.startSession.addEventListener("click", async () => {
       setStatus("Select an existing batch or create a new one", "error");
       return;
     }
+    if (el.maxParallel) {
+      await api("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_parallel_cards: Number(el.maxParallel.value) || 3 }),
+      });
+    }
     await api("/api/session/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    setStatus(`Watching for SD cards → batch "${payload.batch}"`, "ok");
+    setStatus(`Auto offload armed · batch "${payload.batch}" · plug SD cards`, "ok");
     await refreshBatches(payload.batch);
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+
+el.maxParallel?.addEventListener("change", async () => {
+  try {
+    await api("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_parallel_cards: Number(el.maxParallel.value) || 3 }),
+    });
+    setStatus(`Max parallel SD cards set to ${el.maxParallel.value}`, "ok");
     await pollStatus();
   } catch (error) {
     setStatus(error.message, "error");

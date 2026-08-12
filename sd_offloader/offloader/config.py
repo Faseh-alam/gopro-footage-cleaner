@@ -19,10 +19,11 @@ DEFAULT_CONFIG = {
     "ssd1": "",
     "ssd2": "",
     "last_batch": "",
-    "mode": "ssd_only",  # ssd_only | ssd_and_aws
+    "mode": "ssd_and_aws",  # ssd_only | ssd_and_aws — auto SSD→AWS after each card
     "port": 8877,
     "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)
     "aws_upload_retries": 5,  # auto-retries inside the CMD upload script
+    "max_parallel_cards": 3,  # simultaneous SD→SSD copies (1–8)
 }
 
 

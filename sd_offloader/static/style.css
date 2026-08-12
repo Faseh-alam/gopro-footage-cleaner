@@ -304,6 +304,75 @@ button.danger {
   color: var(--warn);
 }
 
+.capacity {
+  margin-top: 0.85rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0d1117;
+}
+
+.capacity-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.55rem;
+}
+
+.capacity-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.capacity-grid > div {
+  display: grid;
+  gap: 0.15rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  background: #080b10;
+  border: 1px solid var(--border);
+}
+
+.capacity .k {
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.capacity .v {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.capacity .s {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.card-error {
+  border-color: rgba(248, 81, 73, 0.45);
+}
+
+.phase.waiting {
+  color: var(--warn);
+}
+
+.phase.removed {
+  color: var(--muted);
+}
+
+.card-removed {
+  opacity: 0.72;
+  border-color: rgba(139, 148, 158, 0.35);
+}
+
+@media (max-width: 900px) {
+  .capacity-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .phase.checking {
   color: var(--warn);
 }

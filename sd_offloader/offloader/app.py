@@ -61,7 +61,7 @@ def create_app() -> Flask:
     @app.post("/api/config")
     def post_config():
         payload = request.get_json(silent=True) or {}
-        allowed = {"s3_uri", "ssd1", "ssd2", "last_batch", "mode", "port"}
+        allowed = {"s3_uri", "ssd1", "ssd2", "last_batch", "mode", "port", "max_parallel_cards"}
         data = {k: payload[k] for k in allowed if k in payload}
         return jsonify(save_config(data))
 
@@ -102,6 +102,32 @@ def create_app() -> Flask:
     @app.post("/api/session/stop")
     def session_stop():
         return jsonify(engine.stop_session())
+
+    @app.post("/api/card/cancel")
+    def card_cancel():
+        payload = request.get_json(silent=True) or {}
+        card_id = str(payload.get("card_id") or "").strip()
+        if not card_id:
+            return jsonify({"error": "card_id required"}), 400
+        try:
+            card = engine.cancel_card_job(card_id)
+            engine.log_message(f"Cancel requested for card {card_id}")
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "card": card})
+
+    @app.post("/api/card/retry")
+    def card_retry():
+        payload = request.get_json(silent=True) or {}
+        card_id = str(payload.get("card_id") or "").strip()
+        if not card_id:
+            return jsonify({"error": "card_id required"}), 400
+        try:
+            card = engine.retry_card_job(card_id)
+            engine.log_message(f"Retry queued for card {card_id}")
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "card": card})
 
     @app.post("/api/aws/upload-batch")
     def aws_upload_batch():
@@ -158,6 +184,19 @@ def create_app() -> Flask:
         try:
             job = aws_upload.restart_job(job_id)
             engine.log_message(f"AWS upload restarted: {job_id}")
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "job": job})
+
+    @app.post("/api/aws/cancel")
+    def aws_cancel():
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            return jsonify({"error": "job_id required"}), 400
+        try:
+            job = aws_upload.cancel_job(job_id)
+            engine.log_message(f"AWS upload cancelled: {job_id}")
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, "job": job})

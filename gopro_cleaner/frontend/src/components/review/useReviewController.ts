@@ -18,7 +18,7 @@ const RECENT_TASKS_KEY = "gopro_eager_recent_tasks";
 const RECENT_TASKS_MAX = 10;
 const SESSION_KEY = "gopro_eager_review_session";
 const SEEN_GIT_SHA_KEY = "gopro_eager_seen_git_sha";
-const PLAYBACK_RATE_MIN = 0.5;
+const PLAYBACK_RATE_MIN = -4;
 const PLAYBACK_RATE_MAX_PREVIEW = 4;
 /** While playing the multi‑GB original, cap speed so decode doesn't freeze the PC. */
 const PLAYBACK_RATE_MAX_ORIGINAL = 2;
@@ -695,12 +695,17 @@ export function useReviewController() {
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
-    // Original stream: max 2×. 720p preview: up to 4×.
+    // Original stream: max 2×. 720p preview: up to 4×. Floor is −4× either way.
     const max = hlsUrlRef.current ? PLAYBACK_RATE_MAX_PREVIEW : PLAYBACK_RATE_MAX_ORIGINAL;
-    const clamped = Math.min(
-      max,
-      Math.max(PLAYBACK_RATE_MIN, Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP),
-    );
+    let clamped = Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP;
+    clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
+    // Skip 0× — stepping ←/→ through zero continues into reverse / forward.
+    if (Math.abs(clamped) < PLAYBACK_RATE_STEP / 2) {
+      clamped = rate < 0 || (rate === 0 && (playbackRateRef.current || 1) > 0)
+        ? -PLAYBACK_RATE_STEP
+        : PLAYBACK_RATE_STEP;
+      clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
+    }
     playbackRateRef.current = clamped;
     if (v) {
       const wasPlaying = wantPlayingRef.current || !v.paused;
@@ -1101,9 +1106,15 @@ export function useReviewController() {
       const resume = wantPlayingRef.current || !v.paused;
       // If we auto-capped to 1× while the encoder caught up, restore the
       // speed the user actually wanted now that the preview can handle it.
-      const wantedRate = Math.max(playbackRateRef.current || 1, preCapRateRef.current || 1);
+      const current = playbackRateRef.current || 1;
+      const preCap = preCapRateRef.current || 0;
+      const wantedRate =
+        preCap !== 0 && Math.abs(preCap) >= Math.abs(current) ? preCap : current;
       preCapRateRef.current = 0;
-      const rate = Math.min(PLAYBACK_RATE_MAX_PREVIEW, wantedRate);
+      const rate = Math.min(
+        PLAYBACK_RATE_MAX_PREVIEW,
+        Math.max(PLAYBACK_RATE_MIN, wantedRate),
+      );
 
       // Freeze the last original frame over the player while the source
       // remounts — the swap reads as a quality change, never a restart.

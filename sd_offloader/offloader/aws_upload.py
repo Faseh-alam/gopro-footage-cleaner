@@ -310,6 +310,200 @@ def start_batch_upload(
     )
 
 
+def cancel_job(job_id: str) -> dict:
+    """Stop a running AWS upload (kill CMD / s5cmd / aws process tree)."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        status = str(job.get("status") or "")
+        if status == "cancelled":
+            return dict(job)
+        if status not in {"running", "checking"}:
+            raise RuntimeError(f"Job is not running ({status}) — nothing to cancel")
+        snap = dict(job)
+        job["cancel_requested"] = True
+        job["pending_resync"] = False
+        job["status"] = "cancelling"
+        job["message"] = "Cancel requested — stopping upload processes…"
+        _append_job_log(job, "Cancel requested by operator")
+    _persist_jobs()
+
+    killed = _kill_upload_processes(snap)
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise RuntimeError("Upload job not found")
+        job["cancel_requested"] = True
+        job["pending_resync"] = False
+        job["status"] = "cancelled"
+        job["speed_mbps"] = 0.0
+        job["eta_seconds"] = None
+        job["aws_pid"] = None
+        job["message"] = (
+            "Cancelled — S3 may have a partial upload; click Retry to resume missing files"
+            + (f" · stopped {killed} process(es)" if killed else "")
+        )
+        _append_job_log(job, f"Cancelled (killed={killed})")
+        # Marker so log monitor does not treat a half-written exit as a hard error.
+        log_path = Path(str(job.get("log_path") or ""))
+        if log_path.is_file():
+            try:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"\n{EXIT_MARKER}cancelled\n")
+            except OSError:
+                pass
+    _persist_jobs()
+    return get_job(job_id) or {"id": job_id, "status": "cancelled"}
+
+
+def _kill_upload_processes(job: dict) -> int:
+    """Kill CMD/PowerShell/s5cmd/aws processes tied to this upload job."""
+    needles: list[str] = []
+    for key in ("script", "log_path", "dest"):
+        value = str(job.get(key) or "").strip()
+        if value:
+            needles.append(value)
+            needles.append(value.replace("/", "\\"))
+            needles.append(value.replace("\\", "/"))
+    # Unique basename of the .bat/.sh also helps match the CMD window title path.
+    script = str(job.get("script") or "")
+    if script:
+        needles.append(Path(script).name)
+    dest = str(job.get("dest") or "").strip()
+    if dest:
+        needles.append(dest.rstrip("/"))
+    needles = [n for n in dict.fromkeys(needles) if len(n) >= 8]
+
+    pids: set[int] = set()
+    stored = job.get("aws_pid")
+    if stored:
+        try:
+            pids.add(int(stored))
+        except (TypeError, ValueError):
+            pass
+
+    if platform.system() == "Windows":
+        pids.update(_windows_pids_matching(needles))
+    else:
+        pids.update(_posix_pids_matching(needles))
+
+    killed = 0
+    for pid in sorted(pids):
+        if _kill_pid_tree(pid):
+            killed += 1
+    return killed
+
+
+def _windows_pids_matching(needles: list[str]) -> set[int]:
+    if not needles:
+        return set()
+    try:
+        ps = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -match '^(aws|s5cmd|cmd|powershell|pwsh)\\.exe$' } | "
+                "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return set()
+    try:
+        data = json.loads(ps.stdout)
+    except json.JSONDecodeError:
+        return set()
+    rows = data if isinstance(data, list) else [data]
+    found: set[int] = set()
+    needles_l = [n.lower() for n in needles]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cmd = str(row.get("CommandLine") or "")
+        if not cmd:
+            continue
+        cmd_l = cmd.lower()
+        # Only touch sync-related shells / uploaders.
+        name = str(row.get("Name") or "").lower()
+        if name in {"aws.exe", "s5cmd.exe"} and "sync" not in cmd_l:
+            continue
+        if name in {"cmd.exe", "powershell.exe", "pwsh.exe"}:
+            if "sync" not in cmd_l and not any(
+                Path(n).name.lower() in cmd_l for n in needles if n.endswith((".bat", ".sh", ".log"))
+            ):
+                # Still match if dest / script path appears.
+                if not any(n in cmd_l for n in needles_l):
+                    continue
+        if any(n in cmd_l for n in needles_l):
+            try:
+                found.add(int(row["ProcessId"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+    return found
+
+
+def _posix_pids_matching(needles: list[str]) -> set[int]:
+    found: set[int] = set()
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return found
+    if out.returncode != 0:
+        return found
+    needles_l = [n.lower() for n in needles]
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        cmd_l = parts[1].lower()
+        if not any(tool in cmd_l for tool in ("s5cmd", "aws s3", "aws_upload", ".sh")):
+            continue
+        if any(n in cmd_l for n in needles_l):
+            try:
+                found.add(int(parts[0]))
+            except ValueError:
+                pass
+    return found
+
+
+def _kill_pid_tree(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return result.returncode == 0
+        os.kill(pid, 15)
+        time.sleep(0.4)
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+        return True
+    except (OSError, subprocess.TimeoutExpired, ProcessLookupError):
+        return False
+
+
 def restart_job(job_id: str) -> dict:
     """Re-run sync for a failed/interrupted/mismatched job (resume-safe)."""
     with _lock:
@@ -329,14 +523,19 @@ def restart_job(job_id: str) -> dict:
     if not dest.startswith("s3://"):
         raise RuntimeError("Job is missing an S3 destination")
 
-    # Heal legacy per-card destinations (…/<batch>/C1234/) and any double-nested
-    # batch prefix back to the flat …/<batch>/ path.
+    # Allow restart from cancelled / error / mismatch states.
     if s3_uri and batch_name:
         dest = batch_s3_prefix(s3_uri, batch_name)
 
     tool = preferred_uploader()
     if not tool:
         raise RuntimeError("Neither s5cmd nor AWS CLI found")
+
+    # Clear cancel flags from a prior stop.
+    with _lock:
+        prev = _jobs.get(job_id)
+        if prev:
+            prev["cancel_requested"] = False
 
     # Replace this job id so the UI Restart button keeps a stable reference.
     return _launch_upload_job(
@@ -388,7 +587,7 @@ def verify_job_sizes(job_id: str) -> dict:
                 job["status"] = "mismatch"
             job["message"] = (
                 f"Size mismatch · local {result['local_bytes']} vs S3 {result['s3_bytes']} "
-                f"(Δ {result['delta']}) — click Restart to resume missing files"
+                f"(Δ {result['delta']}) — click Retry to resume missing files"
             )
         _append_job_log(job, f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} ok={result['ok']}")
     _persist_jobs()
@@ -572,6 +771,7 @@ def _write_external_script(
         lines = [
             "@echo off",
             "setlocal EnableDelayedExpansion",
+            "chcp 65001 >nul",
             f"title {title}",
             "echo ============================================",
             f"echo   {title}",
@@ -589,59 +789,55 @@ def _write_external_script(
             "echo ============================================",
             "echo.",
         ]
-        log_ps = str(log_path).replace("'", "''")
         dest_norm = dest if dest.endswith("/") else dest + "/"
         for idx, src in enumerate(sources):
-            src_ps = _sync_local_arg(src).replace("'", "''")
-            dest_ps = dest_norm.replace("'", "''")
+            src_arg = _sync_local_arg(src)
+            # Prefer quoted paths for cmd.exe (spaces in "batch 1").
+            src_q = f'"{src_arg}"'
+            dest_q = f'"{dest_norm}"'
+            log_q = f'"{log_path}"'
             if tool == "s5cmd":
-                sync_default = f"s5cmd sync '{src_ps}' '{dest_ps}'"
-                sync_workers = (
-                    f"s5cmd --numworkers {numworkers} sync '{src_ps}' '{dest_ps}'"
-                )
+                sync_default = f"s5cmd sync {src_q} {dest_q}"
+                sync_workers = f"s5cmd --numworkers {numworkers} sync {src_q} {dest_q}"
             else:
-                sync_default = f"aws s3 sync '{src_ps}' '{dest_ps}'"
+                sync_default = f"aws s3 sync {src_q} {dest_q}"
                 sync_workers = sync_default
-            lines.append(f'echo Syncing "{src}" → {dest_norm}')
+            lines.append(f"echo Syncing {src_q} → {dest_q}")
+            lines.append(f"echo Syncing {src_q} → {dest_q}>> {log_q}")
             lines.append(f"set MAX_TRIES={retries}")
             lines.append("set TRY=1")
             lines.append(f":retry_loop_{idx}")
             lines.append("echo --- attempt !TRY! of %MAX_TRIES% ---")
-            # Attempt 1: plain sync. Later attempts: --numworkers (s5cmd only).
+            lines.append(f"echo --- attempt !TRY! of %MAX_TRIES% --->> {log_q}")
             lines.append("if !TRY! equ 1 (")
-            lines.append('  echo Using default s5cmd sync' if tool == "s5cmd" else "  echo Using aws s3 sync")
             lines.append(
-                "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-                f"\"& {{ {sync_default} 2>&1 | "
-                f"Tee-Object -FilePath '{log_ps}' -Append ; "
-                f"if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }} else {{ exit 0 }} }}\""
+                "  echo Using default s5cmd sync" if tool == "s5cmd" else "  echo Using aws s3 sync"
             )
+            # Run in this CMD window so progress is visible; UI also tracks via S3 size.
+            lines.append(f"  {sync_default}")
             lines.append(") else (")
             if tool == "s5cmd":
                 lines.append(f"  echo Using s5cmd --numworkers {numworkers} sync")
             else:
                 lines.append("  echo Retrying aws s3 sync")
-            lines.append(
-                "  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-                f"\"& {{ {sync_workers} 2>&1 | "
-                f"Tee-Object -FilePath '{log_ps}' -Append ; "
-                f"if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }} else {{ exit 0 }} }}\""
-            )
+            lines.append(f"  {sync_workers}")
             lines.append(")")
             lines.append("set SYNC_ERR=%ERRORLEVEL%")
+            lines.append(f"echo Sync exit !SYNC_ERR!>> {log_q}")
             lines.append(f"if %SYNC_ERR% equ 0 goto sync_ok_{idx}")
             lines.append("echo Retrying after connection/upload error (exit %SYNC_ERR%)...")
+            lines.append(f"echo Retrying after connection/upload error (exit %SYNC_ERR%)>> {log_q}")
             lines.append("timeout /t 15 /nobreak >nul")
             lines.append("set /a TRY+=1")
             lines.append(f"if !TRY! leq %MAX_TRIES% goto retry_loop_{idx}")
-            lines.append(f"echo {EXIT_MARKER}%SYNC_ERR%>> \"{log_path}\"")
+            lines.append(f"echo {EXIT_MARKER}%SYNC_ERR%>> {log_q}")
             lines.append("echo.")
-            lines.append("echo ERROR: sync failed after retries. Click Restart in the UI.")
+            lines.append("echo ERROR: sync failed after retries. Click Retry in the UI.")
             lines.append("pause")
             lines.append("exit /b %SYNC_ERR%")
             lines.append(f":sync_ok_{idx}")
             lines.append("echo.")
-        lines.append(f"echo {EXIT_MARKER}0>> \"{log_path}\"")
+        lines.append(f'echo {EXIT_MARKER}0>> "{log_path}"')
         lines.append("echo ============================================")
         lines.append("echo   Upload finished OK — UI will verify sizes next")
         lines.append("echo ============================================")
@@ -807,7 +1003,7 @@ def restore_jobs_from_disk() -> None:
                                     ).start()
                             else:
                                 job["status"] = "error"
-                                job["message"] = f"Sync failed (exit {code}) — click Restart"
+                                job["message"] = f"Sync failed (exit {code}) — click Retry"
                             job["speed_mbps"] = 0.0
                             job["eta_seconds"] = None
                         else:
@@ -871,7 +1067,7 @@ def _finalize_checking_jobs() -> None:
                 continue
             job["status"] = "interrupted"
             job["message"] = (
-                "No live upload found — click Restart to resume "
+                "No live upload found — click Retry to resume "
                 "(s5cmd/aws sync skips files already on S3)"
             )
 
@@ -1163,8 +1359,15 @@ def _discover_live_aws_processes() -> None:
 
         with _lock:
             # Prefer an existing job for same batch / dest / pid (revive interrupted).
+            # Never revive an operator-cancelled job.
             existing_id = None
             for jid, j in _jobs.items():
+                if j.get("status") in {"cancelled", "cancelling"} or j.get("cancel_requested"):
+                    if j.get("aws_pid") == pid or (dest and j.get("dest") == dest):
+                        # Same upload was cancelled — do not re-attach.
+                        existing_id = None
+                        break
+                    continue
                 if j.get("status") not in {"running", "interrupted", "checking"}:
                     continue
                 if j.get("aws_pid") == pid:
@@ -1176,6 +1379,18 @@ def _discover_live_aws_processes() -> None:
                 if batch and j.get("batch") == batch:
                     existing_id = jid
                     break
+            # Skip creating a tracker if this dest/batch was just cancelled.
+            cancelled_match = any(
+                (j.get("status") in {"cancelled", "cancelling"} or j.get("cancel_requested"))
+                and (
+                    (dest and j.get("dest") == dest)
+                    or (batch and j.get("batch") == batch)
+                    or j.get("aws_pid") == pid
+                )
+                for j in _jobs.values()
+            )
+            if cancelled_match and not existing_id:
+                continue
             uploader = "s5cmd" if "s5cmd" in name or "s5cmd" in cmd_l else "aws"
             if existing_id:
                 job = _jobs[existing_id]
@@ -1509,8 +1724,21 @@ def _ingest_log_progress(job_id: str) -> bool:
                 return False
             job["log"] = (job.get("log") or [])[-100:] + [line]
             if line.startswith(EXIT_MARKER):
+                raw_code = line.split(":", 1)[1].strip() if ":" in line else "1"
+                if raw_code.lower() == "cancelled" or job.get("cancel_requested") or job.get("status") in {
+                    "cancelled",
+                    "cancelling",
+                }:
+                    job["status"] = "cancelled"
+                    job["message"] = (
+                        "Cancelled — S3 may have a partial upload; click Retry to resume missing files"
+                    )
+                    job["log_offset"] = new_offset
+                    job["speed_mbps"] = 0.0
+                    job["pending_resync"] = False
+                    return True
                 try:
-                    code = int(line.split(":", 1)[1].strip() or "1")
+                    code = int(raw_code or "1")
                 except ValueError:
                     code = 1
                 if code == 0:
@@ -1544,7 +1772,7 @@ def _ingest_log_progress(job_id: str) -> bool:
                 else:
                     job["status"] = "error"
                     job["message"] = (
-                        f"Sync failed (exit {code}) — click Restart (resume-safe)"
+                        f"Sync failed (exit {code}) — click Retry (resume-safe)"
                     )
                     job["log_offset"] = new_offset
                 job["speed_mbps"] = 0.0
