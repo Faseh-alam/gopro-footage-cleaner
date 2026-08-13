@@ -209,6 +209,15 @@ def main() -> int:
     ])
     check("complete labeled pair has no wipe blockers",
           audit_full["blockers"] == [] and audit_full["ok"] == 1, str(audit_full["blockers"]))
+    labeled_a, notes_a = engine._select_labeled_files(inventory.list_transfer_files(card_a))
+    labeled_rels = sorted(f["rel"] for f in labeled_a)
+    check("unlabeled GX010002 not selected for copy",
+          "GX010002.MP4" not in labeled_rels and "GX010001.MP4" in labeled_rels,
+          str(labeled_rels))
+    check("skip note names the leftover file",
+          any("GX010002.MP4" in n for n in notes_a), str(notes_a))
+    labeled_b, _ = engine._select_labeled_files(inventory.list_transfer_files(card_b))
+    check("incomplete JSON is not copied", labeled_b == [], str([f["rel"] for f in labeled_b]))
 
     print("\n[6] AWS script: rebuild work clips into task folders")
     ffmpeg_ok = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))

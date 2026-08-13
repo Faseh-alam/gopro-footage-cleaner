@@ -120,6 +120,18 @@ def create_app() -> Flask:
     def session_stop():
         return jsonify(engine.stop_session())
 
+    @app.post("/api/cards/wipe")
+    def cards_wipe():
+        payload = request.get_json(silent=True) or {}
+        card_id = str(payload.get("card_id") or "").strip()
+        if not card_id:
+            return jsonify({"error": "card_id required"}), 400
+        try:
+            result = engine.confirm_wipe_card(card_id)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
     @app.post("/api/aws/upload-batch")
     def aws_upload_batch():
         payload = request.get_json(silent=True) or {}

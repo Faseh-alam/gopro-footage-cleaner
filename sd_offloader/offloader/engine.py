@@ -42,13 +42,31 @@ ACTIVE_COPY_STATUSES = {
     "ejecting",
     "uploading",
 }
+HOLD_STATUSES = {
+    "completed",
+    "awaiting_wipe",
+    "wiping",
+    "ejecting",
+    "uploading",
+}
 
 
-def _log_line(message: str, *, kind: str = "info") -> None:
+def _log_line(message: str, *, kind: str = "info", card_id: str = "") -> None:
+    entry = {
+        "t": time.time(),
+        "kind": kind,
+        "message": message,
+        "card_id": (card_id or "").upper(),
+    }
     with _lock:
-        _log.append({"t": time.time(), "kind": kind, "message": message})
-        if len(_log) > 300:
-            del _log[:-300]
+        _log.append(entry)
+        if len(_log) > 400:
+            del _log[:-400]
+        cid = entry["card_id"]
+        if cid and cid in _cards:
+            lines = list(_cards[cid].get("card_log") or [])
+            lines.append(entry)
+            _cards[cid]["card_log"] = lines[-50:]
     _save_snapshot(force=False)
 
 
@@ -131,7 +149,7 @@ def get_status() -> dict:
         status = {
             "session": dict(_session),
             "cards": sorted(cards, key=lambda c: c.get("started_at") or 0, reverse=True),
-            "log": list(_log[-80:]),
+            "log": list(_log[-200:]),
             "aws_jobs": aws_upload.list_jobs()[:20],
             # volumes are heavy on Windows — UI loads them via /api/volumes
         }
@@ -261,20 +279,19 @@ def _scan_for_cards() -> None:
                     continue
             if existing and existing.get("status") == "needs_fix":
                 if existing.get("mount") == str(card_root):
-                    audit = _audit_files(files)
-                    if audit["blockers"]:
+                    labeled, _ = _select_labeled_files(files)
+                    if not labeled:
                         continue
-                    _log_line(f"{card_id}: labels look complete now — retrying copy/verify")
+                    _log_line(
+                        f"{card_id}: labeled files appeared — retrying copy",
+                        kind="ok",
+                        card_id=card_id,
+                    )
                 # else: unplugged/replugged or labels fixed — fall through to retry
             # Finished (or finishing) this session. After wipe the volume may still be
             # mounted empty — never re-queue that as ERROR. Only re-offload when the
             # card is "completed" and new labeled MP4s appear.
-            if existing and existing.get("status") in {
-                "completed",
-                "wiping",
-                "ejecting",
-                "uploading",
-            }:
+            if existing and existing.get("status") in HOLD_STATUSES:
                 if not inventory.list_transfer_files(card_root):
                     if existing.get("status") != "completed" and not thread_alive:
                         existing["status"] = "completed"
@@ -423,9 +440,16 @@ def _start_card_job(
             "files_total": len(files),
             "files_done": 0,
             "started_at": time.time(),
+            "issues": [],
+            "can_wipe": False,
+            "wipe_rels": [],
+            "card_log": [],
         }
 
-    _log_line(f"{card_id}: starting copy → {dest} ({len(files)} files, {total} bytes)")
+    _log_line(
+        f"{card_id}: starting copy → {dest} ({len(files)} files, {total} bytes)",
+        card_id=card_id,
+    )
     thread = threading.Thread(
         target=_copy_card_worker,
         args=(card_root, card_id, batch, mode, s3_uri, files, dest, prog),
@@ -604,14 +628,56 @@ def _audit_files(files: list[dict]) -> dict:
     }
 
 
-def _audit_summary_line(card_id: str, audit: dict) -> str:
-    return (
-        f"{card_id}: {audit['mp4s']} MP4s, {audit['jsons']} JSON, "
-        f"{audit['ok']} with IMU+serial+complete, "
-        f"{len(audit['missing_json'])} missing JSON, "
-        f"{len(audit['missing_imu'])} missing IMU, "
-        f"{len(audit['incomplete'])} incomplete"
-    )
+_COPY_REQUIRED = (
+    "complete labeling",
+    "segments",
+    "camera_serial",
+    "IMU sensor list",
+)
+
+
+def _copy_blockers(payload: dict) -> list[str]:
+    missing = _missing_metadata(payload)
+    return [name for name in missing if name in _COPY_REQUIRED]
+
+
+def _select_labeled_files(files: list[dict]) -> tuple[list[dict], list[str]]:
+    """Return (files to copy, skip notes). Unlabeled MP4s stay on the card."""
+    ok_stems: set[str] = set()
+    notes: list[str] = []
+    for item in files:
+        rel = str(item.get("rel") or "")
+        if not rel.upper().endswith(".MP4"):
+            continue
+        sidecar = item.get("embed_json") or ""
+        if not sidecar:
+            notes.append(f"{rel}: no .segments.json — left on card")
+            continue
+        payload = _load_sidecar(sidecar)
+        if not payload:
+            notes.append(f"{rel}: JSON unreadable — left on card")
+            continue
+        blockers = _copy_blockers(payload)
+        if blockers:
+            notes.append(f"{rel}: not copied ({', '.join(blockers)}) — left on card")
+            continue
+        ok_stems.add(Path(rel).stem)
+
+    selected: list[dict] = []
+    for item in files:
+        rel = str(item.get("rel") or "")
+        is_json = rel.lower().endswith(_SIDECAR_SUFFIX)
+        is_mp4 = rel.upper().endswith(".MP4")
+        stem = rel[: -len(_SIDECAR_SUFFIX)] if is_json else Path(rel).stem
+        if (is_mp4 or is_json) and stem in ok_stems:
+            selected.append(item)
+    skipped = sum(1 for n in notes if "left on card" in n)
+    if ok_stems:
+        summary = f"Copying {len(ok_stems)} labeled MP4(s) + JSON."
+        if skipped:
+            summary += f" {skipped} file(s) skipped and left on the card."
+        notes.insert(0, summary)
+    return selected, notes
 
 
 def _copy_card_worker(
@@ -625,17 +691,37 @@ def _copy_card_worker(
     prog: dict,
 ) -> None:
     del batch, mode, s3_uri  # dump is SSD-only; AWS is a separate UI button
+    labeled, notes = _select_labeled_files(files)
+    issues = [n for n in notes if "left on card" in n]
+    _update_card(card_id, issues=issues, can_wipe=False, wipe_rels=[])
+    for note in notes:
+        kind = "error" if "left on card" in note else "ok"
+        _log_line(f"{card_id}: {note}", kind=kind, card_id=card_id)
+
+    if not labeled:
+        msg = "Nothing labeled to copy — card left untouched. Finish labeling in Review Station."
+        _update_card(
+            card_id,
+            status="needs_fix",
+            message=msg,
+            dest=str(dest),
+            issues=issues,
+            can_wipe=False,
+        )
+        _log_line(f"{card_id}: {msg}", kind="error", card_id=card_id)
+        with _lock:
+            _copy_threads.pop(card_id, None)
+        return
+
+    files = labeled
     total_bytes = inventory.total_bytes(files)
-    audit = _audit_files(files)
-    _log_line(_audit_summary_line(card_id, audit), kind="ok" if not audit["blockers"] else "error")
-    for rel in audit["missing_json"]:
-        _log_line(f"{card_id}: {rel} has no .segments.json — will copy MP4 but will not wipe", kind="error")
-    for rel in audit["missing_imu"]:
-        _log_line(f"{card_id}: {rel} JSON has no IMU sensor list — will not wipe", kind="error")
-    for rel in audit["missing_serial"]:
-        _log_line(f"{card_id}: {rel} JSON has no camera serial — will not wipe", kind="error")
-    for rel in audit["incomplete"]:
-        _log_line(f"{card_id}: {rel} is not fully labeled — will not wipe", kind="error")
+    mp4_n = sum(1 for f in files if str(f["rel"]).upper().endswith(".MP4"))
+    json_n = sum(1 for f in files if str(f["rel"]).lower().endswith(_SIDECAR_SUFFIX))
+    _log_line(
+        f"{card_id}: labeled set {mp4_n} MP4 + {json_n} JSON → {dest}",
+        kind="ok",
+        card_id=card_id,
+    )
 
     _update_card(
         card_id,
@@ -702,7 +788,8 @@ def _copy_card_worker(
             dest_file = dest / dest_rel
             if dest_rel != rel and not (prog.get("files") or {}).get(rel):
                 _log_line(
-                    f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}"
+                    f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}",
+                    card_id=card_id,
                 )
             if progress.is_file_done(prog, rel, size, dest_file):
                 try:
@@ -753,14 +840,19 @@ def _copy_card_worker(
                             f"{card_id}: {rel} sidecar is missing "
                             f"{', '.join(missing)} — re-check in Review Station",
                             kind="error",
+                            card_id=card_id,
                         )
                     embed_meta.embed_segments_json(dest_file, payload)
                     dest_size = dest_file.stat().st_size
-                    _log_line(f"{card_id}: embedded segments into {dest_rel}")
+                    _log_line(
+                        f"{card_id}: embedded segments into {dest_rel}",
+                        card_id=card_id,
+                    )
                 except Exception as embed_exc:  # noqa: BLE001
                     _log_line(
                         f"{card_id}: could not embed segments into {rel} — {embed_exc}",
                         kind="error",
+                        card_id=card_id,
                     )
             item["dest_size"] = dest_size
             copied_source_bytes += size
@@ -804,65 +896,98 @@ def _copy_card_worker(
 
         _log_line(
             f"{card_id}: size check — card {_format_bytes(total_bytes)} "
-            f"({audit['mp4s']} MP4 + {audit['jsons']} JSON) → SSD "
+            f"({mp4_n} MP4 + {json_n} JSON) → SSD "
             f"{_format_bytes(copied_source_bytes)} copied"
             + (f" (+{_format_bytes(embed_extra_bytes)} JSON embed in MP4s)" if embed_extra_bytes else "")
-            + ". MATCH.",
+            + ". MATCH. Card NOT wiped — play the SSD files, then click Wipe.",
             kind="ok",
+            card_id=card_id,
         )
-
-        if audit["blockers"]:
-            raise _WipeBlocked("; ".join(audit["blockers"]))
 
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
         _update_card(
             card_id,
-            status="completed",
-            message="Copy verified — wiping & ejecting…",
+            status="awaiting_wipe",
+            message=(
+                "On SSD and verified. Play the files on the SSD, then click "
+                "Wipe copied files on this card."
+            ),
             dest=str(dest),
             speed_mbps=0,
             eta_seconds=0,
             bytes_done=total_bytes,
+            can_wipe=True,
+            wipe_rels=root_rels,
+            issues=issues,
         )
-
-        try:
-            _update_card(card_id, status="wiping", message="Wiping transferred files on card…")
-            eject.wipe_transferred_files(card_root, root_rels)
-        except Exception as wipe_exc:  # noqa: BLE001
-            _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
-
-        try:
-            _update_card(card_id, status="ejecting", message="Ejecting card…")
-            eject.eject_volume(card_root)
-        except Exception as eject_exc:  # noqa: BLE001
-            _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
-
-        _update_card(
-            card_id,
-            status="completed",
-            message="Ready — card ejected (SSD only)",
-            speed_mbps=0,
-            eta_seconds=0,
-            bytes_done=total_bytes,
-        )
-
-        _log_line(f"{card_id}: complete → {dest}", kind="ok")
-    except _WipeBlocked as exc:
-        _update_card(
-            card_id,
-            status="needs_fix",
-            message=f"On SSD, not wiped: {exc}. Fix labels in Review Station.",
-            dest=str(dest),
-        )
-        _log_line(f"{card_id}: on SSD but not wiped — {exc}", kind="error")
+        _log_line(f"{card_id}: waiting for wipe confirm → {dest}", kind="ok", card_id=card_id)
     except Exception as exc:  # noqa: BLE001
-        _update_card(card_id, status="error", message=str(exc), dest=str(dest))
-        _log_line(f"{card_id}: error — {exc}", kind="error")
+        _update_card(
+            card_id,
+            status="error",
+            message=str(exc),
+            dest=str(dest),
+            can_wipe=False,
+        )
+        _log_line(f"{card_id}: error — {exc}", kind="error", card_id=card_id)
     finally:
         with _lock:
             _copy_threads.pop(card_id, None)
+
+
+def confirm_wipe_card(card_id: str) -> dict:
+    """Wipe only files already verified on the SSD. Never runs unless the operator confirms."""
+    card_id = str(card_id or "").strip().upper()
+    if not card_id:
+        raise ValueError("card_id required")
+    with _lock:
+        card = _cards.get(card_id)
+        if not card:
+            raise ValueError(f"Unknown card {card_id}")
+        if not card.get("can_wipe") or card.get("status") != "awaiting_wipe":
+            raise ValueError(
+                f"{card_id} is not waiting for wipe confirm (status={card.get('status')})"
+            )
+        mount = str(card.get("mount") or "")
+        wipe_rels = list(card.get("wipe_rels") or [])
+        dest = str(card.get("dest") or "")
+    if not mount or not Path(mount).exists():
+        raise ValueError(f"{card_id}: card is not connected — plug it back in to wipe")
+    if not wipe_rels:
+        raise ValueError(f"{card_id}: no copied file list to wipe")
+
+    _update_card(card_id, status="wiping", message="Wiping copied MP4 + JSON on card…", can_wipe=False)
+    _log_line(
+        f"{card_id}: operator confirmed wipe of {len(wipe_rels)} file(s)",
+        kind="ok",
+        card_id=card_id,
+    )
+    try:
+        eject.wipe_transferred_files(Path(mount), wipe_rels)
+    except Exception as wipe_exc:  # noqa: BLE001
+        _update_card(card_id, status="awaiting_wipe", can_wipe=True, message=f"Wipe failed: {wipe_exc}")
+        _log_line(f"{card_id}: wipe failed — {wipe_exc}", kind="error", card_id=card_id)
+        raise
+
+    try:
+        _update_card(card_id, status="ejecting", message="Ejecting card…")
+        eject.eject_volume(Path(mount))
+    except Exception as eject_exc:  # noqa: BLE001
+        _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error", card_id=card_id)
+
+    _update_card(
+        card_id,
+        status="completed",
+        message="Ready — copied files wiped, card ejected",
+        dest=dest,
+        can_wipe=False,
+        speed_mbps=0,
+        eta_seconds=0,
+    )
+    _log_line(f"{card_id}: wipe done → {dest}", kind="ok", card_id=card_id)
+    return get_status()
 
 
 def log_message(message: str, *, kind: str = "info") -> None:

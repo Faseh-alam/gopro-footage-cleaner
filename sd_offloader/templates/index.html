@@ -77,8 +77,8 @@
           <h2>SD → SSD (cards)</h2>
           <span id="cards-summary" class="hint">No cards yet</span>
         </div>
-        <p class="hint">Live size, speed, and ETA for each card while it copies. Reopening this page keeps showing transfers while the server is running.</p>
-        <div id="cards" class="cards"></div>
+          <p class="hint">Copies only fully labeled MP4 + JSON. Cards are never wiped until you click Wipe on that card. Problem cards are listed first — each card has its own log.</p>
+          <div id="cards" class="cards"></div>
       </section>
 
       <section class="panel grid-2-panels">
@@ -94,6 +94,12 @@
         </div>
         <div>
           <h2>Log</h2>
+          <label class="hint log-filter-label">
+            Show
+            <select id="log-filter">
+              <option value="">All cards</option>
+            </select>
+          </label>
           <div id="log" class="log"></div>
         </div>
       </section>

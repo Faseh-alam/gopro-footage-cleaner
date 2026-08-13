@@ -23,6 +23,7 @@ const el = {
   log: document.getElementById("log"),
   awsCliStatus: document.getElementById("aws-cli-status"),
   appVersion: document.getElementById("app-version"),
+  logFilter: document.getElementById("log-filter"),
 };
 
 async function api(url, options = {}) {
@@ -224,16 +225,50 @@ function renderCards(cards) {
     ),
   ).length;
   const done = cards.filter((c) => c.status === "completed").length;
-  el.cardsSummary.textContent = `${cards.length} seen · ${active} active · ${done} done`;
+  const waiting = cards.filter((c) => c.status === "awaiting_wipe").length;
+  const broken = cards.filter((c) =>
+    ["error", "needs_fix", "interrupted"].includes(c.status),
+  ).length;
+  el.cardsSummary.textContent = `${cards.length} seen · ${active} copying · ${waiting} wait wipe · ${broken} problem · ${done} done`;
 
-  for (const card of cards) {
+  const rank = (c) => {
+    const s = c.status || "";
+    if (s === "error" || s === "needs_fix" || s === "interrupted") return 0;
+    if (s === "awaiting_wipe") return 1;
+    if (["copying", "verifying", "wiping", "queued", "scanning"].includes(s)) return 2;
+    return 3;
+  };
+  const ordered = cards.slice().sort((a, b) => rank(a) - rank(b));
+
+  for (const card of ordered) {
     const pct = card.bytes_total ? Math.min(100, (card.bytes_done / card.bytes_total) * 100) : 0;
+    const issueList = card.issues || [];
+    const issues = issueList.length
+      ? `<div class="card-issues"><strong>${escapeHtml(card.card_id || "Card")} — ${issueList.length} problem(s)</strong>${issueList
+          .map((line) => `<div>${escapeHtml(String(line))}</div>`)
+          .join("")}</div>`
+      : "";
+    const cardLog = (card.card_log || [])
+      .slice(-16)
+      .map((line) => {
+        const t = new Date((line.t || 0) * 1000).toLocaleTimeString();
+        return `<div class="${line.kind || ""}">[${t}] ${escapeHtml(line.message || "")}</div>`;
+      })
+      .join("");
+    const wipeBtn = card.can_wipe
+      ? `<button type="button" class="danger wipe-card" data-card="${escapeHtml(
+          card.card_id || "",
+        )}">Wipe copied files on this card</button>`
+      : "";
+    const phaseLabel =
+      card.status === "awaiting_wipe" ? "waiting for wipe" : card.status || "";
+    const problem = issueList.length || ["error", "needs_fix", "interrupted"].includes(card.status || "");
     const div = document.createElement("div");
-    div.className = "card";
+    div.className = problem ? "card has-issues" : "card";
     div.innerHTML = `
       <div class="card-top">
-        <span class="card-id">${card.card_id || "?"}</span>
-        <span class="phase ${card.status || ""}">${card.status || ""}</span>
+        <span class="card-id">${escapeHtml(card.card_id || "?")}</span>
+        <span class="phase ${card.status || ""}">${escapeHtml(phaseLabel)}</span>
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="meta">
@@ -243,10 +278,73 @@ function renderCards(cards) {
         <span>${card.files_done || 0}/${card.files_total || 0} files</span>
         <span>${pct.toFixed(0)}%</span>
       </div>
-      <div class="message">${card.message || ""}</div>
-      ${card.dest ? `<div class="hint">SSD dest: ${card.dest}</div>` : ""}
+      <div class="message">${escapeHtml(card.message || "")}</div>
+      ${card.dest ? `<div class="hint">SSD dest: ${escapeHtml(card.dest)}</div>` : ""}
+      ${issues}
+      ${cardLog ? `<div class="card-log"><div class="card-log-head">${escapeHtml(card.card_id || "Card")} log</div>${cardLog}</div>` : ""}
+      ${wipeBtn ? `<div class="job-actions">${wipeBtn}</div>` : ""}
     `;
     el.cards.appendChild(div);
+  }
+  for (const btn of el.cards.querySelectorAll(".wipe-card")) {
+    btn.addEventListener("click", () => wipeCard(btn.getAttribute("data-card")));
+  }
+  refreshLogFilter(cards);
+}
+
+async function wipeCard(cardId) {
+  if (!cardId) return;
+  const ok = window.confirm(
+    `Wipe copied MP4 + JSON on card ${cardId}?\n\nOnly do this after you played the files on the SSD. Unlabeled files stay on the card.`,
+  );
+  if (!ok) return;
+  try {
+    await api("/api/cards/wipe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ card_id: cardId }),
+    });
+    setStatus(`${cardId}: wipe confirmed`, "ok");
+    await pollStatus();
+  } catch (error) {
+    setStatus(`${cardId}: ${error.message}`, "error");
+  }
+}
+
+let lastLogLines = [];
+
+function refreshLogFilter(cards) {
+  if (!el.logFilter) return;
+  const keep = el.logFilter.value;
+  const ids = [...new Set((cards || []).map((c) => c.card_id).filter(Boolean))];
+  el.logFilter.innerHTML = '<option value="">All cards</option>';
+  for (const id of ids) {
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = id;
+    el.logFilter.appendChild(opt);
+  }
+  if (keep && [...el.logFilter.options].some((o) => o.value === keep)) {
+    el.logFilter.value = keep;
+  }
+}
+
+function renderLog(lines) {
+  lastLogLines = lines || [];
+  const filter = el.logFilter ? el.logFilter.value : "";
+  el.log.innerHTML = "";
+  const rows = lastLogLines.filter((line) => !filter || line.card_id === filter || (line.message || "").includes(filter));
+  if (!rows.length) {
+    el.log.innerHTML = '<div class="hint">No log lines for this card yet.</div>';
+    return;
+  }
+  for (const line of rows.slice().reverse()) {
+    const div = document.createElement("div");
+    div.className = `log-line ${line.kind || ""}`;
+    const t = new Date((line.t || 0) * 1000).toLocaleTimeString();
+    const tag = line.card_id ? `${line.card_id} · ` : "";
+    div.textContent = `[${t}] ${tag}${line.message || ""}`;
+    el.log.appendChild(div);
   }
 }
 
@@ -415,17 +513,6 @@ function escapeHtml(text) {
     .replace(/"/g, "&quot;");
 }
 
-function renderLog(lines) {
-  el.log.innerHTML = "";
-  for (const line of (lines || []).slice().reverse()) {
-    const div = document.createElement("div");
-    div.className = `log-line ${line.kind || ""}`;
-    const t = new Date((line.t || 0) * 1000).toLocaleTimeString();
-    div.textContent = `[${t}] ${line.message || ""}`;
-    el.log.appendChild(div);
-  }
-}
-
 async function pollStatus() {
   try {
     const data = await api("/api/status");
@@ -524,6 +611,7 @@ el.refreshVolumes.addEventListener("click", async () => {
 
 el.ssd1.addEventListener("change", () => refreshBatches().catch(() => {}));
 el.ssd2.addEventListener("change", () => refreshBatches().catch(() => {}));
+el.logFilter?.addEventListener("change", () => renderLog(lastLogLines));
 el.batchSelect.addEventListener("change", onBatchSelectChange);
 el.useCustomDest?.addEventListener("click", async () => {
   try {
