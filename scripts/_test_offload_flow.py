@@ -139,19 +139,24 @@ def main() -> int:
     print("\n[1] inventory + detect")
     files_a = inventory.list_transfer_files(card_a)
     rels = sorted(f["rel"] for f in files_a)
-    check("finds root MP4s + sidecar + legacy", rels == [
-        "GX010001.MP4", "GX010001.segments.json", "GX010002.MP4", "pipe-welding/GX019999.MP4",
+    check("finds root MP4s + sidecar only (no task folders)", rels == [
+        "GX010001.MP4", "GX010001.segments.json", "GX010002.MP4",
     ], str(rels))
+    check("legacy task folder is ignored",
+          "pipe-welding/GX019999.MP4" not in rels)
     check("root-level MP4s make card candidate", detect._looks_like_sd_card(card_a, "NO NAME"))
+    check("card id from JSON serial is C0712",
+          engine._card_id_from_sidecars(files_a) == "C0712")
 
     print("\n[2] card A → flat batch folder (no card subfolder)")
-    files_a, prog_a = simulate_worker(card_a, batch_dest, "C1234")
+    files_a, prog_a = simulate_worker(card_a, batch_dest, "C0712")
     check("MP4 sits directly in batch folder", (batch_dest / "GX010001.MP4").is_file())
     check("sidecar sits directly in batch folder",
           (batch_dest / "GX010001.segments.json").is_file())
-    check("no C1234 subfolder created", not (batch_dest / "C1234").exists())
-    check("legacy task folder kept as folder",
-          (batch_dest / "pipe-welding" / "GX019999.MP4").is_file())
+    check("no C1234 / C0712 subfolder created",
+          not (batch_dest / "C1234").exists() and not (batch_dest / "C0712").exists())
+    check("legacy task folder not copied",
+          not (batch_dest / "pipe-welding").exists())
     embedded = embed_meta.read_embedded_segments(batch_dest / "GX010001.MP4")
     check("embedded payload reads back", embedded == full_sidecar)
     check("embedded payload has camera serial + device + IMU sensors",
@@ -194,6 +199,16 @@ def main() -> int:
     check("incomplete sidecar reports missing fields",
           "complete labeling" in missing and "camera_serial" in missing
           and "device_id" in missing and "IMU sensor list" in missing, str(missing))
+    audit_a = engine._audit_files(inventory.list_transfer_files(card_a))
+    check("audit flags MP4 without JSON",
+          "GX010002.MP4" in audit_a["missing_json"] and audit_a["blockers"],
+          str(audit_a["blockers"]))
+    audit_full = engine._audit_files([
+        {"rel": "GX010001.MP4", "size": 1, "embed_json": str(gopro_a / "GX010001.segments.json")},
+        {"rel": "GX010001.segments.json", "size": 1},
+    ])
+    check("complete labeled pair has no wipe blockers",
+          audit_full["blockers"] == [] and audit_full["ok"] == 1, str(audit_full["blockers"]))
 
     print("\n[6] AWS script: rebuild work clips into task folders")
     ffmpeg_ok = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -243,14 +258,13 @@ def main() -> int:
         print("  SKIP  ffmpeg/ffprobe not on PATH")
 
     print("\n[7] wipe transferred files on card A")
-    task_names = sorted({f["task"] for f in files_a if f.get("task")})
-    root_rels = sorted(f["rel"] for f in files_a if not f.get("task"))
-    eject.wipe_transferred_tasks(card_a, task_names, root_rels)
+    root_rels = sorted(f["rel"] for f in files_a)
+    eject.wipe_transferred_files(card_a, root_rels)
     check("root MP4s + sidecar removed",
           not (gopro_a / "GX010001.MP4").exists()
           and not (gopro_a / "GX010001.segments.json").exists()
           and not (gopro_a / "GX010002.MP4").exists())
-    check("legacy task folder removed", not (gopro_a / "pipe-welding").exists())
+    check("untransferred task folder left on card", (gopro_a / "pipe-welding").is_dir())
     check("junk untouched (THM/LRV stay)", (gopro_a / "GX010001.THM").exists())
     check("progress file cleared", progress.load_progress(card_a) is None)
 

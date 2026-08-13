@@ -6,6 +6,10 @@ const el = {
   mode: document.getElementById("mode"),
   ssd1: document.getElementById("ssd1"),
   ssd2: document.getElementById("ssd2"),
+  customDest: document.getElementById("custom-dest"),
+  browseDest: document.getElementById("browse-dest"),
+  useCustomDest: document.getElementById("use-custom-dest"),
+  useCustomDest2: document.getElementById("use-custom-dest-2"),
   s3Uri: document.getElementById("s3-uri"),
   refreshVolumes: document.getElementById("refresh-volumes"),
   startSession: document.getElementById("start-session"),
@@ -75,13 +79,60 @@ function fillVolumeSelect(select, volumes, selected) {
     const option = document.createElement("option");
     option.value = vol.path;
     const free = formatBytes(vol.free_bytes);
-    const tag = vol.is_card_candidate ? " · SD?" : "";
-    option.textContent = `${vol.label} (${vol.path}) · ${free} free${tag}`;
+    const kind = vol.drive_type === "local" ? " · this computer" : vol.is_card_candidate ? " · SD?" : "";
+    option.textContent = `${vol.label} (${vol.path}) · ${free} free${kind}`;
     select.appendChild(option);
+  }
+  if (current && ![...select.options].some((o) => o.value === current)) {
+    const extra = document.createElement("option");
+    extra.value = current;
+    extra.textContent = `Custom folder (${current})`;
+    select.appendChild(extra);
   }
   if (current && [...select.options].some((o) => o.value === current)) {
     select.value = current;
   }
+}
+
+async function applyDestination(vol, which) {
+  const select = which === "ssd2" ? el.ssd2 : el.ssd1;
+  const label = which === "ssd2" ? "SSD 2" : "SSD 1";
+  const exists = [...select.options].some((o) => o.value === vol.path);
+  if (!exists) {
+    const option = document.createElement("option");
+    option.value = vol.path;
+    option.textContent = `${vol.label} (${vol.path}) · ${formatBytes(vol.free_bytes)} free · custom`;
+    select.appendChild(option);
+  }
+  select.value = vol.path;
+  el.customDest.value = vol.path;
+  await refreshBatches();
+  setStatus(`${label} set to ${vol.path}`, "ok");
+}
+
+async function useCustomDestination(which = "ssd1") {
+  const path = (el.customDest.value || "").trim();
+  if (!path) {
+    setStatus("Type a folder path first (e.g. E:\\) or click Browse…", "error");
+    return;
+  }
+  const data = await api("/api/destinations/check", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  await applyDestination(data.volume, which);
+}
+
+async function browseDestination() {
+  setStatus("Folder picker is open on this PC — choose the SSD…");
+  const data = await api("/api/destinations/browse", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    timeoutMs: 180000,
+  });
+  await applyDestination(data.volume, "ssd1");
 }
 
 function selectedBatchName() {
@@ -122,10 +173,14 @@ async function refreshBatches(preferred) {
   for (const batch of batches) {
     const option = document.createElement("option");
     option.value = batch.name;
-    const cards = batch.cards ? `${batch.cards} card(s)` : "empty";
+    const mp4s = Number(batch.mp4s || 0);
+    const jsons = Number(batch.jsons || 0);
+    const files = mp4s || jsons
+      ? `${mp4s} MP4 / ${jsons} JSON`
+      : (batch.cards ? `${batch.cards} file(s)` : "empty");
     const size = batch.bytes ? ` · ${formatBytes(batch.bytes)}` : "";
-    option.textContent = `${batch.name} · ${cards}${size}`;
-    option.dataset.detail = `${batch.name}: ${cards}${
+    option.textContent = `${batch.name} · ${files}${size}`;
+    option.dataset.detail = `${batch.name}: ${files}${
       batch.bytes ? `, ${formatBytes(batch.bytes)} on SSD` : ""
     } — continue SD copy or upload to AWS`;
     el.batchSelect.appendChild(option);
@@ -159,7 +214,7 @@ function renderCards(cards) {
   el.cards.innerHTML = "";
   if (!cards.length) {
     el.cards.innerHTML =
-      '<div class="hint">Waiting for Cxxxx cards with labeled MP4s under DCIM/100GOPRO…</div>';
+      '<div class="hint">Waiting for SD cards with MP4s + .segments.json under DCIM/100GOPRO…</div>';
     el.cardsSummary.textContent = "No cards yet";
     return;
   }
@@ -199,7 +254,7 @@ function renderAwsJobs(jobs) {
   el.awsJobs.innerHTML = "";
   if (!jobs.length) {
     el.awsJobs.innerHTML =
-      '<div class="hint">No AWS uploads yet — use “Upload this batch to AWS (CMD)” or SSD+AWS mode</div>';
+      '<div class="hint">No AWS uploads yet — dump cards first, then use “Upload this batch to AWS (CMD)”</div>';
     return;
   }
   for (const job of jobs.slice(0, 12)) {
@@ -377,9 +432,7 @@ async function pollStatus() {
     const session = data.session || {};
     if (session.active) {
       setStatus(
-        `Watching · batch "${session.batch}" · ${
-          session.mode === "ssd_and_aws" ? "SSD+AWS (CMD survives restart)" : "SSD only"
-        }`,
+        `Watching · batch "${session.batch}" · SSD only`,
         "ok",
       );
     }
@@ -472,6 +525,27 @@ el.refreshVolumes.addEventListener("click", async () => {
 el.ssd1.addEventListener("change", () => refreshBatches().catch(() => {}));
 el.ssd2.addEventListener("change", () => refreshBatches().catch(() => {}));
 el.batchSelect.addEventListener("change", onBatchSelectChange);
+el.useCustomDest?.addEventListener("click", async () => {
+  try {
+    await useCustomDestination("ssd1");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+el.useCustomDest2?.addEventListener("click", async () => {
+  try {
+    await useCustomDestination("ssd2");
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
+el.browseDest?.addEventListener("click", async () => {
+  try {
+    await browseDestination();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+});
 
 el.startSession.addEventListener("click", async () => {
   try {

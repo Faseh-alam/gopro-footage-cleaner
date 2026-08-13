@@ -1,9 +1,8 @@
-"""Delete transferred folders on the card and eject the volume."""
+"""Delete transferred files on the card and eject the volume."""
 
 from __future__ import annotations
 
 import platform
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -11,18 +10,11 @@ from .detect import _find_gopro_root
 from .progress import clear_progress
 
 
-def wipe_transferred_tasks(
-    card_root: Path, task_names: list[str], root_files: list[str] | None = None
-) -> None:
-    """Delete transferred legacy task folders and/or verified root files."""
+def wipe_transferred_files(card_root: Path, root_files: list[str] | None = None) -> None:
+    """Delete verified root MP4s + .segments.json sidecars from the GOPRO folder."""
     gopro = _find_gopro_root(card_root)
     if gopro is None:
         return
-    for name in task_names:
-        folder = gopro / name
-        if folder.is_dir():
-            shutil.rmtree(folder, ignore_errors=True)
-    # Raw MP4s + .segments.json sidecars copied from the GOPRO root.
     for rel in root_files or []:
         target = gopro / rel
         if target.is_file():
@@ -33,16 +25,22 @@ def wipe_transferred_tasks(
     clear_progress(card_root)
 
 
+def wipe_transferred_tasks(
+    card_root: Path, task_names: list[str], root_files: list[str] | None = None
+) -> None:
+    """Back-compat wrapper — task folders are no longer transferred."""
+    del task_names
+    wipe_transferred_files(card_root, root_files)
+
+
 def eject_volume(path: str | Path) -> None:
     root = Path(path).resolve()
     system = platform.system()
     if system == "Darwin":
-        # /Volumes/Name
         subprocess.run(["diskutil", "eject", str(root)], capture_output=True, text=True)
         return
     if system == "Windows":
         letter = root.drive.rstrip(":") or str(root)[:1]
-        # PowerShell eject via Shell.Application
         script = (
             f"$vol = (New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{letter}:');"
             f"if ($vol) {{ $vol.InvokeVerb('Eject') }}"
@@ -53,5 +51,4 @@ def eject_volume(path: str | Path) -> None:
             text=True,
         )
         return
-    # Linux best-effort
     subprocess.run(["umount", str(root)], capture_output=True, text=True)

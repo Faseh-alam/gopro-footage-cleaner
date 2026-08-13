@@ -219,16 +219,10 @@ def start_batch_upload(
 
     sources: list[Path] = []
     if card_id:
-        for root in roots:
-            card_path = root / card_id.upper()
-            if card_path.is_dir():
-                sources.append(card_path)
-        if not sources:
-            raise RuntimeError(f"Card folder {card_id} not found under batch {batch_name}")
-        dest = f"{prefix}{card_id.upper()}/"
-    else:
-        sources = roots
-        dest = prefix
+        # Flat batch layout has no per-card subfolder. Always sync the whole batch.
+        _ = card_id
+    sources = roots
+    dest = prefix
 
     return _launch_upload_job(
         sources=sources,

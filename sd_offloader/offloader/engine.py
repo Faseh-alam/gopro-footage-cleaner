@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -11,6 +12,11 @@ from . import aws_upload, eject, embed_meta, inventory, progress, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
+
+
+class _WipeBlocked(RuntimeError):
+    """Copy verified on SSD, but the card is not wiped (missing JSON / IMU / labels)."""
+
 
 _lock = threading.RLock()
 _session: dict = {
@@ -148,8 +154,14 @@ def start_session(
         raise ValueError("mode must be ssd_only or ssd_and_aws")
     if not ssd1 and not ssd2:
         raise ValueError("Pick at least one SSD")
-    if mode == "ssd_and_aws" and not s3_uri.strip():
-        raise ValueError("S3 URI required for SSD + AWS mode")
+    # AWS is a separate button after the dump — never auto-upload per card.
+    if mode == "ssd_and_aws":
+        _log_line(
+            "SSD + AWS auto-upload is disabled — dumping to SSD only. "
+            "Use Upload this batch to AWS after cards finish.",
+            kind="ok",
+        )
+        mode = "ssd_only"
 
     ssd1_path = str(Path(ssd1).resolve()) if ssd1 else ""
     ssd2_path = str(Path(ssd2).resolve()) if ssd2 else ""
@@ -229,15 +241,16 @@ def _scan_for_cards() -> None:
 
     cards = find_card_volumes(exclude_paths=exclude)
     for vol in cards:
-        card_id = _resolve_card_id(vol)
+        card_root = Path(vol["path"])
+        files = inventory.list_transfer_files(card_root)
+        card_id = _card_id_from_sidecars(files) or _resolve_card_id(vol)
         if not card_id:
             _log_line(
-                f"Skipping volume {vol.get('path')}: no C#### card id "
-                "(rename volume label to C1234 or add a C1234 folder)",
+                f"Skipping volume {vol.get('path')}: could not identify the card "
+                "(need DCIM/###GOPRO with MP4s)",
                 kind="error",
             )
             continue
-        card_root = Path(vol["path"])
         with _lock:
             existing = _cards.get(card_id)
             thread = _copy_threads.get(card_id)
@@ -246,6 +259,13 @@ def _scan_for_cards() -> None:
                 # Real in-flight worker — do not restart
                 if existing.get("mount") == str(card_root):
                     continue
+            if existing and existing.get("status") == "needs_fix":
+                if existing.get("mount") == str(card_root):
+                    audit = _audit_files(files)
+                    if audit["blockers"]:
+                        continue
+                    _log_line(f"{card_id}: labels look complete now — retrying copy/verify")
+                # else: unplugged/replugged or labels fixed — fall through to retry
             # Finished (or finishing) this session. After wipe the volume may still be
             # mounted empty — never re-queue that as ERROR. Only re-offload when the
             # card is "completed" and new labeled MP4s appear.
@@ -293,7 +313,7 @@ def _scan_for_cards() -> None:
             progress.clear_progress(card_root)
             prog = None
 
-        _start_card_job(card_root, card_id, batch, mode, ssd1, ssd2, s3_uri, prog)
+        _start_card_job(card_root, card_id, batch, mode, ssd1, ssd2, s3_uri, prog, files=files)
 
 
 def _resolve_card_id(vol: dict) -> str:
@@ -322,8 +342,9 @@ def _start_card_job(
     ssd2: str,
     s3_uri: str,
     existing_progress: dict | None,
+    files: list[dict] | None = None,
 ) -> None:
-    files = inventory.list_transfer_files(card_root)
+    files = files if files is not None else inventory.list_transfer_files(card_root)
     total = inventory.total_bytes(files)
     if not files:
         with _lock:
@@ -337,7 +358,7 @@ def _start_card_job(
                 "card_id": card_id,
                 "mount": str(card_root),
                 "status": "error",
-                "message": "No MP4s (or task folders) found under DCIM/…GOPRO",
+                "message": "No MP4s found under DCIM/…GOPRO",
                 "bytes_done": 0,
                 "bytes_total": 0,
                 "speed_mbps": 0,
@@ -440,10 +461,6 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
 
     for item in files:
         rel = item["rel"]
-        if item.get("task"):
-            item["dest_rel"] = rel  # legacy task folders keep their layout
-            continue
-
         recorded = (entries.get(rel) or {}).get("dest_rel")
         is_sidecar = rel.lower().endswith(_SIDECAR_SUFFIX)
         base = rel[: -len(_SIDECAR_SUFFIX)] if is_sidecar else Path(rel).stem
@@ -487,6 +504,116 @@ def _missing_metadata(payload: dict) -> list[str]:
     return [name for name, present in _META_CHECKS if not present(payload)]
 
 
+def _camera_id_from_serial(serial: str | None) -> str:
+    digits = re.sub(r"\D", "", str(serial or ""))
+    if len(digits) >= 4:
+        return f"C{digits[-4:]}"
+    return ""
+
+
+def _load_sidecar(path: str | Path) -> dict | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _card_id_from_sidecars(files: list[dict]) -> str:
+    """Prefer C + last 4 of camera serial in the JSON, else card_badge."""
+    for item in files:
+        path = item.get("embed_json")
+        if not path:
+            continue
+        payload = _load_sidecar(path)
+        if not payload:
+            continue
+        meta = payload.get("media_meta") or {}
+        camera_id = _camera_id_from_serial(meta.get("camera_serial"))
+        if camera_id:
+            return camera_id
+        badge = str(payload.get("card_badge") or "").strip().upper()
+        if re.fullmatch(r"C\d{4}", badge):
+            return badge
+    return ""
+
+
+def _format_bytes(n: int) -> str:
+    value = float(max(0, int(n)))
+    units = ("B", "KB", "MB", "GB", "TB")
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(value)} {units[idx]}"
+    return f"{value:.1f} {units[idx]}"
+
+
+def _audit_files(files: list[dict]) -> dict:
+    """Check each MP4 has a sidecar with IMU + serial + complete labeling."""
+    mp4s = [f for f in files if str(f.get("rel") or "").upper().endswith(".MP4")]
+    jsons = [f for f in files if str(f.get("rel") or "").lower().endswith(_SIDECAR_SUFFIX)]
+    missing_json: list[str] = []
+    missing_imu: list[str] = []
+    missing_serial: list[str] = []
+    incomplete: list[str] = []
+    unreadable: list[str] = []
+    ok = 0
+    for item in mp4s:
+        rel = item["rel"]
+        sidecar = item.get("embed_json") or ""
+        if not sidecar:
+            missing_json.append(rel)
+            continue
+        payload = _load_sidecar(sidecar)
+        if not payload:
+            unreadable.append(rel)
+            continue
+        missing = _missing_metadata(payload)
+        if "IMU sensor list" in missing:
+            missing_imu.append(rel)
+        if "camera_serial" in missing:
+            missing_serial.append(rel)
+        if "complete labeling" in missing:
+            incomplete.append(rel)
+        if not missing:
+            ok += 1
+    blockers: list[str] = []
+    if missing_json:
+        blockers.append(f"{len(missing_json)} MP4(s) have no .segments.json")
+    if unreadable:
+        blockers.append(f"{len(unreadable)} JSON file(s) unreadable")
+    if missing_imu:
+        blockers.append(f"{len(missing_imu)} JSON missing IMU sensor list")
+    if missing_serial:
+        blockers.append(f"{len(missing_serial)} JSON missing camera serial")
+    if incomplete:
+        blockers.append(f"{len(incomplete)} video(s) not fully labeled")
+    return {
+        "mp4s": len(mp4s),
+        "jsons": len(jsons),
+        "ok": ok,
+        "missing_json": missing_json,
+        "missing_imu": missing_imu,
+        "missing_serial": missing_serial,
+        "incomplete": incomplete,
+        "unreadable": unreadable,
+        "blockers": blockers,
+        "source_bytes": sum(int(f.get("size") or 0) for f in files),
+    }
+
+
+def _audit_summary_line(card_id: str, audit: dict) -> str:
+    return (
+        f"{card_id}: {audit['mp4s']} MP4s, {audit['jsons']} JSON, "
+        f"{audit['ok']} with IMU+serial+complete, "
+        f"{len(audit['missing_json'])} missing JSON, "
+        f"{len(audit['missing_imu'])} missing IMU, "
+        f"{len(audit['incomplete'])} incomplete"
+    )
+
+
 def _copy_card_worker(
     card_root: Path,
     card_id: str,
@@ -497,7 +624,19 @@ def _copy_card_worker(
     dest: Path,
     prog: dict,
 ) -> None:
+    del batch, mode, s3_uri  # dump is SSD-only; AWS is a separate UI button
     total_bytes = inventory.total_bytes(files)
+    audit = _audit_files(files)
+    _log_line(_audit_summary_line(card_id, audit), kind="ok" if not audit["blockers"] else "error")
+    for rel in audit["missing_json"]:
+        _log_line(f"{card_id}: {rel} has no .segments.json — will copy MP4 but will not wipe", kind="error")
+    for rel in audit["missing_imu"]:
+        _log_line(f"{card_id}: {rel} JSON has no IMU sensor list — will not wipe", kind="error")
+    for rel in audit["missing_serial"]:
+        _log_line(f"{card_id}: {rel} JSON has no camera serial — will not wipe", kind="error")
+    for rel in audit["incomplete"]:
+        _log_line(f"{card_id}: {rel} is not fully labeled — will not wipe", kind="error")
+
     _update_card(
         card_id,
         status="copying",
@@ -513,13 +652,14 @@ def _copy_card_worker(
     started = time.time()
     done_bytes = 0
     files_done = 0
-    task_names = sorted({f["task"] for f in files if f.get("task")})
-    root_rels = sorted(f["rel"] for f in files if not f.get("task"))
+    root_rels = sorted(f["rel"] for f in files)
     _resolve_dest_names(files, dest, prog, card_id)
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
     saw_disk_write = False
+    copied_source_bytes = 0
+    embed_extra_bytes = 0
 
     def _publish(current_file_bytes: int = 0, *, message: str | None = None, force: bool = False) -> None:
         nonlocal last_ui, last_live, last_speed_at
@@ -569,8 +709,11 @@ def _copy_card_worker(
                     item["dest_size"] = dest_file.stat().st_size
                 except OSError:
                     item["dest_size"] = size
+                item["copied_size"] = size
                 done_bytes += size
                 files_done += 1
+                copied_source_bytes += size
+                embed_extra_bytes += max(0, int(item["dest_size"]) - size)
                 saw_disk_write = True
                 _publish(0, message=f"Skipped (done): {rel}", force=True)
                 continue
@@ -588,15 +731,15 @@ def _copy_card_worker(
                 _publish(written, message=f"Copying {_rel}…")
 
             copy_file(src, dest_file, on_progress=on_progress)
-            if not dest_file.is_file() or dest_file.stat().st_size != size:
+            landed = dest_file.stat().st_size if dest_file.is_file() else 0
+            if landed != size:
                 raise RuntimeError(
-                    f"Copy did not land on SSD: expected {dest_file} ({size} bytes)"
+                    f"Size mismatch after copy: {rel} card={size} bytes, SSD={landed} bytes"
                 )
             saw_disk_write = True
+            item["copied_size"] = size
 
-            # Embed the GoPro Cleaner segments JSON inside the SSD copy so the
-            # MP4 itself carries task names + timestamps (sidecar still copied
-            # alongside). Card original is never modified.
+            # Embed JSON into the SSD copy only. Card original is never modified.
             dest_size = size
             sidecar_path = item.get("embed_json") or ""
             if sidecar_path:
@@ -608,7 +751,7 @@ def _copy_card_worker(
                     if missing:
                         _log_line(
                             f"{card_id}: {rel} sidecar is missing "
-                            f"{', '.join(missing)} — re-check in GoPro Cleaner",
+                            f"{', '.join(missing)} — re-check in Review Station",
                             kind="error",
                         )
                     embed_meta.embed_segments_json(dest_file, payload)
@@ -620,6 +763,8 @@ def _copy_card_worker(
                         kind="error",
                     )
             item["dest_size"] = dest_size
+            copied_source_bytes += size
+            embed_extra_bytes += max(0, dest_size - size)
 
             progress.mark_file_done(
                 card_root, prog, rel, size, dest_size=dest_size, dest_rel=dest_rel
@@ -638,12 +783,40 @@ def _copy_card_worker(
             dest_file = dest / (item.get("dest_rel") or item["rel"])
             expected = int(item.get("dest_size") or item["size"])
             if not dest_file.exists() or dest_file.stat().st_size != expected:
-                raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
+                raise RuntimeError(
+                    f"Verify failed: {item['rel']} — card {item['size']} bytes, "
+                    f"SSD expected {expected}, "
+                    f"SSD actual {dest_file.stat().st_size if dest_file.exists() else 0}"
+                )
+            # Sidecars must match the card byte-for-byte (no embed).
+            if str(item["rel"]).lower().endswith(_SIDECAR_SUFFIX):
+                if dest_file.stat().st_size != int(item["size"]):
+                    raise RuntimeError(
+                        f"JSON size mismatch: {item['rel']} card={item['size']} "
+                        f"SSD={dest_file.stat().st_size}"
+                    )
+
+        if copied_source_bytes != total_bytes:
+            raise RuntimeError(
+                f"Card total {_format_bytes(total_bytes)} did not match copied "
+                f"{_format_bytes(copied_source_bytes)} — not wiping"
+            )
+
+        _log_line(
+            f"{card_id}: size check — card {_format_bytes(total_bytes)} "
+            f"({audit['mp4s']} MP4 + {audit['jsons']} JSON) → SSD "
+            f"{_format_bytes(copied_source_bytes)} copied"
+            + (f" (+{_format_bytes(embed_extra_bytes)} JSON embed in MP4s)" if embed_extra_bytes else "")
+            + ". MATCH.",
+            kind="ok",
+        )
+
+        if audit["blockers"]:
+            raise _WipeBlocked("; ".join(audit["blockers"]))
 
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
-        # Mark DONE before wipe/eject so a mid-wipe watcher pass cannot flip us to ERROR.
         _update_card(
             card_id,
             status="completed",
@@ -656,8 +829,7 @@ def _copy_card_worker(
 
         try:
             _update_card(card_id, status="wiping", message="Wiping transferred files on card…")
-            # Keep completed semantics if wipe/eject races the watcher.
-            eject.wipe_transferred_tasks(card_root, task_names, root_rels)
+            eject.wipe_transferred_files(card_root, root_rels)
         except Exception as wipe_exc:  # noqa: BLE001
             _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
 
@@ -667,46 +839,24 @@ def _copy_card_worker(
         except Exception as eject_exc:  # noqa: BLE001
             _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
 
-        if mode == "ssd_and_aws" and s3_uri:
-            _update_card(card_id, status="uploading", message="Queued for AWS upload…")
-            with _lock:
-                ssd1 = _session.get("ssd1") or ""
-                ssd2 = _session.get("ssd2") or ""
-            try:
-                job = aws_upload.start_batch_upload(
-                    s3_uri=s3_uri,
-                    batch_name=batch,
-                    ssd1=ssd1,
-                    ssd2=ssd2,
-                    card_id=card_id,
-                    show_console=True,
-                )
-                _update_card(
-                    card_id,
-                    status="completed",
-                    message=f"Ready — AWS upload live in UI ({job.get('id')})",
-                    speed_mbps=0,
-                    eta_seconds=0,
-                    bytes_done=total_bytes,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _update_card(
-                    card_id,
-                    status="completed",
-                    message=f"SSD copy done; AWS failed to start: {exc}",
-                )
-                _log_line(f"{card_id}: AWS enqueue failed: {exc}", kind="error")
-        else:
-            _update_card(
-                card_id,
-                status="completed",
-                message="Ready — card ejected (SSD only)",
-                speed_mbps=0,
-                eta_seconds=0,
-                bytes_done=total_bytes,
-            )
+        _update_card(
+            card_id,
+            status="completed",
+            message="Ready — card ejected (SSD only)",
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
 
         _log_line(f"{card_id}: complete → {dest}", kind="ok")
+    except _WipeBlocked as exc:
+        _update_card(
+            card_id,
+            status="needs_fix",
+            message=f"On SSD, not wiped: {exc}. Fix labels in Review Station.",
+            dest=str(dest),
+        )
+        _log_line(f"{card_id}: on SSD but not wiped — {exc}", kind="error")
     except Exception as exc:  # noqa: BLE001
         _update_card(card_id, status="error", message=str(exc), dest=str(dest))
         _log_line(f"{card_id}: error — {exc}", kind="error")

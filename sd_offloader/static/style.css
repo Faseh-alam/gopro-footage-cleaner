@@ -110,6 +110,15 @@ select {
   align-items: center;
 }
 
+.dest-row {
+  margin-top: 0.35rem;
+}
+
+.dest-row input {
+  flex: 1;
+  min-width: 16rem;
+}
+
 .actions {
   margin-top: 0.9rem;
 }
@@ -206,7 +215,8 @@ button.secondary {
   color: var(--accent);
 }
 
-.phase.error {
+.phase.error,
+.phase.needs_fix {
   color: var(--danger);
 }
 
@@ -292,7 +302,8 @@ button.danger {
 }
 
 .phase.mismatch,
-.phase.error {
+.phase.error,
+.phase.needs_fix {
   color: var(--danger);
 }
 

@@ -11,8 +11,8 @@ from .detect import volume_free_bytes
 def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
     """Return batches found under ``Batches/`` on either SSD.
 
-    Fast path: only lists card folders (no full-tree size scan — that blocked
-    the UI for minutes on multi‑TB drives).
+    Flat layout: ``Batches/<batch>/*.MP4`` + ``*.segments.json``.
+    Counts files in the batch folder only (no recursive size scan).
     """
     found: dict[str, dict] = {}
 
@@ -31,17 +31,16 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             name = entry.name
-            card_ids: list[str] = []
+            mp4s = 0
+            jsons = 0
             try:
                 for child in entry.iterdir():
-                    if not child.is_dir() or child.name.startswith("."):
+                    if not child.is_file() or child.name.startswith("."):
                         continue
-                    # Card folders look like C1234
-                    child_name = child.name.upper()
-                    if len(child_name) >= 5 and child_name[0] == "C" and child_name[1:5].isdigit():
-                        card_ids.append(child_name)
-                    elif child_name.startswith("C") and child_name[1:].isdigit():
-                        card_ids.append(child_name)
+                    if child.suffix.upper() == ".MP4":
+                        mp4s += 1
+                    elif child.name.lower().endswith(".segments.json"):
+                        jsons += 1
             except OSError:
                 continue
 
@@ -50,14 +49,16 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
                     "name": name,
                     "card_ids": [],
                     "cards": 0,
+                    "mp4s": 0,
+                    "jsons": 0,
                     "bytes": 0,
                     "paths": [],
                 }
             row = found[name]
             row["paths"].append(str(entry))
-            merged = sorted(set(row["card_ids"]) | set(card_ids))
-            row["card_ids"] = merged
-            row["cards"] = len(merged)
+            row["mp4s"] = int(row.get("mp4s") or 0) + mp4s
+            row["jsons"] = int(row.get("jsons") or 0) + jsons
+            row["cards"] = int(row["mp4s"])
 
     rows = sorted(found.values(), key=lambda r: r["name"].lower())
     return rows

@@ -8,7 +8,7 @@ from flask import Flask, jsonify, render_template, request
 
 from . import __version__, aws_upload, batches, engine
 from .config import load_config, save_config
-from .detect import list_volumes
+from .detect import browse_folder, list_volumes, resolve_destination
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 
@@ -68,6 +68,23 @@ def create_app() -> Flask:
     @app.get("/api/volumes")
     def volumes():
         return jsonify({"volumes": list_volumes()})
+
+    @app.post("/api/destinations/check")
+    def destinations_check():
+        payload = request.get_json(silent=True) or {}
+        try:
+            row = resolve_destination(str(payload.get("path") or ""))
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "volume": row})
+
+    @app.post("/api/destinations/browse")
+    def destinations_browse():
+        try:
+            row = browse_folder()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "volume": row})
 
     @app.get("/api/batches")
     def api_batches():

@@ -65,6 +65,7 @@ def _windows_drives() -> list[dict]:
                 return None
             usage = shutil.disk_usage(f"{letter}:\\")
             label = _windows_volume_label(letter) or letter
+            display = f"{letter}: {label}" if label.upper() != letter.upper() else f"{letter}:"
             gopro = _find_gopro_root(root)
             is_card = _looks_like_sd_card(root, label) if gopro else False
             card_id = _card_id_for(root, label)
@@ -75,7 +76,7 @@ def _windows_drives() -> list[dict]:
                 pass
             return {
                 "path": path,
-                "label": label,
+                "label": display,
                 "free_bytes": usage.free,
                 "total_bytes": usage.total,
                 "drive_type": "removable" if drive_type == 2 else "fixed",
@@ -107,9 +108,52 @@ def _windows_volume_label(letter: str) -> str:
     return buf.value.strip() if result else ""
 
 
-def _mac_volumes() -> list[dict]:
+def _destination_row(path: Path, *, label: str, drive_type: str) -> dict | None:
     import shutil
 
+    try:
+        resolved = path.expanduser().resolve()
+        if not resolved.exists():
+            return None
+        usage = shutil.disk_usage(resolved)
+    except OSError:
+        return None
+    gopro = _find_gopro_root(resolved)
+    return {
+        "path": str(resolved),
+        "label": label,
+        "free_bytes": usage.free,
+        "total_bytes": usage.total,
+        "drive_type": drive_type,
+        "is_card_candidate": _looks_like_sd_card(resolved, label) if gopro else False,
+        "card_id": _card_id_for(resolved, label) if gopro else None,
+        "gopro_root": str(gopro) if gopro else None,
+    }
+
+
+def _local_destinations() -> list[dict]:
+    """Always offer this computer as a dump target (home folder)."""
+    home = Path.home()
+    row = _run_with_timeout(
+        lambda: _destination_row(home, label=f"This Mac — {home.name}" if platform.system() == "Darwin" else f"This PC — {home.name}", drive_type="local"),
+        2.0,
+    )
+    return [row] if row else []
+
+
+def _dedupe_volumes(rows: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in rows:
+        key = str(row.get("path") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _mac_volumes() -> list[dict]:
     volumes_root = Path("/Volumes")
     if not volumes_root.exists():
         return []
@@ -121,20 +165,7 @@ def _mac_volumes() -> list[dict]:
             continue
 
         def probe(path: Path = entry) -> dict | None:
-            usage = shutil.disk_usage(path)
-            resolved = path.resolve()
-            label = path.name
-            gopro = _find_gopro_root(resolved)
-            return {
-                "path": str(resolved),
-                "label": label,
-                "free_bytes": usage.free,
-                "total_bytes": usage.total,
-                "drive_type": "removable",
-                "is_card_candidate": _looks_like_sd_card(resolved, label) if gopro else False,
-                "card_id": _card_id_for(resolved, label),
-                "gopro_root": str(gopro) if gopro else None,
-            }
+            return _destination_row(path, label=path.name, drive_type="removable")
 
         row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
         if row:
@@ -145,40 +176,93 @@ def _mac_volumes() -> list[dict]:
 def list_volumes() -> list[dict]:
     system = platform.system()
     if system == "Windows":
-        return _windows_drives()
-    if system == "Darwin":
-        return _mac_volumes()
-    # Linux fallback — keep lightweight
-    import shutil
+        found = _windows_drives()
+    elif system == "Darwin":
+        found = _mac_volumes()
+    else:
+        found = _linux_volumes()
+    return _dedupe_volumes(_local_destinations() + found)
 
+
+def resolve_destination(path: str) -> dict:
+    """Validate a typed folder path so it can be used as SSD 1 / SSD 2."""
+    text = str(path or "").strip().strip('"')
+    if not text:
+        raise ValueError("Folder path is empty")
+    if platform.system() == "Windows" and re.fullmatch(r"[A-Za-z]:", text):
+        text = text + "\\"
+    raw = Path(text).expanduser()
+    if not raw.exists():
+        raise ValueError(f"Folder not found: {raw}")
+    if not raw.is_dir():
+        raise ValueError(f"Not a folder: {raw}")
+    row = _destination_row(raw, label=raw.name or str(raw), drive_type="custom")
+    if not row:
+        raise ValueError(f"Could not read folder: {raw}")
+    return row
+
+
+def browse_folder() -> dict:
+    """Open a native folder picker on this PC (Windows / Mac) and return a destination."""
+    import subprocess
+
+    system = platform.system()
+    if system == "Windows":
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$d.Description = 'Select SSD or destination folder'; "
+            "$d.ShowNewFolderButton = $true; "
+            "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+        )
+        result = subprocess.run(
+            ["powershell", "-STA", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        picked = (result.stdout or "").strip()
+        if not picked:
+            raise ValueError("No folder selected")
+        return resolve_destination(picked)
+    if system == "Darwin":
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'POSIX path of (choose folder with prompt "Select SSD or destination folder")',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise ValueError("No folder selected")
+        picked = (result.stdout or "").strip()
+        if not picked:
+            raise ValueError("No folder selected")
+        return resolve_destination(picked)
+    raise ValueError("Folder picker is only available on Windows and macOS")
+
+
+def _linux_volumes() -> list[dict]:
     volumes: list[dict] = []
     media = Path("/media")
-    if media.exists():
-        for user_dir in media.iterdir():
-            if not user_dir.is_dir():
+    if not media.exists():
+        return volumes
+    for user_dir in media.iterdir():
+        if not user_dir.is_dir():
+            continue
+        for entry in user_dir.iterdir():
+            if not entry.is_dir():
                 continue
-            for entry in user_dir.iterdir():
-                if not entry.is_dir():
-                    continue
 
-                def probe(path: Path = entry) -> dict | None:
-                    usage = shutil.disk_usage(path)
-                    label = path.name
-                    gopro = _find_gopro_root(path)
-                    return {
-                        "path": str(path),
-                        "label": label,
-                        "free_bytes": usage.free,
-                        "total_bytes": usage.total,
-                        "drive_type": "removable",
-                        "is_card_candidate": _looks_like_sd_card(path, label) if gopro else False,
-                        "card_id": _card_id_for(path, label),
-                        "gopro_root": str(gopro) if gopro else None,
-                    }
+            def probe(path: Path = entry) -> dict | None:
+                return _destination_row(path, label=path.name, drive_type="removable")
 
-                row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
-                if row:
-                    volumes.append(row)
+            row = _run_with_timeout(probe, DRIVE_PROBE_TIMEOUT_SEC)
+            if row:
+                volumes.append(row)
     return volumes
 
 
@@ -227,20 +311,14 @@ def _card_id_for(root: Path, label: str) -> str | None:
 
 def _looks_like_sd_card(root: Path, label: str) -> bool:
     """Any volume with DCIM/###GOPRO containing MP4s — name does not matter."""
+    del label
     gopro = _find_gopro_root(root)
     if gopro is None:
         return False
     try:
         for entry in gopro.iterdir():
-            # Raw labeled MP4s directly in DCIM/###GOPRO (label-only workflow)
             if entry.is_file() and entry.suffix.upper() == ".MP4":
                 return True
-            if not entry.is_dir():
-                continue
-            # Legacy pre-trimmed task folders
-            for item in entry.iterdir():
-                if item.is_file() and item.suffix.upper() == ".MP4":
-                    return True
     except OSError:
         return False
     return False

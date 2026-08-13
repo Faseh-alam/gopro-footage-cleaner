@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">Server ingest</p>
           <h1>SD Card Offloader</h1>
-          <p class="hint">Pick an existing batch on the SSDs or create a new one · SD→SSD parallel · AWS via s5cmd (preferred) or AWS CLI in CMD</p>
+          <p class="hint">Pick SSDs and a batch · plug labeled SD cards · copies each MP4 + its .segments.json · AWS upload is a separate button</p>
         </div>
         <div class="header-meta">
           <span id="aws-cli-status" class="pill">Uploader…</span>
@@ -31,6 +31,15 @@
             SSD 2
             <select id="ssd2"></select>
           </label>
+          <label class="full">
+            Add a drive or folder (not in the list? Browse or type e.g. E:\)
+            <span class="row dest-row">
+              <input id="custom-dest" type="text" placeholder="E:\  or  D:\footage" />
+              <button id="browse-dest" type="button" class="secondary">Browse…</button>
+              <button id="use-custom-dest" type="button" class="secondary">Use as SSD 1</button>
+              <button id="use-custom-dest-2" type="button" class="secondary">Use as SSD 2</button>
+            </span>
+          </label>
           <label>
             Batch on SSDs
             <select id="batch-select">
@@ -45,7 +54,6 @@
             Mode
             <select id="mode">
               <option value="ssd_only">SSD only (upload to AWS later)</option>
-              <option value="ssd_and_aws">SSD + AWS (s5cmd in CMD · auto-retry · live UI)</option>
             </select>
           </label>
           <label class="full">
