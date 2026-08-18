@@ -1,8 +1,11 @@
 {
-  "s3_uri": "",
-  "ssd1": "",
+  "s3_uri": "s3://world-context-data-664427478457-ap-south-1-an/worldcontext-data/raw/batches/",
+  "ssd1": "E:\\",
   "ssd2": "",
-  "last_batch": "",
+  "last_batch": "Batch-21",
   "mode": "ssd_only",
-  "port": 8877
+  "port": 8877,
+  "s5cmd_numworkers": 20,
+  "aws_upload_retries": 5,
+  "max_parallel_cards": 3
 }

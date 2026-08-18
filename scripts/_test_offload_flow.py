@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO / "sd_offloader"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from offloader import detect, eject, embed_meta, engine, inventory, progress  # noqa: E402
+from offloader import detect, eject, embed_meta, engine, inventory, pairing, progress  # noqa: E402
 from offloader.transfer import copy_file  # noqa: E402
 
 FAILURES: list[str] = []
@@ -69,11 +69,12 @@ def make_card(root: Path, *, with_sidecar: dict | None, legacy: bool = False) ->
 
 
 def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dict], dict]:
-    """Copy+embed loop exactly like engine._copy_card_worker (no threads/UI)."""
+    """Copy+embed loop like engine._copy_card_worker (no threads/UI)."""
     files = inventory.list_transfer_files(card_root)
     prog = {"batch": "batch 1", "card_id": card_id, "dest": str(dest),
             "files": {}, "status": "in_progress"}
-    engine._resolve_dest_names(files, dest, prog, card_id)
+    with engine._dest_batch_lock(dest):
+        engine._resolve_dest_names(files, dest, prog, card_id)
     for item in files:
         src = Path(item["source"])
         dest_rel = item.get("dest_rel") or item["rel"]
@@ -85,8 +86,9 @@ def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dic
         dest_size = int(item["size"])
         if item.get("embed_json"):
             payload = json.loads(Path(item["embed_json"]).read_text(encoding="utf-8"))
-            embed_meta.embed_segments_json(dest_file, payload)
-            dest_size = dest_file.stat().st_size
+            if not pairing.validate_sidecar_for_mp4(src, Path(item["embed_json"]), payload):
+                embed_meta.embed_segments_json(dest_file, payload)
+                dest_size = dest_file.stat().st_size
         item["dest_size"] = dest_size
         progress.mark_file_done(card_root, prog, item["rel"], int(item["size"]),
                                 dest_size=dest_size, dest_rel=dest_rel)
@@ -130,11 +132,14 @@ def main() -> int:
         "media_meta": {},
         "segments": [{"kind": "work", "task": "Cable Pulling", "start": 0.0, "end": 0.4}],
     }
+    bad_sidecar = {**full_sidecar, "source": "GX010999.MP4"}
 
     card_a = tmp / "cardA"
     card_b = tmp / "cardB"
+    card_bad = tmp / "cardBad"
     gopro_a = make_card(card_a, with_sidecar=full_sidecar, legacy=True)
     make_card(card_b, with_sidecar=incomplete_sidecar)
+    gopro_bad = make_card(card_bad, with_sidecar=bad_sidecar)
 
     print("\n[1] inventory + detect")
     files_a = inventory.list_transfer_files(card_a)
@@ -175,7 +180,7 @@ def main() -> int:
     check("card A copy untouched",
           embed_meta.read_embedded_segments(batch_dest / "GX010001.MP4") == full_sidecar)
 
-    print("\n[4] resume with renamed + embedded files")
+    print("\n[4] resume + duplicate prevention")
     loaded_b = progress.load_progress(card_b)
     entry = (loaded_b.get("files") or {}).get("GX010001.MP4") or {}
     check("progress remembers dest_rel", entry.get("dest_rel") == "GX010001__C5678.MP4")
@@ -183,17 +188,38 @@ def main() -> int:
           progress.is_file_done(loaded_b, "GX010001.MP4", int(mp4_b["size"]),
                                 batch_dest / "GX010001__C5678.MP4"))
     check("dest_looks_complete via dest_rel", progress.dest_looks_complete(loaded_b, batch_dest))
-    files_b2, _ = simulate_worker(card_b, batch_dest, "C5678")
-    # Re-running with saved progress must not create a double-suffixed copy.
     check("re-run reuses same names (no dupes)",
           not any("__C5678__" in p.name for p in batch_dest.iterdir()))
+    progress.clear_progress(card_a)
+    before_a = {p.name for p in batch_dest.iterdir()}
+    simulate_worker(card_a, batch_dest, "C1234")
+    after_a = {p.name for p in batch_dest.iterdir()}
+    check("re-offload same card reuses batch file (no duplicate)",
+          before_a == after_a
+          and (batch_dest / "GX010001.MP4").is_file()
+          and not (batch_dest / "GX010001__C1234.MP4").exists())
 
-    print("\n[5] metadata completeness check")
+    print("\n[5] metadata pairing checks")
     check("full sidecar passes", engine._missing_metadata(full_sidecar) == [])
     missing = engine._missing_metadata(incomplete_sidecar)
     check("incomplete sidecar reports missing fields",
           "complete labeling" in missing and "camera_serial" in missing
           and "device_id" in missing and "IMU sensor list" in missing, str(missing))
+    mp4_path = gopro_a / "GX010001.MP4"
+    sized = {**full_sidecar, "size_bytes": mp4_path.stat().st_size}
+    check("size_bytes match passes", pairing.validate_sidecar_for_mp4(
+        mp4_path, gopro_a / "GX010001.segments.json", sized) == [])
+    wrong_size = {**full_sidecar, "size_bytes": mp4_path.stat().st_size + 1}
+    check("size_bytes mismatch detected",
+          any("size_bytes" in e for e in pairing.validate_sidecar_for_mp4(
+              mp4_path, gopro_a / "GX010001.segments.json", wrong_size)))
+    mismatches = pairing.validate_sidecar_for_mp4(
+        gopro_bad / "GX010001.MP4", gopro_bad / "GX010001.segments.json", bad_sidecar)
+    check("wrong sidecar source detected", any("source" in m for m in mismatches), str(mismatches))
+    simulate_worker(card_bad, batch_dest / "bad", "CBAD")
+    bad_mp4 = batch_dest / "bad" / "GX010001.MP4"
+    check("mismatch skips embed (MP4 still copied)", bad_mp4.is_file())
+    check("mismatch skips embed payload", embed_meta.read_embedded_segments(bad_mp4) is None)
 
     print("\n[6] AWS script: rebuild work clips into task folders")
     ffmpeg_ok = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -203,7 +229,6 @@ def main() -> int:
             capture_output=True, text=True, timeout=300,
         )
         out_root = batch_dest / "_trimmed"
-        # C + last 4 of serial C3501324500712 → C0712 / task / original name
         clip = out_root / "C0712" / "pipe-welding" / "GX010001.MP4"
         check("script exits 0", result.returncode == 0,
               (result.stdout + result.stderr)[-300:])
@@ -229,7 +254,6 @@ def main() -> int:
             dur = float(json.loads(probe.stdout or "{}").get("format", {}).get("duration") or 0)
             check("clip playable, duration sane", probe.returncode == 0 and 0.2 <= dur <= 1.1,
                   f"duration={dur}")
-        # --include-incomplete picks up card B (no serial → falls back to card_badge C5678)
         result2 = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "aws_trim_batch.py"), str(batch_dest),
              "--include-incomplete"],

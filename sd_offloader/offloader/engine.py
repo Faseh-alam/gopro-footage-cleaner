@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, embed_meta, inventory, progress, space
+from . import aws_upload, eject, embed_meta, inventory, pairing, progress, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -24,6 +24,7 @@ _session: dict = {
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
 _copy_threads: dict[str, threading.Thread] = {}
+_batch_dest_locks: dict[str, threading.Lock] = {}
 _cancel_requested: set[str] = set()
 _waiting_queue: list[dict] = []  # queued starts when at max parallel
 _watcher_started = False
@@ -817,13 +818,22 @@ def _sidecar_stem(rel: str) -> str:
     return Path(rel).stem
 
 
+def _dest_batch_lock(dest: Path) -> threading.Lock:
+    key = str(dest.resolve()).lower()
+    with _lock:
+        if key not in _batch_dest_locks:
+            _batch_dest_locks[key] = threading.Lock()
+        return _batch_dest_locks[key]
+
+
 def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str) -> None:
     """Assign collision-safe destination names into the flat batch folder.
 
     GoPro numbering repeats across cards (every card has a GX010001.MP4), so
-    when another card already parked the same name in this batch the incoming
-    pair (MP4 + JSON sidecar) is renamed to ``<stem>__<CARDID><ext>``.
-    Names are remembered in the card's progress file so resume stays stable.
+    when another card already parked a *different* video under the same name,
+    the incoming pair is renamed to ``<stem>__<CARDID><ext>``. When the batch
+    already holds the same video (size + sidecar identity), the existing name
+    is reused so re-offloads do not create duplicates.
     """
     entries = prog.get("files") or {}
     stem_map: dict[str, str] = {}  # source MP4 stem -> final stem
@@ -860,6 +870,18 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
             return
 
         name = Path(rel).name
+        card_size = int(item.get("size") or 0)
+        sidecar_payload = (
+            pairing.load_sidecar(item["embed_json"]) if item.get("embed_json") else None
+        )
+        existing = pairing.find_existing_dest_name(
+            dest, name, card_mp4_size=card_size, sidecar=sidecar_payload
+        )
+        if existing:
+            item["dest_rel"] = existing
+            stem_map[base] = Path(existing).stem
+            return
+
         if (dest / name).exists():
             final_base = f"{base}__{card_id.upper()}"
             item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
@@ -873,6 +895,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         assign_one(item, sidecar_pass=False)
     for item in files:
         assign_one(item, sidecar_pass=True)
+
+
 _META_CHECKS = (
     ("complete labeling", lambda p: p.get("complete") is True),
     ("segments", lambda p: bool(p.get("segments"))),
@@ -917,7 +941,8 @@ def _copy_card_worker(
     files_done = 0
     task_names = sorted({f["task"] for f in files if f.get("task")})
     root_rels = sorted(f["rel"] for f in files if not f.get("task"))
-    _resolve_dest_names(files, dest, prog, card_id)
+    with _dest_batch_lock(dest):
+        _resolve_dest_names(files, dest, prog, card_id)
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
@@ -969,9 +994,14 @@ def _copy_card_worker(
             dest_rel = item.get("dest_rel") or rel
             dest_file = dest / dest_rel
             if dest_rel != rel and not (prog.get("files") or {}).get(rel):
-                _log_line(
-                    f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}"
-                )
+                if Path(rel).name == dest_rel:
+                    _log_line(
+                        f"{card_id}: {rel} already in batch — reusing {dest_rel} (no duplicate)"
+                    )
+                else:
+                    _log_line(
+                        f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}"
+                    )
             if progress.is_file_done(prog, rel, size, dest_file):
                 try:
                     item["dest_size"] = dest_file.stat().st_size
@@ -1022,16 +1052,26 @@ def _copy_card_worker(
                     payload = json.loads(
                         Path(sidecar_path).read_text(encoding="utf-8")
                     )
-                    missing = _missing_metadata(payload)
-                    if missing:
+                    mismatches = pairing.validate_sidecar_for_mp4(
+                        src, Path(sidecar_path), payload
+                    )
+                    if mismatches:
                         _log_line(
-                            f"{card_id}: {rel} sidecar is missing "
-                            f"{', '.join(missing)} — re-check in GoPro Cleaner",
+                            f"{card_id}: {rel} metadata mismatch — "
+                            f"{'; '.join(mismatches)} (sidecar copied; embed skipped)",
                             kind="error",
                         )
-                    embed_meta.embed_segments_json(dest_file, payload)
-                    dest_size = dest_file.stat().st_size
-                    _log_line(f"{card_id}: embedded segments into {dest_rel}")
+                    else:
+                        missing = _missing_metadata(payload)
+                        if missing:
+                            _log_line(
+                                f"{card_id}: {rel} sidecar is missing "
+                                f"{', '.join(missing)} — re-check in GoPro Cleaner",
+                                kind="error",
+                            )
+                        embed_meta.embed_segments_json(dest_file, payload)
+                        dest_size = dest_file.stat().st_size
+                        _log_line(f"{card_id}: embedded segments into {dest_rel}")
                 except CopyCancelled:
                     raise
                 except Exception as embed_exc:  # noqa: BLE001
