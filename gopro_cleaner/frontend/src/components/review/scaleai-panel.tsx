@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
 
@@ -7,13 +8,24 @@ function hoursLabel(value: number | null | undefined): string {
   return `${value.toFixed(2)}h`;
 }
 
-export function ScaleAiPanel({ c }: { c: ReviewController }) {
+export function ScaleAiPanel({
+  c,
+  highlightedTask,
+  onHighlightTask,
+}: {
+  c: ReviewController;
+  highlightedTask?: string;
+  onHighlightTask?: (task: string) => void;
+}) {
   const annotation = c.currentScaleAi();
   const segments = annotation?.segments || [];
   const progress = c.scaleAiTaskProgress();
   const video = c.currentVideo();
   const videosInTask = c.videosInCurrentParentTask();
   const videoIndex = videosInTask.findIndex((item) => item.path === video?.path);
+  const normalizedHighlight = String(highlightedTask || "")
+    .trim()
+    .toLowerCase();
 
   return (
     <div className="grid gap-3 rounded-sm border border-border bg-surface-2/40 p-3">
@@ -23,8 +35,8 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
           {annotation?.parent_task || "Open a 50-hour folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          T marks a segment · type a label · Enter assigns (creates if new) · G = garbage · N =
-          next · Trim when ready
+          T marks a segment · type a label · Enter assigns (creates if new) · G = garbage · N = next
+          · Trim when ready
         </p>
       </div>
 
@@ -36,7 +48,9 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
         <div className="flex justify-between gap-2">
           <span className="text-muted-foreground">IN TASK</span>
           <span className="font-mono">
-            {videoIndex >= 0 ? `${videoIndex + 1} / ${videosInTask.length}` : `— / ${videosInTask.length}`}
+            {videoIndex >= 0
+              ? `${videoIndex + 1} / ${videosInTask.length}`
+              : `— / ${videosInTask.length}`}
           </span>
         </div>
         <div className="flex justify-between gap-2">
@@ -66,8 +80,7 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
           <div className="flex justify-between gap-2">
             <span className="text-muted-foreground">PROGRESS</span>
             <span className={`font-mono ${progress.complete ? "text-success" : ""}`}>
-              {progress.percent_complete.toFixed(0)}%
-              {progress.complete ? " · GOAL" : ""}
+              {progress.percent_complete.toFixed(0)}%{progress.complete ? " · GOAL" : ""}
             </span>
           </div>
         ) : null}
@@ -81,7 +94,21 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
       ) : (
         <div className="text-[10px] text-muted-foreground">
           Last / selected label:{" "}
-          <span className="font-medium text-foreground">{c.selectedTaskValue || "—"}</span>
+          {c.selectedTaskValue ? (
+            <button
+              type="button"
+              aria-pressed={highlightedTask === c.selectedTaskValue}
+              title="Highlight this task in the labeled region"
+              onClick={() => onHighlightTask?.(c.selectedTaskValue)}
+              className={`rounded-sm px-1 font-medium text-foreground underline decoration-dotted underline-offset-2 transition-colors hover:bg-surface ${
+                highlightedTask === c.selectedTaskValue ? "bg-accent/15 text-accent" : ""
+              }`}
+            >
+              {c.selectedTaskValue}
+            </button>
+          ) : (
+            <span className="font-medium text-foreground">—</span>
+          )}
         </div>
       )}
 
@@ -94,10 +121,19 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
           segments.map((segment) => {
             const color = taskColor(segment.label || segment.type);
             const isGarbage = segment.type === "garbage";
+            const isHighlighted =
+              !isGarbage &&
+              normalizedHighlight.length > 0 &&
+              String(segment.label || "")
+                .trim()
+                .toLowerCase() === normalizedHighlight;
             return (
               <div
                 key={String(segment.id)}
-                className="flex items-center gap-2 border-b border-border px-2 py-2 last:border-b-0"
+                className={cn(
+                  "flex items-center gap-2 border-b border-border px-2 py-2 transition-colors last:border-b-0",
+                  isHighlighted && "bg-accent/15 ring-1 ring-inset ring-accent",
+                )}
               >
                 <span
                   className="size-2.5 shrink-0 rounded-full"
@@ -105,9 +141,19 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
                   aria-hidden
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-xs font-medium">
-                    {isGarbage ? "garbage" : segment.label}
-                  </div>
+                  {isGarbage ? (
+                    <div className="truncate text-xs font-medium">garbage</div>
+                  ) : (
+                    <button
+                      type="button"
+                      aria-pressed={isHighlighted}
+                      title={`Highlight ${segment.label} in the labeled region`}
+                      onClick={() => onHighlightTask?.(segment.label)}
+                      className="block max-w-full truncate rounded-sm text-left text-xs font-medium underline decoration-dotted underline-offset-2 hover:text-accent"
+                    >
+                      {segment.label}
+                    </button>
+                  )}
                   <div className="font-mono text-[10px] text-muted-foreground">
                     {c.formatTime(segment.start)} → {c.formatTime(segment.end)} ·{" "}
                     {segment.duration.toFixed(2)}s

@@ -1,3 +1,4 @@
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { Loader2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/wc/panel";
@@ -19,7 +20,8 @@ function imuSummary(sensors: string[]) {
   for (const [pattern, short] of MOTION_SENSORS) {
     if (sensors.some((s) => pattern.test(s)) && !motion.includes(short)) motion.push(short);
   }
-  const extra = sensors.length - sensors.filter((s) => MOTION_SENSORS.some(([p]) => p.test(s))).length;
+  const extra =
+    sensors.length - sensors.filter((s) => MOTION_SENSORS.some(([p]) => p.test(s))).length;
   if (!motion.length) return `${sensors.length} streams`;
   return extra > 0 ? `${motion.join(", ")} +${extra}` : motion.join(", ");
 }
@@ -45,7 +47,11 @@ function MediaMetaStrip({ meta }: { meta?: MediaMeta | null }) {
     <div className="border-b border-border px-4 py-2">
       <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-x-5 gap-y-1 rounded-md border border-border bg-surface-2/60 px-3 py-2 font-mono text-[10px] text-muted-foreground">
         {items.map((item) => (
-          <div key={item.label} title={item.title || item.value} className="flex min-w-0 items-baseline gap-1.5">
+          <div
+            key={item.label}
+            title={item.title || item.value}
+            className="flex min-w-0 items-baseline gap-1.5"
+          >
             <span className="shrink-0 uppercase tracking-[0.14em] opacity-60">{item.label}</span>
             <span className="min-w-0 truncate text-foreground/80">{item.value}</span>
           </div>
@@ -55,7 +61,13 @@ function MediaMetaStrip({ meta }: { meta?: MediaMeta | null }) {
   );
 }
 
-export function PlayerPanel({ c }: { c: ReviewController }) {
+export function PlayerPanel({
+  c,
+  highlightedScaleAiTask,
+}: {
+  c: ReviewController;
+  highlightedScaleAiTask?: string;
+}) {
   const video = c.currentVideo();
   const ann = c.currentAnnotation();
   const scaleAi = c.scaleAiMode ? c.currentScaleAi() : null;
@@ -76,7 +88,8 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
     : segments.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
   const coverage = duration > 0 ? Math.min(100, Math.round((covered / duration) * 100)) : 0;
   const playFraction = duration > 0 ? Math.min(1, c.scrubTime / duration) : 0;
-  const shareReady = c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
+  const shareReady =
+    c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
 
   // Zoom window around labeled work so 0.5–1s clips stay readable without lying about end times.
   const zoomBounds = (() => {
@@ -103,6 +116,36 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
     zoomBounds && zoomSpan > 0 ? ((t - zoomBounds.start) / zoomSpan) * 100 : 0;
   const zoomWidth = (start: number, end: number) =>
     zoomBounds && zoomSpan > 0 ? Math.max(0.15, ((end - start) / zoomSpan) * 100) : 0;
+  const highlightedTask = String(highlightedScaleAiTask || "")
+    .trim()
+    .toLowerCase();
+  const hasHighlightedSegments =
+    highlightedTask.length > 0 &&
+    scaleAiSegments.some(
+      (segment) =>
+        segment.type === "subtask" &&
+        String(segment.label || "")
+          .trim()
+          .toLowerCase() === highlightedTask,
+    );
+
+  const seekInZoom = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!zoomBounds || zoomSpan <= 0) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    c.scheduleSeek(zoomBounds.start + fraction * zoomSpan, true);
+  };
+
+  const beginZoomScrub = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    seekInZoom(event);
+  };
+
+  const continueZoomScrub = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) seekInZoom(event);
+  };
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
@@ -168,150 +211,129 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           </div>
         )}
 
-        {/* Scrub track — display only; clicks never seek (use , . or ← →). */}
-        <div
-          className={cn(
-            "pointer-events-none relative select-none border-t border-border bg-surface-2",
-            c.scaleAiMode ? "h-10" : "h-8",
-          )}
-          aria-hidden
-          title="Use , . or ← → to step through the timeline"
-        >
-          {segments.map((s, i) => {
-            const color = s.kind === "work" ? taskColor(s.task) : null;
-            const pct =
-              duration > 0 ? Math.max(0, ((s.end - s.start) / duration) * 100) : 0;
-            return (
-              <div
-                key={s.id || i}
-                title={`${s.kind}${s.task ? ` · ${s.task}` : ""}`}
-                className={cn("absolute inset-y-0", s.kind !== "work" && "bg-destructive/30")}
-                style={{
-                  left: duration ? `${(s.start / duration) * 100}%` : "0%",
-                  width: `${pct}%`,
-                  ...(color ? { backgroundColor: color.fill } : null),
-                }}
-              />
-            );
-          })}
-          {c.scaleAiMode &&
-            scaleAiSegments.map((segment) => {
-              const isGarbage = segment.type === "garbage";
-              const color = isGarbage ? null : taskColor(segment.label);
-              const leftPct = duration > 0 ? (segment.start / duration) * 100 : 0;
-              const widthPct =
-                duration > 0
-                  ? Math.max(0.08, ((segment.end - segment.start) / duration) * 100)
-                  : 0;
-              // Accurate span only — never force min-width (that lied past the real end).
-              // Start/end ticks make short clips findable on a long source.
+        {/* The full-video timeline is retained for the standard review workflow only. */}
+        {!c.scaleAiMode ? (
+          <div
+            className="pointer-events-none relative h-8 select-none border-t border-border bg-surface-2"
+            aria-hidden
+            title="Use , . or ← → to step through the timeline"
+          >
+            {segments.map((s, i) => {
+              const color = s.kind === "work" ? taskColor(s.task) : null;
+              const pct = duration > 0 ? Math.max(0, ((s.end - s.start) / duration) * 100) : 0;
               return (
-                <div key={String(segment.id)}>
-                  <div
-                    title={`${segment.label} · ${c.formatTime(segment.start)} → ${c.formatTime(segment.end)}`}
-                    className={cn("absolute top-2 bottom-2", isGarbage && "bg-destructive/50")}
-                    style={{
-                      left: `${leftPct}%`,
-                      width: `${widthPct}%`,
-                      ...(color ? { backgroundColor: color.solid, opacity: 0.85 } : null),
-                    }}
-                  />
-                  <div
-                    className="absolute top-0 bottom-0 w-0.5"
-                    style={{
-                      left: `${leftPct}%`,
-                      backgroundColor: isGarbage ? "#ef4444" : color?.solid || "#fff",
-                    }}
-                  />
-                  <div
-                    className="absolute top-0 bottom-0 w-0.5"
-                    style={{
-                      left: `calc(${leftPct}% + ${widthPct}% - 1px)`,
-                      backgroundColor: isGarbage ? "#ef4444" : color?.solid || "#fff",
-                    }}
-                  />
-                </div>
+                <div
+                  key={s.id || i}
+                  title={`${s.kind}${s.task ? ` · ${s.task}` : ""}`}
+                  className={cn("absolute inset-y-0", s.kind !== "work" && "bg-destructive/30")}
+                  style={{
+                    left: duration ? `${(s.start / duration) * 100}%` : "0%",
+                    width: `${pct}%`,
+                    ...(color ? { backgroundColor: color.fill } : null),
+                  }}
+                />
               );
             })}
-          {pendingRange && duration > 0 && (
+            {pendingRange && duration > 0 && (
+              <div
+                className="absolute top-2 bottom-2 border border-warning bg-warning/35"
+                style={{
+                  left: `${(pendingRange.start / duration) * 100}%`,
+                  width: `${Math.max(
+                    0.08,
+                    ((pendingRange.end - pendingRange.start) / duration) * 100,
+                  )}%`,
+                }}
+              />
+            )}
+            {shareReady && duration > 0 && (
+              <div
+                className="absolute inset-y-0 border-x border-sky-400/80 bg-sky-400/25"
+                title="Share clip range"
+                style={{
+                  left: `${(c.shareClipIn! / duration) * 100}%`,
+                  width: `${Math.max(0.4, ((c.shareClipOut! - c.shareClipIn!) / duration) * 100)}%`,
+                }}
+              />
+            )}
+            {c.shareClipIn != null && duration > 0 && (
+              <div
+                className="absolute top-0 bottom-0 w-0.5 bg-sky-400"
+                style={{ left: `${(c.shareClipIn / duration) * 100}%` }}
+                title={`In ${c.formatTime(c.shareClipIn)}`}
+              />
+            )}
+            {c.shareClipOut != null && duration > 0 && (
+              <div
+                className="absolute top-0 bottom-0 w-0.5 bg-sky-300"
+                style={{ left: `${(c.shareClipOut / duration) * 100}%` }}
+                title={`Out ${c.formatTime(c.shareClipOut)}`}
+              />
+            )}
             <div
-              className="absolute top-2 bottom-2 border border-warning bg-warning/35"
-              style={{
-                left: `${(pendingRange.start / duration) * 100}%`,
-                width: `${Math.max(
-                  0.08,
-                  ((pendingRange.end - pendingRange.start) / duration) * 100,
-                )}%`,
-              }}
+              className="absolute inset-y-0 w-px bg-foreground"
+              style={{ left: `${playFraction * 100}%` }}
             />
-          )}
-          {shareReady && duration > 0 && (
-            <div
-              className="absolute inset-y-0 border-x border-sky-400/80 bg-sky-400/25"
-              title="Share clip range"
-              style={{
-                left: `${(c.shareClipIn! / duration) * 100}%`,
-                width: `${Math.max(0.4, ((c.shareClipOut! - c.shareClipIn!) / duration) * 100)}%`,
-              }}
-            />
-          )}
-          {c.shareClipIn != null && duration > 0 && (
-            <div
-              className="absolute top-0 bottom-0 w-0.5 bg-sky-400"
-              style={{ left: `${(c.shareClipIn / duration) * 100}%` }}
-              title={`In ${c.formatTime(c.shareClipIn)}`}
-            />
-          )}
-          {c.shareClipOut != null && duration > 0 && (
-            <div
-              className="absolute top-0 bottom-0 w-0.5 bg-sky-300"
-              style={{ left: `${(c.shareClipOut / duration) * 100}%` }}
-              title={`Out ${c.formatTime(c.shareClipOut)}`}
-            />
-          )}
-          <div
-            className="absolute inset-y-0 w-px bg-foreground"
-            style={{ left: `${playFraction * 100}%` }}
-          />
-        </div>
+          </div>
+        ) : null}
 
         {c.scaleAiMode && zoomBounds ? (
-          <div className="pointer-events-none border-t border-border bg-surface px-3 py-2">
+          <div className="border-t border-border bg-surface px-3 py-2">
             <div className="mb-1 flex items-baseline justify-between gap-2 font-mono text-[10px] text-muted-foreground">
               <span className="eyebrow text-[9px]">Labeled region (zoomed)</span>
               <span>
                 {c.formatTime(zoomBounds.start)} → {c.formatTime(zoomBounds.end)}
               </span>
             </div>
-            <div className="relative h-14 overflow-hidden rounded-sm border border-border bg-surface-2">
+            <div
+              className="relative h-10 touch-none select-none overflow-hidden rounded-sm border border-border bg-surface-2 cursor-ew-resize"
+              onPointerDown={beginZoomScrub}
+              onPointerMove={continueZoomScrub}
+              onPointerUp={(event) => event.currentTarget.releasePointerCapture(event.pointerId)}
+              onPointerCancel={(event) => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+              }}
+              role="slider"
+              aria-label="Labeled region video position"
+              aria-valuemin={zoomBounds.start}
+              aria-valuemax={zoomBounds.end}
+              aria-valuenow={Math.min(zoomBounds.end, Math.max(zoomBounds.start, c.scrubTime))}
+              title="Click or drag to move through the labeled region"
+            >
               {scaleAiSegments.map((segment) => {
                 const isGarbage = segment.type === "garbage";
                 const color = isGarbage ? null : taskColor(segment.label);
                 const left = zoomLeft(segment.start);
                 const width = zoomWidth(segment.start, segment.end);
+                const isHighlighted =
+                  !isGarbage &&
+                  hasHighlightedSegments &&
+                  String(segment.label || "")
+                    .trim()
+                    .toLowerCase() === highlightedTask;
                 return (
                   <div key={`zoom-${segment.id}`}>
                     <div
                       title={`${segment.label} · ${c.formatTime(segment.start)} → ${c.formatTime(segment.end)} · ${segment.duration.toFixed(2)}s`}
                       className={cn(
-                        "absolute top-2 bottom-2 rounded-[2px] border border-black/50",
+                        "absolute top-2 bottom-2 rounded-[2px] border border-black/50 transition-[opacity,filter,box-shadow]",
                         isGarbage && "bg-destructive/70",
+                        hasHighlightedSegments && !isHighlighted && "opacity-25",
+                        isHighlighted && "z-10 brightness-150 outline outline-2 outline-white",
                       )}
                       style={{
                         left: `${left}%`,
                         width: `${width}%`,
                         ...(color ? { backgroundColor: color.solid } : null),
+                        ...(isHighlighted
+                          ? {
+                              boxShadow: "inset 0 0 0 2px white, 0 0 12px rgba(255,255,255,.9)",
+                            }
+                          : null),
                       }}
                     />
-                    <div
-                      className="absolute bottom-0 truncate px-0.5 text-center font-mono text-[9px] leading-3 text-foreground/90"
-                      style={{
-                        left: `${left}%`,
-                        width: `${Math.max(width, 8)}%`,
-                      }}
-                    >
-                      {!isGarbage ? segment.label : "g"}
-                    </div>
                   </div>
                 );
               })}
@@ -326,9 +348,11 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
               ) : null}
               {c.scrubTime >= zoomBounds.start && c.scrubTime <= zoomBounds.end ? (
                 <div
-                  className="absolute inset-y-0 w-0.5 bg-foreground"
+                  className="pointer-events-none absolute inset-y-0 z-20 -ml-2 w-4"
                   style={{ left: `${zoomLeft(c.scrubTime)}%` }}
-                />
+                >
+                  <span className="absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_5px_rgba(255,255,255,.85)]" />
+                </div>
               ) : null}
             </div>
           </div>
@@ -340,7 +364,9 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
         <div className="border-b border-border px-4 py-3">
           <div className="mb-2 flex items-baseline justify-between gap-3">
             <span className="eyebrow">Recent</span>
-            <span className="font-mono text-[10px] text-muted-foreground">last {recent.length}</span>
+            <span className="font-mono text-[10px] text-muted-foreground">
+              last {recent.length}
+            </span>
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             {recent.map(({ s, i }) => (
@@ -434,8 +460,8 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
 
       {ann?.pendingWork && (
         <p className="border-b border-border bg-warning/10 px-4 py-2 font-mono text-[11px] text-warning">
-          Pending work {c.formatTime(ann.pendingWork.start)} → {c.formatTime(ann.pendingWork.end)} — pick a task and
-          press Enter
+          Pending work {c.formatTime(ann.pendingWork.start)} → {c.formatTime(ann.pendingWork.end)} —
+          pick a task and press Enter
         </p>
       )}
 
@@ -454,7 +480,10 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
         {[...segments].reverse().map((s, revI) => {
           const i = segments.length - 1 - revI;
           return (
-            <li key={s.id || i} className="flex items-center justify-between gap-3 px-4 py-2 text-xs">
+            <li
+              key={s.id || i}
+              className="flex items-center justify-between gap-3 px-4 py-2 text-xs"
+            >
               <span className="flex min-w-0 items-center gap-2">
                 {s.kind === "work" ? (
                   <span

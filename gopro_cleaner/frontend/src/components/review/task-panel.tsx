@@ -7,7 +7,15 @@ import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
 import { ScaleAiPanel } from "./scaleai-panel";
 
-export function TaskPanel({ c }: { c: ReviewController }) {
+export function TaskPanel({
+  c,
+  highlightedScaleAiTask,
+  onHighlightScaleAiTask,
+}: {
+  c: ReviewController;
+  highlightedScaleAiTask?: string;
+  onHighlightScaleAiTask?: (task: string) => void;
+}) {
   const [newTask, setNewTask] = useState("");
   const groups = c.orderedTaskGroups();
 
@@ -29,13 +37,16 @@ export function TaskPanel({ c }: { c: ReviewController }) {
           onClick={() => {
             c.setSelectedTaskValue(task);
             c.touchRecentTask(task);
+            if (c.scaleAiMode) onHighlightScaleAiTask?.(task);
             if (c.scaleAiMode && c.scaleAiPending) {
               void c.commitScaleAiSegment(task, "subtask");
             }
           }}
           className={cn(
             "flex min-w-0 flex-1 items-center gap-2 truncate px-2 py-1.5 text-left text-xs transition-colors",
-            task === c.selectedTaskValue ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+            task === c.selectedTaskValue
+              ? "text-foreground"
+              : "text-muted-foreground hover:text-foreground",
           )}
         >
           <span
@@ -70,9 +81,7 @@ export function TaskPanel({ c }: { c: ReviewController }) {
         type="search"
         autoComplete="off"
         placeholder={
-          c.scaleAiMode
-            ? "Type label · Enter assigns (creates if new)"
-            : "Filter tasks…"
+          c.scaleAiMode ? "Type label · Enter assigns (creates if new)" : "Filter tasks…"
         }
         value={c.taskSearch}
         onChange={(e) => c.setTaskSearch(e.currentTarget.value)}
@@ -156,7 +165,11 @@ export function TaskPanel({ c }: { c: ReviewController }) {
 
       {c.scaleAiMode ? (
         <>
-          <ScaleAiPanel c={c} />
+          <ScaleAiPanel
+            c={c}
+            highlightedTask={highlightedScaleAiTask}
+            onHighlightTask={onHighlightScaleAiTask}
+          />
           <div className="grid gap-3">
             <div className="eyebrow">Subtask labels</div>
             {taskPicker}
@@ -164,8 +177,7 @@ export function TaskPanel({ c }: { c: ReviewController }) {
               T → type label → Enter · G = garbage · U = undo · N = next
             </p>
             <Button size="sm" variant="outline" onClick={() => void c.undoSegment()}>
-              Undo last{" "}
-              <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">U</kbd>
+              Undo last <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">U</kbd>
             </Button>
           </div>
         </>

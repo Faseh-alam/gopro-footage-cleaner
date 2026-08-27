@@ -54,6 +54,7 @@ function ReviewPage() {
   const cards = useCardTracking(c.setStatus);
   const { refreshToday } = useAuth();
   const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
+  const [highlightedScaleAiTask, setHighlightedScaleAiTask] = useState("");
 
   // One-click updater: pull the checked-out branch from GitHub, let the backend
   // relaunch itself (run.bat / run.sh), then reload once it's back.
@@ -88,7 +89,10 @@ function ReviewPage() {
         }
       }
       setUpdateState("idle");
-      c.setStatus("Server did not come back — start it with run.bat, then reload this page", "error");
+      c.setStatus(
+        "Server did not come back — start it with run.bat, then reload this page",
+        "error",
+      );
     } catch (error: any) {
       setUpdateState("idle");
       c.setStatus(error?.message || "Update failed", "error");
@@ -146,7 +150,6 @@ function ReviewPage() {
     })();
   }, [c.sdCardValue, c.sdCards, cards.addCard, refreshToday]);
 
-
   // Global review shortcuts — mirror the original keyboard model.
   useEffect(() => {
     const isField = (t: EventTarget | null) =>
@@ -178,9 +181,7 @@ function ReviewPage() {
           const exact = matches.find((t) => t.toLowerCase() === query.toLowerCase());
           // Arrow ↑/↓ selection wins over the raw filter text.
           const highlighted =
-            c.selectedTaskValue && matches.includes(c.selectedTaskValue)
-              ? c.selectedTaskValue
-              : "";
+            c.selectedTaskValue && matches.includes(c.selectedTaskValue) ? c.selectedTaskValue : "";
           const task = c.scaleAiMode
             ? highlighted || exact || query || c.lastLabelTask.trim() || ""
             : exact || highlighted || (!query ? c.lastLabelTask.trim() : "") || "";
@@ -196,9 +197,7 @@ function ReviewPage() {
             return;
           }
           c.setSelectedTaskValue(task);
-          const hasPending = Boolean(
-            c.scaleAiPending || c.currentAnnotation()?.pendingWork,
-          );
+          const hasPending = Boolean(c.scaleAiPending || c.currentAnnotation()?.pendingWork);
           if (hasPending) void c.labelCurrentClip(task);
           else if (c.scaleAiMode && query && !highlighted && !exact) {
             void c.addTask(task);
@@ -213,7 +212,8 @@ function ReviewPage() {
           c.leaveTaskSearch({ clear: true });
           return;
         }
-        if (event.key.length === 1 && !(event.key.toLowerCase() === "u" && !c.taskSearch.trim())) return;
+        if (event.key.length === 1 && !(event.key.toLowerCase() === "u" && !c.taskSearch.trim()))
+          return;
       } else if (isField(target)) {
         return;
       }
@@ -221,37 +221,33 @@ function ReviewPage() {
       const key = event.key.toLowerCase();
       let handled = true;
 
-      if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
-      else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
+      if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{")
+        c.bumpPlaybackRate(-0.5);
+      else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}")
+        c.bumpPlaybackRate(0.5);
       else if (event.key === "," || event.key === "<") {
         c.fineTune(-c.scrubStepSeconds(event.shiftKey || event.key === "<"));
       } else if (event.key === "." || event.key === ">") {
         c.fineTune(c.scrubStepSeconds(event.shiftKey || event.key === ">"));
-      }
-      else if (key === "i") c.markShareIn();
+      } else if (key === "i") c.markShareIn();
       else if (key === "o") c.markShareOut();
       else if (key === "t" || key === "d") {
         if (c.scaleAiMode) void c.markWork();
         else if (key === "t") c.markWork();
         else handled = false;
-      }
-      else if (key === "g") {
+      } else if (key === "g") {
         c.markGarbage();
-      }
-      else if (key === "u") {
+      } else if (key === "u") {
         void c.undoSegment();
-      }
-      else if (key === "a") c.focusNewTask();
+      } else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
       else if (key === "n") {
         if (c.scaleAiMode) void c.nextScaleAiVideo();
         else void c.finishCleaningFile();
-      }
-      else if (event.key === " ") c.togglePlay();
+      } else if (event.key === " ") c.togglePlay();
       else if (event.key === "Enter" && !isField(target)) {
         void c.labelCurrentClip();
-      }
-      else handled = false;
+      } else handled = false;
 
       if (handled) {
         event.preventDefault();
@@ -336,10 +332,16 @@ function ReviewPage() {
             </div>
 
             <nav className="flex items-center gap-3 border-l border-border pl-3 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72]">
-              <Link to="/metadata" className="inline-flex items-center gap-1 transition-opacity hover:opacity-75">
+              <Link
+                to="/metadata"
+                className="inline-flex items-center gap-1 transition-opacity hover:opacity-75"
+              >
                 Metadata <ArrowUpRight className="size-3" />
               </Link>
-              <Link to="/" className="inline-flex items-center gap-1 transition-opacity hover:opacity-75">
+              <Link
+                to="/"
+                className="inline-flex items-center gap-1 transition-opacity hover:opacity-75"
+              >
                 Cleaner <ArrowUpRight className="size-3" />
               </Link>
             </nav>
@@ -349,18 +351,25 @@ function ReviewPage() {
 
       <main className="grid min-h-0 flex-1 gap-4 p-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)]">
         <div className="grid min-h-0 content-start gap-4">
-          <PlayerPanel c={c} />
+          <PlayerPanel c={c} highlightedScaleAiTask={highlightedScaleAiTask} />
           <BatchPanel c={c} />
         </div>
 
         <aside className="panel-surface flex min-h-0 flex-col">
-          <TaskPanel c={c} />
+          <TaskPanel
+            c={c}
+            highlightedScaleAiTask={highlightedScaleAiTask}
+            onHighlightScaleAiTask={setHighlightedScaleAiTask}
+          />
           <FootageList c={c} />
           <details className="border-b border-border px-4 py-3">
             <summary className="eyebrow cursor-pointer">Keys</summary>
             <ul className="mt-2 grid gap-1">
               {KEYS.map(([k, label]) => (
-                <li key={k} className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
+                <li
+                  key={k}
+                  className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground"
+                >
                   <kbd className="font-mono text-[10px] text-foreground">{k}</kbd>
                   <span className="truncate">{label}</span>
                 </li>
