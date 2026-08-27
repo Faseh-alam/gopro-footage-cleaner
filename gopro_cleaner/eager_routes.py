@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import re
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request, send_file, send_from_directory
 
-from .core import annotation_store, batch_registry
+from .core import annotation_store, batch_registry, scaleai_store
 from .core.eager import (
     assign_clip_to_task,
     label_progress,
@@ -697,7 +698,8 @@ def create_eager_blueprint() -> Blueprint:
 
             sidecar = annotation_store.sidecar_path_for(source)
             text_sidecar = sidecar.with_suffix("").with_suffix(".segments.txt")
-            for companion in (sidecar, text_sidecar):
+            scaleai_sidecar = scaleai_store.sidecar_path_for(source)
+            for companion in (sidecar, text_sidecar, scaleai_sidecar):
                 if companion.is_file():
                     move_to_trash(companion)
 
@@ -1067,117 +1069,397 @@ def create_eager_blueprint() -> Blueprint:
 
     # ---- ScaleAI micro-task stitch export ----------------------------------
 
-    @eager.post("/api/eager/scaleai/process-video")
-    def eager_scaleai_process_video():
-        """Queue trims for one annotated video; optionally stitch task folders after.
-
-        Body: {"path": "...mp4", "stitch": false, "overwrite": false, "delete_source": false}
-
-        Label PCs should use stitch=false (JSON already saved). Strong PCs can set
-        stitch=true to cut clips then build ``*__stitched.MP4`` per micro-task.
-        """
-        payload = request.get_json(silent=True) or {}
-        raw_path = str(payload.get("path") or "").strip()
-        do_stitch = bool(payload.get("stitch", False))
-        overwrite = bool(payload.get("overwrite", False))
-        delete_source = bool(payload.get("delete_source", False))
+    @eager.get("/api/eager/scaleai/annotation")
+    def eager_scaleai_annotation():
+        raw_path = str(request.args.get("path") or "").strip()
+        raw_root = str(request.args.get("root") or "").strip()
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         try:
-            source = Path(raw_path).expanduser().resolve(strict=True)
+            video = Path(raw_path).expanduser().resolve(strict=True)
+            root = Path(raw_root).expanduser().resolve() if raw_root else None
+            annotation = scaleai_store.load_annotation(video, root=root)
         except FileNotFoundError:
             return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "annotation": annotation,
+                "sidecar": str(scaleai_store.sidecar_path_for(video)),
+            }
+        )
 
-        annotation = annotation_store.load_annotation(source)
-        segments = [
-            s
-            for s in (annotation or {}).get("segments") or []
-            if str(s.get("kind") or "").lower() == "work"
-        ]
+    @eager.post("/api/eager/scaleai/parent-cycles")
+    def eager_scaleai_add_parent_cycle():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        raw_root = str(payload.get("root") or "").strip()
+        parent_task = str(payload.get("parent_task") or "").strip() or None
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            start = float(payload.get("start"))
+            end = float(payload.get("end"))
+            root = Path(raw_root).expanduser().resolve() if raw_root else None
+            annotation = scaleai_store.add_parent_cycle(
+                Path(raw_path),
+                start,
+                end,
+                parent_task=parent_task,
+                root=root,
+            )
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "annotation": annotation})
+
+    @eager.delete("/api/eager/scaleai/parent-cycles")
+    def eager_scaleai_delete_parent_cycle():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        cycle_id = str(payload.get("cycle_id") or payload.get("id") or "").strip()
+        if not raw_path or not cycle_id:
+            return jsonify({"error": "path and cycle_id are required"}), 400
+        try:
+            annotation = scaleai_store.delete_parent_cycle(Path(raw_path), cycle_id)
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "annotation": annotation})
+
+    @eager.post("/api/eager/scaleai/example")
+    def eager_scaleai_prepare_example():
+        """Select a clean parent cycle and prepare its WhatsApp MP4."""
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        cycle_id = str(payload.get("cycle_id") or "").strip()
+        quality = str(payload.get("quality") or "720p").strip()
+        if not raw_path or not cycle_id:
+            return jsonify({"error": "path and cycle_id are required"}), 400
+        try:
+            video = Path(raw_path).expanduser().resolve(strict=True)
+            annotation = scaleai_store.select_example(video, cycle_id)
+            cycle = scaleai_store.cycle_by_id(annotation, cycle_id)
+            prepared = prepare_share_download(
+                video,
+                float(cycle["start"]),
+                float(cycle["end"]),
+                quality=quality,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"ok": True, "annotation": annotation, **prepared})
+
+    @eager.post("/api/eager/scaleai/subtasks")
+    def eager_scaleai_set_subtasks():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        names = payload.get("names") or []
+        if not raw_path or not isinstance(names, list):
+            return jsonify({"error": "path and names list are required"}), 400
+        try:
+            annotation = scaleai_store.set_subtask_names(
+                Path(raw_path), [str(name) for name in names]
+            )
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "annotation": annotation})
+
+    @eager.post("/api/eager/scaleai/subtask-segments")
+    def eager_scaleai_add_subtask_segment():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        cycle_id = str(payload.get("cycle_id") or "").strip()
+        task = str(payload.get("task") or "").strip()
+        if not raw_path or not cycle_id or not task:
+            return jsonify({"error": "path, cycle_id, and task are required"}), 400
+        try:
+            annotation = scaleai_store.add_subtask_segment(
+                Path(raw_path),
+                cycle_id,
+                task,
+                float(payload.get("start")),
+                float(payload.get("end")),
+            )
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "annotation": annotation})
+
+    @eager.delete("/api/eager/scaleai/subtask-segments")
+    def eager_scaleai_delete_subtask_segment():
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        segment_id = str(payload.get("segment_id") or payload.get("id") or "").strip()
+        if not raw_path or not segment_id:
+            return jsonify({"error": "path and segment_id are required"}), 400
+        try:
+            annotation = scaleai_store.delete_subtask_segment(
+                Path(raw_path), segment_id
+            )
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "annotation": annotation})
+
+    def _scaleai_output_directory(source: Path, task_name: str) -> Path:
+        """Keep generated data separate from downloaded originals."""
+        return task_directory(source.parent / "_ScaleAI", task_name)
+
+    def _write_scaleai_provenance(
+        output: Path,
+        *,
+        source: Path,
+        annotation: dict,
+        segment: dict,
+        source_has_gpmf: bool | None,
+    ) -> None:
+        provenance = {
+            "version": 1,
+            "source": str(source),
+            "parent_task": annotation.get("parent_task"),
+            "parent_cycle_id": segment.get("parent_cycle_id"),
+            "subtask": segment.get("task"),
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "output": str(output),
+            "source_has_gpmf": source_has_gpmf,
+        }
+        path = output.with_suffix(".scaleai-source.json")
+        path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+
+    def _queue_scaleai_source(source: Path) -> dict:
+        annotation = scaleai_store.load_annotation(source)
+        segments = annotation.get("subtask_segments") or []
         if not segments:
-            return jsonify({"error": "No work segments on this video — mark tasks first"}), 400
+            return {
+                "path": str(source),
+                "queued": 0,
+                "skipped": 0,
+                "errors": ["No confirmed subtask segments"],
+                "task_dirs": [],
+                "task_outputs": {},
+            }
 
         queued = 0
         skipped = 0
         errors: list[str] = []
         task_dirs: set[Path] = set()
-        for seg in segments:
-            try:
-                start = float(seg.get("start", 0))
-                end = float(seg.get("end", 0))
-            except (TypeError, ValueError):
-                continue
-            if end <= start + 0.05:
-                continue
-            task_name = str(seg.get("task") or "").strip()
-            if not task_name:
-                errors.append("work segment missing task name")
-                continue
-            if eager_trim_queue.has_equivalent_job(source, start, end):
+        task_outputs: dict[str, list[str]] = {}
+        for segment in segments:
+            start = float(segment["start"])
+            end = float(segment["end"])
+            task_name = str(segment["task"]).strip()
+            output_dir = _scaleai_output_directory(source, task_name)
+            task_dirs.add(output_dir)
+            equivalent = next(
+                (
+                    record
+                    for record in eager_trim_queue.jobs_for_source(source)
+                    if record.status in {"queued", "running", "completed"}
+                    and abs(float(record.start_seconds) - start) < 0.05
+                    and abs(float(record.end_seconds) - end) < 0.05
+                    and str(record.task or "").strip() == task_name
+                    and bool(record.output)
+                    and Path(str(record.output)).parent.resolve()
+                    == output_dir.resolve()
+                ),
+                None,
+            )
+            if equivalent:
+                task_outputs.setdefault(str(output_dir), []).append(
+                    str(equivalent.output)
+                )
                 skipped += 1
-                task_dirs.add(task_output_directory(source, task_name))
                 continue
             try:
-                output_dir = task_output_directory(source, task_name)
-                eager_trim_queue.submit(
+                record = eager_trim_queue.submit(
                     source,
                     start,
                     end,
                     output_dir=output_dir,
                     task=task_name,
+                    kind="scaleai-subtask",
                 )
-                task_dirs.add(output_dir)
+                if record.output:
+                    task_outputs.setdefault(str(output_dir), []).append(
+                        str(record.output)
+                    )
+                    _write_scaleai_provenance(
+                        Path(record.output),
+                        source=source,
+                        annotation=annotation,
+                        segment=segment,
+                        source_has_gpmf=record.source_has_gpmf,
+                    )
                 queued += 1
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
+        return {
+            "path": str(source),
+            "queued": queued,
+            "skipped": skipped,
+            "errors": errors,
+            "task_dirs": [str(path) for path in sorted(task_dirs)],
+            "task_outputs": task_outputs,
+        }
 
-        if delete_source and (queued or skipped):
-            try:
-                eager_trim_queue.schedule_source_finish(source, delete_source=True)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"finish/delete — {exc}")
+    def _schedule_scaleai_stitch(
+        sources: list[Path],
+        expected_by_dir: dict[Path, list[Path]],
+        *,
+        overwrite: bool,
+    ) -> bool:
+        if not sources or not expected_by_dir:
+            return False
 
-        stitch_scheduled = False
-        if do_stitch and task_dirs:
+        def _wait_and_stitch() -> None:
+            import time
 
-            def _wait_and_stitch(dirs: list[Path], src: Path) -> None:
-                import time
+            # Weak label PCs never call this. On the strong PC, wait for every
+            # source trim to settle before stitching task folders.
+            for _ in range(14400):
+                if all(
+                    eager_trim_queue.active_count_for_source(source) == 0
+                    for source in sources
+                ):
+                    break
+                time.sleep(1)
+            for task_dir, clips in expected_by_dir.items():
+                # Never build a partial delivery after one trim failed or was
+                # cancelled, and never consume stale files from an older run.
+                if not clips or any(
+                    not clip.is_file() or clip.stat().st_size <= 0 for clip in clips
+                ):
+                    continue
+                try:
+                    stitch_task_clips(
+                        task_dir,
+                        clips=clips,
+                        overwrite=overwrite,
+                    )
+                except Exception:  # noqa: BLE001
+                    # The trim dock and stitch API expose detailed failures;
+                    # never delete source or individual clips on a stitch error.
+                    pass
 
-                # Wait until this source has no active trim jobs (max ~2h).
-                for _ in range(7200):
-                    if eager_trim_queue.active_count_for_source(src) == 0:
-                        break
-                    time.sleep(1)
-                for task_dir in dirs:
-                    try:
-                        stitch_task_clips(task_dir, overwrite=overwrite)
-                    except Exception:  # noqa: BLE001
-                        pass
+        import threading
 
-            import threading
+        threading.Thread(
+            target=_wait_and_stitch,
+            daemon=True,
+            name="scaleai-stitch-after-trim",
+        ).start()
+        return True
 
-            threading.Thread(
-                target=_wait_and_stitch,
-                args=(list(task_dirs), source),
-                daemon=True,
-                name="scaleai-stitch-after-trim",
-            ).start()
-            stitch_scheduled = True
-
+    @eager.post("/api/eager/scaleai/process-video")
+    def eager_scaleai_process_video():
+        """Trim confirmed layered subtasks for one video; optionally stitch."""
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        do_stitch = bool(payload.get("stitch", False))
+        overwrite = bool(payload.get("overwrite", False))
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+            result = _queue_scaleai_source(source)
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        expected_by_dir = {
+            Path(task_dir): [Path(output) for output in outputs]
+            for task_dir, outputs in result["task_outputs"].items()
+        }
+        stitch_scheduled = (
+            _schedule_scaleai_stitch(
+                [source],
+                expected_by_dir,
+                overwrite=overwrite,
+            )
+            if do_stitch and result["queued"] + result["skipped"] > 0
+            else False
+        )
         return jsonify(
             {
-                "ok": True,
-                "path": str(source),
+                "ok": not result["errors"],
+                **result,
+                "stitch_scheduled": stitch_scheduled,
+                "message": (
+                    f"Queued {result['queued']} subtask trim(s)"
+                    + ("; stitch will run when trims finish" if stitch_scheduled else "")
+                ),
+            }
+        )
+
+    @eager.post("/api/eager/scaleai/process-folder")
+    def eager_scaleai_process_folder():
+        """Queue every layered sidecar below a folder, then stitch per subtask."""
+        payload = request.get_json(silent=True) or {}
+        raw_root = str(payload.get("root") or payload.get("path") or "").strip()
+        do_stitch = bool(payload.get("stitch", True))
+        overwrite = bool(payload.get("overwrite", False))
+        if not raw_root:
+            return jsonify({"error": "root is required"}), 400
+        try:
+            root = normalize_path(raw_root)
+            sources = [
+                source
+                for sidecar in scaleai_store.iter_sidecars(root)
+                if (source := scaleai_store.source_for_sidecar(sidecar)) is not None
+            ]
+            results = [_queue_scaleai_source(source) for source in sources]
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+
+        expected_by_dir: dict[Path, list[Path]] = {}
+        for result in results:
+            for task_dir, outputs in (result.get("task_outputs") or {}).items():
+                expected_by_dir.setdefault(Path(task_dir), []).extend(
+                    Path(output) for output in outputs
+                )
+        task_dirs = sorted(expected_by_dir)
+        queued = sum(int(result["queued"]) for result in results)
+        skipped = sum(int(result["skipped"]) for result in results)
+        errors = [
+            f"{Path(result['path']).name}: {error}"
+            for result in results
+            for error in result.get("errors") or []
+        ]
+        stitch_scheduled = (
+            _schedule_scaleai_stitch(
+                sources,
+                expected_by_dir,
+                overwrite=overwrite,
+            )
+            if do_stitch and queued + skipped > 0
+            else False
+        )
+        return jsonify(
+            {
+                "ok": not errors and bool(sources),
+                "root": str(root),
+                "source_count": len(sources),
                 "queued": queued,
                 "skipped": skipped,
                 "errors": errors,
-                "task_dirs": [str(p) for p in sorted(task_dirs)],
+                "task_dirs": [str(path) for path in task_dirs],
                 "stitch_scheduled": stitch_scheduled,
-                "message": (
-                    f"Queued {queued} trim(s)"
-                    + ("; stitch will run when trims finish" if stitch_scheduled else "")
-                    + ("; JSON-only marks are already saved" if queued == 0 and skipped else "")
-                ),
             }
         )
 

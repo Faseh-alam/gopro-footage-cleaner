@@ -812,6 +812,8 @@ def _sidecar_stem(rel: str) -> str:
     lower = rel.lower()
     if lower.endswith(".segments.json"):
         return rel[: -len(".segments.json")]
+    if lower.endswith(".scaleai.json"):
+        return rel[: -len(".scaleai.json")]
     if lower.endswith(".json"):
         return rel[: -len(Path(rel).suffix)]
     return Path(rel).stem
@@ -843,6 +845,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         suffix = Path(rel).suffix
         if rel.lower().endswith(".segments.json"):
             suffix = ".segments.json"
+        elif rel.lower().endswith(".scaleai.json"):
+            suffix = ".scaleai.json"
 
         if is_sidecar:
             final_base = stem_map.get(base, base)
@@ -850,6 +854,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
                 item["dest_rel"] = recorded
             elif suffix.lower() == ".segments.json":
                 item["dest_rel"] = f"{final_base}.segments.json"
+            elif suffix.lower() == ".scaleai.json":
+                item["dest_rel"] = f"{final_base}.scaleai.json"
             else:
                 item["dest_rel"] = f"{final_base}{suffix}"
             return

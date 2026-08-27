@@ -219,14 +219,35 @@ function ReviewPage() {
       }
       else if (key === "i") c.markShareIn();
       else if (key === "o") c.markShareOut();
-      else if (key === "t") c.markWork();
-      else if (key === "g") c.markGarbage();
-      else if (key === "u") c.undoSegment();
+      else if (key === "t") {
+        if (c.scaleAiMode && c.scaleAiStage === "subtask") c.markScaleAiSubtaskStart();
+        else if (!c.scaleAiMode) c.markWork();
+        else handled = false;
+      }
+      else if (key === "g") {
+        if (!c.scaleAiMode) c.markGarbage();
+        else handled = false;
+      }
+      else if (key === "u") {
+        if (!c.scaleAiMode) c.undoSegment();
+        else handled = false;
+      }
       else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
-      else if (key === "n") c.finishCleaningFile();
+      else if (key === "n") {
+        if (c.scaleAiMode) void c.nextScaleAiVideo();
+        else void c.finishCleaningFile();
+      }
       else if (event.key === " ") c.togglePlay();
-      else if (event.key === "Enter" && !isField(target)) c.labelCurrentClip();
+      else if (event.key === "Enter" && !isField(target)) {
+        if (c.scaleAiMode && c.scaleAiStage === "parent") {
+          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
+          else void c.saveScaleAiParentCycle();
+        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
+          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
+          else void c.saveScaleAiSubtask();
+        } else c.labelCurrentClip();
+      }
       else handled = false;
 
       if (handled) {

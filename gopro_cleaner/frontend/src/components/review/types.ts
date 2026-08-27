@@ -21,6 +21,35 @@ export interface PendingWork {
   end: number;
 }
 
+export interface ScaleAiParentCycle {
+  id: string;
+  start: number;
+  end: number;
+  created_at?: string;
+}
+
+export interface ScaleAiSubtaskSegment {
+  id: string;
+  parent_cycle_id: string;
+  start: number;
+  end: number;
+  task: string;
+  created_at?: string;
+}
+
+export interface ScaleAiAnnotation {
+  version: number;
+  source: string;
+  duration: number | null;
+  parent_task: string;
+  parent_cycles: ScaleAiParentCycle[];
+  example_cycle_id: string | null;
+  parent_example?: { source: string; cycle_id: string } | null;
+  subtask_names: string[];
+  subtask_segments: ScaleAiSubtaskSegment[];
+  updated_at?: string;
+}
+
 /** Camera / IMU metadata extracted from the GoPro file (GPMF + ffprobe). */
 export interface MediaMeta {
   recorded_at?: string | null;

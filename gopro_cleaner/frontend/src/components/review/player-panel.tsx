@@ -58,22 +58,27 @@ function MediaMetaStrip({ meta }: { meta?: MediaMeta | null }) {
 export function PlayerPanel({ c }: { c: ReviewController }) {
   const video = c.currentVideo();
   const ann = c.currentAnnotation();
+  const scaleAi = c.scaleAiMode ? c.currentScaleAi() : null;
   const duration = c.duration || video?.duration || 0;
-  const segments = ann?.segments || [];
+  const segments = c.scaleAiMode ? [] : ann?.segments || [];
   // Latest-first indices into `segments` (chronological array).
   const recent = segments
     .map((s, i) => ({ s, i }))
     .slice(-2)
     .reverse();
 
-  const covered = segments.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
+  const scaleAiRanges =
+    c.scaleAiStage === "parent" ? scaleAi?.parent_cycles || [] : scaleAi?.subtask_segments || [];
+  const covered = c.scaleAiMode
+    ? scaleAiRanges.reduce((acc, range) => acc + Math.max(0, range.end - range.start), 0)
+    : segments.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
   const coverage = duration > 0 ? Math.min(100, Math.round((covered / duration) * 100)) : 0;
   const playFraction = duration > 0 ? Math.min(1, c.scrubTime / duration) : 0;
   const shareReady = c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
-      <MediaMetaStrip meta={ann?.mediaMeta} />
+      <MediaMetaStrip meta={ann?.mediaMeta ?? null} />
 
       <header className="flex items-start justify-between gap-4 border-b border-border px-4 py-3">
         <div className="min-w-0">
@@ -86,7 +91,11 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           </span>
           <span>{c.playbackRate.toFixed(1)}×</span>
           {c.previewNote ? <Badge tone="muted">{c.previewNote}</Badge> : null}
-          <Badge tone={coverage >= 100 ? "ok" : "muted"}>{coverage}% covered</Badge>
+          <Badge tone={coverage >= 100 ? "ok" : "muted"}>
+            {c.scaleAiMode
+              ? `${scaleAiRanges.length} ${c.scaleAiStage === "parent" ? "cycles" : "subtasks"}`
+              : `${coverage}% covered`}
+          </Badge>
         </div>
       </header>
 
@@ -154,6 +163,50 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
               />
             );
           })}
+          {c.scaleAiMode &&
+            scaleAi?.parent_cycles.map((cycle, index) => {
+              const parentColor = taskColor(scaleAi.parent_task);
+              const isActive = cycle.id === c.scaleAiActiveCycleId;
+              return (
+                <div
+                  key={cycle.id}
+                  title={`${scaleAi.parent_task} · Cycle ${index + 1} · ${(cycle.end - cycle.start).toFixed(2)}s`}
+                  className={cn(
+                    "absolute inset-y-0 border-x",
+                    c.scaleAiStage === "subtask" && "bg-transparent",
+                    isActive && "ring-1 ring-inset ring-white/80",
+                  )}
+                  style={{
+                    left: duration ? `${(cycle.start / duration) * 100}%` : "0%",
+                    width: duration
+                      ? `${Math.max(0.4, ((cycle.end - cycle.start) / duration) * 100)}%`
+                      : "0%",
+                    borderColor: parentColor.solid,
+                    ...(c.scaleAiStage === "parent"
+                      ? { backgroundColor: parentColor.fill }
+                      : null),
+                  }}
+                />
+              );
+            })}
+          {c.scaleAiMode &&
+            scaleAi?.subtask_segments.map((segment) => {
+              const color = taskColor(segment.task);
+              return (
+                <div
+                  key={segment.id}
+                  title={`${segment.task} · ${(segment.end - segment.start).toFixed(2)}s`}
+                  className="absolute bottom-0 top-1/2"
+                  style={{
+                    left: duration ? `${(segment.start / duration) * 100}%` : "0%",
+                    width: duration
+                      ? `${Math.max(0.4, ((segment.end - segment.start) / duration) * 100)}%`
+                      : "0%",
+                    backgroundColor: color.solid,
+                  }}
+                />
+              );
+            })}
           {ann?.pendingWork && duration > 0 && (
             <div
               className="absolute inset-y-0 border-x border-warning bg-warning/25"

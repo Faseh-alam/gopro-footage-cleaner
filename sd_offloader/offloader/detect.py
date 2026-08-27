@@ -253,6 +253,7 @@ def _sidecar_paths_for_mp4(mp4: Path) -> list[Path]:
     """Possible sidecar paths for a video (Cleaner + plain .JSON)."""
     return [
         mp4.with_name(f"{mp4.stem}.segments.json"),
+        mp4.with_name(f"{mp4.stem}.scaleai.json"),
         mp4.with_name(f"{mp4.stem}.JSON"),
         mp4.with_name(f"{mp4.stem}.json"),
     ]

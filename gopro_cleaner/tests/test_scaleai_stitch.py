@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gopro_cleaner.core.probe import MediaInfo, StreamInfo
 from gopro_cleaner.core.scaleai_stitch import (
+    _build_concat_command,
     discover_task_dirs,
     list_task_clips,
     plan_stitch,
+    stitch_task_clips,
 )
 
 
@@ -74,6 +78,15 @@ class ScaleAIStitchTests(unittest.TestCase):
         self.assertTrue(plan.all_have_gpmf)
         self.assertTrue(plan.output.name.endswith("__stitched.MP4"))
 
+    def test_explicit_clip_list_preserves_order_and_excludes_stale_files(self) -> None:
+        with patch(
+            "gopro_cleaner.core.scaleai_stitch.probe_media",
+            side_effect=lambda path: _media(Path(path)),
+        ):
+            plan = plan_stitch(self.task, clips=[self.b, self.a])
+        self.assertEqual(plan.clips, [self.b.resolve(), self.a.resolve()])
+        self.assertNotIn(self.task / "grab-cloth__stitched.MP4", plan.clips)
+
     def test_plan_rejects_gpmf_mismatch(self) -> None:
         def fake_probe(path: Path) -> MediaInfo:
             gpmf = "0001" in Path(path).name
@@ -82,6 +95,67 @@ class ScaleAIStitchTests(unittest.TestCase):
         with patch("gopro_cleaner.core.scaleai_stitch.probe_media", side_effect=fake_probe):
             with self.assertRaises(RuntimeError):
                 plan_stitch(self.task)
+
+    def test_concat_tags_first_data_stream_as_gpmd(self) -> None:
+        command = _build_concat_command(
+            _media(self.a),
+            self.task / "concat.txt",
+            self.task / "out.MP4",
+        )
+        tag_index = command.index("-tag:d:0")
+        self.assertEqual(command[tag_index + 1], "gpmd")
+
+    def test_plan_rejects_trim_missing_expected_gpmf(self) -> None:
+        self.a.with_suffix(".scaleai-source.json").write_text(
+            json.dumps({"source_has_gpmf": True}),
+            encoding="utf-8",
+        )
+
+        def fake_probe(path: Path) -> MediaInfo:
+            return _media(Path(path), gpmf=False)
+
+        with patch("gopro_cleaner.core.scaleai_stitch.probe_media", side_effect=fake_probe):
+            with self.assertRaisesRegex(RuntimeError, "source had GPMF"):
+                plan_stitch(self.task)
+
+    def test_manifest_maps_stitched_interval_to_source_cycle(self) -> None:
+        self.a.with_suffix(".scaleai-source.json").write_text(
+            json.dumps(
+                {
+                    "source": "/footage/GX010001.MP4",
+                    "parent_task": "Label Attachment",
+                    "parent_cycle_id": "cycle-1",
+                    "start": 5.1,
+                    "end": 5.5,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_probe(path: Path) -> MediaInfo:
+            path = Path(path)
+            if path.name.endswith("__stitched.MP4"):
+                return _media(path, duration=1.0)
+            return _media(path, duration=0.4 if "0001" in path.name else 0.6)
+
+        def fake_run(command: list[str], **_kwargs):
+            Path(command[-1]).write_bytes(b"stitched")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("gopro_cleaner.core.scaleai_stitch.probe_media", side_effect=fake_probe),
+            patch("gopro_cleaner.core.scaleai_stitch.subprocess.run", side_effect=fake_run),
+            patch("gopro_cleaner.core.scaleai_stitch._run_udtacopy"),
+        ):
+            result = stitch_task_clips(self.task, overwrite=True)
+
+        self.assertTrue(result.ok)
+        first = result.manifest["clips"][0]
+        self.assertEqual(first["source"], "/footage/GX010001.MP4")
+        self.assertEqual(first["parent_cycle_id"], "cycle-1")
+        self.assertEqual(first["source_start"], 5.1)
+        self.assertEqual(first["stitched_start"], 0.0)
+        self.assertEqual(first["stitched_end"], 0.4)
 
 
 if __name__ == "__main__":

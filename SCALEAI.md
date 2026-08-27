@@ -1,93 +1,79 @@
-# ScaleAI micro-task pipeline (plain language)
+# ScaleAI two-stage micro-task pipeline
 
 Branch: `ScaleAI` — separate from the normal textile review/offload product.
 
-## What you asked for (example)
+## Folder layout and parent task
 
-One 30‑minute stitching video. The person grabs cloth ~20 times.
-
-1. You mark each grab as a tiny work segment and name the task `grab-cloth`
-   (maybe 0.5–0.7s each).
-2. Those marks are saved as **JSON next to the video** (no heavy trim yet).
-3. When you process that video, the app cuts those 20 snippets and puts them in
-   a folder named `grab-cloth/`.
-4. Then it **stitches** them into **one file**:
+Open the parent-task folder, for example:
 
 ```text
-grab-cloth__stitched.MP4   ≈ 0.7s × 20 ≈ 14 seconds
+50 hours/AWS/Label Attachment/
+  GX010123.MP4
+  GX010124.MP4
 ```
 
-That 14‑second video is *only* grabbing cloth, back to back. Same idea for
-`place-on-machine`, `stretch-forward`, etc.
+The app infers `Label Attachment` from the folder name. Labelers do not choose
+the parent task again for every video.
 
-That is what “one stitched file per micro-task” means — **not** “per SD card”
-and **not** “per Google Drive folder”. One micro-task name → one combined clip
-(for the footage you processed).
+## Stage 1 — clean parent-task cycles
 
-## Where the videos live
+1. Turn on **ScaleAI two-stage mode**.
+2. Stay on **1 · Parent cycles**.
+3. At the beginning of a complete clean repetition, click **Set cycle start**.
+4. At its end, click **End + save cycle**.
+5. Leave garbage unmarked. Delete and redo a cycle if its boundaries are weak.
+6. Choose the cleanest cycle with the download icon. The app records it as the
+   one parent-task example and downloads a small 720p WhatsApp MP4.
+7. Click **Next video · JSON only**.
 
-Google Drive download on a local PC is fine. Use **Open footage** / browse to
-that folder. No SD card required.
-
-## Weak labeling PCs vs strong process PC
-
-**Labeling (weak PC)** only writes sidecars:
+Stage 1 does not trim footage. It writes:
 
 ```text
-GX010123.MP4
-GX010123.segments.json     ← timestamps + task names (grab-cloth, …)
-GX010123.segments.txt
+GX010123.scaleai.json
 ```
 
-Trimming dozens of sub‑second clips is slow on weak machines. So the flow is:
+The existing `GX010123.segments.json` normal annotation is not changed.
 
-| Step | Where | What happens |
-|------|--------|--------------|
-| Mark work / garbage / tasks | Label PC | JSON only |
-| Next video | Label PC | Leave JSON; no trim |
-| **Trim this video** (optional) | Label PC or strong PC | Cuts clips into `grab-cloth/`, … |
-| **Trim + stitch this video** | Prefer strong PC | Cut, then build `*__stitched.MP4` |
-| Copy folder to strong PC | USB / network | Take MP4s + `.segments.json` |
+## Stage 2 — CEO-confirmed subtasks
 
-You can mark everything first, then process overnight on the better machine.
+After the CEO returns the subtask names:
 
-## What is `eager_tasks.json`?
+1. Switch to **2 · Subtasks**.
+2. Add the confirmed names, such as `grab-cloth`, `position-label`, and
+   `release-cloth`.
+3. Select a parent cycle. Playback and frame stepping stay inside that saved
+   parent window and automatically continue to the next cycle.
+4. Choose a subtask, click **Set subtask start**, then **End + save subtask**.
+5. Delete and redo weak ranges. A subtask that crosses its parent-cycle boundary
+   is rejected by both the UI and server.
 
-It is **only the dropdown list of task names** the app remembers.
+Subtask colors are stable in the task list and timeline. Parent windows keep
+the stable parent-task color.
 
-- Normal product list (coarse textile names like `Garment-Edge-Hemming`) lives in
-  `eager_tasks.json` / `eager_tasks.default.json`.
-- ScaleAI starts from **`scaleai_tasks.json`**, which begins **empty**.
-- You **add micro-tasks live** with “New task” while labeling
-  (`grab-cloth`, `fold-once`, `put-in-bag`, …).
-- Those names are saved so tomorrow’s session still has them.
+## Weak labeling PCs
 
-It is **not** the footage, **not** the timestamps, and **not** the stitched
-output. Timestamps live in `*.segments.json` beside each video.
+Both stages only update `*.scaleai.json`. Copy the original MP4s together with
+their sidecars to the strong processing PC. No preliminary trim is required.
 
-## Scrub precision (recommendation for textile)
+ScaleAI precision:
 
-Folding / grab / place actions are often **0.2–0.5s**. Current `,` / `.` at
-**1 second** is too coarse for that.
+- `,` / `.`: 0.1 seconds
+- Shift + `,` / `.`: one frame (approximately 1/30 second)
+- Enter: set/save the current stage boundary
+- N: next video without trimming
 
-In **ScaleAI mode**:
+## Strong PC processing
 
-- `,` / `.` move **0.1s** (good default for textile micro-tasks)
-- Hold **Shift** + `,` / `.` for **one frame** (~1/30s ≈ 0.033s) when you need
-  tighter edges
+Use **Process folder + stitch** after Stage 2 is complete. The app:
 
-You do not need perfect frame accuracy on every mark; 0.1s is usually enough
-if labeling discipline is good.
+1. reads every layered sidecar below the opened folder;
+2. trims only confirmed subtask ranges;
+3. writes clips under `_ScaleAI/<subtask>/`;
+4. stitches clips with the same subtask into `<subtask>__stitched.MP4`;
+5. writes a manifest mapping every stitched interval back to source video,
+   parent-cycle ID, and source timestamps.
 
-## IMU / GPMF
-
-Individual trims keep IMU (stream copy). Stitched files also map the `gpmd`
-track. Absolute continuous time across joins is not guaranteed; each segment’s
-IMU is preserved in order. Stitch **fails** if IMU would be lost.
-
-## Safety
-
-- Marking never deletes source videos.
-- Trim/stitch never overwrite an existing `*__stitched.MP4` unless you confirm
-  overwrite.
-- Individual clips stay on disk after stitch until you delete them yourself.
+Individual trims use stream copy and retain GoPro GPMF/IMU. Stitching maps the
+`gpmd` track and fails closed when GPMF is expected but missing. Source videos
+and individual trims are never deleted by this workflow. Existing stitched
+outputs are not overwritten unless overwrite is explicitly enabled.

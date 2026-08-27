@@ -33,5 +33,5 @@ export function taskColor(task: string | null | undefined): {
   if (!name) {
     return { fill: "hsla(210, 90%, 55%, 0.35)", solid: "hsl(210, 90%, 55%)" };
   }
-  return TASK_PALETTE[hashTask(name) % TASK_PALETTE.length];
+  return TASK_PALETTE[hashTask(name) % TASK_PALETTE.length]!;
 }

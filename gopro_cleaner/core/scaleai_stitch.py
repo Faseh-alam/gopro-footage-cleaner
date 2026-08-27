@@ -113,6 +113,18 @@ def plan_stitch(
         raise ValueError(f"No clips found in {root}")
 
     probed = [_probe_or_raise(p) for p in selected]
+    for clip, media in zip(selected, probed, strict=True):
+        provenance_path = clip.with_suffix(".scaleai-source.json")
+        if not provenance_path.is_file():
+            continue
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if provenance.get("source_has_gpmf") is True and not media.has_gpmf:
+            raise RuntimeError(
+                f"{clip.name} is missing GPMF / IMU even though its source had GPMF"
+            )
     base = probed[0]
     for other in probed[1:]:
         mismatches = _compatible(base, other)
@@ -155,13 +167,12 @@ def _build_concat_command(first: MediaInfo, list_file: Path, output: Path) -> li
     if first.audio_index is not None:
         command.extend(["-map", f"0:{first.audio_index}"])
     if first.gpmf_index is not None:
-        data_tag_index = 2 if first.audio_index is not None else 1
         command.extend(
             [
                 "-map",
                 f"0:{first.gpmf_index}",
                 "-copy_unknown",
-                f"-tag:d:{data_tag_index}",
+                "-tag:d:0",
                 "gpmd",
             ]
         )
@@ -254,16 +265,35 @@ def stitch_task_clips(
             )
 
         clip_rows = []
+        stitched_offset = 0.0
         for p in plan.clips:
             info = probe_media(p)
+            duration = float(info.duration or 0.0)
+            provenance_path = p.with_suffix(".scaleai-source.json")
+            provenance = {}
+            if provenance_path.is_file():
+                try:
+                    parsed = json.loads(provenance_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        provenance = parsed
+                except (json.JSONDecodeError, OSError):
+                    provenance = {}
             clip_rows.append(
                 {
                     "path": str(p),
                     "name": p.name,
                     "duration": info.duration,
                     "has_gpmf": info.has_gpmf,
+                    "stitched_start": round(stitched_offset, 6),
+                    "stitched_end": round(stitched_offset + duration, 6),
+                    "source": provenance.get("source"),
+                    "parent_task": provenance.get("parent_task"),
+                    "parent_cycle_id": provenance.get("parent_cycle_id"),
+                    "source_start": provenance.get("start"),
+                    "source_end": provenance.get("end"),
                 }
             )
+            stitched_offset += duration
         manifest = {
             "task": plan.task,
             "output": str(plan.output),

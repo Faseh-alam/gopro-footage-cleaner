@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { TextInput } from "@/components/wc/field";
 import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
+import { ScaleAiPanel } from "./scaleai-panel";
 
 export function TaskPanel({ c }: { c: ReviewController }) {
   const [newTask, setNewTask] = useState("");
@@ -59,40 +60,37 @@ export function TaskPanel({ c }: { c: ReviewController }) {
     );
   };
 
-  return (
-    <div className="grid gap-3 border-b border-border p-4">
-      <div className="eyebrow">Task</div>
-
+  const taskPicker = (
+    <>
       <TextInput
         ref={c.taskSearchRef}
         type="search"
         autoComplete="off"
-        placeholder="Filter tasks… (recent pinned above)"
+        placeholder={c.scaleAiMode ? "Filter confirmed subtasks…" : "Filter tasks…"}
         value={c.taskSearch}
         onChange={(e) => c.setTaskSearch(e.currentTarget.value)}
         onFocus={() => c.focusTaskSearch()}
         className="h-8 text-xs"
       />
 
-      <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Filter only · pick a listed task · New task below to create · custom tasks show × to remove · T then Enter
-        repeats last · G = garbage
-      </p>
-
       <div className="max-h-56 overflow-auto rounded-sm border border-border p-1">
         {groups.matches.length === 0 && (
-          <div className="px-2 py-4 text-center text-xs text-muted-foreground">No matching tasks</div>
+          <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+            {c.scaleAiMode ? "Add the CEO-confirmed subtasks below" : "No matching tasks"}
+          </div>
         )}
         {groups.recent.length > 0 && <div className="eyebrow px-2 py-1">Recent</div>}
         {groups.recent.map(renderTask)}
-        {groups.others.length > 0 && groups.recent.length > 0 && <div className="eyebrow px-2 py-1">All</div>}
+        {groups.others.length > 0 && groups.recent.length > 0 && (
+          <div className="eyebrow px-2 py-1">All</div>
+        )}
         {groups.others.map(renderTask)}
       </div>
 
       <div className="flex gap-2">
         <TextInput
           ref={c.newTaskInputRef}
-          placeholder="New task (A)"
+          placeholder={c.scaleAiMode ? "New confirmed subtask" : "New task (A)"}
           value={newTask}
           onChange={(e) => setNewTask(e.currentTarget.value)}
           onKeyDown={(e) => {
@@ -120,43 +118,48 @@ export function TaskPanel({ c }: { c: ReviewController }) {
           Add
         </Button>
       </div>
+    </>
+  );
 
-      <div className="grid gap-2">
-        <Button size="sm" variant="outline" onClick={() => c.undoSegment()}>
-          Delete last markup <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">U</kbd>
-        </Button>
-        <Button size="sm" variant="destructive" onClick={() => c.deleteCurrentFile()}>
-          Move video to Trash
-        </Button>
-      </div>
+  return (
+    <div className="grid gap-3 border-b border-border p-4">
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          checked={c.scaleAiMode}
+          onChange={(e) => void c.setScaleAiMode(e.currentTarget.checked)}
+        />
+        <span className="font-medium">ScaleAI two-stage mode</span>
+      </label>
 
-      <div className="grid gap-2 rounded-sm border border-border p-2">
-        <label className="flex items-center gap-2 text-xs">
-          <input
-            type="checkbox"
-            checked={c.scaleAiMode}
-            onChange={(e) => void c.setScaleAiMode(e.currentTarget.checked)}
-          />
-          <span className="font-medium">ScaleAI micro-task mode</span>
-        </label>
-        <p className="text-[10px] leading-relaxed text-muted-foreground">
-          Empty task list — add names like grab-cloth live. Marking saves JSON only.
-          {c.scaleAiMode ? " ,/. = 0.1s · Shift+,/. = 1 frame." : ""}
-        </p>
-        {c.scaleAiMode ? (
-          <div className="grid gap-1.5">
-            <Button size="sm" variant="outline" onClick={() => void c.processCurrentVideoScaleAi({ stitch: false })}>
-              Trim this video
+      {c.scaleAiMode ? (
+        <>
+          <ScaleAiPanel c={c} />
+          {c.scaleAiStage === "subtask" ? (
+            <div className="grid gap-3">
+              <div className="eyebrow">CEO-confirmed subtasks</div>
+              {taskPicker}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <div className="eyebrow">Task</div>
+          {taskPicker}
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Pick a listed task · T then Enter repeats last · G = garbage
+          </p>
+          <div className="grid gap-2">
+            <Button size="sm" variant="outline" onClick={() => c.undoSegment()}>
+              Delete last markup{" "}
+              <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">U</kbd>
             </Button>
-            <Button size="sm" variant="accent" onClick={() => void c.processCurrentVideoScaleAi({ stitch: true })}>
-              Trim + stitch this video
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => void c.finishCleaningFile()}>
-              Next video (JSON only) <kbd className="ml-1 font-mono text-[10px]">N</kbd>
+            <Button size="sm" variant="destructive" onClick={() => c.deleteCurrentFile()}>
+              Move video to Trash
             </Button>
           </div>
-        ) : null}
-      </div>
+        </>
+      )}
     </div>
   );
 }

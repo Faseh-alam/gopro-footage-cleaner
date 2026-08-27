@@ -5,6 +5,8 @@ import type {
   Annotation,
   BatchDetail,
   CardIdentity,
+  ScaleAiAnnotation,
+  ScaleAiParentCycle,
   SdCard,
   Segment,
   StatusKind,
@@ -261,6 +263,12 @@ export function useReviewController() {
       return false;
     }
   });
+  const [scaleAiStage, setScaleAiStage] = useState<"parent" | "subtask">("parent");
+  const [scaleAiByPath, setScaleAiByPath] = useState<Record<string, ScaleAiAnnotation>>({});
+  const [scaleAiActiveCycleId, setScaleAiActiveCycleId] = useState<string | null>(null);
+  const [scaleAiParentStart, setScaleAiParentStart] = useState<number | null>(null);
+  const [scaleAiSubtaskStart, setScaleAiSubtaskStart] = useState<number | null>(null);
+  const [scaleAiExampleBusy, setScaleAiExampleBusy] = useState(false);
 
   /** Bumped per video open — stale async work checks this before touching the player. */
   const previewTokenRef = useRef(0);
@@ -309,6 +317,11 @@ export function useReviewController() {
     duration,
     deleteSourceAfterTrim,
     scaleAiMode,
+    scaleAiStage,
+    scaleAiByPath,
+    scaleAiActiveCycleId,
+    scaleAiParentStart,
+    scaleAiSubtaskStart,
   };
 
   const setStatus = useCallback((message: string, kind: StatusKind = "") => {
@@ -422,6 +435,41 @@ export function useReviewController() {
     },
     [applyAnnotationPayload, setStatus],
   );
+
+  const applyScaleAiPayload = useCallback((path: string, payload: any) => {
+    const annotation = (payload?.annotation || payload) as ScaleAiAnnotation;
+    setScaleAiByPath((prev) => ({ ...prev, [path]: annotation }));
+    setTasks(annotation.subtask_names || []);
+    setScaleAiActiveCycleId((current) => {
+      if (current && annotation.parent_cycles.some((cycle) => cycle.id === current)) {
+        return current;
+      }
+      return annotation.parent_cycles[0]?.id || null;
+    });
+    return annotation;
+  }, []);
+
+  const loadScaleAiForPath = useCallback(
+    async (path: string) => {
+      if (!path) return null;
+      try {
+        const root = stateRef.current.scanRoot || "";
+        const query = new URLSearchParams({ path });
+        if (root) query.set("root", root);
+        const data = await api(`/api/eager/scaleai/annotation?${query.toString()}`);
+        return applyScaleAiPayload(path, data);
+      } catch (error: any) {
+        setStatus(error.message || "Could not load ScaleAI annotation", "error");
+        return null;
+      }
+    },
+    [applyScaleAiPayload, setStatus],
+  );
+
+  const currentScaleAi = useCallback((): ScaleAiAnnotation | null => {
+    const path = currentVideo()?.path;
+    return path ? stateRef.current.scaleAiByPath[path] || null : null;
+  }, [currentVideo]);
 
   const annotationContext = useCallback(() => {
     const id = stateRef.current.cardIdentity as CardIdentity;
@@ -658,7 +706,18 @@ export function useReviewController() {
   const fineTune = useCallback(
     (seconds: number) => {
       if (!currentVideo()) return;
-      scheduleSeek(stateRef.current.scrubTime + seconds, true);
+      let target = stateRef.current.scrubTime + seconds;
+      if (stateRef.current.scaleAiMode && stateRef.current.scaleAiStage === "subtask") {
+        const video = currentVideo();
+        const annotation = video
+          ? stateRef.current.scaleAiByPath[video.path]
+          : null;
+        const cycle = annotation?.parent_cycles.find(
+          (row: ScaleAiParentCycle) => row.id === stateRef.current.scaleAiActiveCycleId,
+        );
+        if (cycle) target = Math.min(cycle.end, Math.max(cycle.start, target));
+      }
+      scheduleSeek(target, true);
     },
     [currentVideo, scheduleSeek],
   );
@@ -1240,6 +1299,12 @@ export function useReviewController() {
 
       await loadAnnotationForPath(video.path, { keepPending: true });
       if (token !== previewTokenRef.current) return;
+      if (stateRef.current.scaleAiMode) {
+        await loadScaleAiForPath(video.path);
+        if (token !== previewTokenRef.current) return;
+        setScaleAiParentStart(null);
+        setScaleAiSubtaskStart(null);
+      }
 
       const startAt = targetResume();
       resumeTargetRef.current = startAt;
@@ -1259,6 +1324,7 @@ export function useReviewController() {
       cancelFastJob,
       isVideoFullyDone,
       loadAnnotationForPath,
+      loadScaleAiForPath,
       nextPreviewTargetIndex,
       pollFastReady,
       resumeTimeForPath,
@@ -1287,6 +1353,236 @@ export function useReviewController() {
     }
     setStatus("All videos complete", "ok");
   }, [isVideoFullyDone, loadVideo, nextIncompleteIndex, setStatus]);
+
+  const nextScaleAiVideo = useCallback(async () => {
+    const s = stateRef.current;
+    if (!s.videos.length) return;
+    const next = s.index + 1;
+    if (next >= s.videos.length) {
+      setStatus("All videos in this task folder are marked", "ok");
+      return;
+    }
+    await loadVideo(next, { force: true });
+    setStatus("Moved to next video — parent/subtask JSON saved", "ok");
+  }, [loadVideo, setStatus]);
+
+  const changeScaleAiStage = useCallback(
+    async (stage: "parent" | "subtask") => {
+      setScaleAiStage(stage);
+      setScaleAiParentStart(null);
+      setScaleAiSubtaskStart(null);
+      const video = currentVideo();
+      let annotation = currentScaleAi();
+      if (video && !annotation) annotation = await loadScaleAiForPath(video.path);
+      if (stage === "subtask") {
+        const cycle = annotation?.parent_cycles?.[0];
+        if (!cycle) {
+          setStatus("Mark at least one clean parent-task cycle first", "error");
+          setScaleAiStage("parent");
+          return;
+        }
+        setScaleAiActiveCycleId(cycle.id);
+        scheduleSeek(cycle.start, true);
+        setStatus("Subtask stage — label only inside the selected parent cycle", "ok");
+      } else {
+        setStatus("Parent task stage — mark complete clean repetitions", "ok");
+      }
+    },
+    [currentScaleAi, currentVideo, loadScaleAiForPath, scheduleSeek, setStatus],
+  );
+
+  const markScaleAiParentStart = useCallback(() => {
+    if (!currentVideo()) return;
+    const start = Math.max(0, currentScrubTime());
+    setScaleAiParentStart(start);
+    safePause();
+    setStatus(`Parent cycle starts at ${formatTime(start)}`, "ok");
+  }, [currentScrubTime, currentVideo, safePause, setStatus]);
+
+  const saveScaleAiParentCycle = useCallback(async () => {
+    const video = currentVideo();
+    const start = stateRef.current.scaleAiParentStart;
+    if (!video || start == null) {
+      setStatus("Set cycle start first", "error");
+      return;
+    }
+    const end = Math.max(0, currentScrubTime());
+    if (end <= start + 0.05) {
+      setStatus("Cycle end must be after its start", "error");
+      return;
+    }
+    try {
+      const data = await api("/api/eager/scaleai/parent-cycles", {
+        method: "POST",
+        body: JSON.stringify({
+          path: video.path,
+          root: stateRef.current.scanRoot || "",
+          start,
+          end,
+        }),
+      });
+      const annotation = applyScaleAiPayload(video.path, data);
+      const created = annotation.parent_cycles.find(
+        (cycle) => Math.abs(cycle.start - start) < 0.001 && Math.abs(cycle.end - end) < 0.001,
+      );
+      if (created) setScaleAiActiveCycleId(created.id);
+      setScaleAiParentStart(null);
+      setStatus(
+        `Saved ${annotation.parent_task} cycle ${formatTime(start)} → ${formatTime(end)}`,
+        "ok",
+      );
+    } catch (error: any) {
+      setStatus(error.message || "Could not save parent cycle", "error");
+    }
+  }, [applyScaleAiPayload, currentScrubTime, currentVideo, setStatus]);
+
+  const deleteScaleAiParentCycle = useCallback(
+    async (cycleId: string) => {
+      const video = currentVideo();
+      if (!video) return;
+      try {
+        const data = await api("/api/eager/scaleai/parent-cycles", {
+          method: "DELETE",
+          body: JSON.stringify({ path: video.path, cycle_id: cycleId }),
+        });
+        applyScaleAiPayload(video.path, data);
+        setStatus("Deleted parent cycle and its linked subtasks", "ok");
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [applyScaleAiPayload, currentVideo, setStatus],
+  );
+
+  const selectScaleAiCycle = useCallback(
+    (cycleId: string) => {
+      const annotation = currentScaleAi();
+      const cycle = annotation?.parent_cycles.find((row) => row.id === cycleId);
+      if (!cycle) return;
+      setScaleAiActiveCycleId(cycleId);
+      setScaleAiSubtaskStart(null);
+      scheduleSeek(cycle.start, true);
+      setStatus(
+        `Cycle ${annotation!.parent_cycles.indexOf(cycle) + 1} · ${formatTime(cycle.start)} → ${formatTime(cycle.end)}`,
+        "ok",
+      );
+    },
+    [currentScaleAi, scheduleSeek, setStatus],
+  );
+
+  const prepareScaleAiExample = useCallback(
+    async (cycleId: string) => {
+      const video = currentVideo();
+      if (!video || scaleAiExampleBusy) return;
+      setScaleAiExampleBusy(true);
+      setStatus("Encoding clean WhatsApp example…");
+      try {
+        const data = await api("/api/eager/scaleai/example", {
+          method: "POST",
+          body: JSON.stringify({
+            path: video.path,
+            cycle_id: cycleId,
+            quality: "720p",
+          }),
+        });
+        applyScaleAiPayload(video.path, data);
+        openDownloadUrl(data.download_url);
+        setStatus("WhatsApp example ready and selected", "ok");
+      } catch (error: any) {
+        setStatus(error.message || "Could not prepare example", "error");
+      } finally {
+        setScaleAiExampleBusy(false);
+      }
+    },
+    [applyScaleAiPayload, currentVideo, scaleAiExampleBusy, setStatus],
+  );
+
+  const markScaleAiSubtaskStart = useCallback(() => {
+    const annotation = currentScaleAi();
+    const cycle = annotation?.parent_cycles.find(
+      (row) => row.id === stateRef.current.scaleAiActiveCycleId,
+    );
+    if (!cycle) {
+      setStatus("Select a parent cycle first", "error");
+      return;
+    }
+    const start = currentScrubTime();
+    if (start < cycle.start - 0.001 || start > cycle.end - 0.05) {
+      setStatus("Subtask start must be inside the selected parent cycle", "error");
+      scheduleSeek(cycle.start, true);
+      return;
+    }
+    setScaleAiSubtaskStart(start);
+    safePause();
+    setStatus(`Subtask starts at ${formatTime(start)} — choose task then end`, "ok");
+  }, [currentScaleAi, currentScrubTime, safePause, scheduleSeek, setStatus]);
+
+  const saveScaleAiSubtask = useCallback(async () => {
+    const video = currentVideo();
+    const annotation = currentScaleAi();
+    const cycleId = stateRef.current.scaleAiActiveCycleId;
+    const cycle = annotation?.parent_cycles.find((row) => row.id === cycleId);
+    const start = stateRef.current.scaleAiSubtaskStart;
+    const task = String(stateRef.current.selectedTaskValue || "").trim();
+    if (!video || !cycle || start == null) {
+      setStatus("Select cycle and set subtask start first", "error");
+      return;
+    }
+    if (!task) {
+      setStatus("Choose or add a subtask name first", "error");
+      focusTaskSearch();
+      return;
+    }
+    const end = currentScrubTime();
+    if (end <= start + 0.05 || end > cycle.end + 0.001) {
+      setStatus("Subtask end must be after start and inside this cycle", "error");
+      return;
+    }
+    try {
+      const data = await api("/api/eager/scaleai/subtask-segments", {
+        method: "POST",
+        body: JSON.stringify({
+          path: video.path,
+          cycle_id: cycle.id,
+          task,
+          start,
+          end,
+        }),
+      });
+      applyScaleAiPayload(video.path, data);
+      setScaleAiSubtaskStart(null);
+      touchRecentTask(task);
+      setStatus(`Saved ${task} ${formatTime(start)} → ${formatTime(end)}`, "ok");
+    } catch (error: any) {
+      setStatus(error.message || "Could not save subtask", "error");
+    }
+  }, [
+    applyScaleAiPayload,
+    currentScaleAi,
+    currentScrubTime,
+    currentVideo,
+    focusTaskSearch,
+    setStatus,
+    touchRecentTask,
+  ]);
+
+  const deleteScaleAiSubtask = useCallback(
+    async (segmentId: string) => {
+      const video = currentVideo();
+      if (!video) return;
+      try {
+        const data = await api("/api/eager/scaleai/subtask-segments", {
+          method: "DELETE",
+          body: JSON.stringify({ path: video.path, segment_id: segmentId }),
+        });
+        applyScaleAiPayload(video.path, data);
+        setStatus("Deleted subtask segment", "ok");
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [applyScaleAiPayload, currentVideo, setStatus],
+  );
 
   // ---------------------------------------------------------------------
   // Mark work / garbage / undo / assign
@@ -1874,6 +2170,11 @@ export function useReviewController() {
         setTasks(data.tasks || []);
         setDefaultTasks(data.default_tasks || []);
         setSelectedTaskValue("");
+        if (on) {
+          setScaleAiStage("parent");
+          const video = currentVideo();
+          if (video) await loadScaleAiForPath(video.path);
+        }
         setStatus(
           on
             ? "ScaleAI mode — empty task list; add micro-tasks live · ,/. = 0.1s"
@@ -1884,7 +2185,7 @@ export function useReviewController() {
         setStatus(error.message || "Could not switch task profile", "error");
       }
     },
-    [setStatus],
+    [currentVideo, loadScaleAiForPath, setStatus],
   );
 
   const isUserDefinedTask = useCallback(
@@ -1903,10 +2204,14 @@ export function useReviewController() {
         setStatus("Type a task name first", "error");
         return;
       }
-      const already = stateRef.current.tasks.some((t) => t.toLowerCase() === trimmed.toLowerCase());
+      const already = stateRef.current.tasks.some(
+        (t: string) => t.toLowerCase() === trimmed.toLowerCase(),
+      );
       if (already) {
         setSelectedTaskValue(
-          stateRef.current.tasks.find((t) => t.toLowerCase() === trimmed.toLowerCase()) || trimmed,
+          stateRef.current.tasks.find(
+            (t: string) => t.toLowerCase() === trimmed.toLowerCase(),
+          ) || trimmed,
         );
         setStatus(`Task already exists: ${trimmed}`, "ok");
         return;
@@ -1926,12 +2231,20 @@ export function useReviewController() {
         });
         setTasks(data.tasks || []);
         setDefaultTasks(data.default_tasks || defaultTasks);
+        const video = currentVideo();
+        if (stateRef.current.scaleAiMode && video) {
+          const sidecar = await api("/api/eager/scaleai/subtasks", {
+            method: "POST",
+            body: JSON.stringify({ path: video.path, names: data.tasks || [trimmed] }),
+          });
+          applyScaleAiPayload(video.path, sidecar);
+        }
       } catch (error: any) {
         setTasks((prev) => prev.filter((t) => t.toLowerCase() !== trimmed.toLowerCase()));
         setStatus(error.message, "error");
       }
     },
-    [defaultTasks, scanTargetPath, setStatus],
+    [applyScaleAiPayload, currentVideo, defaultTasks, scanTargetPath, setStatus],
   );
 
   const removeTask = useCallback(
@@ -1949,6 +2262,14 @@ export function useReviewController() {
         });
         setTasks(data.tasks || []);
         setDefaultTasks(data.default_tasks || defaultTasks);
+        const video = currentVideo();
+        if (stateRef.current.scaleAiMode && video) {
+          const sidecar = await api("/api/eager/scaleai/subtasks", {
+            method: "POST",
+            body: JSON.stringify({ path: video.path, names: data.tasks || [] }),
+          });
+          applyScaleAiPayload(video.path, sidecar);
+        }
         if (stateRef.current.selectedTaskValue.toLowerCase() === trimmed.toLowerCase()) {
           setSelectedTaskValue("");
         }
@@ -1957,7 +2278,7 @@ export function useReviewController() {
         setStatus(error.message, "error");
       }
     },
-    [defaultTasks, isUserDefinedTask, setStatus],
+    [applyScaleAiPayload, currentVideo, defaultTasks, isUserDefinedTask, setStatus],
   );
 
   const importBatchCsv = useCallback(
@@ -2075,7 +2396,6 @@ export function useReviewController() {
     async (opts: { stitch: boolean }) => {
       const current = currentVideo();
       if (!current) return;
-      if (!currentAnnotation()) await loadAnnotationForPath(current.path);
       try {
         const data = await api("/api/eager/scaleai/process-video", {
           method: "POST",
@@ -2092,8 +2412,31 @@ export function useReviewController() {
         setStatus(error.message, "error");
       }
     },
-    [currentAnnotation, currentVideo, loadAnnotationForPath, pollGlobalTrims, setStatus, startGlobalTrimPolling],
+    [currentVideo, pollGlobalTrims, setStatus, startGlobalTrimPolling],
   );
+
+  const processScaleAiFolder = useCallback(async () => {
+    const root = String(stateRef.current.scanRoot || "").trim();
+    if (!root) {
+      setStatus("Open a parent-task folder first", "error");
+      return;
+    }
+    try {
+      const data = await api("/api/eager/scaleai/process-folder", {
+        method: "POST",
+        body: JSON.stringify({ root, stitch: true, overwrite: false }),
+      });
+      setStatus(
+        `Queued ${data.queued || 0} subtask trims across ${data.source_count || 0} video(s)`
+          + (data.stitch_scheduled ? " · stitch scheduled" : ""),
+        data.errors?.length ? "error" : "ok",
+      );
+      startGlobalTrimPolling();
+      await pollGlobalTrims();
+    } catch (error: any) {
+      setStatus(error.message || "Could not process ScaleAI folder", "error");
+    }
+  }, [pollGlobalTrims, setStatus, startGlobalTrimPolling]);
 
   const markShareIn = useCallback(() => {
     if (!currentVideo()) return;
@@ -2308,6 +2651,37 @@ export function useReviewController() {
     const onTimeUpdate = () => {
       if (!Number.isFinite(v.currentTime)) return;
       const originalT = v.currentTime;
+      const state = stateRef.current;
+      if (state.scaleAiMode && state.scaleAiStage === "subtask") {
+        const video = state.index >= 0 ? state.videos[state.index] : null;
+        const annotation = video ? state.scaleAiByPath[video.path] : null;
+        const cycles = annotation?.parent_cycles || [];
+        const cycleIndex = cycles.findIndex(
+          (cycle: ScaleAiParentCycle) => cycle.id === state.scaleAiActiveCycleId,
+        );
+        const cycle = cycles[cycleIndex] || cycles[0];
+        if (cycle && originalT < cycle.start - 0.05) {
+          seekMediaToOriginal(cycle.start);
+          setScrubTime(cycle.start);
+          return;
+        }
+        if (cycle && originalT >= cycle.end - 0.005) {
+          const nextCycle = cycles[cycleIndex + 1];
+          setScaleAiSubtaskStart(null);
+          if (nextCycle) {
+            setScaleAiActiveCycleId(nextCycle.id);
+            seekMediaToOriginal(nextCycle.start);
+            setScrubTime(nextCycle.start);
+            setStatus(`Moved to parent cycle ${cycleIndex + 2}`, "ok");
+          } else {
+            safePause();
+            seekMediaToOriginal(cycle.end);
+            setScrubTime(cycle.end);
+            setStatus("Reached the end of the last parent cycle", "ok");
+          }
+          return;
+        }
+      }
       const target = resumeTargetRef.current;
       // While resuming, fight browsers that snap the playhead back to 0.
       if (Date.now() < resumeHoldUntilRef.current && target > 0.5 && originalT < 0.35) {
@@ -2389,7 +2763,7 @@ export function useReviewController() {
       v.removeEventListener("waiting", onWaiting);
       v.removeEventListener("stalled", onWaiting);
     };
-  }, [applyMediaRate, safePlay, seekMediaToOriginal, updateScrubUiFromEl]);
+  }, [applyMediaRate, safePause, safePlay, seekMediaToOriginal, setStatus, updateScrubUiFromEl]);
 
   return {
     videoRef,
@@ -2483,8 +2857,26 @@ export function useReviewController() {
     queueClips,
     queueAllClips,
     processCurrentVideoScaleAi,
+    processScaleAiFolder,
     scaleAiMode,
     setScaleAiMode,
+    scaleAiStage,
+    changeScaleAiStage,
+    scaleAiByPath,
+    currentScaleAi,
+    scaleAiActiveCycleId,
+    scaleAiParentStart,
+    scaleAiSubtaskStart,
+    scaleAiExampleBusy,
+    markScaleAiParentStart,
+    saveScaleAiParentCycle,
+    deleteScaleAiParentCycle,
+    selectScaleAiCycle,
+    prepareScaleAiExample,
+    markScaleAiSubtaskStart,
+    saveScaleAiSubtask,
+    deleteScaleAiSubtask,
+    nextScaleAiVideo,
     cancelTrim,
     cancelAllTrims,
     formatTime,
