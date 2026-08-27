@@ -4,7 +4,23 @@ Branch: `ScaleAI` — separate from the normal textile review/offload product.
 
 ## Folder layout and parent task
 
-Open the parent-task folder, for example:
+Open the parent delivery folder named **50 hours**. Inside it there should be:
+
+```text
+50 hours/
+  AWS/
+    Label Attachment/
+      GX010123.MP4
+    Hem Stitching/
+      GX010124.MP4
+  Google Drive/
+    …
+```
+
+In ScaleAI mode click **Open 50 hours**, select that `50 hours` folder, and the app
+loads every raw MP4 under both `AWS` and `Google Drive`. It does **not** auto-scan
+connected DCIM/###GOPRO cards. Parent task names are still inferred from the folder
+under AWS / Google Drive (for example `Label Attachment`).
 
 ```text
 50 hours/AWS/Label Attachment/

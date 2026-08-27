@@ -288,19 +288,33 @@ function ReviewPage() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={c.detecting}
-                title="Detect connected SD cards and scan their footage"
-                onClick={() => c.refreshSdCards({ autoScan: true })}
+                disabled={c.detecting || c.scanning}
+                title={
+                  c.scaleAiMode
+                    ? "Re-scan the opened 50 hours / drive folder"
+                    : "Detect connected SD cards and scan their footage"
+                }
+                onClick={() => {
+                  if (c.scaleAiMode) {
+                    void c.scanSource();
+                    return;
+                  }
+                  void c.refreshSdCards({ autoScan: true });
+                }}
               >
-                {c.detecting ? "Scanning…" : "Scan"}
+                {c.detecting || c.scanning ? "Scanning…" : "Scan"}
               </Button>
               <Button
                 size="sm"
-                variant="ghost"
+                variant={c.scaleAiMode ? "accent" : "ghost"}
                 onClick={() => c.chooseFootageFolder()}
-                title="Open a folder on this computer or an external drive"
+                title={
+                  c.scaleAiMode
+                    ? "Open the 50 hours folder (Google Drive + AWS inside)"
+                    : "Open a folder on this computer or an external drive"
+                }
               >
-                Open
+                {c.scaleAiMode ? "Open 50 hours" : "Open"}
               </Button>
               <Button
                 size="sm"

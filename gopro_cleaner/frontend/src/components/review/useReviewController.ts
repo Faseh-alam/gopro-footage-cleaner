@@ -372,6 +372,11 @@ export function useReviewController() {
   const currentAnnotation = useCallback(() => annotationFor(currentVideo()?.path), [annotationFor, currentVideo]);
 
   const scanTargetPath = useCallback(() => {
+    // ScaleAI labeling always uses the chosen 50 hours / drive folder — never
+    // a detected DCIM/###GOPRO card root that may still be mounted.
+    if (stateRef.current.scaleAiMode) {
+      return stateRef.current.scanRoot?.trim() || "";
+    }
     const card = stateRef.current.sdCardValue?.trim();
     if (card) return card;
     return stateRef.current.scanRoot?.trim() || "";
@@ -1927,9 +1932,10 @@ export function useReviewController() {
     
     setScanning(true);
     try {
+      const scanMode = stateRef.current.scaleAiMode ? "scaleai" : "annotate";
       const data = await api("/api/eager/scan", {
         method: "POST",
-        body: JSON.stringify({ path, recursive: true, mode: "annotate" }),
+        body: JSON.stringify({ path, recursive: true, mode: scanMode }),
       });
 
       if (stateRef.current.batchId) {
@@ -2013,8 +2019,13 @@ export function useReviewController() {
       setLabelRoot(path);
       setSdCardValue((prev) => {
         const exists = stateRef.current.sdCards.some((c: SdCard) => (c.scan_path || c.path) === path);
-        return exists ? path : prev;
+        // Opening a PC / external-drive folder must clear any prior DCIM card
+        // selection, or later Scan calls keep returning SD footage.
+        return exists ? path : "";
       });
+      if (!stateRef.current.sdCards.some((c: SdCard) => (c.scan_path || c.path) === path)) {
+        stateRef.current.sdCardValue = "";
+      }
     },
     [],
   );
@@ -2058,7 +2069,11 @@ export function useReviewController() {
 
 
   const chooseFootageFolder = useCallback(async () => {
-    setStatus("Choose footage on this computer or an external drive…");
+    setStatus(
+      stateRef.current.scaleAiMode
+        ? "Choose the 50 hours folder (contains Google Drive and AWS)…"
+        : "Choose footage on this computer or an external drive…",
+    );
     try {
       const initial = stateRef.current.scanRoot || stateRef.current.sdCardValue || "";
       const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
@@ -2069,6 +2084,9 @@ export function useReviewController() {
       }
       const folderName = data.path.split(/[/\\]/).filter(Boolean).pop() || "Footage";
       applySelectedPath(data.path);
+      stateRef.current.scanRoot = data.path;
+      stateRef.current.labelRoot = data.path;
+      stateRef.current.sdCardValue = "";
       setStatus(`Scanning ${folderName}…`);
       await scanSource(data.path);
     } catch (error: any) {
@@ -2162,6 +2180,11 @@ export function useReviewController() {
       } catch {
         /* ignore */
       }
+      if (on) {
+        // Leave any auto-detected DCIM card behind before ScaleAI labeling.
+        setSdCardValue("");
+        stateRef.current.sdCardValue = "";
+      }
       try {
         const data = await api("/api/eager/tasks/profile", {
           method: "POST",
@@ -2177,7 +2200,7 @@ export function useReviewController() {
         }
         setStatus(
           on
-            ? "ScaleAI mode — empty task list; add micro-tasks live · ,/. = 0.1s"
+            ? "ScaleAI mode — Open 50 hours (Google Drive + AWS). Marking saves JSON only."
             : "Normal textile task list restored",
           "ok",
         );
@@ -2604,7 +2627,12 @@ export function useReviewController() {
           api("/api/health"),
           api("/api/eager/config"),
           api("/api/eager/batches"),
-          refreshSdCards({ quiet: true, autoScan: true }),
+          // ScaleAI stations label from the 50 hours drive folder. Do not
+          // auto-open whatever DCIM/###GOPRO card happens to be mounted.
+          refreshSdCards({
+            quiet: true,
+            autoScan: !stateRef.current.scaleAiMode,
+          }),
         ]);
         if (cancelled) return;
         setAppVersion(health.version || "");

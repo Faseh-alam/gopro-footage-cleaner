@@ -17,7 +17,7 @@ LABELED_FOLDER = "Labeled"  # legacy folder name — no longer created for new l
 TRIMMED_SUFFIX_RE = re.compile(r"-\d+$", re.IGNORECASE)
 CAMERA_FOLDER_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
 GOPRO_MEDIA_DIR_RE = re.compile(r"^\d{3}GOPRO$", re.IGNORECASE)
-SKIP_DIR_NAMES = {LABELED_FOLDER.lower(), "labeled", "tasks", ".trash"}
+SKIP_DIR_NAMES = {LABELED_FOLDER.lower(), "labeled", "tasks", ".trash", "_scaleai"}
 NON_TASK_DIR_NAMES = SKIP_DIR_NAMES | {
     "dcim",
     "misc",
@@ -25,6 +25,10 @@ NON_TASK_DIR_NAMES = SKIP_DIR_NAMES | {
     "system volume information",
     "gopro",
     ".trash",
+    # ScaleAI delivery layout: 50 hours/{AWS|Google Drive}/<parent-task>/…
+    "50 hours",
+    "aws",
+    "google drive",
 }
 
 
@@ -133,6 +137,22 @@ def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
     return not _footage_blocked(path, root)
 
 
+def is_scaleai_source_footage(path: Path, *, root: Path | None = None) -> bool:
+    """Raw MP4s under ``50 hours/{AWS|Google Drive}/<parent-task>/``.
+
+    Unlike annotate mode, parent-task folders are source containers here — not
+    textile trim destinations — so they must stay visible in the review list.
+    """
+    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
+        return False
+    if is_trimmed_clip(path):
+        return False
+    for part in path.parts:
+        if part.lower() in SKIP_DIR_NAMES:
+            return False
+    return True
+
+
 def _video_dict(path: Path, root: Path) -> dict:
     duration = _probe_duration(path)
     try:
@@ -232,7 +252,7 @@ def scan_mp4_files(
     recursive: bool = True,
     mode: str = "all",
 ) -> list[dict]:
-    """mode: all | raw | clips | label | annotate"""
+    """mode: all | raw | clips | label | annotate | scaleai"""
     from .ffmpeg_tools import FFmpegNotFoundError, ffmpeg_available
 
     tools = ffmpeg_available()
@@ -255,6 +275,9 @@ def scan_mp4_files(
             # Original source footage only — skip already-trimmed -N clips and
             # anything already sitting inside a task folder.
             if is_raw_footage(path, root=root):
+                candidates.append(path)
+        elif mode == "scaleai":
+            if is_scaleai_source_footage(path, root=root):
                 candidates.append(path)
         elif (
             mode == "all"
