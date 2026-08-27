@@ -67,14 +67,42 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
     .slice(-2)
     .reverse();
 
-  const scaleAiRanges =
-    c.scaleAiStage === "parent" ? scaleAi?.parent_cycles || [] : scaleAi?.subtask_segments || [];
+  const scaleAiSegments = scaleAi?.segments || [];
+  const pendingRange = ann?.pendingWork || c.scaleAiPending || null;
   const covered = c.scaleAiMode
-    ? scaleAiRanges.reduce((acc, range) => acc + Math.max(0, range.end - range.start), 0)
+    ? scaleAiSegments
+        .filter((segment) => segment.type === "subtask")
+        .reduce((acc, range) => acc + Math.max(0, range.end - range.start), 0)
     : segments.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
   const coverage = duration > 0 ? Math.min(100, Math.round((covered / duration) * 100)) : 0;
   const playFraction = duration > 0 ? Math.min(1, c.scrubTime / duration) : 0;
   const shareReady = c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
+
+  // Zoom window around labeled work so 0.5–1s clips stay readable without lying about end times.
+  const zoomBounds = (() => {
+    if (!c.scaleAiMode || duration <= 0) return null;
+    const points: number[] = [];
+    for (const segment of scaleAiSegments) {
+      points.push(Number(segment.start) || 0, Number(segment.end) || 0);
+    }
+    if (pendingRange) {
+      points.push(pendingRange.start, pendingRange.end);
+    }
+    if (!points.length) return null;
+    const rawStart = Math.min(...points);
+    const rawEnd = Math.max(...points);
+    const span = Math.max(0.01, rawEnd - rawStart);
+    const pad = Math.max(1.5, span * 0.35);
+    const start = Math.max(0, rawStart - pad);
+    const end = Math.min(duration, rawEnd + pad);
+    if (end - start < 0.05) return null;
+    return { start, end };
+  })();
+  const zoomSpan = zoomBounds ? zoomBounds.end - zoomBounds.start : 0;
+  const zoomLeft = (t: number) =>
+    zoomBounds && zoomSpan > 0 ? ((t - zoomBounds.start) / zoomSpan) * 100 : 0;
+  const zoomWidth = (start: number, end: number) =>
+    zoomBounds && zoomSpan > 0 ? Math.max(0.15, ((end - start) / zoomSpan) * 100) : 0;
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
@@ -93,7 +121,7 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           {c.previewNote ? <Badge tone="muted">{c.previewNote}</Badge> : null}
           <Badge tone={coverage >= 100 ? "ok" : "muted"}>
             {c.scaleAiMode
-              ? `${scaleAiRanges.length} ${c.scaleAiStage === "parent" ? "cycles" : "subtasks"}`
+              ? `${scaleAiSegments.filter((s) => s.type === "subtask").length} subtasks`
               : `${coverage}% covered`}
           </Badge>
         </div>
@@ -142,12 +170,17 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
 
         {/* Scrub track — display only; clicks never seek (use , . or ← →). */}
         <div
-          className="pointer-events-none relative h-8 select-none border-t border-border bg-surface-2"
+          className={cn(
+            "pointer-events-none relative select-none border-t border-border bg-surface-2",
+            c.scaleAiMode ? "h-10" : "h-8",
+          )}
           aria-hidden
           title="Use , . or ← → to step through the timeline"
         >
           {segments.map((s, i) => {
             const color = s.kind === "work" ? taskColor(s.task) : null;
+            const pct =
+              duration > 0 ? Math.max(0, ((s.end - s.start) / duration) * 100) : 0;
             return (
               <div
                 key={s.id || i}
@@ -155,64 +188,60 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
                 className={cn("absolute inset-y-0", s.kind !== "work" && "bg-destructive/30")}
                 style={{
                   left: duration ? `${(s.start / duration) * 100}%` : "0%",
-                  width: duration
-                    ? `${Math.max(0.4, ((s.end - s.start) / duration) * 100)}%`
-                    : "0%",
+                  width: `${pct}%`,
                   ...(color ? { backgroundColor: color.fill } : null),
                 }}
               />
             );
           })}
           {c.scaleAiMode &&
-            scaleAi?.parent_cycles.map((cycle, index) => {
-              const parentColor = taskColor(scaleAi.parent_task);
-              const isActive = cycle.id === c.scaleAiActiveCycleId;
+            scaleAiSegments.map((segment) => {
+              const isGarbage = segment.type === "garbage";
+              const color = isGarbage ? null : taskColor(segment.label);
+              const leftPct = duration > 0 ? (segment.start / duration) * 100 : 0;
+              const widthPct =
+                duration > 0
+                  ? Math.max(0.08, ((segment.end - segment.start) / duration) * 100)
+                  : 0;
+              // Accurate span only — never force min-width (that lied past the real end).
+              // Start/end ticks make short clips findable on a long source.
               return (
-                <div
-                  key={cycle.id}
-                  title={`${scaleAi.parent_task} · Cycle ${index + 1} · ${(cycle.end - cycle.start).toFixed(2)}s`}
-                  className={cn(
-                    "absolute inset-y-0 border-x",
-                    c.scaleAiStage === "subtask" && "bg-transparent",
-                    isActive && "ring-1 ring-inset ring-white/80",
-                  )}
-                  style={{
-                    left: duration ? `${(cycle.start / duration) * 100}%` : "0%",
-                    width: duration
-                      ? `${Math.max(0.4, ((cycle.end - cycle.start) / duration) * 100)}%`
-                      : "0%",
-                    borderColor: parentColor.solid,
-                    ...(c.scaleAiStage === "parent"
-                      ? { backgroundColor: parentColor.fill }
-                      : null),
-                  }}
-                />
+                <div key={String(segment.id)}>
+                  <div
+                    title={`${segment.label} · ${c.formatTime(segment.start)} → ${c.formatTime(segment.end)}`}
+                    className={cn("absolute top-2 bottom-2", isGarbage && "bg-destructive/50")}
+                    style={{
+                      left: `${leftPct}%`,
+                      width: `${widthPct}%`,
+                      ...(color ? { backgroundColor: color.solid, opacity: 0.85 } : null),
+                    }}
+                  />
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5"
+                    style={{
+                      left: `${leftPct}%`,
+                      backgroundColor: isGarbage ? "#ef4444" : color?.solid || "#fff",
+                    }}
+                  />
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5"
+                    style={{
+                      left: `calc(${leftPct}% + ${widthPct}% - 1px)`,
+                      backgroundColor: isGarbage ? "#ef4444" : color?.solid || "#fff",
+                    }}
+                  />
+                </div>
               );
             })}
-          {c.scaleAiMode &&
-            scaleAi?.subtask_segments.map((segment) => {
-              const color = taskColor(segment.task);
-              return (
-                <div
-                  key={segment.id}
-                  title={`${segment.task} · ${(segment.end - segment.start).toFixed(2)}s`}
-                  className="absolute bottom-0 top-1/2"
-                  style={{
-                    left: duration ? `${(segment.start / duration) * 100}%` : "0%",
-                    width: duration
-                      ? `${Math.max(0.4, ((segment.end - segment.start) / duration) * 100)}%`
-                      : "0%",
-                    backgroundColor: color.solid,
-                  }}
-                />
-              );
-            })}
-          {ann?.pendingWork && duration > 0 && (
+          {pendingRange && duration > 0 && (
             <div
-              className="absolute inset-y-0 border-x border-warning bg-warning/25"
+              className="absolute top-2 bottom-2 border border-warning bg-warning/35"
               style={{
-                left: `${(ann.pendingWork.start / duration) * 100}%`,
-                width: `${Math.max(0.4, ((ann.pendingWork.end - ann.pendingWork.start) / duration) * 100)}%`,
+                left: `${(pendingRange.start / duration) * 100}%`,
+                width: `${Math.max(
+                  0.08,
+                  ((pendingRange.end - pendingRange.start) / duration) * 100,
+                )}%`,
               }}
             />
           )}
@@ -245,6 +274,65 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
             style={{ left: `${playFraction * 100}%` }}
           />
         </div>
+
+        {c.scaleAiMode && zoomBounds ? (
+          <div className="pointer-events-none border-t border-border bg-surface px-3 py-2">
+            <div className="mb-1 flex items-baseline justify-between gap-2 font-mono text-[10px] text-muted-foreground">
+              <span className="eyebrow text-[9px]">Labeled region (zoomed)</span>
+              <span>
+                {c.formatTime(zoomBounds.start)} → {c.formatTime(zoomBounds.end)}
+              </span>
+            </div>
+            <div className="relative h-14 overflow-hidden rounded-sm border border-border bg-surface-2">
+              {scaleAiSegments.map((segment) => {
+                const isGarbage = segment.type === "garbage";
+                const color = isGarbage ? null : taskColor(segment.label);
+                const left = zoomLeft(segment.start);
+                const width = zoomWidth(segment.start, segment.end);
+                return (
+                  <div key={`zoom-${segment.id}`}>
+                    <div
+                      title={`${segment.label} · ${c.formatTime(segment.start)} → ${c.formatTime(segment.end)} · ${segment.duration.toFixed(2)}s`}
+                      className={cn(
+                        "absolute top-2 bottom-2 rounded-[2px] border border-black/50",
+                        isGarbage && "bg-destructive/70",
+                      )}
+                      style={{
+                        left: `${left}%`,
+                        width: `${width}%`,
+                        ...(color ? { backgroundColor: color.solid } : null),
+                      }}
+                    />
+                    <div
+                      className="absolute bottom-0 truncate px-0.5 text-center font-mono text-[9px] leading-3 text-foreground/90"
+                      style={{
+                        left: `${left}%`,
+                        width: `${Math.max(width, 8)}%`,
+                      }}
+                    >
+                      {!isGarbage ? segment.label : "g"}
+                    </div>
+                  </div>
+                );
+              })}
+              {pendingRange ? (
+                <div
+                  className="absolute top-2 bottom-2 rounded-[2px] border border-warning bg-warning/40"
+                  style={{
+                    left: `${zoomLeft(pendingRange.start)}%`,
+                    width: `${zoomWidth(pendingRange.start, pendingRange.end)}%`,
+                  }}
+                />
+              ) : null}
+              {c.scrubTime >= zoomBounds.start && c.scrubTime <= zoomBounds.end ? (
+                <div
+                  className="absolute inset-y-0 w-0.5 bg-foreground"
+                  style={{ left: `${zoomLeft(c.scrubTime)}%` }}
+                />
+              ) : null}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Last two segments — compact strip so the player stays full-width. */}

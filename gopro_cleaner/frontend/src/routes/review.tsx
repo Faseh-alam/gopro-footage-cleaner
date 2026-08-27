@@ -41,9 +41,11 @@ const KEYS: [string, string][] = [
   ["← →", "Speed −0.5× / +0.5× (up to 5× — no encoding, no waiting)"],
   ["[ ]", "Speed −0.5× / +0.5× (same range)"],
   [", .", "−0.1s / +0.1s in ScaleAI · Shift+,/. or < > = 1 frame"],
-  ["T / D / Enter", "ScaleAI: set cycle/subtask start, press again to save end"],
-  ["I / O", "Mark share-clip in / out (WhatsApp example)"],
-  ["N", "Next video (JSON only in ScaleAI)"],
+  ["T / D", "Mark segment end (pending)"],
+  ["Enter", "Assign typed/selected label (creates if new)"],
+  ["G", "Mark garbage"],
+  ["U", "Undo last / clear pending"],
+  ["N", "Next video (JSON autosaved)"],
   ["Home", "Jump to 0:00"],
 ];
 
@@ -157,6 +159,7 @@ function ReviewPage() {
       if (inTaskSearch) {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
+          event.stopImmediatePropagation();
           const matches = c.orderedTaskGroups().matches;
           if (!matches.length) return;
           const at = matches.indexOf(c.selectedTaskValue);
@@ -169,32 +172,44 @@ function ReviewPage() {
         }
         if (event.key === "Enter") {
           event.preventDefault();
-          // Filter field only filters — never invent a task from typed text.
+          event.stopImmediatePropagation();
           const query = c.taskSearch.trim();
           const matches = c.orderedTaskGroups().matches;
           const exact = matches.find((t) => t.toLowerCase() === query.toLowerCase());
+          // Arrow ↑/↓ selection wins over the raw filter text.
           const highlighted =
             c.selectedTaskValue && matches.includes(c.selectedTaskValue)
               ? c.selectedTaskValue
               : "";
-          const task =
-            exact || highlighted || (!query ? c.lastLabelTask.trim() : "") || "";
+          const task = c.scaleAiMode
+            ? highlighted || exact || query || c.lastLabelTask.trim() || ""
+            : exact || highlighted || (!query ? c.lastLabelTask.trim() : "") || "";
           if (!task) {
             c.setStatus(
-              query
-                ? "No matching task — pick from the list or add via New task"
-                : "Choose a task first",
+              c.scaleAiMode
+                ? "Type a label, then press Enter"
+                : query
+                  ? "No matching task — pick from the list or add via New task"
+                  : "Choose a task first",
               "error",
             );
             return;
           }
           c.setSelectedTaskValue(task);
-          if (c.currentAnnotation()?.pendingWork) c.labelCurrentClip(task);
-          else c.leaveTaskSearch({ clear: false });
+          const hasPending = Boolean(
+            c.scaleAiPending || c.currentAnnotation()?.pendingWork,
+          );
+          if (hasPending) void c.labelCurrentClip(task);
+          else if (c.scaleAiMode && query && !highlighted && !exact) {
+            void c.addTask(task);
+          } else {
+            c.leaveTaskSearch({ clear: false });
+          }
           return;
         }
         if (event.key === "Escape") {
           event.preventDefault();
+          event.stopImmediatePropagation();
           c.leaveTaskSearch({ clear: true });
           return;
         }
@@ -215,33 +230,16 @@ function ReviewPage() {
       }
       else if (key === "i") c.markShareIn();
       else if (key === "o") c.markShareOut();
-      else if (key === "t") {
-        if (c.scaleAiMode && c.scaleAiStage === "parent") {
-          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
-          else void c.saveScaleAiParentCycle();
-        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
-          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
-          else void c.saveScaleAiSubtask();
-        } else if (!c.scaleAiMode) c.markWork();
+      else if (key === "t" || key === "d") {
+        if (c.scaleAiMode) void c.markWork();
+        else if (key === "t") c.markWork();
         else handled = false;
-      }
-      else if (key === "d") {
-        // Same as T — some labelers hit D for “done / mark this cycle”.
-        if (c.scaleAiMode && c.scaleAiStage === "parent") {
-          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
-          else void c.saveScaleAiParentCycle();
-        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
-          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
-          else void c.saveScaleAiSubtask();
-        } else handled = false;
       }
       else if (key === "g") {
-        if (!c.scaleAiMode) c.markGarbage();
-        else handled = false;
+        c.markGarbage();
       }
       else if (key === "u") {
-        if (!c.scaleAiMode) c.undoSegment();
-        else handled = false;
+        void c.undoSegment();
       }
       else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
@@ -251,13 +249,7 @@ function ReviewPage() {
       }
       else if (event.key === " ") c.togglePlay();
       else if (event.key === "Enter" && !isField(target)) {
-        if (c.scaleAiMode && c.scaleAiStage === "parent") {
-          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
-          else void c.saveScaleAiParentCycle();
-        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
-          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
-          else void c.saveScaleAiSubtask();
-        } else c.labelCurrentClip();
+        void c.labelCurrentClip();
       }
       else handled = false;
 
@@ -325,7 +317,7 @@ function ReviewPage() {
                     : "Open a folder on this computer or an external drive"
                 }
               >
-                {c.scaleAiMode ? "Open 50 hours" : "Open"}
+                {c.scaleAiMode ? "Open 50-hour folder" : "Open"}
               </Button>
               <Button
                 size="sm"

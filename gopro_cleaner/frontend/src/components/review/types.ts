@@ -6,6 +6,8 @@ export interface VideoItem {
   duration?: number | null;
   duration_label?: string | null;
   size_bytes?: number | null;
+  relative?: string | null;
+  parent_task?: string | null;
 }
 
 export interface Segment {
@@ -21,33 +23,45 @@ export interface PendingWork {
   end: number;
 }
 
-export interface ScaleAiParentCycle {
-  id: string;
+export interface ScaleAiSegment {
+  id: string | number;
   start: number;
   end: number;
-  created_at?: string;
-}
-
-export interface ScaleAiSubtaskSegment {
-  id: string;
-  parent_cycle_id: string;
-  start: number;
-  end: number;
-  task: string;
-  created_at?: string;
+  duration: number;
+  type: "subtask" | "garbage" | string;
+  label: string;
 }
 
 export interface ScaleAiAnnotation {
   version: number;
-  source: string;
-  duration: number | null;
+  source_video: string;
+  source_path: string;
   parent_task: string;
-  parent_cycles: ScaleAiParentCycle[];
-  example_cycle_id: string | null;
-  parent_example?: { source: string; cycle_id: string } | null;
-  subtask_names: string[];
-  subtask_segments: ScaleAiSubtaskSegment[];
+  camera_serial?: string | null;
+  cl_number?: string | null;
+  duration_seconds: number | null;
+  media_meta?: MediaMeta | null;
+  segments: ScaleAiSegment[];
   updated_at?: string;
+}
+
+export interface ScaleAiTaskProgress {
+  task: string;
+  target_hours: number | null;
+  labeled_hours: number;
+  remaining_hours: number | null;
+  percent_complete: number | null;
+  complete: boolean;
+  video_count: number;
+  labeled_video_count: number;
+  labels: string[];
+}
+
+export interface ScaleAiProgress {
+  version: number;
+  root: string;
+  updated_at?: string;
+  tasks: ScaleAiTaskProgress[];
 }
 
 /** Camera / IMU metadata extracted from the GoPro file (GPMF + ffprobe). */

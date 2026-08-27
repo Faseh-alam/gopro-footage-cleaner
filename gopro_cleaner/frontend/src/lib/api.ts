@@ -126,10 +126,11 @@ export function formatBytes(bytes?: number | null) {
 }
 
 export function formatClock(seconds?: number | null) {
-  if (!seconds && seconds !== 0) return "00:00:00";
-  const s = Math.max(0, Math.floor(seconds));
-  const h = String(Math.floor(s / 3600)).padStart(2, "0");
-  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-  const sec = String(s % 60).padStart(2, "0");
-  return `${h}:${m}:${sec}`;
+  if (!seconds && seconds !== 0) return "00:00:00.00";
+  const total = Math.max(0, Number(seconds) || 0);
+  const h = String(Math.floor(total / 3600)).padStart(2, "0");
+  const m = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+  const whole = Math.floor(total % 60);
+  const hundredths = String(Math.floor((total % 1) * 100 + 1e-9)).padStart(2, "0");
+  return `${h}:${m}:${String(whole).padStart(2, "0")}.${hundredths}`;
 }

@@ -128,6 +128,7 @@ class EagerTrimQueue:
         output_dir: Path | None = None,
         kind: str = "trim",
         task: str | None = None,
+        output_filename: str | None = None,
     ) -> EagerTrimRecord:
         source = source.expanduser().resolve()
         if not source.exists():
@@ -146,12 +147,17 @@ class EagerTrimQueue:
             clip_number = _next_clip_number(source, reserved=reserved)
             target_dir = output_dir.expanduser().resolve() if output_dir else source.parent
             target_dir.mkdir(parents=True, exist_ok=True)
-            output_path = build_output_path(source, clip_number, target_dir)
-            # Avoid colliding with a file already on disk while another job is mid-flight.
-            while output_path.exists() or clip_number in reserved:
-                reserved.add(clip_number)
-                clip_number = _next_clip_number(source, reserved=reserved)
+            if output_filename:
+                output_path = target_dir / Path(output_filename).name
+                if output_path.exists():
+                    raise FileExistsError(f"Output already exists: {output_path}")
+            else:
                 output_path = build_output_path(source, clip_number, target_dir)
+                # Avoid colliding with a file already on disk while another job is mid-flight.
+                while output_path.exists() or clip_number in reserved:
+                    reserved.add(clip_number)
+                    clip_number = _next_clip_number(source, reserved=reserved)
+                    output_path = build_output_path(source, clip_number, target_dir)
 
             record = EagerTrimRecord(
                 job_id=job_id,
@@ -439,13 +445,32 @@ class EagerTrimQueue:
                     source, clip_number, source.parent
                 )
                 if output_path.exists():
-                    # Rare race with a leftover file — pick a free number instead of failing.
-                    with self._lock:
-                        reserved = self._reserved_clip_numbers_locked(source)
-                        reserved.add(clip_number)
-                    clip_number = _next_clip_number(source, reserved=reserved)
-                    output_path = build_output_path(source, clip_number, output_path.parent)
-                    record.clip_number = clip_number
+                    # Rare race with a leftover file — pick a free name instead of failing.
+                    # Keep numeric 000N naming for fifty-hour subtask exports.
+                    if record.kind == "fifty-subtask":
+                        from . import fifty_hour_store
+
+                        reserved = {
+                            Path(r.output).name
+                            for r in self.jobs_for_source(source)
+                            if r.output
+                            and Path(r.output).parent.resolve() == output_path.parent.resolve()
+                            and r.job_id != record.job_id
+                        }
+                        filename = fifty_hour_store.next_clip_filename(
+                            source,
+                            str(record.task or "clip"),
+                            output_path.parent,
+                            reserved=reserved,
+                        )
+                        output_path = output_path.parent / filename
+                    else:
+                        with self._lock:
+                            reserved_nums = self._reserved_clip_numbers_locked(source)
+                            reserved_nums.add(clip_number)
+                        clip_number = _next_clip_number(source, reserved=reserved_nums)
+                        output_path = build_output_path(source, clip_number, output_path.parent)
+                        record.clip_number = clip_number
                     record.output = str(output_path)
 
                 trim_job = TrimJob(

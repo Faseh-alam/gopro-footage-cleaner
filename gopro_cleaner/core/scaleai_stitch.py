@@ -149,6 +149,8 @@ def plan_stitch(
 
 
 def _build_concat_command(first: MediaInfo, list_file: Path, output: Path) -> list[str]:
+    # analyzeduration/probesize: concat + GoPro gpmd often look like "Unknown: none"
+    # until enough of the first samples are read.
     command = [
         ffmpeg_bin(),
         "-hide_banner",
@@ -159,6 +161,10 @@ def _build_concat_command(first: MediaInfo, list_file: Path, output: Path) -> li
         "concat",
         "-safe",
         "0",
+        "-analyzeduration",
+        "100M",
+        "-probesize",
+        "100M",
         "-i",
         str(list_file),
         "-map",
@@ -167,16 +173,19 @@ def _build_concat_command(first: MediaInfo, list_file: Path, output: Path) -> li
     if first.audio_index is not None:
         command.extend(["-map", f"0:{first.audio_index}"])
     if first.gpmf_index is not None:
+        data_tag_index = 2 if first.audio_index is not None else 1
         command.extend(
             [
                 "-map",
                 f"0:{first.gpmf_index}",
                 "-copy_unknown",
-                "-tag:d:0",
+                f"-tag:d:{data_tag_index}",
                 "gpmd",
             ]
         )
-    command.extend(["-c", "copy", str(output)])
+    # Force mp4 muxer — temp names like ``.partial.MP4`` still need an explicit -f
+    # when the demuxer is concat.
+    command.extend(["-c", "copy", "-f", "mp4", str(output)])
     return command
 
 
@@ -213,7 +222,10 @@ def stitch_task_clips(
         plan.output.parent.mkdir(parents=True, exist_ok=True)
         first = _probe_or_raise(plan.clips[0])
 
-        partial = plan.output.with_suffix(plan.output.suffix + ".partial")
+        # Keep a real media extension last — ``.MP4.partial`` makes ffmpeg refuse
+        # to pick a muxer ("Unable to choose an output format").
+        ext = plan.output.suffix or ".MP4"
+        partial = plan.output.with_name(f"{plan.output.stem}.partial{ext}")
         if partial.exists():
             partial.unlink()
 

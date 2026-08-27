@@ -102,8 +102,13 @@ class ScaleAIStitchTests(unittest.TestCase):
             self.task / "concat.txt",
             self.task / "out.MP4",
         )
-        tag_index = command.index("-tag:d:0")
+        # Video + audio → data stream is tagged as d:2 (matches trimmer).
+        tag_index = command.index("-tag:d:2")
         self.assertEqual(command[tag_index + 1], "gpmd")
+        # Output muxer forced to mp4 (after codec copy), distinct from concat -f.
+        out_f = len(command) - 1 - command[::-1].index("-f")
+        self.assertEqual(command[out_f + 1], "mp4")
+        self.assertIn("100M", command)
 
     def test_plan_rejects_trim_missing_expected_gpmf(self) -> None:
         self.a.with_suffix(".scaleai-source.json").write_text(

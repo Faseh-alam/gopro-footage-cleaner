@@ -1,255 +1,147 @@
-import { Check, Download, Play, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
 
+function hoursLabel(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return "—";
+  return `${value.toFixed(2)}h`;
+}
+
 export function ScaleAiPanel({ c }: { c: ReviewController }) {
   const annotation = c.currentScaleAi();
-  const cycles = annotation?.parent_cycles || [];
-  const activeCycle =
-    cycles.find((cycle) => cycle.id === c.scaleAiActiveCycleId) || cycles[0] || null;
-  const activeSegments = (annotation?.subtask_segments || []).filter(
-    (segment) => segment.parent_cycle_id === activeCycle?.id,
-  );
+  const segments = annotation?.segments || [];
+  const progress = c.scaleAiTaskProgress();
+  const video = c.currentVideo();
+  const videosInTask = c.videosInCurrentParentTask();
+  const videoIndex = videosInTask.findIndex((item) => item.path === video?.path);
 
   return (
     <div className="grid gap-3 rounded-sm border border-border bg-surface-2/40 p-3">
       <div>
-        <div className="eyebrow">Two-stage ScaleAI</div>
+        <div className="eyebrow">ScaleAI 50-hour</div>
         <div className="mt-1 truncate text-sm font-semibold">
-          {annotation?.parent_task || "Open a task folder"}
+          {annotation?.parent_task || "Open a 50-hour folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          Parent task comes from the folder name (example: Axle Shaft Cutting). Stage 1 only
-          marks complete clean cycles — no task picker. Later, Stage 2 labels CEO subtasks
-          inside those cycles.
+          T marks a segment · type a label · Enter assigns (creates if new) · G = garbage · N =
+          next · Trim when ready
         </p>
-        {annotation?.parent_example ? (
-          <p className="mt-1 text-[10px] font-medium text-success">
-            Example selected · {c.basenamePath(annotation.parent_example.source)}
-          </p>
+      </div>
+
+      <div className="grid gap-1 rounded-sm border border-border bg-surface px-2 py-2 text-[11px]">
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">VIDEO</span>
+          <span className="truncate font-mono">{video?.name || "—"}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">IN TASK</span>
+          <span className="font-mono">
+            {videoIndex >= 0 ? `${videoIndex + 1} / ${videosInTask.length}` : `— / ${videosInTask.length}`}
+          </span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">CAMERA</span>
+          <span className="font-mono">{annotation?.camera_serial || "—"}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">CL</span>
+          <span className="font-mono">{annotation?.cl_number || "—"}</span>
+        </div>
+      </div>
+
+      <div className="grid gap-1 rounded-sm border border-border bg-surface px-2 py-2 text-[11px]">
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">TARGET</span>
+          <span className="font-mono">{hoursLabel(progress?.target_hours)}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">COMPLETED</span>
+          <span className="font-mono">{hoursLabel(progress?.labeled_hours ?? 0)}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">REMAINING</span>
+          <span className="font-mono">{hoursLabel(progress?.remaining_hours)}</span>
+        </div>
+        {progress?.percent_complete != null ? (
+          <div className="flex justify-between gap-2">
+            <span className="text-muted-foreground">PROGRESS</span>
+            <span className={`font-mono ${progress.complete ? "text-success" : ""}`}>
+              {progress.percent_complete.toFixed(0)}%
+              {progress.complete ? " · GOAL" : ""}
+            </span>
+          </div>
         ) : null}
       </div>
 
-      <div className="grid grid-cols-2 overflow-hidden rounded-sm border border-border">
-        <button
-          type="button"
-          onClick={() => void c.changeScaleAiStage("parent")}
-          className={`px-2 py-2 text-xs ${
-            c.scaleAiStage === "parent"
-              ? "bg-accent text-accent-foreground"
-              : "text-muted-foreground hover:bg-surface-2"
-          }`}
-        >
-          1 · Parent cycles
-        </button>
-        <button
-          type="button"
-          onClick={() => void c.changeScaleAiStage("subtask")}
-          className={`border-l border-border px-2 py-2 text-xs ${
-            c.scaleAiStage === "subtask"
-              ? "bg-accent text-accent-foreground"
-              : "text-muted-foreground hover:bg-surface-2"
-          }`}
-        >
-          2 · Subtasks
-        </button>
+      {c.scaleAiPending ? (
+        <div className="rounded-sm border border-accent/40 bg-accent/10 px-2 py-2 text-[11px]">
+          Pending {c.formatTime(c.scaleAiPending.start)} → {c.formatTime(c.scaleAiPending.end)} —
+          type a label and press Enter
+        </div>
+      ) : (
+        <div className="text-[10px] text-muted-foreground">
+          Last / selected label:{" "}
+          <span className="font-medium text-foreground">{c.selectedTaskValue || "—"}</span>
+        </div>
+      )}
+
+      <div className="max-h-44 overflow-auto rounded-sm border border-border">
+        {!segments.length ? (
+          <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+            No segments yet. Press T at the end of a subtask.
+          </p>
+        ) : (
+          segments.map((segment) => {
+            const color = taskColor(segment.label || segment.type);
+            const isGarbage = segment.type === "garbage";
+            return (
+              <div
+                key={String(segment.id)}
+                className="flex items-center gap-2 border-b border-border px-2 py-2 last:border-b-0"
+              >
+                <span
+                  className="size-2.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: isGarbage ? "#6b7280" : color.solid }}
+                  aria-hidden
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium">
+                    {isGarbage ? "garbage" : segment.label}
+                  </div>
+                  <div className="font-mono text-[10px] text-muted-foreground">
+                    {c.formatTime(segment.start)} → {c.formatTime(segment.end)} ·{" "}
+                    {segment.duration.toFixed(2)}s
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void c.deleteScaleAiSegment(segment.id)}
+                  className="text-[10px] text-muted-foreground hover:text-destructive"
+                >
+                  Delete
+                </button>
+              </div>
+            );
+          })
+        )}
       </div>
 
-      {c.scaleAiStage === "parent" ? (
-        <>
-          <div className="grid grid-cols-2 gap-2">
-            <Button
-              size="sm"
-              variant={c.scaleAiParentStart == null ? "outline" : "accent"}
-              onClick={() => c.markScaleAiParentStart()}
-            >
-              {c.scaleAiParentStart == null
-                ? "Set cycle start"
-                : `Start ${c.formatTime(c.scaleAiParentStart)}`}
-            </Button>
-            <Button
-              size="sm"
-              variant="accent"
-              disabled={c.scaleAiParentStart == null}
-              onClick={() => void c.saveScaleAiParentCycle()}
-            >
-              End + save cycle
-            </Button>
-          </div>
-
-          <div className="max-h-56 overflow-auto rounded-sm border border-border">
-            {!cycles.length ? (
-              <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                No clean cycles yet. Leave garbage unmarked.
-              </p>
-            ) : (
-              cycles.map((cycle, index) => {
-                const selected = annotation?.example_cycle_id === cycle.id;
-                return (
-                  <div
-                    key={cycle.id}
-                    className="flex items-center gap-2 border-b border-border px-2 py-2 last:border-b-0"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => c.selectScaleAiCycle(cycle.id)}
-                      className="grid size-7 shrink-0 place-items-center rounded-sm hover:bg-surface-2"
-                      title="Play / inspect this cycle"
-                    >
-                      <Play className="size-3.5" />
-                    </button>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs font-medium">
-                        Cycle {index + 1}
-                        {selected ? (
-                          <span className="ml-1.5 text-success">· example</span>
-                        ) : null}
-                      </div>
-                      <div className="font-mono text-[10px] text-muted-foreground">
-                        {c.formatTime(cycle.start)} → {c.formatTime(cycle.end)} ·{" "}
-                        {(cycle.end - cycle.start).toFixed(1)}s
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={c.scaleAiExampleBusy}
-                      onClick={() => void c.prepareScaleAiExample(cycle.id)}
-                      className={`grid size-7 shrink-0 place-items-center rounded-sm ${
-                        selected
-                          ? "bg-success/15 text-success"
-                          : "text-muted-foreground hover:bg-accent/15 hover:text-accent"
-                      }`}
-                      title={
-                        selected
-                          ? "Download selected WhatsApp example again"
-                          : "Select and prepare as WhatsApp example"
-                      }
-                    >
-                      {selected ? <Check className="size-3.5" /> : <Download className="size-3.5" />}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void c.deleteScaleAiParentCycle(cycle.id)}
-                      className="grid size-7 shrink-0 place-items-center rounded-sm text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
-                      title="Delete cycle and linked subtasks"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          <Button size="sm" variant="outline" onClick={() => void c.nextScaleAiVideo()}>
-            Next video · JSON only
-          </Button>
-        </>
-      ) : (
-        <>
-          <div className="flex flex-wrap gap-1">
-            {cycles.map((cycle, index) => (
-              <button
-                key={cycle.id}
-                type="button"
-                onClick={() => c.selectScaleAiCycle(cycle.id)}
-                className={`rounded-sm border px-2 py-1 font-mono text-[10px] ${
-                  cycle.id === activeCycle?.id
-                    ? "border-accent bg-accent/15 text-accent"
-                    : "border-border text-muted-foreground"
-                }`}
-              >
-                Cycle {index + 1}
-              </button>
-            ))}
-          </div>
-
-          {activeCycle ? (
-            <p className="font-mono text-[10px] text-muted-foreground">
-              Allowed window {c.formatTime(activeCycle.start)} → {c.formatTime(activeCycle.end)}
-            </p>
-          ) : null}
-
-          <div className="grid grid-cols-2 gap-2">
-            <Button
-              size="sm"
-              variant={c.scaleAiSubtaskStart == null ? "outline" : "accent"}
-              disabled={!activeCycle}
-              onClick={() => c.markScaleAiSubtaskStart()}
-            >
-              {c.scaleAiSubtaskStart == null
-                ? "Set subtask start"
-                : `Start ${c.formatTime(c.scaleAiSubtaskStart)}`}
-            </Button>
-            <Button
-              size="sm"
-              variant="accent"
-              disabled={c.scaleAiSubtaskStart == null || !c.selectedTaskValue}
-              onClick={() => void c.saveScaleAiSubtask()}
-            >
-              End + save subtask
-            </Button>
-          </div>
-
-          <div className="max-h-44 overflow-auto rounded-sm border border-border">
-            {!activeSegments.length ? (
-              <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                Choose/add a subtask below, then mark it inside this cycle.
-              </p>
-            ) : (
-              activeSegments.map((segment) => {
-                const color = taskColor(segment.task);
-                return (
-                  <div
-                    key={segment.id}
-                    className="flex items-center gap-2 border-b border-border px-2 py-2 last:border-b-0"
-                  >
-                    <span
-                      className="size-2.5 shrink-0 rounded-full"
-                      style={{ backgroundColor: color.solid }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => c.scheduleSeek(segment.start, true)}
-                      className="min-w-0 flex-1 truncate text-left text-xs"
-                    >
-                      {segment.task}
-                    </button>
-                    <span className="font-mono text-[9px] text-muted-foreground">
-                      {(segment.end - segment.start).toFixed(2)}s
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void c.deleteScaleAiSubtask(segment.id)}
-                      className="grid size-7 place-items-center text-muted-foreground hover:text-destructive"
-                      title="Delete subtask segment"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          <div className="grid gap-1.5">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void c.processCurrentVideoScaleAi({ stitch: false })}
-            >
-              Process this video later / now
-            </Button>
-            <Button size="sm" variant="accent" onClick={() => void c.processScaleAiFolder()}>
-              Process folder + stitch
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => void c.nextScaleAiVideo()}>
-              Next video · JSON only
-            </Button>
-          </div>
-        </>
-      )}
+      <div className="grid grid-cols-2 gap-2">
+        <Button size="sm" variant="accent" onClick={() => void c.processScaleAiVideo()}>
+          Trim this video
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => void c.stitchScaleAiVideo()}>
+          Stitch this video
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <Button size="sm" variant="outline" onClick={() => void c.nextScaleAiVideo()}>
+          Next video
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => void c.processScaleAiFolder()}>
+          Trim whole folder
+        </Button>
+      </div>
     </div>
   );
 }

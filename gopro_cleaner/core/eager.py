@@ -17,7 +17,14 @@ LABELED_FOLDER = "Labeled"  # legacy folder name — no longer created for new l
 TRIMMED_SUFFIX_RE = re.compile(r"-\d+$", re.IGNORECASE)
 CAMERA_FOLDER_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
 GOPRO_MEDIA_DIR_RE = re.compile(r"^\d{3}GOPRO$", re.IGNORECASE)
-SKIP_DIR_NAMES = {LABELED_FOLDER.lower(), "labeled", "tasks", ".trash", "_scaleai"}
+SKIP_DIR_NAMES = {
+    LABELED_FOLDER.lower(),
+    "labeled",
+    "tasks",
+    ".trash",
+    "_scaleai",
+    "_labeling",
+}
 NON_TASK_DIR_NAMES = SKIP_DIR_NAMES | {
     "dcim",
     "misc",
@@ -138,10 +145,10 @@ def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
 
 
 def is_scaleai_source_footage(path: Path, *, root: Path | None = None) -> bool:
-    """Raw MP4s under ``50 hours/{AWS|Google Drive}/<parent-task>/``.
+    """Source MP4s under a 50-hour dataset root (``<root>/<parent-task>/…``).
 
-    Unlike annotate mode, parent-task folders are source containers here — not
-    textile trim destinations — so they must stay visible in the review list.
+    Parent-task folders are source containers — not textile trim destinations —
+    so they stay visible. Per-video export folders are skipped.
     """
     if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
         return False
@@ -150,6 +157,13 @@ def is_scaleai_source_footage(path: Path, *, root: Path | None = None) -> bool:
     for part in path.parts:
         if part.lower() in SKIP_DIR_NAMES:
             return False
+    try:
+        from .fifty_hour_store import is_export_path
+
+        if is_export_path(path, root):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -159,6 +173,13 @@ def _video_dict(path: Path, root: Path) -> dict:
         relative = str(path.relative_to(root))
     except ValueError:
         relative = path.name
+    parent_task = None
+    try:
+        from .fifty_hour_store import infer_parent_task
+
+        parent_task = infer_parent_task(path, root)
+    except Exception:  # noqa: BLE001
+        parent_task = path.parent.name if path.parent != root else None
     return {
         "path": str(path.resolve()),
         "name": path.name,
@@ -166,6 +187,7 @@ def _video_dict(path: Path, root: Path) -> dict:
         "duration": duration,
         "duration_label": format_timestamp(duration) if duration else None,
         "relative": relative,
+        "parent_task": parent_task,
         "is_trimmed": is_trimmed_clip(path),
     }
 
@@ -308,7 +330,19 @@ def scan_mp4_files(
                 filtered.append(path)
         candidates = filtered
 
-    ordered = sorted(candidates, key=lambda p: p.name.lower())
+    if mode == "scaleai":
+        from .fifty_hour_store import infer_parent_task
+
+        ordered = sorted(
+            candidates,
+            key=lambda p: (
+                infer_parent_task(p, root).lower(),
+                p.name.lower(),
+                str(p).lower(),
+            ),
+        )
+    else:
+        ordered = sorted(candidates, key=lambda p: p.name.lower())
     if not ordered:
         return []
     # Probe in parallel — serial ffprobe over a big folder on a USB drive is slow.
