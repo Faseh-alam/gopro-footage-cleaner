@@ -197,8 +197,10 @@ def create_eager_blueprint() -> Blueprint:
         raw_path = str(payload.get("path", "")).strip()
         recursive = bool(payload.get("recursive", True))
         mode = str(payload.get("mode", "all")).strip().lower()
-        if mode not in {"all", "raw", "clips", "label", "annotate"}:
-            return jsonify({"error": "mode must be all, raw, clips, label, or annotate"}), 400
+        if mode not in {"all", "raw", "clips", "label", "annotate", "scaleai"}:
+            return jsonify(
+                {"error": "mode must be all, raw, clips, label, annotate, or scaleai"}
+            ), 400
         if not raw_path:
             return jsonify({"error": "path is required"}), 400
         try:
