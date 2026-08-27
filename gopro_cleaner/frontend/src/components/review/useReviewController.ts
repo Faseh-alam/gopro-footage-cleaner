@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import Hls from "hls.js";
 import { toast } from "sonner";
 import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
 import type {
@@ -33,7 +34,7 @@ const PLAYBACK_RATE_STEP = 0.5;
  *  - `fast`     GoPro LRV proxy or an SSD copy (zero encode, smooth at 5×)
  *  - `original` the untouched file streamed directly
  */
-type ActiveSource = "original" | "fast";
+type ActiveSource = "original" | "fast" | "preview";
 
 type ReviewSession = {
   path: string;
@@ -289,6 +290,9 @@ export function useReviewController() {
   /** Bumped per video open — stale async work checks this before touching the player. */
   const previewTokenRef = useRef(0);
   const fastPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const compatiblePreviewPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const compatiblePreviewPathRef = useRef("");
+  const hlsRef = useRef<Hls | null>(null);
   /** Paths whose fast source we already asked the backend to warm. */
   const warmedFastRef = useRef<Set<string>>(new Set());
   /** Media URL currently attached (absolute) + which ladder rung it is. */
@@ -998,6 +1002,18 @@ export function useReviewController() {
     }
   }, []);
 
+  const stopCompatiblePreview = useCallback(() => {
+    if (compatiblePreviewPollRef.current) {
+      clearInterval(compatiblePreviewPollRef.current);
+      compatiblePreviewPollRef.current = null;
+    }
+    compatiblePreviewPathRef.current = "";
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+  }, []);
+
   const cancelFastJob = useCallback(async (path: string) => {
     if (!path) return;
     try {
@@ -1050,11 +1066,114 @@ export function useReviewController() {
   }, []);
 
   /**
+   * Chrome cannot decode HEVC on Windows unless the optional system codec is
+   * installed. If a direct source fails, build and attach the existing H.264
+   * HLS preview instead of leaving a black player.
+   */
+  const startCompatiblePreview = useCallback(
+    (path: string, token: number, startAt: number) => {
+      if (!path || token !== previewTokenRef.current) return;
+      if (compatiblePreviewPathRef.current === path) return;
+      stopCompatiblePreview();
+      compatiblePreviewPathRef.current = path;
+      setLoadingVideo(true);
+      setPreviewNote("Preparing browser-compatible preview…");
+      setStatus("This video uses HEVC. Preparing a browser-compatible preview…");
+
+      const attach = (url: string) => {
+        const v = videoRef.current;
+        if (!v || token !== previewTokenRef.current || !url) return;
+        if (!Hls.isSupported()) {
+          setLoadingVideo(false);
+          setStatus("This browser cannot play the HEVC video or its HLS preview", "error");
+          return;
+        }
+        if (compatiblePreviewPollRef.current) {
+          clearInterval(compatiblePreviewPollRef.current);
+          compatiblePreviewPollRef.current = null;
+        }
+        hlsRef.current?.destroy();
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          backBufferLength: 30,
+        });
+        hlsRef.current = hls;
+        activeSourceRef.current = "preview";
+        const absolute = url.startsWith("http") ? url : host + url;
+        mediaUrlRef.current = absolute;
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (token !== previewTokenRef.current) return;
+          setLoadingVideo(false);
+          setPreviewNote("Compatible 720p preview");
+          setStatus(`Ready — ${mediaBasename(path)} · compatible 720p preview`, "ok");
+          try {
+            if (startAt > 0.05) v.currentTime = startAt;
+          } catch {
+            /* ignore */
+          }
+          applyMediaRate(playbackRateRef.current || 1);
+          // A muted autoplay also forces Chromium to decode and paint the first
+          // MSE frame; otherwise some Windows builds leave a valid HLS stream black.
+          void safePlay();
+        });
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal || token !== previewTokenRef.current) return;
+          setLoadingVideo(false);
+          setStatus(data.details || "Could not load compatible preview", "error");
+        });
+        hls.loadSource(absolute);
+        hls.attachMedia(v);
+      };
+
+      const tick = async () => {
+        if (token !== previewTokenRef.current) {
+          stopCompatiblePreview();
+          return;
+        }
+        try {
+          const st = await api(
+            `/api/eager/preview/status?path=${encodeURIComponent(path)}&start=1&preempt=1`,
+          );
+          if (token !== previewTokenRef.current) return;
+          if (st?.playable && st?.hls) {
+            attach(String(st.hls));
+            return;
+          }
+          if (st?.status === "error" || st?.status === "skipped") {
+            stopCompatiblePreview();
+            setLoadingVideo(false);
+            setStatus(st?.error || st?.message || "Could not build compatible preview", "error");
+            return;
+          }
+          const progress = Number(st?.progress) || 0;
+          setPreviewNote(
+            progress > 0
+              ? `Preparing compatible preview · ${progress}%`
+              : "Preparing browser-compatible preview…",
+          );
+        } catch (error: any) {
+          stopCompatiblePreview();
+          setLoadingVideo(false);
+          setStatus(error?.message || "Could not build compatible preview", "error");
+        }
+      };
+      compatiblePreviewPollRef.current = setInterval(tick, 750);
+      void tick();
+    },
+    [applyMediaRate, safePlay, setStatus, stopCompatiblePreview],
+  );
+
+  /**
    * Attach a review source at an original-timeline position. Every rung of the
    * ladder is 1:1 with the original, so there is no time remapping.
    */
   const attachFastMedia = useCallback(
     (v: HTMLVideoElement, url: string, kind: string, startAt: number, token: number) => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
       const absolute = url.startsWith("http") ? url : host + url;
       mediaUrlRef.current = absolute;
       activeSourceRef.current = kind === "original" ? "original" : "fast";
@@ -1220,6 +1339,7 @@ export function useReviewController() {
       setShareClipOut(null);
       setPreviewNote("");
       stopFastPoll();
+      stopCompatiblePreview();
       mediaUrlRef.current = "";
       activeSourceRef.current = "original";
       if (seekTimerRef.current) {
@@ -1329,8 +1449,7 @@ export function useReviewController() {
         () => {
           if (token !== previewTokenRef.current) return;
           window.clearTimeout(loaderCap);
-          clearLoader();
-          setStatus("Could not load video", "error");
+          startCompatiblePreview(video.path, token, targetResume());
         },
         { once: true },
       );
@@ -1340,14 +1459,29 @@ export function useReviewController() {
       } catch {
         /* ignore */
       }
-      attachFastMedia(v, sourceUrl, sourceKind, resumeTime, token);
+      if (stateRef.current.scaleAiMode) {
+        // ScaleAI delivery footage may be HEVC. Use the browser-compatible
+        // source directly so Chromium never gets stuck on an undecodable MP4.
+        v.pause();
+        v.removeAttribute("src");
+        v.load();
+        startCompatiblePreview(video.path, token, resumeTime);
+      } else {
+        attachFastMedia(v, sourceUrl, sourceKind, resumeTime, token);
+      }
 
       if (stateRef.current.scaleAiMode) {
         // ScaleAI uses only adjacent VIDEO.json — never touch *.segments.json.
-        await loadScaleAiForPath(video.path);
+        const scaleData = await loadScaleAiForPath(video.path);
         if (token !== previewTokenRef.current) return;
         setScaleAiPending(null);
-        const scaleAnn = stateRef.current.scaleAiByPath[video.path];
+        const scaleAnn = scaleData || stateRef.current.scaleAiByPath[video.path];
+        const codec = String(scaleAnn?.media_meta?.video_codec || "").toLowerCase();
+        // Chromium can parse HEVC metadata without being able to decode a
+        // frame, so its media element may stay black and never emit `error`.
+        if (codec === "hevc" || codec === "h265" || codec === "h.265") {
+          startCompatiblePreview(video.path, token, targetResume());
+        }
         const scaleDur = Number(scaleAnn?.duration_seconds) || 0;
         if (scaleDur > 0) setDuration(scaleDur);
         // Keep media strip populated without creating textile sidecars.
@@ -1398,6 +1532,8 @@ export function useReviewController() {
       setPlaybackRate,
       setStatus,
       sourceLabel,
+      startCompatiblePreview,
+      stopCompatiblePreview,
       stopFastPoll,
       updateScrubUiFromEl,
       warmFastSources,
@@ -2212,6 +2348,9 @@ export function useReviewController() {
       if (trimPollRef.current) clearInterval(trimPollRef.current);
       if (seekTimerRef.current) clearTimeout(seekTimerRef.current);
       if (fastPollRef.current) clearInterval(fastPollRef.current);
+      if (compatiblePreviewPollRef.current) clearInterval(compatiblePreviewPollRef.current);
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

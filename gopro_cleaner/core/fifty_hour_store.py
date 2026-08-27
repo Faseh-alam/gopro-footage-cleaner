@@ -51,6 +51,16 @@ def _atomic_write(path: Path, payload: dict | list) -> None:
     temp.replace(path)
 
 
+def _read_json(path: Path) -> dict | list:
+    """Read sidecars from Windows tools that may have saved CP-1252 JSON."""
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")
+    return json.loads(text)
+
+
 def safe_label_name(label: str) -> str:
     cleaned = SAFE_NAME_RE.sub("-", (label or "").strip()).strip("-._")
     return cleaned or "untitled"
@@ -224,7 +234,7 @@ def load_annotation(video: Path, *, root: Path | None = None) -> dict:
         if not sidecar.is_file():
             # Do not create the JSON until the first label is saved.
             return empty_annotation(source, root=root)
-        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+        raw = _read_json(sidecar)
         annotation = normalize_annotation(raw, source, root=root)
         # Heal metadata / duration without rewriting unless the file already exists
         # and content meaningfully changed.
@@ -487,8 +497,8 @@ def load_tasks_doc(root: Path) -> dict:
             _atomic_write(path, doc)
             return doc
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = _read_json(path)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return _empty_tasks_doc()
     tasks = raw.get("tasks") if isinstance(raw, dict) else {}
     if not isinstance(tasks, dict):
@@ -599,12 +609,8 @@ def refresh_progress(root: Path) -> dict:
         if source is None:
             continue
         try:
-            annotation = normalize_annotation(
-                json.loads(sidecar.read_text(encoding="utf-8")),
-                source,
-                root=root,
-            )
-        except (OSError, json.JSONDecodeError):
+            annotation = normalize_annotation(_read_json(sidecar), source, root=root)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         parent = str(annotation.get("parent_task") or infer_parent_task(source, root)).strip()
         entry = by_task.setdefault(
@@ -682,8 +688,8 @@ def load_progress(root: Path, *, refresh: bool = False) -> dict:
     if refresh or not path.is_file():
         return refresh_progress(root)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return _read_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return refresh_progress(root)
 
 
