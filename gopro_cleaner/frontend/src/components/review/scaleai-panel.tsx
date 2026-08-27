@@ -20,7 +20,9 @@ export function ScaleAiPanel({ c }: { c: ReviewController }) {
           {annotation?.parent_task || "Open a task folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          Parent task is inferred from the folder name. Both stages save JSON only.
+          Parent task comes from the folder name (example: Axle Shaft Cutting). Stage 1 only
+          marks complete clean cycles — no task picker. Later, Stage 2 labels CEO subtasks
+          inside those cycles.
         </p>
         {annotation?.parent_example ? (
           <p className="mt-1 text-[10px] font-medium text-success">

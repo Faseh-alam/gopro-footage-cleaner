@@ -255,12 +255,12 @@ export function useReviewController() {
   const [shareClipQuality, setShareClipQuality] = useState<"720p" | "1080p">("1080p");
   const [appVersion, setAppVersion] = useState("");
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
-  /** ScaleAI micro-task mode: empty task list + fine scrub; process/stitch optional. */
+  /** ScaleAI two-stage labeling is the default on this branch. */
   const [scaleAiMode, setScaleAiModeState] = useState(() => {
     try {
-      return localStorage.getItem("wc-scaleai-mode") === "1";
+      return localStorage.getItem("wc-scaleai-mode") !== "0";
     } catch {
-      return false;
+      return true;
     }
   });
   const [scaleAiStage, setScaleAiStage] = useState<"parent" | "subtask">("parent");
@@ -903,11 +903,12 @@ export function useReviewController() {
     return covered >= dur - 0.05;
   }, []);
 
-  /** List: current clip, or any clip already done. Never open unfinished others. */
+  /** List: in ScaleAI, every clip is openable. Otherwise only current or 100% done. */
   const canOpenVideo = useCallback(
     (i: number) => {
       const s = stateRef.current;
       if (i < 0 || i >= s.videos.length) return false;
+      if (s.scaleAiMode) return true;
       if (i === s.index) return true;
       return isVideoFullyDone(s.videos[i].path);
     },
@@ -1159,8 +1160,8 @@ export function useReviewController() {
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
 
-      // Click/nav without force: current video, or fully labelled (100% covered) only.
-      if (!opts.force && i !== s.index && !isVideoFullyDone(video.path)) {
+      // Click/nav without force: ScaleAI can open any clip; textile stays locked.
+      if (!opts.force && !stateRef.current.scaleAiMode && i !== s.index && !isVideoFullyDone(video.path)) {
         setStatus("Only finished (100% covered) videos can be opened from the list", "error");
         return;
       }
@@ -2606,6 +2607,12 @@ export function useReviewController() {
     let cancelled = false;
     (async () => {
       try {
+        // ScaleAI branch defaults to two-stage mode unless the operator opted out.
+        if (localStorage.getItem("wc-scaleai-mode") == null) {
+          localStorage.setItem("wc-scaleai-mode", "1");
+          setScaleAiModeState(true);
+          stateRef.current.scaleAiMode = true;
+        }
         await loadTasks();
         // Prefer local ScaleAI preference so weak label PCs stay on micro-task profile.
         if (stateRef.current.scaleAiMode) {

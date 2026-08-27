@@ -34,7 +34,9 @@ export function FootageList({ c }: { c: ReviewController }) {
               title={
                 openable
                   ? v.name
-                  : "Only the current video or 100% covered videos can be opened"
+                  : c.scaleAiMode
+                    ? v.name
+                    : "Only the current video or 100% covered videos can be opened"
               }
               className={cn(
                 "flex w-full items-center justify-between gap-2 border-t border-border px-4 py-2 text-left text-xs transition-colors",

@@ -41,13 +41,9 @@ const KEYS: [string, string][] = [
   ["← →", "Speed −0.5× / +0.5× (up to 5× — no encoding, no waiting)"],
   ["[ ]", "Speed −0.5× / +0.5× (same range)"],
   [", .", "−0.1s / +0.1s in ScaleAI · Shift+,/. or < > = 1 frame"],
-  ["I / O", "Mark share-clip in / out"],
-  ["T", "End work segment + select task"],
-  ["Enter", "Assign task to pending work"],
-  ["A", "Focus New task field"],
-  ["G", "Mark garbage to playhead"],
-  ["U", "Delete last markup"],
-  ["N", "Next unfinished (current must be 100% covered)"],
+  ["T / D / Enter", "ScaleAI: set cycle/subtask start, press again to save end"],
+  ["I / O", "Mark share-clip in / out (WhatsApp example)"],
+  ["N", "Next video (JSON only in ScaleAI)"],
   ["Home", "Jump to 0:00"],
 ];
 
@@ -220,9 +216,24 @@ function ReviewPage() {
       else if (key === "i") c.markShareIn();
       else if (key === "o") c.markShareOut();
       else if (key === "t") {
-        if (c.scaleAiMode && c.scaleAiStage === "subtask") c.markScaleAiSubtaskStart();
-        else if (!c.scaleAiMode) c.markWork();
+        if (c.scaleAiMode && c.scaleAiStage === "parent") {
+          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
+          else void c.saveScaleAiParentCycle();
+        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
+          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
+          else void c.saveScaleAiSubtask();
+        } else if (!c.scaleAiMode) c.markWork();
         else handled = false;
+      }
+      else if (key === "d") {
+        // Same as T — some labelers hit D for “done / mark this cycle”.
+        if (c.scaleAiMode && c.scaleAiStage === "parent") {
+          if (c.scaleAiParentStart == null) c.markScaleAiParentStart();
+          else void c.saveScaleAiParentCycle();
+        } else if (c.scaleAiMode && c.scaleAiStage === "subtask") {
+          if (c.scaleAiSubtaskStart == null) c.markScaleAiSubtaskStart();
+          else void c.saveScaleAiSubtask();
+        } else handled = false;
       }
       else if (key === "g") {
         if (!c.scaleAiMode) c.markGarbage();
