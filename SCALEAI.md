@@ -4,32 +4,28 @@ Branch: `ScaleAI` — separate from the normal textile review/offload product.
 
 ## Folder layout and parent task
 
-Open the parent delivery folder named **50 hours**. Inside it there should be:
+Open the SD-card / drive folder named **50 hours**. Real layout:
 
 ```text
 50 hours/
+  Google Drive/
+    Axle Shaft Cutting/
+      Axle Shaft Cutting/
+        clip_a.mp4
+        clip_b.mp4
   AWS/
     Label Attachment/
-      GX010123.MP4
-    Hem Stitching/
-      GX010124.MP4
-  Google Drive/
-    …
+      Label Attachment/
+        GX010123.MP4
 ```
+
+So: `50 hours → Google Drive or AWS → task folder → nested task folder → footage`.
 
 In ScaleAI mode click **Open 50 hours**, select that `50 hours` folder, and the app
-loads every raw MP4 under both `AWS` and `Google Drive`. It does **not** auto-scan
-connected DCIM/###GOPRO cards. Parent task names are still inferred from the folder
-under AWS / Google Drive (for example `Label Attachment`).
+loads every raw MP4 under both trees. It does **not** auto-scan DCIM cards.
 
-```text
-50 hours/AWS/Label Attachment/
-  GX010123.MP4
-  GX010124.MP4
-```
-
-The app infers `Label Attachment` from the folder name. Labelers do not choose
-the parent task again for every video.
+Parent task is inferred from the first folder under Google Drive / AWS
+(for example `Axle Shaft Cutting`). Labelers do not choose it again.
 
 ## Stage 1 — clean parent-task cycles
 

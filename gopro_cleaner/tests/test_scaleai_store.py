@@ -14,10 +14,22 @@ class ScaleAIStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.task_dir = self.root / "50 hours" / "AWS" / "Label Attachment"
+        self.task_dir = (
+            self.root / "50 hours" / "AWS" / "Label Attachment" / "Label Attachment"
+        )
         self.task_dir.mkdir(parents=True)
         self.video = self.task_dir / "GX010001.MP4"
         self.video.write_bytes(b"fake")
+        self.gdrive_dir = (
+            self.root
+            / "50 hours"
+            / "Google Drive"
+            / "Axle Shaft Cutting"
+            / "Axle Shaft Cutting"
+        )
+        self.gdrive_dir.mkdir(parents=True)
+        self.gdrive_video = self.gdrive_dir / "clp_demo.mp4"
+        self.gdrive_video.write_bytes(b"fake")
         self.duration_patch = patch(
             "gopro_cleaner.core.scaleai_store.resolve_media_duration",
             return_value=600.0,
@@ -32,6 +44,19 @@ class ScaleAIStoreTests(unittest.TestCase):
         self.assertEqual(
             scaleai_store.infer_parent_task(self.video),
             "Label Attachment",
+        )
+
+    def test_infers_task_from_nested_google_drive_folder(self) -> None:
+        self.assertEqual(
+            scaleai_store.infer_parent_task(self.gdrive_video),
+            "Axle Shaft Cutting",
+        )
+
+    def test_infers_task_when_scan_root_is_50_hours(self) -> None:
+        fifty = self.root / "50 hours"
+        self.assertEqual(
+            scaleai_store.infer_parent_task(self.gdrive_video, root=fifty),
+            "Axle Shaft Cutting",
         )
 
     def test_parent_and_subtask_layers_overlap_safely(self) -> None:

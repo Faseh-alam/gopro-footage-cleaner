@@ -37,29 +37,47 @@ def sidecar_path_for(video: Path) -> Path:
     return path.with_name(f"{path.stem}{SIDECAR_SUFFIX}")
 
 
+SOURCE_BUCKET_NAMES = {"aws", "google drive"}
+
+
 def infer_parent_task(video: Path, root: Path | None = None) -> str:
-    """Infer ``50 hours/AWS/<task-name>/...`` task, with safe fallbacks."""
+    """Infer parent task from the real ScaleAI delivery layout.
+
+    Expected paths look like::
+
+        …/50 hours/Google Drive/<task>/<task>/clip.mp4
+        …/50 hours/AWS/<task>/<task>/clip.mp4
+
+    The parent task is the first folder under AWS / Google Drive, even when that
+    task name is nested twice before the footage files.
+    """
     source = Path(video).expanduser().resolve()
-    parents = list(source.parents)
-    for ancestor in parents:
-        if ancestor.name.lower() == "aws":
-            try:
-                relative = source.relative_to(ancestor)
-            except ValueError:
-                continue
-            if len(relative.parts) >= 2:
-                return relative.parts[0].strip()
+
+    for ancestor in source.parents:
+        if ancestor.name.lower() not in SOURCE_BUCKET_NAMES:
+            continue
+        try:
+            relative = source.relative_to(ancestor)
+        except ValueError:
+            continue
+        # relative = <task> / [optional nested folders…] / filename
+        if len(relative.parts) >= 2:
+            return relative.parts[0].strip()
 
     if root is not None:
         resolved_root = Path(root).expanduser().resolve()
         try:
             relative = source.relative_to(resolved_root)
-            if len(relative.parts) >= 2:
-                return relative.parts[0].strip()
         except ValueError:
-            pass
+            relative = None
+        if relative is not None:
+            parts = [part for part in relative.parts[:-1] if part.strip()]
+            # Drop delivery wrappers so we land on the task folder.
+            while parts and parts[0].lower() in SOURCE_BUCKET_NAMES | {"50 hours"}:
+                parts = parts[1:]
+            if parts:
+                return parts[0].strip()
 
-    # In the expected layout, the video sits directly in <task-name>/.
     return source.parent.name.strip() or "Uncategorized"
 
 

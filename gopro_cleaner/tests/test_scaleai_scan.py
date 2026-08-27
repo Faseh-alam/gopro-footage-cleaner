@@ -14,8 +14,8 @@ class ScaleAIScanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "50 hours"
-        aws = self.root / "AWS" / "Label Attachment"
-        gdrive = self.root / "Google Drive" / "Hem Stitching"
+        aws = self.root / "AWS" / "Label Attachment" / "Label Attachment"
+        gdrive = self.root / "Google Drive" / "Hem Stitching" / "Hem Stitching"
         aws.mkdir(parents=True)
         gdrive.mkdir(parents=True)
         self.aws_video = aws / "GX010001.MP4"
