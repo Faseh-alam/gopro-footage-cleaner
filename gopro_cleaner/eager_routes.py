@@ -31,11 +31,25 @@ from .core.skim_proxy import cancel_skim, skim_cache_root, skim_status
 from .core.fast_proxy import cancel_fast, fast_cache_root, fast_status
 from .core.lite_mode import performance_config
 from .core.snapshot_strip import cancel_snapshots
-from .core.task_store import add_task, bundled_tasks, load_tasks, remove_task
+from .core.task_store import (
+    add_task,
+    bundled_tasks,
+    get_profile,
+    load_tasks,
+    remove_task,
+    set_profile,
+)
 from .core.share_clip import prepare_share_download, take_prepared_download
 from .core.trimmer import move_to_trash
 from .core.work_log import append_work_session, list_work_sessions
 from .core.volumes import list_sd_cards, list_volume_roots, normalize_path
+from .core.scaleai_stitch import (
+    discover_task_dirs,
+    list_task_clips,
+    plan_stitch,
+    stitch_all_tasks,
+    stitch_task_clips,
+)
 
 
 def create_eager_blueprint() -> Blueprint:
@@ -96,7 +110,32 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.get("/api/eager/tasks")
     def eager_tasks():
-        return jsonify({"tasks": load_tasks(), "default_tasks": bundled_tasks()})
+        return jsonify(
+            {
+                "tasks": load_tasks(),
+                "default_tasks": bundled_tasks(),
+                "profile": get_profile(),
+            }
+        )
+
+    @eager.post("/api/eager/tasks/profile")
+    def eager_tasks_profile():
+        """Switch task list: default (textile) or scaleai (empty, add live)."""
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("profile") or payload.get("name") or "").strip()
+        try:
+            profile = set_profile(name)
+            tasks = load_tasks()
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "profile": profile,
+                "tasks": tasks,
+                "default_tasks": bundled_tasks(),
+            }
+        )
 
     @eager.post("/api/eager/tasks")
     def eager_add_task():
@@ -112,7 +151,14 @@ def create_eager_blueprint() -> Blueprint:
             root = normalize_path(raw_root)
             task_dir = task_directory(root, name)
             task_dir.mkdir(parents=True, exist_ok=True)
-        return jsonify({"tasks": tasks, "default_tasks": bundled_tasks(), "task_dir": str(task_dir) if task_dir else None})
+        return jsonify(
+            {
+                "tasks": tasks,
+                "default_tasks": bundled_tasks(),
+                "profile": get_profile(),
+                "task_dir": str(task_dir) if task_dir else None,
+            }
+        )
 
     @eager.delete("/api/eager/tasks")
     def eager_remove_task():
@@ -122,7 +168,13 @@ def create_eager_blueprint() -> Blueprint:
             tasks = remove_task(name)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"tasks": tasks, "default_tasks": bundled_tasks()})
+        return jsonify(
+            {
+                "tasks": tasks,
+                "default_tasks": bundled_tasks(),
+                "profile": get_profile(),
+            }
+        )
 
     @eager.get("/api/eager/cameras")
     def eager_cameras():
@@ -1012,5 +1064,230 @@ def create_eager_blueprint() -> Blueprint:
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, **result})
+
+    # ---- ScaleAI micro-task stitch export ----------------------------------
+
+    @eager.post("/api/eager/scaleai/process-video")
+    def eager_scaleai_process_video():
+        """Queue trims for one annotated video; optionally stitch task folders after.
+
+        Body: {"path": "...mp4", "stitch": false, "overwrite": false, "delete_source": false}
+
+        Label PCs should use stitch=false (JSON already saved). Strong PCs can set
+        stitch=true to cut clips then build ``*__stitched.MP4`` per micro-task.
+        """
+        payload = request.get_json(silent=True) or {}
+        raw_path = str(payload.get("path") or "").strip()
+        do_stitch = bool(payload.get("stitch", False))
+        overwrite = bool(payload.get("overwrite", False))
+        delete_source = bool(payload.get("delete_source", False))
+        if not raw_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+        except FileNotFoundError:
+            return jsonify({"error": f"Not found: {raw_path}"}), 404
+
+        annotation = annotation_store.load_annotation(source)
+        segments = [
+            s
+            for s in (annotation or {}).get("segments") or []
+            if str(s.get("kind") or "").lower() == "work"
+        ]
+        if not segments:
+            return jsonify({"error": "No work segments on this video — mark tasks first"}), 400
+
+        queued = 0
+        skipped = 0
+        errors: list[str] = []
+        task_dirs: set[Path] = set()
+        for seg in segments:
+            try:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if end <= start + 0.05:
+                continue
+            task_name = str(seg.get("task") or "").strip()
+            if not task_name:
+                errors.append("work segment missing task name")
+                continue
+            if eager_trim_queue.has_equivalent_job(source, start, end):
+                skipped += 1
+                task_dirs.add(task_output_directory(source, task_name))
+                continue
+            try:
+                output_dir = task_output_directory(source, task_name)
+                eager_trim_queue.submit(
+                    source,
+                    start,
+                    end,
+                    output_dir=output_dir,
+                    task=task_name,
+                )
+                task_dirs.add(output_dir)
+                queued += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+
+        if delete_source and (queued or skipped):
+            try:
+                eager_trim_queue.schedule_source_finish(source, delete_source=True)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"finish/delete — {exc}")
+
+        stitch_scheduled = False
+        if do_stitch and task_dirs:
+
+            def _wait_and_stitch(dirs: list[Path], src: Path) -> None:
+                import time
+
+                # Wait until this source has no active trim jobs (max ~2h).
+                for _ in range(7200):
+                    if eager_trim_queue.active_count_for_source(src) == 0:
+                        break
+                    time.sleep(1)
+                for task_dir in dirs:
+                    try:
+                        stitch_task_clips(task_dir, overwrite=overwrite)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            import threading
+
+            threading.Thread(
+                target=_wait_and_stitch,
+                args=(list(task_dirs), source),
+                daemon=True,
+                name="scaleai-stitch-after-trim",
+            ).start()
+            stitch_scheduled = True
+
+        return jsonify(
+            {
+                "ok": True,
+                "path": str(source),
+                "queued": queued,
+                "skipped": skipped,
+                "errors": errors,
+                "task_dirs": [str(p) for p in sorted(task_dirs)],
+                "stitch_scheduled": stitch_scheduled,
+                "message": (
+                    f"Queued {queued} trim(s)"
+                    + ("; stitch will run when trims finish" if stitch_scheduled else "")
+                    + ("; JSON-only marks are already saved" if queued == 0 and skipped else "")
+                ),
+            }
+        )
+
+    @eager.post("/api/eager/scaleai/stitch-task")
+    def eager_scaleai_stitch_task():
+        """Concatenate all clips in one task folder into a GPMF-preserving MP4."""
+        payload = request.get_json(silent=True) or {}
+        raw_dir = str(payload.get("task_dir") or payload.get("path") or "").strip()
+        task_name = str(payload.get("task") or "").strip() or None
+        overwrite = bool(payload.get("overwrite", False))
+        if not raw_dir:
+            return jsonify({"error": "task_dir is required"}), 400
+        try:
+            result = stitch_task_clips(
+                Path(raw_dir),
+                task_name=task_name,
+                overwrite=overwrite,
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except FileExistsError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        status = 200 if result.ok else 400
+        return jsonify(
+            {
+                "ok": result.ok,
+                "task": result.task,
+                "output": result.output,
+                "clip_count": result.clip_count,
+                "duration": result.duration,
+                "has_gpmf": result.has_gpmf,
+                "message": result.message,
+                "error": result.error,
+                "manifest": result.manifest,
+            }
+        ), status
+
+    @eager.post("/api/eager/scaleai/stitch-all")
+    def eager_scaleai_stitch_all():
+        """Stitch every task folder under a footage root (ScaleAI delivery pack)."""
+        payload = request.get_json(silent=True) or {}
+        raw_root = str(payload.get("root") or payload.get("path") or "").strip()
+        overwrite = bool(payload.get("overwrite", False))
+        if not raw_root:
+            return jsonify({"error": "root is required"}), 400
+        try:
+            root = normalize_path(raw_root)
+            results = stitch_all_tasks(root, overwrite=overwrite)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        ok_count = sum(1 for r in results if r.ok)
+        return jsonify(
+            {
+                "ok": ok_count == len(results) and len(results) > 0,
+                "root": str(root),
+                "task_count": len(results),
+                "ok_count": ok_count,
+                "results": [
+                    {
+                        "ok": r.ok,
+                        "task": r.task,
+                        "output": r.output,
+                        "clip_count": r.clip_count,
+                        "duration": r.duration,
+                        "has_gpmf": r.has_gpmf,
+                        "message": r.message,
+                        "error": r.error,
+                    }
+                    for r in results
+                ],
+            }
+        )
+
+    @eager.get("/api/eager/scaleai/preview")
+    def eager_scaleai_preview():
+        """List task folders + clip counts under a root before stitching."""
+        raw_root = str(request.args.get("root") or request.args.get("path") or "").strip()
+        if not raw_root:
+            return jsonify({"error": "root is required"}), 400
+        try:
+            root = normalize_path(raw_root)
+            dirs = discover_task_dirs(root)
+            tasks = []
+            for task_dir in dirs:
+                clips = list_task_clips(task_dir)
+                try:
+                    plan = plan_stitch(task_dir)
+                    tasks.append(
+                        {
+                            "task": plan.task,
+                            "task_dir": str(task_dir),
+                            "clip_count": plan.clip_count,
+                            "total_duration": plan.total_duration,
+                            "all_have_gpmf": plan.all_have_gpmf,
+                            "output": str(plan.output),
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    tasks.append(
+                        {
+                            "task": task_dir.name,
+                            "task_dir": str(task_dir),
+                            "clip_count": len(clips),
+                            "error": str(exc),
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "root": str(root), "tasks": tasks})
 
     return eager

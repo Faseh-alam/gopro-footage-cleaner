@@ -253,6 +253,14 @@ export function useReviewController() {
   const [shareClipQuality, setShareClipQuality] = useState<"720p" | "1080p">("1080p");
   const [appVersion, setAppVersion] = useState("");
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
+  /** ScaleAI micro-task mode: empty task list + fine scrub; process/stitch optional. */
+  const [scaleAiMode, setScaleAiModeState] = useState(() => {
+    try {
+      return localStorage.getItem("wc-scaleai-mode") === "1";
+    } catch {
+      return false;
+    }
+  });
 
   /** Bumped per video open — stale async work checks this before touching the player. */
   const previewTokenRef = useRef(0);
@@ -300,6 +308,7 @@ export function useReviewController() {
     scrubTime,
     duration,
     deleteSourceAfterTrim,
+    scaleAiMode,
   };
 
   const setStatus = useCallback((message: string, kind: StatusKind = "") => {
@@ -652,6 +661,15 @@ export function useReviewController() {
       scheduleSeek(stateRef.current.scrubTime + seconds, true);
     },
     [currentVideo, scheduleSeek],
+  );
+
+  /** ScaleAI: 0.1s steps (textile grabs ~0.2–0.5s). Shift = one frame @30fps. */
+  const scrubStepSeconds = useCallback(
+    (fineFrame = false) => {
+      if (fineFrame) return 1 / 30;
+      return stateRef.current.scaleAiMode ? 0.1 : 1;
+    },
+    [],
   );
 
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
@@ -1830,7 +1848,44 @@ export function useReviewController() {
     const data = await api("/api/eager/tasks");
     setTasks(data.tasks || []);
     setDefaultTasks(data.default_tasks || []);
+    if (data.profile === "scaleai") {
+      setScaleAiModeState(true);
+      try {
+        localStorage.setItem("wc-scaleai-mode", "1");
+      } catch {
+        /* ignore */
+      }
+    }
   }, []);
+
+  const setScaleAiMode = useCallback(
+    async (on: boolean) => {
+      setScaleAiModeState(on);
+      try {
+        localStorage.setItem("wc-scaleai-mode", on ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      try {
+        const data = await api("/api/eager/tasks/profile", {
+          method: "POST",
+          body: JSON.stringify({ profile: on ? "scaleai" : "default" }),
+        });
+        setTasks(data.tasks || []);
+        setDefaultTasks(data.default_tasks || []);
+        setSelectedTaskValue("");
+        setStatus(
+          on
+            ? "ScaleAI mode — empty task list; add micro-tasks live · ,/. = 0.1s"
+            : "Normal textile task list restored",
+          "ok",
+        );
+      } catch (error: any) {
+        setStatus(error.message || "Could not switch task profile", "error");
+      }
+    },
+    [setStatus],
+  );
 
   const isUserDefinedTask = useCallback(
     (name: string) => {
@@ -2015,6 +2070,31 @@ export function useReviewController() {
     await queueWorkSegments(paths, "across all videos");
   }, [queueWorkSegments]);
 
+  /** ScaleAI: trim current video; optionally stitch task folders when trims finish. */
+  const processCurrentVideoScaleAi = useCallback(
+    async (opts: { stitch: boolean }) => {
+      const current = currentVideo();
+      if (!current) return;
+      if (!currentAnnotation()) await loadAnnotationForPath(current.path);
+      try {
+        const data = await api("/api/eager/scaleai/process-video", {
+          method: "POST",
+          body: JSON.stringify({
+            path: current.path,
+            stitch: Boolean(opts.stitch),
+            delete_source: false,
+          }),
+        });
+        setStatus(data.message || `Queued ${data.queued || 0} trim(s)`, "ok");
+        startGlobalTrimPolling();
+        await pollGlobalTrims();
+      } catch (error: any) {
+        setStatus(error.message, "error");
+      }
+    },
+    [currentAnnotation, currentVideo, loadAnnotationForPath, pollGlobalTrims, setStatus, startGlobalTrimPolling],
+  );
+
   const markShareIn = useCallback(() => {
     if (!currentVideo()) return;
     const t = Math.max(0, currentScrubTime());
@@ -2161,6 +2241,19 @@ export function useReviewController() {
     (async () => {
       try {
         await loadTasks();
+        // Prefer local ScaleAI preference so weak label PCs stay on micro-task profile.
+        if (stateRef.current.scaleAiMode) {
+          try {
+            const data = await api("/api/eager/tasks/profile", {
+              method: "POST",
+              body: JSON.stringify({ profile: "scaleai" }),
+            });
+            setTasks(data.tasks || []);
+            setDefaultTasks(data.default_tasks || []);
+          } catch {
+            /* ignore */
+          }
+        }
         const ws = createWorkspace("Footage");
         setWorkspaces([ws]);
         setActiveWorkspaceId(ws.id);
@@ -2365,6 +2458,7 @@ export function useReviewController() {
     scheduleSeek,
     seekToFraction,
     fineTune,
+    scrubStepSeconds,
     bumpPlaybackRate,
     togglePlay,
     jumpToClipStart,
@@ -2388,6 +2482,9 @@ export function useReviewController() {
     completeBatch,
     queueClips,
     queueAllClips,
+    processCurrentVideoScaleAi,
+    scaleAiMode,
+    setScaleAiMode,
     cancelTrim,
     cancelAllTrims,
     formatTime,

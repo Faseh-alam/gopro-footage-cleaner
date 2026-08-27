@@ -14,11 +14,36 @@ BUNDLED_TASKS_FILE = PROJECT_ROOT / "eager_tasks.default.json"
 TASK_LIST_VERSION = 2
 
 _lock = threading.RLock()
+_profile = "default"  # "default" | "scaleai"
+
+
+SCALEAI_TASKS_FILE = PROJECT_ROOT / "scaleai_tasks.json"
+
+
+def get_profile() -> str:
+    with _lock:
+        return _profile
+
+
+def set_profile(name: str) -> str:
+    """Switch between normal textile tasks and empty ScaleAI micro-task list."""
+    global _profile
+    key = (name or "default").strip().lower()
+    if key not in {"default", "scaleai"}:
+        raise ValueError("profile must be 'default' or 'scaleai'")
+    with _lock:
+        _profile = key
+        return _profile
 
 
 def _tasks_path() -> Path:
-    custom = Path(os.environ.get("EAGER_TASKS_FILE", str(DEFAULT_TASKS_FILE)))
-    return custom.expanduser()
+    custom = os.environ.get("EAGER_TASKS_FILE", "").strip()
+    if custom:
+        return Path(custom).expanduser()
+    with _lock:
+        if _profile == "scaleai":
+            return SCALEAI_TASKS_FILE
+    return DEFAULT_TASKS_FILE
 
 
 def _slug(name: str) -> str:
@@ -93,35 +118,46 @@ def bundled_tasks() -> list[str]:
 def _write_tasks_unlocked(path: Path, tasks: list[str]) -> list[str]:
     cleaned = _clean_task_names(tasks)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"version": TASK_LIST_VERSION, "tasks": cleaned}, indent=2),
-        encoding="utf-8",
-    )
+    payload = {"version": TASK_LIST_VERSION, "tasks": cleaned}
+    if path == SCALEAI_TASKS_FILE or _profile == "scaleai":
+        payload["profile"] = "scaleai"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return cleaned
 
 
 def _read_tasks_unlocked(path: Path) -> list[str]:
-    canonical = bundled_tasks()
+    """Load tasks from disk.
+
+    ScaleAI profile is allowed to be empty (operators add micro-tasks live).
+    Default profile falls back to the bundled textile list when missing/empty.
+    """
+    allow_empty = _profile == "scaleai" or path == SCALEAI_TASKS_FILE
     if not path.exists():
-        return canonical
+        if allow_empty:
+            return []
+        return bundled_tasks()
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return canonical
+        return [] if allow_empty else bundled_tasks()
 
     if data.get("version") != TASK_LIST_VERSION:
-        return canonical
+        return [] if allow_empty else bundled_tasks()
 
     tasks = _clean_task_names([str(item) for item in data.get("tasks", [])])
-    return tasks if tasks else canonical
+    if tasks:
+        return tasks
+    return [] if allow_empty else bundled_tasks()
 
 
 def load_tasks() -> list[str]:
     path = _tasks_path()
     with _lock:
         tasks = _read_tasks_unlocked(path)
-        if not path.exists() or _file_needs_refresh(path):
+        if not path.exists():
+            return _write_tasks_unlocked(path, tasks)
+        if _file_needs_refresh(path) and _profile != "scaleai":
             return _write_tasks_unlocked(path, tasks)
         return tasks
 
@@ -133,6 +169,9 @@ def _file_needs_refresh(path: Path) -> bool:
         return True
     if data.get("version") != TASK_LIST_VERSION:
         return True
+    # Empty is valid for ScaleAI — do not treat it as "needs refresh".
+    if _profile == "scaleai" or path == SCALEAI_TASKS_FILE:
+        return False
     return not data.get("tasks")
 
 
@@ -156,6 +195,9 @@ def add_task(name: str) -> list[str]:
 
 
 def is_default_task(name: str) -> bool:
+    """Bundled textile defaults are protected only in the default profile."""
+    if _profile == "scaleai":
+        return False
     key = name.strip().lower()
     if not key:
         return False

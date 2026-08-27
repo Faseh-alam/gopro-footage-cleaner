@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { TextInput } from "@/components/wc/field";
 import type { ReviewController } from "./useReviewController";
+import { taskColor } from "./task-color";
 
 export function TaskPanel({ c }: { c: ReviewController }) {
   const [newTask, setNewTask] = useState("");
@@ -11,6 +12,7 @@ export function TaskPanel({ c }: { c: ReviewController }) {
 
   const renderTask = (task: string) => {
     const deletable = c.isUserDefinedTask(task);
+    const color = taskColor(task);
     return (
       <div
         key={task}
@@ -28,11 +30,16 @@ export function TaskPanel({ c }: { c: ReviewController }) {
             c.touchRecentTask(task);
           }}
           className={cn(
-            "min-w-0 flex-1 truncate px-2 py-1.5 text-left text-xs transition-colors",
+            "flex min-w-0 flex-1 items-center gap-2 truncate px-2 py-1.5 text-left text-xs transition-colors",
             task === c.selectedTaskValue ? "text-foreground" : "text-muted-foreground hover:text-foreground",
           )}
         >
-          {task}
+          <span
+            className="size-2.5 shrink-0 rounded-full"
+            style={{ backgroundColor: color.solid }}
+            aria-hidden
+          />
+          <span className="truncate">{task}</span>
         </button>
         {deletable ? (
           <button
@@ -121,6 +128,34 @@ export function TaskPanel({ c }: { c: ReviewController }) {
         <Button size="sm" variant="destructive" onClick={() => c.deleteCurrentFile()}>
           Move video to Trash
         </Button>
+      </div>
+
+      <div className="grid gap-2 rounded-sm border border-border p-2">
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={c.scaleAiMode}
+            onChange={(e) => void c.setScaleAiMode(e.currentTarget.checked)}
+          />
+          <span className="font-medium">ScaleAI micro-task mode</span>
+        </label>
+        <p className="text-[10px] leading-relaxed text-muted-foreground">
+          Empty task list — add names like grab-cloth live. Marking saves JSON only.
+          {c.scaleAiMode ? " ,/. = 0.1s · Shift+,/. = 1 frame." : ""}
+        </p>
+        {c.scaleAiMode ? (
+          <div className="grid gap-1.5">
+            <Button size="sm" variant="outline" onClick={() => void c.processCurrentVideoScaleAi({ stitch: false })}>
+              Trim this video
+            </Button>
+            <Button size="sm" variant="accent" onClick={() => void c.processCurrentVideoScaleAi({ stitch: true })}>
+              Trim + stitch this video
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => void c.finishCleaningFile()}>
+              Next video (JSON only) <kbd className="ml-1 font-mono text-[10px]">N</kbd>
+            </Button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

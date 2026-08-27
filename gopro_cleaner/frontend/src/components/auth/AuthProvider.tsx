@@ -30,6 +30,9 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/** ScaleAI / local stations: no Supabase login gate. Re-enable when cloud auth is back. */
+const AUTH_DISABLED = true;
+
 const PUBLIC_PATHS = new Set(["/login"]);
 
 function formatClock(iso?: string | null) {
@@ -54,7 +57,7 @@ export function formatMetricsSummary(today: TodayMetrics | null) {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(AUTH_DISABLED);
   const [auth, setAuth] = useState<AuthState | null>(null);
 
   const applyAuth = useCallback((next: AuthState | null) => {
@@ -63,6 +66,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshToday = useCallback(async () => {
+    if (AUTH_DISABLED) return;
     if (!loadAuth()?.session?.access_token) return;
     try {
       const data = await api("/api/auth/metrics/today");
@@ -78,6 +82,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (AUTH_DISABLED) {
+      applyAuth(null);
+      setReady(true);
+      return;
+    }
     let cancelled = false;
     (async () => {
       const stored = loadAuth();
@@ -98,7 +107,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         });
       } catch {
         if (cancelled) return;
-        // Try one refresh before clearing.
         try {
           const refreshed = await api("/api/auth/refresh", {
             method: "POST",
@@ -125,6 +133,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!ready) return;
+    if (AUTH_DISABLED) {
+      if (pathname === "/login") navigate({ to: "/review" });
+      return;
+    }
     const isPublic = PUBLIC_PATHS.has(pathname);
     if (!auth?.user && !isPublic) {
       navigate({ to: "/login" });
@@ -135,6 +147,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
+      if (AUTH_DISABLED) {
+        navigate({ to: "/review" });
+        return;
+      }
       const data = await api("/api/auth/login", {
         method: "POST",
         body: JSON.stringify({ email, password }),
@@ -152,6 +168,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signup = useCallback(
     async (fullName: string, email: string, password: string) => {
+      if (AUTH_DISABLED) {
+        navigate({ to: "/review" });
+        return;
+      }
       const data = await api("/api/auth/signup", {
         method: "POST",
         body: JSON.stringify({ full_name: fullName, email, password }),
@@ -168,6 +188,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
+    if (AUTH_DISABLED) {
+      navigate({ to: "/review" });
+      return;
+    }
     try {
       await api("/api/auth/logout", { method: "POST" });
     } catch {
@@ -199,7 +223,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     );
   }
 
-  if (!auth?.user && !PUBLIC_PATHS.has(pathname)) {
+  if (!AUTH_DISABLED && !auth?.user && !PUBLIC_PATHS.has(pathname)) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-sm text-muted-foreground">
         Redirecting to login…

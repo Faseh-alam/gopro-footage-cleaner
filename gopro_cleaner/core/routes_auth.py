@@ -10,6 +10,10 @@ from . import auth_service, employee_metrics, supabase_db
 def create_auth_blueprint() -> Blueprint:
     bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
+    # Local / ScaleAI stations: skip Supabase entirely so missing packages
+    # never break the review UI. Flip to False when cloud login is needed again.
+    AUTH_DISABLED = True
+
     def _auth_error(exc: Exception):
         if isinstance(exc, PermissionError):
             return jsonify({"error": str(exc)}), 401
@@ -21,15 +25,20 @@ def create_auth_blueprint() -> Blueprint:
 
     @bp.get("/status")
     def auth_status():
+        if AUTH_DISABLED:
+            return jsonify({"configured": False, "ok": False, "disabled": True})
         return jsonify(
             {
                 "configured": supabase_db.supabase_configured(),
                 "ok": supabase_db.supabase_configured(),
+                "disabled": False,
             }
         )
 
     @bp.post("/signup")
     def signup():
+        if AUTH_DISABLED:
+            return jsonify({"error": "Login is disabled on this station", "disabled": True}), 503
         if not supabase_db.supabase_configured():
             return jsonify({"error": "Supabase is not configured"}), 503
         data = request.get_json(silent=True) or {}
@@ -54,6 +63,8 @@ def create_auth_blueprint() -> Blueprint:
 
     @bp.post("/login")
     def login():
+        if AUTH_DISABLED:
+            return jsonify({"error": "Login is disabled on this station", "disabled": True}), 503
         if not supabase_db.supabase_configured():
             return jsonify({"error": "Supabase is not configured"}), 503
         data = request.get_json(silent=True) or {}

@@ -1,4 +1,4 @@
-import { Logo } from "@/components/wc/logo";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, RefreshCw } from "lucide-react";
@@ -7,8 +7,7 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/components/auth/AuthProvider";
-import { UserAccountMenu } from "@/components/auth/UserAccountMenu";
+import { Logo } from "@/components/wc/logo";
 import { useReviewController } from "@/components/review/useReviewController";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
@@ -41,7 +40,7 @@ const KEYS: [string, string][] = [
   ["Space", "Play / pause (resets to 1×)"],
   ["← →", "Speed −0.5× / +0.5× (up to 5× — no encoding, no waiting)"],
   ["[ ]", "Speed −0.5× / +0.5× (same range)"],
-  [", .", "−1s / +1s original time (stops at end)"],
+  [", .", "−0.1s / +0.1s in ScaleAI · Shift+,/. or < > = 1 frame"],
   ["I / O", "Mark share-clip in / out"],
   ["T", "End work segment + select task"],
   ["Enter", "Assign task to pending work"],
@@ -213,8 +212,11 @@ function ReviewPage() {
 
       if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{") c.bumpPlaybackRate(-0.5);
       else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}") c.bumpPlaybackRate(0.5);
-      else if (event.key === ",") c.fineTune(-1);
-      else if (event.key === ".") c.fineTune(1);
+      else if (event.key === "," || event.key === "<") {
+        c.fineTune(-c.scrubStepSeconds(event.shiftKey || event.key === "<"));
+      } else if (event.key === "." || event.key === ">") {
+        c.fineTune(c.scrubStepSeconds(event.shiftKey || event.key === ">"));
+      }
       else if (key === "i") c.markShareIn();
       else if (key === "o") c.markShareOut();
       else if (key === "t") c.markWork();
@@ -293,10 +295,6 @@ function ReviewPage() {
                     ? "Updating…"
                     : "Restarting…"}
               </Button>
-            </div>
-
-            <div className="flex items-center gap-2 border-l border-border pl-3">
-              <UserAccountMenu />
             </div>
 
             <nav className="flex items-center gap-3 border-l border-border pl-3 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72]">

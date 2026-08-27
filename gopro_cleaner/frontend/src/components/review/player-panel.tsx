@@ -4,6 +4,7 @@ import { Badge } from "@/components/wc/panel";
 import { Button } from "@/components/ui/button";
 import type { MediaMeta } from "./types";
 import type { ReviewController } from "./useReviewController";
+import { taskColor } from "./task-color";
 
 const MOTION_SENSORS: [RegExp, string][] = [
   [/acceler/i, "Accel"],
@@ -136,20 +137,23 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           aria-hidden
           title="Use , . or ← → to step through the timeline"
         >
-          {segments.map((s, i) => (
-            <div
-              key={s.id || i}
-              title={`${s.kind}${s.task ? ` · ${s.task}` : ""}`}
-              className={cn(
-                "absolute inset-y-0",
-                s.kind === "work" ? "bg-accent/35" : "bg-destructive/30",
-              )}
-              style={{
-                left: duration ? `${(s.start / duration) * 100}%` : "0%",
-                width: duration ? `${Math.max(0.4, ((s.end - s.start) / duration) * 100)}%` : "0%",
-              }}
-            />
-          ))}
+          {segments.map((s, i) => {
+            const color = s.kind === "work" ? taskColor(s.task) : null;
+            return (
+              <div
+                key={s.id || i}
+                title={`${s.kind}${s.task ? ` · ${s.task}` : ""}`}
+                className={cn("absolute inset-y-0", s.kind !== "work" && "bg-destructive/30")}
+                style={{
+                  left: duration ? `${(s.start / duration) * 100}%` : "0%",
+                  width: duration
+                    ? `${Math.max(0.4, ((s.end - s.start) / duration) * 100)}%`
+                    : "0%",
+                  ...(color ? { backgroundColor: color.fill } : null),
+                }}
+              />
+            );
+          })}
           {ann?.pendingWork && duration > 0 && (
             <div
               className="absolute inset-y-0 border-x border-warning bg-warning/25"
@@ -204,8 +208,20 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
                 className="flex items-center justify-between gap-3 px-1 py-1.5 text-xs"
               >
                 <span className="flex min-w-0 items-center gap-2">
-                  <Badge tone={s.kind === "work" ? "accent" : "danger"}>{s.kind}</Badge>
-                  <span className="truncate text-muted-foreground">{s.task || "—"}</span>
+                  {s.kind === "work" ? (
+                    <span
+                      className="inline-flex max-w-[9rem] items-center gap-1.5 truncate rounded-sm border border-border/60 px-1.5 py-0.5 text-[10px] font-medium"
+                      style={{
+                        backgroundColor: taskColor(s.task).fill,
+                        boxShadow: `inset 3px 0 0 ${taskColor(s.task).solid}`,
+                      }}
+                      title={s.task || "work"}
+                    >
+                      {s.task || "work"}
+                    </span>
+                  ) : (
+                    <Badge tone="danger">{s.kind}</Badge>
+                  )}
                 </span>
                 <span className="flex shrink-0 items-center gap-2">
                   <span className="font-mono text-[11px] text-muted-foreground">
@@ -299,8 +315,19 @@ export function PlayerPanel({ c }: { c: ReviewController }) {
           return (
             <li key={s.id || i} className="flex items-center justify-between gap-3 px-4 py-2 text-xs">
               <span className="flex min-w-0 items-center gap-2">
-                <Badge tone={s.kind === "work" ? "accent" : "danger"}>{s.kind}</Badge>
-                <span className="truncate text-muted-foreground">{s.task || "—"}</span>
+                {s.kind === "work" ? (
+                  <span
+                    className="inline-flex max-w-[11rem] items-center gap-1.5 truncate rounded-sm border border-border/60 px-1.5 py-0.5 text-[10px] font-medium"
+                    style={{
+                      backgroundColor: taskColor(s.task).fill,
+                      boxShadow: `inset 3px 0 0 ${taskColor(s.task).solid}`,
+                    }}
+                  >
+                    {s.task || "work"}
+                  </span>
+                ) : (
+                  <Badge tone="danger">garbage</Badge>
+                )}
               </span>
               <span className="flex shrink-0 items-center gap-2">
                 <span className="font-mono text-[11px] text-muted-foreground">
