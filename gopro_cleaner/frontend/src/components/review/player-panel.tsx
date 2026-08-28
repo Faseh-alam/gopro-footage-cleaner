@@ -407,59 +407,6 @@ export function PlayerPanel({
           pick a task and press Enter
         </p>
       )}
-
-      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-2">
-        <span className="eyebrow">All segments</span>
-        <span className="font-mono text-[10px] text-muted-foreground">
-          {segments.length ? `${segments.length} · latest first` : "none yet"}
-        </span>
-      </div>
-      <ul className="max-h-52 min-h-0 flex-1 divide-y divide-border overflow-auto">
-        {segments.length === 0 && (
-          <li className="px-4 py-6 text-center text-xs text-muted-foreground">
-            No segments yet — press T to end a work segment, G to mark garbage.
-          </li>
-        )}
-        {[...segments].reverse().map((s, revI) => {
-          const i = segments.length - 1 - revI;
-          return (
-            <li
-              key={s.id || i}
-              className="flex items-center justify-between gap-3 px-4 py-2 text-xs"
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                {s.kind === "work" ? (
-                  <span
-                    className="inline-flex max-w-[11rem] items-center gap-1.5 truncate rounded-sm border border-border/60 px-1.5 py-0.5 text-[10px] font-medium"
-                    style={{
-                      backgroundColor: taskColor(s.task).fill,
-                      boxShadow: `inset 3px 0 0 ${taskColor(s.task).solid}`,
-                    }}
-                  >
-                    {s.task || "work"}
-                  </span>
-                ) : (
-                  <Badge tone="danger">garbage</Badge>
-                )}
-              </span>
-              <span className="flex shrink-0 items-center gap-2">
-                <span className="font-mono text-[11px] text-muted-foreground">
-                  {c.formatTime(s.start)} → {c.formatTime(s.end)}
-                </span>
-                <button
-                  type="button"
-                  title="Delete this segment and everything after it"
-                  aria-label={`Delete segment ${i + 1}`}
-                  onClick={() => c.deleteSegmentAt(i)}
-                  className="grid size-6 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
-                >
-                  <X className="size-3.5" strokeWidth={2} />
-                </button>
-              </span>
-            </li>
-          );
-        })}
-      </ul>
     </section>
   );
 }
