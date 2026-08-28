@@ -1,8 +1,5 @@
 {
   "version": 2,
-  "tasks": [
-    "grabbing cloth",
-    "opening cloth"
-  ],
+  "tasks": [],
   "profile": "scaleai"
 }

@@ -132,9 +132,11 @@ def _read_tasks_unlocked(path: Path) -> list[str]:
     Default profile falls back to the bundled textile list when missing/empty.
     """
     allow_empty = _profile == "scaleai" or path == SCALEAI_TASKS_FILE
+    # ScaleAI subtask names live in each task folder's manifest.json.
+    # Never seed the review list from leftover global names.
+    if allow_empty:
+        return []
     if not path.exists():
-        if allow_empty:
-            return []
         return bundled_tasks()
 
     try:

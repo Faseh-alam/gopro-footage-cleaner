@@ -344,6 +344,9 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         # Auto-fallback: if the HW encoder failed mid-run, retry once with libx264.
         joined = " ".join(command)
         if any(hw in joined for hw in ("nvenc", "qsv", "amf")):
+            with _lock:
+                if _jobs.get(job_key, {}).get("status") != "running":
+                    raise RuntimeError("preview cancelled")
             _clear_dir_contents(dest_dir)
             soft = [
                 ffmpeg_bin(),
@@ -367,11 +370,46 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
                 "0",
                 *_hls_output_args(dest_dir),
             ]
-            retry = subprocess.run(soft, capture_output=True, text=True, check=False)
+            # Popen so cancel_preview can stop a software retry. subprocess.run
+            # ignored cancel and held the shared encode slot for hours.
+            retry = subprocess.Popen(
+                soft,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                **popen_kwargs,
+            )
+            process_holder.clear()
+            process_holder.append(retry)
+            with _lock:
+                if job_key in _jobs:
+                    _jobs[job_key]["process"] = retry
+            while True:
+                with _lock:
+                    job = _jobs.get(job_key)
+                    if not job or job.get("status") != "running":
+                        try:
+                            retry.terminate()
+                            retry.wait(timeout=2)
+                        except (OSError, subprocess.TimeoutExpired):
+                            try:
+                                retry.kill()
+                            except OSError:
+                                pass
+                        raise RuntimeError("preview cancelled")
+                retry_code = retry.poll()
+                if retry_code is not None:
+                    break
+                time.sleep(0.4)
+            retry_err = ""
+            try:
+                retry_err = (retry.stderr.read() if retry.stderr else "") or ""
+            except OSError:
+                retry_err = ""
             segments, finished = _playlist_state(dest_dir / _PLAYLIST_NAME)
             if retry.returncode == 0 and segments > 0 and finished:
                 return
-            err = (retry.stderr or err or "").strip()
+            err = (retry_err or err or "").strip()
         raise RuntimeError(err.strip() or "ffmpeg failed while building preview")
 
 
@@ -458,6 +496,20 @@ def _public_job(job: dict, extra: dict | None = None) -> dict:
     return out
 
 
+def _encoder_is_writing(job: dict | None) -> bool:
+    """True when ffmpeg is actually producing segments for this job.
+
+    A queued job can sit on leftover segments from a cancelled build. Those
+    files are deleted as soon as the worker acquires the encode slot, so the
+    player must not attach them as if they were a live preview.
+    """
+    return bool(job) and job.get("status") == "running" and job.get("process") is not None
+
+
+def _live_preview_playable(job: dict | None, segments: int) -> bool:
+    return segments >= _MIN_PLAYABLE_SEGMENTS and _encoder_is_writing(job)
+
+
 def preview_status(source: Path, *, start: bool = False, preempt: bool = False) -> dict:
     source = source.expanduser().resolve()
     if not source.exists():
@@ -500,7 +552,7 @@ def preview_status(source: Path, *, start: bool = False, preempt: bool = False) 
                         "source_bytes": size,
                         "hls": hls_url,
                         "segments": segments,
-                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                        "playable": _live_preview_playable(job, segments),
                     },
                 )
         if job and job.get("status") in {"error", "cancelled"}:
@@ -518,7 +570,7 @@ def preview_status(source: Path, *, start: bool = False, preempt: bool = False) 
                         "source_bytes": size,
                         "hls": hls_url,
                         "segments": segments,
-                        "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                        "playable": _live_preview_playable(job, segments),
                     },
                 )
 
@@ -534,7 +586,7 @@ def preview_status(source: Path, *, start: bool = False, preempt: bool = False) 
                     "source_bytes": size,
                     "hls": hls_url,
                     "segments": segments,
-                    "playable": segments >= _MIN_PLAYABLE_SEGMENTS,
+                    "playable": _live_preview_playable(existing, segments),
                 },
             )
         _jobs[key] = {

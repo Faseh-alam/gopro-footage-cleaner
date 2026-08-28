@@ -1087,14 +1087,16 @@ export function useReviewController() {
   const startCompatiblePreview = useCallback(
     (path: string, token: number, startAt: number) => {
       if (!path || token !== previewTokenRef.current) return;
-      if (compatiblePreviewPathRef.current === path) return;
+      // Skip only when HLS is already attached for this clip. A no-op here after
+      // a later swap to the HEVC original leaves a black player with a moving clock.
+      if (compatiblePreviewPathRef.current === path && hlsRef.current) return;
       stopCompatiblePreview();
       compatiblePreviewPathRef.current = path;
       setLoadingVideo(true);
       setPreviewNote("Preparing browser-compatible preview…");
       setStatus("This video uses HEVC. Preparing a browser-compatible preview…");
 
-      const attach = (url: string) => {
+      const attach = (url: string, availableSeconds = 0) => {
         const v = videoRef.current;
         if (!v || token !== previewTokenRef.current || !url) return;
         if (!Hls.isSupported()) {
@@ -1107,10 +1109,20 @@ export function useReviewController() {
           compatiblePreviewPollRef.current = null;
         }
         hlsRef.current?.destroy();
+        // Seeking to the live edge of a still-building playlist paints black
+        // (last fragment is incomplete). Stay a few seconds behind until ready.
+        const livePad = 2.5;
+        let seekTo = startAt;
+        if (availableSeconds > 0 && startAt > Math.max(0, availableSeconds - livePad)) {
+          seekTo = 0;
+          resumeTargetRef.current = 0;
+          resumeHoldUntilRef.current = 0;
+        }
         const hls = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
           backBufferLength: 30,
+          startPosition: seekTo > 0.05 ? seekTo : -1,
         });
         hlsRef.current = hls;
         activeSourceRef.current = "preview";
@@ -1122,7 +1134,7 @@ export function useReviewController() {
           setPreviewNote("Compatible 720p preview");
           setStatus(`Ready — ${mediaBasename(path)} · compatible 720p preview`, "ok");
           try {
-            if (startAt > 0.05) v.currentTime = startAt;
+            if (seekTo > 0.05) v.currentTime = seekTo;
           } catch {
             /* ignore */
           }
@@ -1130,6 +1142,17 @@ export function useReviewController() {
           // A muted autoplay also forces Chromium to decode and paint the first
           // MSE frame; otherwise some Windows builds leave a valid HLS stream black.
           void safePlay();
+          window.setTimeout(() => {
+            if (token !== previewTokenRef.current) return;
+            const el = videoRef.current;
+            if (!el || el.videoWidth > 0) return;
+            try {
+              hls.recoverMediaError();
+            } catch {
+              /* ignore */
+            }
+            void safePlay();
+          }, 800);
         });
         hls.on(Hls.Events.ERROR, (_event, data) => {
           if (!data.fatal || token !== previewTokenRef.current) return;
@@ -1151,7 +1174,7 @@ export function useReviewController() {
           );
           if (token !== previewTokenRef.current) return;
           if (st?.playable && st?.hls) {
-            attach(String(st.hls));
+            attach(String(st.hls), Number(st.segments) || 0);
             return;
           }
           if (st?.status === "error" || st?.status === "skipped") {
@@ -1219,6 +1242,9 @@ export function useReviewController() {
     (path: string, token: number, url: string, kind: string, cached?: boolean) => {
       const v = videoRef.current;
       if (!v || token !== previewTokenRef.current || !url) return;
+      // ScaleAI delivery is HEVC. Chrome will advance currentTime on the
+      // original MP4 without painting frames — never leave the H.264 preview.
+      if (stateRef.current.scaleAiMode || activeSourceRef.current === "preview") return;
       const absolute = url.startsWith("http") ? url : host + url;
       if (mediaUrlRef.current === absolute) return;
 
@@ -1473,9 +1499,11 @@ export function useReviewController() {
       } catch {
         /* ignore */
       }
-      if (stateRef.current.scaleAiMode) {
+      const scaleAi = Boolean(stateRef.current.scaleAiMode);
+      if (scaleAi) {
         // ScaleAI delivery footage may be HEVC. Use the browser-compatible
         // source directly so Chromium never gets stuck on an undecodable MP4.
+        v.removeEventListener("loadedmetadata", onMeta);
         v.pause();
         v.removeAttribute("src");
         v.load();
@@ -1517,7 +1545,7 @@ export function useReviewController() {
       const startAt = targetResume();
       resumeTargetRef.current = startAt;
       setScrubTime(startAt);
-      applyResumeSeek(startAt);
+      if (!scaleAi) applyResumeSeek(startAt);
       setTaskSelectionMode(
         stateRef.current.scaleAiMode
           ? Boolean(stateRef.current.scaleAiPending)
@@ -1529,9 +1557,10 @@ export function useReviewController() {
       }
 
       // Upgrade to the SSD copy if one is still landing, and keep the next
-      // couple of clips warm so N never waits.
-      if (!fast?.ready) pollFastReady(video.path, token);
-      warmFastSources(i, undefined, 3);
+      // couple of clips warm so N never waits. ScaleAI stays on the H.264
+      // preview — swapping to the original HEVC paints a black moving clock.
+      if (!scaleAi && !fast?.ready) pollFastReady(video.path, token);
+      if (!scaleAi) warmFastSources(i, undefined, 3);
     },
     [
       attachFastMedia,
@@ -2419,7 +2448,9 @@ export function useReviewController() {
   // ---------------------------------------------------------------------
   const loadTasks = useCallback(async () => {
     const data = await api("/api/eager/tasks");
-    setTasks(data.tasks || []);
+    // ScaleAI subtask names come from this folder's manifest.json, not the
+    // leftover global scaleai_tasks.json list.
+    setTasks(data.profile === "scaleai" ? [] : data.tasks || []);
     setDefaultTasks(data.default_tasks || []);
     if (data.profile === "scaleai") {
       setScaleAiModeState(true);
@@ -2449,7 +2480,7 @@ export function useReviewController() {
           method: "POST",
           body: JSON.stringify({ profile: on ? "scaleai" : "default" }),
         });
-        setTasks(data.tasks || []);
+        setTasks(on ? [] : data.tasks || []);
         setDefaultTasks(data.default_tasks || []);
         setSelectedTaskValue("");
         if (on) {
@@ -2474,6 +2505,9 @@ export function useReviewController() {
     (name: string) => {
       const key = name.trim().toLowerCase();
       if (!key) return false;
+      // ScaleAI names come from the current task folder; do not treat leftover
+      // global names as a deletable shared list.
+      if (stateRef.current.scaleAiMode) return false;
       return !defaultTasks.some((t) => t.toLowerCase() === key);
     },
     [defaultTasks],
@@ -2511,7 +2545,9 @@ export function useReviewController() {
             label_root: stateRef.current.labelRoot || stateRef.current.scanRoot || scanTargetPath(),
           }),
         });
-        setTasks(data.tasks || []);
+        if (!stateRef.current.scaleAiMode) {
+          setTasks(data.tasks || []);
+        }
         setDefaultTasks(data.default_tasks || defaultTasks);
         const video = currentVideo();
         if (stateRef.current.scaleAiMode && video) {
@@ -2548,15 +2584,15 @@ export function useReviewController() {
         return;
       }
       try {
-        const data = await api("/api/eager/tasks", {
-          method: "DELETE",
-          body: JSON.stringify({ name: trimmed }),
-        });
-        setTasks(data.tasks || []);
-        setDefaultTasks(data.default_tasks || defaultTasks);
-        const video = currentVideo();
-        if (stateRef.current.scaleAiMode && video) {
-          /* ScaleAI labels are per parent-task under _labeling/; global remove still updates UI list. */
+        if (stateRef.current.scaleAiMode) {
+          setTasks((prev) => prev.filter((t) => t.toLowerCase() !== trimmed.toLowerCase()));
+        } else {
+          const data = await api("/api/eager/tasks", {
+            method: "DELETE",
+            body: JSON.stringify({ name: trimmed }),
+          });
+          setTasks(data.tasks || []);
+          setDefaultTasks(data.default_tasks || defaultTasks);
         }
         if (stateRef.current.selectedTaskValue.toLowerCase() === trimmed.toLowerCase()) {
           setSelectedTaskValue("");
@@ -2912,7 +2948,7 @@ export function useReviewController() {
               method: "POST",
               body: JSON.stringify({ profile: "scaleai" }),
             });
-            setTasks(data.tasks || []);
+            setTasks([]);
             setDefaultTasks(data.default_tasks || []);
           } catch {
             /* ignore */

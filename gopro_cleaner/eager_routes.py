@@ -1566,6 +1566,10 @@ def create_eager_blueprint() -> Blueprint:
                             "error": str(exc),
                         }
                     )
+            try:
+                fifty_hour_store.update_stitch_durations(source, results)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"manifest durations: {exc}")
         except FileNotFoundError:
             return jsonify({"error": f"Not found: {raw_path}"}), 404
         except Exception as exc:  # noqa: BLE001

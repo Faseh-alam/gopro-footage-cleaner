@@ -124,8 +124,50 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertEqual(manifest.name, "manifest.json")
         self.assertEqual(manifest_data["subtasks"][0]["id"], "001")
         self.assertEqual(manifest_data["subtasks"][0]["total_clips"], 1)
+        self.assertAlmostEqual(manifest_data["subtasks"][0]["duration_seconds"], 1.5)
+        self.assertAlmostEqual(manifest_data["total_duration_seconds"], 1.5)
         self.assertEqual(manifest_data["subtasks"][0]["clips"][0]["filename"], name)
+        self.assertAlmostEqual(
+            manifest_data["subtasks"][0]["clips"][0]["duration_seconds"], 1.5
+        )
         self.assertTrue(fifty_hour_store.is_export_path(sub / name, self.root))
+
+    def test_manifest_records_subtask_and_stitched_duration(self) -> None:
+        fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.5,
+            label="pick cloth",
+            root=self.root,
+        )
+        fifty_hour_store.add_segment(
+            self.video,
+            start=3.0,
+            end=4.0,
+            label="pick cloth",
+            root=self.root,
+        )
+        data = fifty_hour_store.load_manifest(self.task)
+        self.assertAlmostEqual(data["subtasks"][0]["duration_seconds"], 2.5)
+        self.assertAlmostEqual(data["total_duration_seconds"], 2.5)
+        folder = data["subtasks"][0]["folder"]
+        stitched = self.task / folder / f"{folder}-stitched.mp4"
+        stitched.parent.mkdir(parents=True, exist_ok=True)
+        stitched.write_bytes(b"stitched")
+        updated = fifty_hour_store.update_stitch_durations(
+            self.video,
+            [
+                {
+                    "ok": True,
+                    "task": "pick cloth",
+                    "output": str(stitched),
+                    "duration": 2.4,
+                }
+            ],
+        )
+        self.assertEqual(updated["subtasks"][0]["stitched_filename"], stitched.name)
+        self.assertAlmostEqual(updated["subtasks"][0]["stitched_duration_seconds"], 2.4)
+        self.assertAlmostEqual(updated["total_stitched_duration_seconds"], 2.4)
 
     def test_scan_skips_generated_clip_in_subtask_folder(self) -> None:
         clip = self.task / "pick-cloth-001" / "CAM001-001-001.mp4"

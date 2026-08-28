@@ -179,11 +179,13 @@ function ReviewPage() {
       const target = event.target;
       const inTaskSearch = target === c.taskSearchRef.current;
 
+      // T is a shortcut only outside the name box. Inside it, T is just a letter
+      // so names like "taking cloth" can be typed after marking a segment.
       if (
         event.key.toLowerCase() === "t" &&
         c.scaleAiMode &&
         c.scaleAiPending &&
-        (!inTaskSearch || !c.taskSearch.trim())
+        !inTaskSearch
       ) {
         event.preventDefault();
         event.stopImmediatePropagation();

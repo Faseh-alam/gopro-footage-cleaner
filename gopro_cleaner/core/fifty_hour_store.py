@@ -479,9 +479,7 @@ def add_segment(
         if seg_type == "subtask":
             add_label(root, annotation["parent_task"], clean_label)
         refresh_progress(Path(root))
-    elif seg_type == "subtask":
-        # Still try to update vocab when root unknown (parent folder of parent task).
-        pass
+    refresh_manifest_durations(task_directory(source))
     return annotation
 
 
@@ -502,6 +500,7 @@ def delete_segment(video: Path, segment_id: str | int, *, root: Path | None = No
         save_annotation(source, annotation, root=root)
     if root is not None:
         refresh_progress(Path(root))
+    refresh_manifest_durations(task_directory(source))
     return annotation
 
 
@@ -567,6 +566,7 @@ def update_segment(
         if new_type == "subtask":
             add_label(root, annotation["parent_task"], new_label)
         refresh_progress(Path(root))
+    refresh_manifest_durations(task_directory(source))
     return annotation
 
 
@@ -583,6 +583,7 @@ def undo_last_segment(video: Path, *, root: Path | None = None) -> dict:
         save_annotation(source, annotation, root=root)
     if root is not None:
         refresh_progress(Path(root))
+    refresh_manifest_durations(task_directory(source))
     return annotation
 
 
@@ -717,7 +718,23 @@ def _task_dir_for_name(root: Path, parent_task: str) -> Path | None:
 
 
 def _empty_manifest() -> dict:
-    return {"version": VERSION, "subtasks": [], "updated_at": _now_iso()}
+    return {
+        "version": VERSION,
+        "subtasks": [],
+        "total_duration_seconds": 0.0,
+        "total_stitched_duration_seconds": 0.0,
+        "updated_at": _now_iso(),
+    }
+
+
+def _as_seconds(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return round(number, 3)
 
 
 def subtask_folder_name(name: str, subtask_id: str) -> str:
@@ -740,28 +757,63 @@ def _normalize_manifest(raw: dict | None) -> dict:
         subtask_id = raw_id.zfill(3) if raw_id.isdigit() else f"{index:03d}"
         while subtask_id in used_ids:
             subtask_id = f"{int(subtask_id) + 1:03d}"
-        clips = [
-            dict(clip)
-            for clip in item.get("clips") or []
-            if isinstance(clip, dict) and str(clip.get("filename") or "").strip()
-        ]
-        clips.sort(key=lambda clip: int(clip.get("video_serial") or 0))
-        subtasks.append(
-            {
-                "id": subtask_id,
-                "name": name,
-                "folder": str(
-                    item.get("folder") or subtask_folder_name(name, subtask_id)
-                ),
-                "total_clips": len(clips),
-                "clips": clips,
+        clips = []
+        for clip in item.get("clips") or []:
+            if not isinstance(clip, dict):
+                continue
+            filename = str(clip.get("filename") or "").strip()
+            if not filename:
+                continue
+            row = {
+                "camera_serial": str(clip.get("camera_serial") or "UNKNOWN"),
+                "video_serial": int(clip.get("video_serial") or 0),
+                "filename": filename,
+                "source_video": str(clip.get("source_video") or ""),
             }
+            duration = _as_seconds(clip.get("duration_seconds", clip.get("duration")))
+            if duration is not None:
+                row["duration_seconds"] = duration
+            start = _as_seconds(clip.get("source_start"))
+            end = _as_seconds(clip.get("source_end"))
+            if start is not None:
+                row["source_start"] = start
+            if end is not None:
+                row["source_end"] = end
+            clips.append(row)
+        clips.sort(key=lambda clip: int(clip.get("video_serial") or 0))
+        clip_seconds = sum(float(clip.get("duration_seconds") or 0.0) for clip in clips)
+        duration_seconds = _as_seconds(item.get("duration_seconds", item.get("duration")))
+        if duration_seconds is None:
+            duration_seconds = round(clip_seconds, 3)
+        stitched_duration = _as_seconds(
+            item.get("stitched_duration_seconds", item.get("stitched_duration"))
         )
+        subtask = {
+            "id": subtask_id,
+            "name": name,
+            "folder": str(item.get("folder") or subtask_folder_name(name, subtask_id)),
+            "total_clips": len(clips),
+            "duration_seconds": duration_seconds,
+            "clips": clips,
+        }
+        stitched_name = str(item.get("stitched_filename") or "").strip()
+        if stitched_name:
+            subtask["stitched_filename"] = stitched_name
+        if stitched_duration is not None:
+            subtask["stitched_duration_seconds"] = stitched_duration
+        subtasks.append(subtask)
         seen_names.add(name.lower())
         used_ids.add(subtask_id)
+    total_duration = round(sum(float(row.get("duration_seconds") or 0.0) for row in subtasks), 3)
+    total_stitched = round(
+        sum(float(row.get("stitched_duration_seconds") or 0.0) for row in subtasks),
+        3,
+    )
     return {
         "version": VERSION,
         "subtasks": subtasks,
+        "total_duration_seconds": total_duration,
+        "total_stitched_duration_seconds": total_stitched,
         "updated_at": str((raw or {}).get("updated_at") or _now_iso()),
     }
 
@@ -844,6 +896,123 @@ def _migrate_clip_layout(task_dir: Path, manifest: dict) -> bool:
     return changed
 
 
+def _labeled_seconds_by_subtask(task_dir: Path) -> dict[str, float]:
+    """Sum labeled subtask time from segment.json."""
+    path = Path(task_dir) / SEGMENT_FILE
+    totals: dict[str, float] = {}
+    if not path.is_file():
+        return totals
+    try:
+        doc = _read_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return totals
+    videos = doc.get("videos") if isinstance(doc, dict) else None
+    if not isinstance(videos, list):
+        return totals
+    for video in videos:
+        if not isinstance(video, dict):
+            continue
+        for segment in video.get("segments") or []:
+            if not isinstance(segment, dict):
+                continue
+            if str(segment.get("type") or "").lower() != "subtask":
+                continue
+            label = str(segment.get("label") or "").strip().lower()
+            if not label:
+                continue
+            seconds = _as_seconds(segment.get("duration"))
+            if seconds is None:
+                start = _as_seconds(segment.get("start"))
+                end = _as_seconds(segment.get("end"))
+                if start is None or end is None or end <= start:
+                    continue
+                seconds = round(end - start, 3)
+            totals[label] = round(totals.get(label, 0.0) + seconds, 3)
+    return totals
+
+
+def _stitched_path(task_dir: Path, subtask: dict) -> Path:
+    folder = str(subtask.get("folder") or subtask_folder_name(subtask["name"], subtask["id"]))
+    stored = str(subtask.get("stitched_filename") or "").strip()
+    if stored:
+        nested = Path(task_dir) / folder / stored
+        if nested.is_file():
+            return nested
+        loose = Path(task_dir) / stored
+        if loose.is_file():
+            return loose
+    return Path(task_dir) / folder / f"{folder}-stitched.mp4"
+
+
+def _attach_manifest_durations(task_dir: Path, manifest: dict) -> dict:
+    labeled = _labeled_seconds_by_subtask(task_dir)
+    for subtask in manifest.get("subtasks") or []:
+        clip_seconds = round(
+            sum(float(clip.get("duration_seconds") or 0.0) for clip in subtask.get("clips") or []),
+            3,
+        )
+        labeled_seconds = labeled.get(str(subtask.get("name") or "").lower())
+        subtask["duration_seconds"] = (
+            labeled_seconds if labeled_seconds is not None else clip_seconds
+        )
+        stitched = _stitched_path(task_dir, subtask)
+        if stitched.is_file():
+            subtask["stitched_filename"] = stitched.name
+            stored = _as_seconds(subtask.get("stitched_duration_seconds"))
+            if stored is None:
+                stored = _as_seconds(resolve_media_duration(stitched))
+            if stored is not None:
+                subtask["stitched_duration_seconds"] = stored
+        elif "stitched_duration_seconds" in subtask and not stitched.is_file():
+            subtask.pop("stitched_duration_seconds", None)
+            subtask.pop("stitched_filename", None)
+    manifest["total_duration_seconds"] = round(
+        sum(float(row.get("duration_seconds") or 0.0) for row in manifest.get("subtasks") or []),
+        3,
+    )
+    manifest["total_stitched_duration_seconds"] = round(
+        sum(
+            float(row.get("stitched_duration_seconds") or 0.0)
+            for row in manifest.get("subtasks") or []
+        ),
+        3,
+    )
+    return manifest
+
+
+def update_stitch_durations(source: Path, results: list[dict]) -> dict:
+    """Record stitched-file duration for each subtask after a stitch run."""
+    task_dir = export_directory(source)
+    manifest = load_manifest(task_dir)
+    by_name = {
+        str(row.get("name") or "").strip().lower(): row for row in manifest["subtasks"]
+    }
+    for result in results:
+        if not result.get("ok"):
+            continue
+        row = by_name.get(str(result.get("task") or "").strip().lower())
+        if row is None:
+            continue
+        output = result.get("output")
+        if output:
+            path = Path(str(output))
+            row["stitched_filename"] = path.name
+            row["folder"] = row.get("folder") or path.parent.name
+        duration = _as_seconds(result.get("duration"))
+        if duration is None and output:
+            duration = _as_seconds(resolve_media_duration(Path(str(output))))
+        if duration is not None:
+            row["stitched_duration_seconds"] = duration
+    return _save_manifest(task_dir, manifest)
+
+
+def refresh_manifest_durations(task_dir: Path) -> dict:
+    path = Path(task_dir)
+    if not (path / MANIFEST_FILE).is_file():
+        return _empty_manifest()
+    return _save_manifest(path, load_manifest(path))
+
+
 def load_manifest(path: Path) -> dict:
     manifest_path = Path(path)
     if manifest_path.is_dir():
@@ -855,7 +1024,13 @@ def load_manifest(path: Path) -> dict:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return _empty_manifest()
     manifest = _normalize_manifest(raw if isinstance(raw, dict) else None)
-    if _migrate_clip_layout(manifest_path.parent, manifest):
+    task_dir = manifest_path.parent
+    changed = _migrate_clip_layout(task_dir, manifest)
+    _attach_manifest_durations(task_dir, manifest)
+    raw_missing_durations = not (
+        isinstance(raw, dict) and "total_duration_seconds" in raw
+    )
+    if changed or raw_missing_durations:
         manifest["updated_at"] = _now_iso()
         _atomic_write(manifest_path, manifest)
     return manifest
@@ -864,6 +1039,7 @@ def load_manifest(path: Path) -> dict:
 def _save_manifest(task_dir: Path, manifest: dict) -> dict:
     normalized = _normalize_manifest(manifest)
     normalized["updated_at"] = _now_iso()
+    _attach_manifest_durations(task_dir, normalized)
     for subtask in normalized["subtasks"]:
         (Path(task_dir) / subtask["folder"]).mkdir(parents=True, exist_ok=True)
     _atomic_write(Path(task_dir) / MANIFEST_FILE, normalized)
@@ -1177,6 +1353,15 @@ def write_export_manifest(source: Path, rows: list[dict]) -> Path:
             "filename": filename,
             "source_video": str(row.get("source_video") or ""),
         }
+        duration = _as_seconds(row.get("duration_seconds", row.get("duration")))
+        if duration is not None:
+            clip["duration_seconds"] = duration
+        start = _as_seconds(row.get("source_start"))
+        end = _as_seconds(row.get("source_end"))
+        if start is not None:
+            clip["source_start"] = start
+        if end is not None:
+            clip["source_end"] = end
         by_name = {
             str(existing.get("filename") or ""): existing
             for existing in subtask.get("clips") or []
