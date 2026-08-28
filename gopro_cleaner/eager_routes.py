@@ -694,9 +694,9 @@ def create_eager_blueprint() -> Blueprint:
 
             sidecar = annotation_store.sidecar_path_for(source)
             text_sidecar = sidecar.with_suffix("").with_suffix(".segments.txt")
-            fifty_sidecar = fifty_hour_store.sidecar_path_for(source)
             legacy_scaleai = source.with_name(f"{source.stem}.scaleai.json")
-            for companion in (sidecar, text_sidecar, fifty_sidecar, legacy_scaleai):
+            fifty_hour_store.remove_video_annotation(source)
+            for companion in (sidecar, text_sidecar, legacy_scaleai):
                 if companion.is_file():
                     move_to_trash(companion)
 
@@ -1303,6 +1303,26 @@ def create_eager_blueprint() -> Blueprint:
             end = float(segment["end"])
             label = str(segment["label"]).strip()
             output_dir = fifty_hour_store.subtask_export_directory(source, label)
+            recorded_name = str(segment.get("clip_filename") or "").strip()
+            recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
+            if recorded_match and (output_dir / recorded_name).is_file():
+                skipped += 1
+                segment["clip_path"] = f"{output_dir.name}/{recorded_name}"
+                reserved_names.setdefault(str(output_dir), set()).add(recorded_name)
+                manifest_rows.append(
+                    {
+                        "clip_filename": recorded_name,
+                        "source_video": annotation.get("source_video") or source.name,
+                        "parent_task": annotation.get("parent_task") or "",
+                        "subtask": label,
+                        "source_start": f"{start:.3f}",
+                        "source_end": f"{end:.3f}",
+                        "duration": f"{(end - start):.3f}",
+                        "camera_serial": annotation.get("camera_serial") or "",
+                        "cl_number": annotation.get("cl_number") or "",
+                    }
+                )
+                continue
             equivalent = next(
                 (
                     record
@@ -1322,6 +1342,17 @@ def create_eager_blueprint() -> Blueprint:
             if equivalent and equivalent.output:
                 skipped += 1
                 out_name = Path(equivalent.output).name
+                clip_match = fifty_hour_store.CLIP_NAME_RE.match(out_name)
+                if clip_match:
+                    segment.update(
+                        {
+                            "subtask_id": clip_match.group("subtask"),
+                            "clip_serial": int(clip_match.group("clip")),
+                            "clip_filename": out_name,
+                            "clip_path": f"{output_dir.name}/{out_name}",
+                            "camera_serial": annotation.get("camera_serial"),
+                        }
+                    )
                 reserved_names.setdefault(str(output_dir), set()).add(out_name)
                 manifest_rows.append(
                     {
@@ -1340,10 +1371,34 @@ def create_eager_blueprint() -> Blueprint:
             try:
                 dir_key = str(output_dir)
                 claimed = reserved_names.setdefault(dir_key, set())
-                filename = fifty_hour_store.next_clip_filename(
-                    source, label, output_dir, reserved=claimed
-                )
+                recorded_name = str(segment.get("clip_filename") or "").strip()
+                recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
+                if (
+                    recorded_match
+                    and not (output_dir / recorded_name).exists()
+                    and recorded_name.lower() not in {
+                        reserved_name.lower() for reserved_name in claimed
+                    }
+                ):
+                    # Rebuild a missing trim using the same serial already stored
+                    # in segment.json/manifest.json.
+                    filename = recorded_name
+                else:
+                    filename = fifty_hour_store.next_clip_filename(
+                        source, label, output_dir, reserved=claimed
+                    )
                 claimed.add(filename)
+                clip_match = fifty_hour_store.CLIP_NAME_RE.match(filename)
+                if clip_match:
+                    segment.update(
+                        {
+                            "subtask_id": clip_match.group("subtask"),
+                            "clip_serial": int(clip_match.group("clip")),
+                            "clip_filename": filename,
+                            "clip_path": f"{output_dir.name}/{filename}",
+                            "camera_serial": annotation.get("camera_serial"),
+                        }
+                    )
                 record = eager_trim_queue.submit(
                     source,
                     start,
@@ -1376,6 +1431,7 @@ def create_eager_blueprint() -> Blueprint:
         manifest_path = None
         if manifest_rows:
             try:
+                fifty_hour_store.save_annotation(source, annotation, root=root)
                 manifest_path = str(
                     fifty_hour_store.write_export_manifest(source, manifest_rows)
                 )
@@ -1393,7 +1449,7 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.post("/api/eager/scaleai/process-video")
     def eager_scaleai_process_video():
-        """Trim labeled subtasks for one video into VIDEO_STEM/subtask/clips."""
+        """Trim labeled subtasks into the source video's main-task folder."""
         payload = request.get_json(silent=True) or {}
         raw_path = str(payload.get("path") or "").strip()
         raw_root = str(payload.get("root") or "").strip()
@@ -1420,18 +1476,14 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.post("/api/eager/scaleai/process-folder")
     def eager_scaleai_process_folder():
-        """Queue exports for every VIDEO.json under a 50-hour root."""
+        """Queue exports for every source listed in task-level segment.json files."""
         payload = request.get_json(silent=True) or {}
         raw_root = str(payload.get("root") or payload.get("path") or "").strip()
         if not raw_root:
             return jsonify({"error": "root is required"}), 400
         try:
             root = normalize_path(raw_root)
-            sources = [
-                source
-                for sidecar in fifty_hour_store.iter_sidecars(root)
-                if (source := fifty_hour_store.source_for_sidecar(sidecar)) is not None
-            ]
+            sources = fifty_hour_store.annotated_sources(root)
             results = [_queue_fifty_source(source, root) for source in sources]
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
@@ -1458,7 +1510,7 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.post("/api/eager/scaleai/stitch-video")
     def eager_scaleai_stitch_video():
-        """Stitch every subtask folder under ``<VIDEO_STEM>/`` (GPMF stream-copy)."""
+        """Create one stitched video per subtask across the whole main task."""
         payload = request.get_json(silent=True) or {}
         raw_path = str(payload.get("path") or "").strip()
         overwrite = bool(payload.get("overwrite", False))
@@ -1466,24 +1518,29 @@ def create_eager_blueprint() -> Blueprint:
             return jsonify({"error": "path is required"}), 400
         try:
             source = Path(raw_path).expanduser().resolve(strict=True)
-            task_dirs = fifty_hour_store.list_subtask_export_dirs(source)
-            if not task_dirs:
+            grouped_clips = fifty_hour_store.clips_by_subtask(source)
+            if not grouped_clips:
                 return jsonify(
                     {
                         "ok": False,
-                        "error": "No trimmed subtask clips found — Trim this video first",
+                        "error": "No trimmed subtask clips found — trim the task videos first",
                         "export_dir": str(fifty_hour_store.export_directory(source)),
                         "results": [],
                     }
                 ), 400
             results = []
             errors: list[str] = []
-            for task_dir in task_dirs:
+            for subtask, clips in grouped_clips:
+                task_name = str(subtask["name"])
+                subtask_dir = clips[0].parent
                 try:
                     result = stitch_task_clips(
-                        task_dir,
-                        task_name=task_dir.name,
+                        subtask_dir,
+                        task_name=task_name,
+                        clips=clips,
+                        output=subtask_dir / f"{subtask['folder']}-stitched.mp4",
                         overwrite=overwrite,
+                        write_manifest=False,
                     )
                     results.append(
                         {
@@ -1498,13 +1555,13 @@ def create_eager_blueprint() -> Blueprint:
                         }
                     )
                     if not result.ok:
-                        errors.append(f"{task_dir.name}: {result.error or result.message}")
+                        errors.append(f"{task_name}: {result.error or result.message}")
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{task_dir.name}: {exc}")
+                    errors.append(f"{task_name}: {exc}")
                     results.append(
                         {
                             "ok": False,
-                            "task": task_dir.name,
+                            "task": task_name,
                             "output": None,
                             "error": str(exc),
                         }
@@ -1525,7 +1582,7 @@ def create_eager_blueprint() -> Blueprint:
                 "errors": errors,
                 "results": results,
                 "message": (
-                    f"Stitched {ok_count}/{len(results)} subtask folder(s)"
+                    f"Created {ok_count}/{len(results)} subtask stitched video(s)"
                     + (" with GPMF preserved" if ok_count else "")
                 ),
             }

@@ -26,9 +26,9 @@ class FiftyHourStoreTests(unittest.TestCase):
             "garment-folding-general",
         )
 
-    def test_sidecar_is_stem_json(self) -> None:
+    def test_sidecar_is_task_level_segment_json(self) -> None:
         path = fifty_hour_store.sidecar_path_for(self.video)
-        self.assertEqual(path.name, "GX010001.json")
+        self.assertEqual(path, self.task / "segment.json")
 
     def test_add_subtask_and_garbage(self) -> None:
         ann = fifty_hour_store.add_segment(
@@ -78,21 +78,31 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertAlmostEqual(second["end"], 3.0, places=3)
 
     def test_export_paths_and_manifest(self) -> None:
+        ann = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.5,
+            label="pick cloth",
+            segment_type="subtask",
+            root=self.root,
+        )
+        ann["camera_serial"] = "CAM001"
+        fifty_hour_store.save_annotation(self.video, ann, root=self.root)
         export_dir = fifty_hour_store.export_directory(self.video)
         sub = fifty_hour_store.subtask_export_directory(self.video, "pick cloth")
-        self.assertEqual(export_dir.name, "GX010001")
-        self.assertEqual(sub.name, "pick-cloth")
-        sub.mkdir(parents=True)
+        self.assertEqual(export_dir, self.task)
+        self.assertEqual(sub, self.task / "pick-cloth-001")
+        sub.mkdir(parents=True, exist_ok=True)
         name = fifty_hour_store.next_clip_filename(self.video, "pick cloth", sub)
-        self.assertEqual(name, "0001.MP4")
+        self.assertEqual(name, "CAM001-001-001.mp4")
         (sub / name).write_bytes(b"clip")
         name2 = fifty_hour_store.next_clip_filename(self.video, "pick cloth", sub)
-        self.assertEqual(name2, "0002.MP4")
-        reserved = {"0001.MP4", "0002.MP4"}
+        self.assertEqual(name2, "CAM001-001-002.mp4")
+        reserved = {"CAM001-001-001.mp4", "CAM001-001-002.mp4"}
         name3 = fifty_hour_store.next_clip_filename(
             self.video, "pick cloth", sub, reserved=reserved
         )
-        self.assertEqual(name3, "0003.MP4")
+        self.assertEqual(name3, "CAM001-001-003.mp4")
         manifest = fifty_hour_store.write_export_manifest(
             self.video,
             [
@@ -100,7 +110,7 @@ class FiftyHourStoreTests(unittest.TestCase):
                     "clip_filename": name,
                     "source_video": "GX010001.MP4",
                     "parent_task": "garment-folding-general",
-                    "subtask": "pick-cloth",
+                    "subtask": "pick cloth",
                     "source_start": "1.000",
                     "source_end": "2.500",
                     "duration": "1.500",
@@ -110,18 +120,133 @@ class FiftyHourStoreTests(unittest.TestCase):
             ],
         )
         self.assertTrue(manifest.is_file())
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(manifest.name, "manifest.json")
+        self.assertEqual(manifest_data["subtasks"][0]["id"], "001")
+        self.assertEqual(manifest_data["subtasks"][0]["total_clips"], 1)
+        self.assertEqual(manifest_data["subtasks"][0]["clips"][0]["filename"], name)
         self.assertTrue(fifty_hour_store.is_export_path(sub / name, self.root))
 
-    def test_scan_skips_export_folder(self) -> None:
-        export = self.task / "GX010001" / "pick-cloth"
-        export.mkdir(parents=True)
-        clip = export / "GX010001_pick-cloth_0001.MP4"
+    def test_scan_skips_generated_clip_in_subtask_folder(self) -> None:
+        clip = self.task / "pick-cloth-001" / "CAM001-001-001.mp4"
+        clip.parent.mkdir()
         clip.write_bytes(b"clip")
-        (self.task / "GX010001" / "export_manifest.csv").write_text(
-            "clip_filename\n", encoding="utf-8"
-        )
         self.assertTrue(is_scaleai_source_footage(self.video, root=self.root))
         self.assertFalse(is_scaleai_source_footage(clip, root=self.root))
+
+    def test_first_video_defines_subtasks_for_later_videos(self) -> None:
+        second = self.task / "GX010002.MP4"
+        second.write_bytes(b"fake-mp4-2")
+        self.assertEqual(
+            fifty_hour_store.labels_for_task(self.root, "garment-folding-general"),
+            [],
+        )
+        fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="pick up box",
+            root=self.root,
+        )
+        self.assertEqual(
+            fifty_hour_store.labels_for_task(self.root, "garment-folding-general"),
+            ["pick up box"],
+        )
+        fifty_hour_store.add_segment(
+            second,
+            start=3.0,
+            end=4.0,
+            label="pick up box",
+            root=self.root,
+        )
+        segment_doc = json.loads(
+            (self.task / "segment.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [row["source_video"] for row in segment_doc["videos"]],
+            ["GX010001.MP4", "GX010002.MP4"],
+        )
+
+    def test_old_video_json_is_migrated_before_trim(self) -> None:
+        legacy = self.video.with_name("GX010001.json")
+        legacy.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_video": "GX010001.MP4",
+                    "source_path": "/old/computer/GX010001.MP4",
+                    "parent_task": "garment-folding-general",
+                    "camera_serial": "CAM001",
+                    "duration_seconds": 10.0,
+                    "segments": [
+                        {
+                            "id": 1,
+                            "start": 1.0,
+                            "end": 2.0,
+                            "type": "subtask",
+                            "label": "pick cloth",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        annotation = fifty_hour_store.load_annotation(self.video, root=self.root)
+
+        self.assertEqual(annotation["source_path"], str(self.video.resolve()))
+        self.assertTrue((self.task / "segment.json").is_file())
+        manifest = json.loads((self.task / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(row["id"], row["name"]) for row in manifest["subtasks"]],
+            [("001", "pick cloth")],
+        )
+        self.assertEqual(
+            fifty_hour_store.next_clip_filename(
+                self.video,
+                "pick cloth",
+                fifty_hour_store.subtask_export_directory(self.video, "pick cloth"),
+            ),
+            "CAM001-001-001.mp4",
+        )
+
+    def test_direct_source_clips_move_to_subtask_folder_with_camera_name(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="pick cloth",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "CAM001"
+        annotation["segments"][0]["clip_filename"] = "GX010001.001.001.mp4"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        old_clip = self.task / "GX010001.001.001.mp4"
+        old_clip.write_bytes(b"clip")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_clip.name,
+                    "source_video": self.video.name,
+                    "subtask": "pick cloth",
+                    "camera_serial": "CAM001",
+                }
+            ],
+        )
+
+        manifest = fifty_hour_store.load_manifest(self.task)
+
+        new_clip = self.task / "pick-cloth-001" / "CAM001-001-001.mp4"
+        self.assertTrue(new_clip.is_file())
+        self.assertFalse(old_clip.exists())
+        self.assertEqual(manifest["subtasks"][0]["clips"][0]["filename"], new_clip.name)
+        self.assertEqual(manifest["subtasks"][0]["clips"][0]["camera_serial"], "CAM001")
+        segment_doc = json.loads((self.task / "segment.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            segment_doc["videos"][0]["segments"][0]["clip_filename"],
+            new_clip.name,
+        )
 
 
 class FiftyHourScanSortTests(unittest.TestCase):

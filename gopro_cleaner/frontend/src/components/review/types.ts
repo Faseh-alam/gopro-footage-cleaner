@@ -30,6 +30,10 @@ export interface ScaleAiSegment {
   duration: number;
   type: "subtask" | "garbage" | string;
   label: string;
+  subtask_id?: string;
+  clip_serial?: number;
+  clip_filename?: string;
+  camera_serial?: string;
 }
 
 export interface ScaleAiAnnotation {

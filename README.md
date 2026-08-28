@@ -238,21 +238,39 @@ In the **task filter** field: ↑↓ move selection, **Enter** assign, **Esc** c
 
 ---
 
-### Folder layout after labeling
+### ScaleAI 50-hour folder layout
 
-Task names create folders **beside** your footage on the same drive:
+Each main-task folder shares one timestamp document and one subtask manifest.
+The subtasks defined while labeling the first video automatically appear for
+the later videos in the same task:
 
 ```text
-E:\
-  GH012330.MP4                 (whole file kept if fully useful)
-  GH012330-1.MP4               (trimmed clip)
-  forward-stitch\
-    GH012330-1.MP4             (moved when using label/move workflow)
-  picking\
-    GH012330-2.MP4
+50HoursVideos/
+  PackagingBoxes/
+    video1.mp4
+    video2.mp4
+    video3.mp4
+    segment.json
+    manifest.json
+    Picking-up-box-001/
+      CAM001-001-001.mp4
+      CAM001-001-002.mp4
+      Picking-up-box-001-stitched.mp4
+    Labeling-box-002/
+      CAM001-002-001.mp4
+      Labeling-box-002-stitched.mp4
 ```
 
-Sidecar annotation files live next to each video: `GX010001.segments.json`.
+`segment.json` contains each source video's metadata and timestamp segments.
+`manifest.json` contains only the stable subtask IDs and their generated clip
+records. Short clips use
+`CAMERA.SUBTASK_ID.CLIP_SERIAL` information with the filename form
+`CAMERA-SUBTASK_ID-CLIP_SERIAL.mp4`. Every subtask has a shared
+`SUBTASK_NAME-SUBTASK_ID` folder across all source videos, and its stitched
+output is written inside that folder.
+
+Normal (non-ScaleAI) review annotations continue to use adjacent
+`GX010001.segments.json` files.
 
 ---
 

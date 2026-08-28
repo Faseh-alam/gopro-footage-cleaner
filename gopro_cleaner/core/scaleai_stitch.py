@@ -212,6 +212,7 @@ def stitch_task_clips(
     output: Path | None = None,
     clips: list[Path] | None = None,
     overwrite: bool = False,
+    write_manifest: bool = True,
 ) -> StitchResult:
     """Concatenate all clips in a task folder into one MP4 with GPMF mapped."""
     with _lock:
@@ -314,8 +315,9 @@ def stitch_task_clips(
             "stitched_duration": trimmed.duration,
             "has_gpmf": trimmed.has_gpmf,
         }
-        manifest_path = plan.output.with_suffix(".manifest.json")
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if write_manifest:
+            manifest_path = plan.output.with_suffix(".manifest.json")
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         return StitchResult(
             ok=True,

@@ -179,7 +179,7 @@ export function ScaleAiPanel({
           Trim this video
         </Button>
         <Button size="sm" variant="outline" onClick={() => void c.stitchScaleAiVideo()}>
-          Stitch this video
+          Stitch each subtask
         </Button>
       </div>
       <div className="grid grid-cols-2 gap-2">

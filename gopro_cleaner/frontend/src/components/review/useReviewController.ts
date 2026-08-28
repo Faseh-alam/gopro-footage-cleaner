@@ -459,39 +459,45 @@ export function useReviewController() {
     [applyAnnotationPayload, setStatus],
   );
 
-  const applyScaleAiPayload = useCallback((path: string, data: any) => {
-    const annotation = data.annotation as ScaleAiAnnotation;
-    setScaleAiByPath((prev) => ({ ...prev, [path]: annotation }));
-    if (Array.isArray(data.labels)) {
-      const labels = data.labels.map((name: string) => String(name).trim()).filter(Boolean);
-      if (labels.length) {
-        setTasks((prev) => {
-          const seen = new Set(prev.map((t) => t.toLowerCase()));
-          const merged = [...prev];
-          for (const label of labels) {
-            if (!seen.has(label.toLowerCase())) {
-              merged.push(label);
-              seen.add(label.toLowerCase());
-            }
-          }
-          return merged;
-        });
+  const applyScaleAiPayload = useCallback(
+    (path: string, data: any) => {
+      const annotation = data.annotation as ScaleAiAnnotation;
+      setScaleAiByPath((prev) => ({ ...prev, [path]: annotation }));
+      if (Array.isArray(data.labels)) {
+        const labels = data.labels
+          .map((name: string) => String(name).trim())
+          .filter(Boolean);
+        // The first video starts with no predefined subtasks. Once its labels are
+        // saved in manifest.json, every later video in this main task gets exactly
+        // that same list (without leaking labels from another main task).
+        setTasks(labels);
+        const includesLabel = (value: string) =>
+          labels.some(
+            (label: string) =>
+              label.toLowerCase() === String(value || "").toLowerCase(),
+          );
+        if (!includesLabel(stateRef.current.selectedTaskValue))
+          setSelectedTaskValue("");
+        if (!includesLabel(stateRef.current.lastLabelTask)) setLastLabelTask("");
       }
-    }
-    if (data.progress) {
-      setScaleAiProgress(data.progress as ScaleAiProgress);
-      const parent = annotation?.parent_task;
-      const row = (data.progress.tasks || []).find((task: ScaleAiTaskProgress) => task.task === parent);
-      if (row?.complete && parent && !scaleAiGoalShown[parent]) {
-        setScaleAiGoalShown((prev) => ({ ...prev, [parent]: true }));
-        toast.success("GOAL COMPLETED", {
-          description: `${parent}\nTarget: ${(row.target_hours ?? 0).toFixed(2)}h\nLabeled: ${row.labeled_hours.toFixed(2)}h+`,
-          duration: 8000,
-        });
+      if (data.progress) {
+        setScaleAiProgress(data.progress as ScaleAiProgress);
+        const parent = annotation?.parent_task;
+        const row = (data.progress.tasks || []).find(
+          (task: ScaleAiTaskProgress) => task.task === parent,
+        );
+        if (row?.complete && parent && !scaleAiGoalShown[parent]) {
+          setScaleAiGoalShown((prev) => ({ ...prev, [parent]: true }));
+          toast.success("GOAL COMPLETED", {
+            description: `${parent}\nTarget: ${(row.target_hours ?? 0).toFixed(2)}h\nLabeled: ${row.labeled_hours.toFixed(2)}h+`,
+            duration: 8000,
+          });
+        }
       }
-    }
-    return annotation;
-  }, [scaleAiGoalShown]);
+      return annotation;
+    },
+    [scaleAiGoalShown],
+  );
 
   const loadScaleAiForPath = useCallback(
     async (path: string) => {
@@ -2630,7 +2636,7 @@ export function useReviewController() {
     await queueWorkSegments(paths, "across all videos");
   }, [queueWorkSegments]);
 
-  /** ScaleAI: trim current video into VIDEO_STEM/subtask/ clips. */
+  /** ScaleAI: trim current video into globally numbered clips in its main-task folder. */
   const processScaleAiVideo = useCallback(async () => {
     const current = currentVideo();
     if (!current) return;
@@ -2677,12 +2683,13 @@ export function useReviewController() {
   const stitchScaleAiVideo = useCallback(async () => {
     const current = currentVideo();
     if (!current) return;
-    setStatus(`Stitching subtask clips for ${current.name}…`);
+    setStatus(`Creating one stitched video per subtask for this main task…`);
     try {
       const data = await api("/api/eager/scaleai/stitch-video", {
         method: "POST",
         body: JSON.stringify({
           path: current.path,
+          root: stateRef.current.scanRoot || "",
           overwrite: true,
         }),
       });
@@ -2699,7 +2706,7 @@ export function useReviewController() {
         toast.error(String(data.errors[0]));
       }
     } catch (error: any) {
-      setStatus(error.message || "Could not stitch video", "error");
+      setStatus(error.message || "Could not stitch task subtasks", "error");
     }
   }, [currentVideo, setStatus]);
 
