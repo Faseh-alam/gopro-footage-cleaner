@@ -1,8 +1,8 @@
 """Task-level JSON storage for the Scale AI 50-hour workflow.
 
-Each main-task folder owns one ``segment.json`` containing source metadata and
-timestamp cuts, plus one ``manifest.json`` containing stable subtask IDs and
-their generated short clips. Free-form subtask / garbage gaps are allowed.
+Each source video owns ``{stem}.json`` (timestamps and camera metadata). Each
+main-task folder also owns one ``manifest.json`` with stable subtask IDs and
+generated short clips. Free-form subtask / garbage gaps are allowed.
 """
 
 from __future__ import annotations
@@ -18,12 +18,20 @@ from pathlib import Path
 from .annotation_store import MIN_SEGMENT, normalize_boundary, resolve_media_duration
 
 VERSION = 2
-SEGMENT_FILE = "segment.json"
+LEGACY_SEGMENT_FILE = "segment.json"
+SEGMENT_FILE = LEGACY_SEGMENT_FILE  # leftover combined task document
 MANIFEST_FILE = "manifest.json"
 SIDECAR_SUFFIX = ".json"
 LABELING_DIR = "_labeling"
 TASKS_FILE = "tasks.json"
 PROGRESS_FILE = "progress.json"
+VIDEO_EXTENSIONS = {".mp4", ".mov"}
+JUNK_JSON_SUFFIXES = (
+    ".segments.json",
+    ".scaleai.json",
+    ".scaleai-source.json",
+)
+JUNK_TXT_SUFFIXES = (".segments.txt",)
 EPSILON = 0.001
 CL_RE = re.compile(r"(?i)\b(C\d{3,6}|CL[-_]?\w+)\b")
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -81,8 +89,9 @@ def task_directory(video: Path) -> Path:
 
 
 def sidecar_path_for(video: Path) -> Path:
-    """Task-level segment document shared by every source video."""
-    return task_directory(video) / SEGMENT_FILE
+    """Per-source annotation file: ``video2.mp4`` → ``video2.json``."""
+    source = Path(video).expanduser().resolve()
+    return source.with_name(f"{source.stem}{SIDECAR_SUFFIX}")
 
 
 def manifest_path_for(video: Path) -> Path:
@@ -179,6 +188,27 @@ def empty_annotation(
     }
 
 
+def _is_source_video_file(path: Path) -> bool:
+    if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return False
+    name = path.name
+    if name.lower().endswith("-stitched.mp4"):
+        return False
+    if CLIP_NAME_RE.match(name) or SOURCE_CLIP_NAME_RE.match(name):
+        return False
+    return True
+
+
+def source_videos_in_task(task_dir: Path) -> list[Path]:
+    folder = Path(task_dir)
+    if not folder.is_dir():
+        return []
+    return sorted(
+        (path for path in folder.iterdir() if _is_source_video_file(path)),
+        key=lambda path: path.name.lower(),
+    )
+
+
 def _empty_segment_doc(parent_task: str) -> dict:
     return {
         "version": VERSION,
@@ -211,6 +241,127 @@ def _read_segment_doc(path: Path, parent_task: str) -> dict:
         "videos": [row for row in videos if isinstance(row, dict)],
         "updated_at": str(raw.get("updated_at") or _now_iso()),
     }
+
+
+def _sidecar_destination_for_row(task_dir: Path, row: dict) -> Path | None:
+    source_path = Path(str(row.get("source_path") or "")).expanduser()
+    source_name = str(row.get("source_video") or "").strip()
+    if source_path.is_file():
+        return sidecar_path_for(source_path)
+    if source_name:
+        return Path(task_dir) / f"{Path(source_name).stem}{SIDECAR_SUFFIX}"
+    return None
+
+
+def _write_video_json(dest: Path, raw: dict, source: Path, *, root: Path | None = None) -> None:
+    try:
+        payload = normalize_annotation(raw, source, root=root)
+    except Exception:  # noqa: BLE001
+        payload = raw if isinstance(raw, dict) else {}
+    _atomic_write(dest, payload)
+
+
+def _split_legacy_segment_json(task_dir: Path, *, root: Path | None = None) -> None:
+    """Turn leftover ``segment.json`` into one ``{stem}.json`` per source video."""
+    task_dir = Path(task_dir)
+    legacy = task_dir / LEGACY_SEGMENT_FILE
+    if not legacy.is_file():
+        return
+    doc = _read_segment_doc(legacy, task_dir.name)
+    for row in doc["videos"]:
+        dest = _sidecar_destination_for_row(task_dir, row)
+        if dest is None or dest.is_file():
+            continue
+        source_path = Path(str(row.get("source_path") or "")).expanduser()
+        if not source_path.is_file():
+            name = str(row.get("source_video") or dest.stem).strip()
+            source_path = task_dir / name
+        if isinstance(row.get("segments"), list) and row.get("source_video"):
+            payload = dict(row)
+            if source_path.is_file():
+                payload["source_path"] = str(source_path.resolve())
+            _atomic_write(dest, payload)
+        else:
+            _write_video_json(dest, row, source_path, root=root)
+    legacy.unlink(missing_ok=True)
+
+
+def _promote_segments_json(task_dir: Path, *, root: Path | None = None) -> None:
+    """``GX020399.segments.json`` → ``GX020399.json`` when the per-video file is missing."""
+    for video in source_videos_in_task(task_dir):
+        dest = sidecar_path_for(video)
+        if dest.is_file():
+            continue
+        old = video.with_name(f"{video.stem}.segments.json")
+        if not old.is_file():
+            continue
+        try:
+            raw = _read_json(old)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        _write_video_json(dest, raw, video, root=root)
+
+
+def _is_kept_task_json(path: Path, task_dir: Path) -> bool:
+    if path.parent.resolve() != Path(task_dir).resolve():
+        return False
+    name = path.name.lower()
+    if name == MANIFEST_FILE.lower():
+        return True
+    if name == LEGACY_SEGMENT_FILE.lower():
+        return False
+    return any(video.stem.lower() == path.stem.lower() for video in source_videos_in_task(task_dir))
+
+
+def cleanup_task_folder_files(task_dir: Path, *, root: Path | None = None) -> None:
+    """Drop leftover txt/json sidecars; keep per-video JSON and ``manifest.json``."""
+    task_dir = Path(task_dir)
+    if not task_dir.is_dir():
+        return
+    _split_legacy_segment_json(task_dir, root=root)
+    _promote_segments_json(task_dir, root=root)
+    for path in list(task_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if LABELING_DIR in path.parts:
+            continue
+        if path.name.startswith("._"):
+            if path.suffix.lower() in {".json", ".txt"}:
+                path.unlink(missing_ok=True)
+            continue
+        lower = path.name.lower()
+        if any(lower.endswith(suffix) for suffix in JUNK_TXT_SUFFIXES):
+            path.unlink(missing_ok=True)
+            continue
+        if any(lower.endswith(suffix) for suffix in JUNK_JSON_SUFFIXES):
+            path.unlink(missing_ok=True)
+            continue
+        if lower.endswith(".manifest.json") and lower != MANIFEST_FILE.lower():
+            path.unlink(missing_ok=True)
+            continue
+        if path.suffix.lower() != ".json":
+            continue
+        if _is_kept_task_json(path, task_dir):
+            continue
+        path.unlink(missing_ok=True)
+    leftover = task_dir / LEGACY_SEGMENT_FILE
+    leftover.unlink(missing_ok=True)
+
+
+def _raw_annotation_rows(sidecar: Path) -> list[dict]:
+    try:
+        raw = _read_json(sidecar)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    if sidecar.name.lower() == LEGACY_SEGMENT_FILE.lower() and isinstance(
+        raw.get("videos"), list
+    ):
+        return [row for row in raw["videos"] if isinstance(row, dict)]
+    return [raw]
 
 
 def normalize_annotation(raw: dict, video: Path, *, root: Path | None = None) -> dict:
@@ -292,44 +443,28 @@ def load_annotation(video: Path, *, root: Path | None = None) -> dict:
     source = Path(video).expanduser().resolve()
     sidecar = sidecar_path_for(source)
     with _lock:
+        cleanup_task_folder_files(task_directory(source), root=root)
         if not sidecar.is_file():
-            # Read an old per-video sidecar if this task has not been migrated yet.
-            legacy = source.with_name(f"{source.stem}.json")
-            if legacy.is_file() and legacy != sidecar:
-                annotation = normalize_annotation(_read_json(legacy), source, root=root)
-                _ensure_manifest_from_annotation(source, annotation)
-                save_annotation(source, annotation, root=root)
-                return annotation
             return empty_annotation(source, root=root)
-        parent = infer_parent_task(source, root)
-        doc = _read_segment_doc(sidecar, parent)
-        source_key = str(source).lower()
-        raw = next(
-            (
-                row
-                for row in doc["videos"]
-                if str(row.get("source_path") or "").lower() == source_key
-                or (
-                    not row.get("source_path")
-                    and str(row.get("source_video") or "").lower() == source.name.lower()
-                )
-            ),
-            None,
+        try:
+            raw = _read_json(sidecar)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw = {}
+        annotation = normalize_annotation(
+            raw if isinstance(raw, dict) else {}, source, root=root
         )
-        annotation = normalize_annotation(raw or {}, source, root=root)
         _ensure_manifest_from_annotation(source, annotation)
         # Manifest loading may migrate clip files into subtask folders and update
-        # clip references in segment.json. Return that migrated annotation.
-        refreshed = _read_segment_doc(sidecar, parent)
-        refreshed_raw = next(
-            (
-                row
-                for row in refreshed["videos"]
-                if str(row.get("source_path") or "").lower() == source_key
-            ),
-            raw,
-        )
-        return normalize_annotation(refreshed_raw or {}, source, root=root)
+        # clip references in this video's JSON. Return that migrated annotation.
+        if sidecar.is_file():
+            try:
+                refreshed = _read_json(sidecar)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                refreshed = raw
+            annotation = normalize_annotation(
+                refreshed if isinstance(refreshed, dict) else {}, source, root=root
+            )
+        return annotation
 
 
 def save_annotation(video: Path, annotation: dict, *, root: Path | None = None) -> dict:
@@ -337,51 +472,35 @@ def save_annotation(video: Path, annotation: dict, *, root: Path | None = None) 
     normalized = normalize_annotation(annotation, source, root=root)
     normalized["updated_at"] = _now_iso()
     with _lock:
-        path = sidecar_path_for(source)
-        doc = _read_segment_doc(path, normalized["parent_task"])
-        source_key = str(source).lower()
-        videos = [
-            row
-            for row in doc["videos"]
-            if str(row.get("source_path") or "").lower() != source_key
-            and not (
-                not row.get("source_path")
-                and str(row.get("source_video") or "").lower() == source.name.lower()
-            )
-        ]
-        videos.append(normalized)
-        videos.sort(key=lambda row: str(row.get("source_video") or "").lower())
-        doc.update(
-            {
-                "version": VERSION,
-                "main_task": normalized["parent_task"],
-                "videos": videos,
-                "updated_at": _now_iso(),
-            }
-        )
-        _atomic_write(path, doc)
+        cleanup_task_folder_files(task_directory(source), root=root)
+        _atomic_write(sidecar_path_for(source), normalized)
     if root is not None:
         refresh_progress(Path(root))
     return normalized
 
 
 def remove_video_annotation(video: Path) -> None:
-    """Remove one source entry without deleting the shared task segment.json."""
+    """Delete this source video's JSON. Shared ``manifest.json`` is left in place."""
     source = Path(video).expanduser().resolve()
     path = sidecar_path_for(source)
+    task_dir = task_directory(source)
     with _lock:
-        if not path.is_file():
-            return
-        doc = _read_segment_doc(path, source.parent.name)
-        source_key = str(source).lower()
-        doc["videos"] = [
-            row
-            for row in doc["videos"]
-            if str(row.get("source_path") or "").lower() != source_key
-            and str(row.get("source_video") or "").lower() != source.name.lower()
-        ]
-        doc["updated_at"] = _now_iso()
-        _atomic_write(path, doc)
+        path.unlink(missing_ok=True)
+        legacy = task_dir / LEGACY_SEGMENT_FILE
+        if legacy.is_file():
+            doc = _read_segment_doc(legacy, source.parent.name)
+            source_key = str(source).lower()
+            doc["videos"] = [
+                row
+                for row in doc["videos"]
+                if str(row.get("source_path") or "").lower() != source_key
+                and str(row.get("source_video") or "").lower() != source.name.lower()
+            ]
+            doc["updated_at"] = _now_iso()
+            if doc["videos"]:
+                _atomic_write(legacy, doc)
+            else:
+                legacy.unlink(missing_ok=True)
 
 
 def _next_segment_id(annotation: dict) -> int:
@@ -589,37 +708,63 @@ def undo_last_segment(video: Path, *, root: Path | None = None) -> dict:
 
 def iter_sidecars(root: Path):
     root = Path(root).expanduser().resolve()
-    yield from sorted(root.rglob(SEGMENT_FILE))
+    seen: set[str] = set()
+    for path in sorted(root.rglob("*.json")):
+        if not path.is_file() or LABELING_DIR in path.parts:
+            continue
+        name = path.name.lower()
+        if name == MANIFEST_FILE.lower():
+            continue
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        if name == LEGACY_SEGMENT_FILE.lower():
+            seen.add(key)
+            yield path
+            continue
+        if any(video.stem.lower() == path.stem.lower() for video in source_videos_in_task(path.parent)):
+            seen.add(key)
+            yield path
 
 
 def source_for_sidecar(sidecar: Path) -> Path | None:
-    """Return the first source in a task-level segment file (legacy helper)."""
     sidecar = Path(sidecar).expanduser().resolve()
-    try:
-        raw = _read_json(sidecar)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    rows = raw.get("videos") if isinstance(raw, dict) else None
-    if isinstance(rows, list):
-        for row in rows:
-            candidate = Path(str(row.get("source_path") or "")).expanduser()
-            if candidate.is_file():
-                return candidate.resolve()
+    for row in _raw_annotation_rows(sidecar):
+        candidate = Path(str(row.get("source_path") or "")).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+        name = str(row.get("source_video") or "").strip()
+        if name:
+            sibling = sidecar.parent / name
+            if sibling.is_file():
+                return sibling.resolve()
+    for video in source_videos_in_task(sidecar.parent):
+        if video.stem.lower() == sidecar.stem.lower():
+            return video.resolve()
     return None
 
 
 def annotated_sources(root: Path) -> list[Path]:
+    root = Path(root).expanduser().resolve()
+    pending = {sidecar.parent.resolve() for sidecar in iter_sidecars(root)}
+    pending.update(
+        path.parent.resolve()
+        for path in root.rglob(LEGACY_SEGMENT_FILE)
+        if LABELING_DIR not in path.parts
+    )
+    for task_dir in pending:
+        cleanup_task_folder_files(task_dir, root=root)
     sources: list[Path] = []
     seen: set[str] = set()
     for sidecar in iter_sidecars(root):
-        try:
-            raw = _read_json(sidecar)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        for row in raw.get("videos") or [] if isinstance(raw, dict) else []:
+        for row in _raw_annotation_rows(sidecar):
             candidate = Path(str(row.get("source_path") or "")).expanduser()
             if not candidate.is_file():
-                candidate = sidecar.parent / str(row.get("source_video") or "")
+                name = str(row.get("source_video") or "").strip()
+                candidate = sidecar.parent / name if name else Path()
+            if not candidate.is_file():
+                matched = source_for_sidecar(sidecar)
+                candidate = matched if matched is not None else Path()
             if candidate.is_file() and str(candidate.resolve()).lower() not in seen:
                 resolved = candidate.resolve()
                 sources.append(resolved)
@@ -696,13 +841,18 @@ def save_tasks_doc(root: Path, doc: dict) -> dict:
 def _task_dir_for_name(root: Path, parent_task: str) -> Path | None:
     root = Path(root).expanduser().resolve()
     task = parent_task.strip().lower()
-    for segment_path in root.rglob(SEGMENT_FILE):
+    for sidecar in iter_sidecars(root):
         try:
-            raw = _read_json(segment_path)
+            raw = _read_json(sidecar)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if str(raw.get("main_task") or raw.get("parent_task") or "").strip().lower() == task:
-            return segment_path.parent.resolve()
+        if not isinstance(raw, dict):
+            continue
+        parent = str(
+            raw.get("parent_task") or raw.get("main_task") or sidecar.parent.name
+        ).strip()
+        if parent.lower() == task:
+            return sidecar.parent.resolve()
     candidates = [
         path
         for path in root.rglob("*")
@@ -710,7 +860,7 @@ def _task_dir_for_name(root: Path, parent_task: str) -> Path | None:
     ]
     candidates.sort(
         key=lambda path: (
-            not any(child.suffix.lower() in {".mp4", ".mov"} for child in path.iterdir()),
+            not any(child.suffix.lower() in VIDEO_EXTENSIONS for child in path.iterdir()),
             -len(path.parts),
         )
     )
@@ -818,21 +968,27 @@ def _normalize_manifest(raw: dict | None) -> dict:
     }
 
 
+def _task_annotations(task_dir: Path) -> list[dict]:
+    rows: list[dict] = []
+    folder = Path(task_dir)
+    legacy = folder / LEGACY_SEGMENT_FILE
+    if legacy.is_file():
+        rows.extend(_raw_annotation_rows(legacy))
+    for video in source_videos_in_task(folder):
+        sidecar = sidecar_path_for(video)
+        if sidecar.is_file():
+            rows.extend(_raw_annotation_rows(sidecar))
+    return rows
+
+
 def _migrate_clip_layout(task_dir: Path, manifest: dict) -> bool:
     """Move clips into stable subtask folders using CAMERA-ID-SERIAL names."""
-    segment_path = task_dir / SEGMENT_FILE
-    try:
-        segment_doc = _read_json(segment_path) if segment_path.is_file() else None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        segment_doc = None
-    camera_by_source = {}
-    if isinstance(segment_doc, dict):
-        camera_by_source = {
-            str(video.get("source_video") or "").lower(): str(
-                video.get("camera_serial") or "UNKNOWN"
-            )
-            for video in segment_doc.get("videos") or []
-        }
+    camera_by_source = {
+        str(video.get("source_video") or "").lower(): str(
+            video.get("camera_serial") or "UNKNOWN"
+        )
+        for video in _task_annotations(task_dir)
+    }
 
     renamed: dict[str, tuple[str, str]] = {}
     changed = False
@@ -883,33 +1039,37 @@ def _migrate_clip_layout(task_dir: Path, manifest: dict) -> bool:
                 changed = True
                 break
 
-    if renamed and isinstance(segment_doc, dict):
-        for video in segment_doc.get("videos") or []:
-            for segment in video.get("segments") or []:
+    if renamed:
+        for video in source_videos_in_task(task_dir):
+            sidecar = sidecar_path_for(video)
+            if not sidecar.is_file():
+                continue
+            try:
+                annotation = _read_json(sidecar)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(annotation, dict):
+                continue
+            updated = False
+            for segment in annotation.get("segments") or []:
+                if not isinstance(segment, dict):
+                    continue
                 old_name = str(segment.get("clip_filename") or "")
                 if old_name in renamed:
                     folder, new_name = renamed[old_name]
                     segment["clip_filename"] = new_name
                     segment["clip_path"] = f"{folder}/{new_name}"
-        segment_doc["updated_at"] = _now_iso()
-        _atomic_write(segment_path, segment_doc)
+                    updated = True
+            if updated:
+                annotation["updated_at"] = _now_iso()
+                _atomic_write(sidecar, annotation)
     return changed
 
 
 def _labeled_seconds_by_subtask(task_dir: Path) -> dict[str, float]:
-    """Sum labeled subtask time from segment.json."""
-    path = Path(task_dir) / SEGMENT_FILE
+    """Sum labeled subtask time from each source video's JSON."""
     totals: dict[str, float] = {}
-    if not path.is_file():
-        return totals
-    try:
-        doc = _read_json(path)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return totals
-    videos = doc.get("videos") if isinstance(doc, dict) else None
-    if not isinstance(videos, list):
-        return totals
-    for video in videos:
+    for video in _task_annotations(task_dir):
         if not isinstance(video, dict):
             continue
         for segment in video.get("segments") or []:
@@ -1017,6 +1177,8 @@ def load_manifest(path: Path) -> dict:
     manifest_path = Path(path)
     if manifest_path.is_dir():
         manifest_path = manifest_path / MANIFEST_FILE
+    task_dir = manifest_path.parent
+    cleanup_task_folder_files(task_dir)
     if not manifest_path.is_file():
         return _empty_manifest()
     try:
@@ -1024,7 +1186,6 @@ def load_manifest(path: Path) -> dict:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return _empty_manifest()
     manifest = _normalize_manifest(raw if isinstance(raw, dict) else None)
-    task_dir = manifest_path.parent
     changed = _migrate_clip_layout(task_dir, manifest)
     _attach_manifest_durations(task_dir, manifest)
     raw_missing_durations = not (
@@ -1142,19 +1303,43 @@ def refresh_progress(root: Path) -> dict:
     root = Path(root).expanduser().resolve()
     tasks_doc = load_tasks_doc(root)
     by_task: dict[str, dict] = {}
+    pending = {sidecar.parent.resolve() for sidecar in iter_sidecars(root)}
+    pending.update(
+        path.parent.resolve()
+        for path in root.rglob(LEGACY_SEGMENT_FILE)
+        if LABELING_DIR not in path.parts
+    )
+    pending.update(
+        path.parent.resolve()
+        for path in root.rglob(MANIFEST_FILE)
+        if LABELING_DIR not in path.parts
+    )
+    for task_dir in pending:
+        cleanup_task_folder_files(task_dir, root=root)
 
     for sidecar in iter_sidecars(root):
+        rows = _raw_annotation_rows(sidecar)
+        if not rows:
+            continue
+        parent_fallback = sidecar.parent.name
         try:
             doc = _read_json(sidecar)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        parent = str(doc.get("main_task") or doc.get("parent_task") or sidecar.parent.name).strip()
-        for raw_annotation in doc.get("videos") or []:
-            source = Path(str(raw_annotation.get("source_path") or ""))
+            doc = {}
+        if isinstance(doc, dict):
+            parent_fallback = str(
+                doc.get("parent_task") or doc.get("main_task") or parent_fallback
+            ).strip() or parent_fallback
+        for raw_annotation in rows:
+            parent = str(raw_annotation.get("parent_task") or parent_fallback).strip()
+            source = Path(str(raw_annotation.get("source_path") or "")).expanduser()
             if not source.is_file():
                 source = sidecar.parent / str(raw_annotation.get("source_video") or "")
             if not source.is_file():
-                continue
+                matched = source_for_sidecar(sidecar)
+                if matched is None:
+                    continue
+                source = matched
             annotation = normalize_annotation(raw_annotation, source, root=root)
             entry = by_task.setdefault(
                 parent,

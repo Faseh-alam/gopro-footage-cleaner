@@ -52,11 +52,12 @@ class ScaleAIRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         annotation = response.get_json()["annotation"]
         self.assertEqual(annotation["segments"][0]["label"], "pick-up-button")
-        self.assertTrue((self.task_dir / "segment.json").is_file())
+        self.assertTrue((self.task_dir / "GX010001.json").is_file())
         self.assertTrue((self.task_dir / "manifest.json").is_file())
+        self.assertFalse((self.task_dir / "segment.json").exists())
         self.assertFalse(self.video.with_name("GX010001.segments.json").exists())
 
-    def test_video_delete_keeps_shared_task_sidecars(self) -> None:
+    def test_video_delete_removes_video_json_keeps_manifest(self) -> None:
         response = self.client.post(
             "/api/eager/scaleai/segments",
             json={
@@ -68,7 +69,7 @@ class ScaleAIRouteTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        shared_sidecar = self.task_dir / "segment.json"
+        video_sidecar = self.task_dir / "GX010001.json"
         with patch("gopro_cleaner.eager_routes.move_to_trash") as move:
             response = self.client.post(
                 "/api/eager/video/delete",
@@ -77,7 +78,8 @@ class ScaleAIRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         moved = [call.args[0] for call in move.call_args_list]
         self.assertIn(self.video.resolve(), moved)
-        self.assertNotIn(shared_sidecar.resolve(), moved)
+        self.assertFalse(video_sidecar.exists())
+        self.assertTrue((self.task_dir / "manifest.json").is_file())
 
 
 if __name__ == "__main__":

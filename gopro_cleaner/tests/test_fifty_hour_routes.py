@@ -101,12 +101,11 @@ class FiftyHourRouteTests(unittest.TestCase):
             "CAM001-001-001.mp4",
         )
 
-        segment = json.loads((self.task / "segment.json").read_text(encoding="utf-8"))
-        self.assertEqual(len(segment["videos"]), 2)
-        self.assertEqual(
-            [row["segments"][0]["clip_filename"] for row in segment["videos"]],
-            ["CAM001-001-001.mp4", "CAM001-001-002.mp4"],
-        )
+        first = json.loads((self.task / "video1.json").read_text(encoding="utf-8"))
+        second = json.loads((self.task / "video2.json").read_text(encoding="utf-8"))
+        self.assertEqual(first["segments"][0]["clip_filename"], "CAM001-001-001.mp4")
+        self.assertEqual(second["segments"][0]["clip_filename"], "CAM001-001-002.mp4")
+        self.assertFalse((self.task / "segment.json").exists())
 
         manifest = json.loads((self.task / "manifest.json").read_text(encoding="utf-8"))
         subtask = manifest["subtasks"][0]

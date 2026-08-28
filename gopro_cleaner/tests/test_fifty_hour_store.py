@@ -26,9 +26,9 @@ class FiftyHourStoreTests(unittest.TestCase):
             "garment-folding-general",
         )
 
-    def test_sidecar_is_task_level_segment_json(self) -> None:
+    def test_sidecar_is_per_video_json(self) -> None:
         path = fifty_hour_store.sidecar_path_for(self.video)
-        self.assertEqual(path, self.task / "segment.json")
+        self.assertEqual(path, self.task / "GX010001.json")
 
     def test_add_subtask_and_garbage(self) -> None:
         ann = fifty_hour_store.add_segment(
@@ -201,13 +201,12 @@ class FiftyHourStoreTests(unittest.TestCase):
             label="pick up box",
             root=self.root,
         )
-        segment_doc = json.loads(
-            (self.task / "segment.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            [row["source_video"] for row in segment_doc["videos"]],
-            ["GX010001.MP4", "GX010002.MP4"],
-        )
+        first = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
+        second_doc = json.loads((self.task / "GX010002.json").read_text(encoding="utf-8"))
+        self.assertEqual(first["source_video"], "GX010001.MP4")
+        self.assertEqual(second_doc["source_video"], "GX010002.MP4")
+        self.assertFalse((self.task / "segment.json").exists())
+        self.assertTrue((self.task / "manifest.json").is_file())
 
     def test_old_video_json_is_migrated_before_trim(self) -> None:
         legacy = self.video.with_name("GX010001.json")
@@ -237,7 +236,8 @@ class FiftyHourStoreTests(unittest.TestCase):
         annotation = fifty_hour_store.load_annotation(self.video, root=self.root)
 
         self.assertEqual(annotation["source_path"], str(self.video.resolve()))
-        self.assertTrue((self.task / "segment.json").is_file())
+        self.assertTrue((self.task / "GX010001.json").is_file())
+        self.assertFalse((self.task / "segment.json").exists())
         manifest = json.loads((self.task / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(
             [(row["id"], row["name"]) for row in manifest["subtasks"]],
@@ -284,11 +284,92 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertFalse(old_clip.exists())
         self.assertEqual(manifest["subtasks"][0]["clips"][0]["filename"], new_clip.name)
         self.assertEqual(manifest["subtasks"][0]["clips"][0]["camera_serial"], "CAM001")
-        segment_doc = json.loads((self.task / "segment.json").read_text(encoding="utf-8"))
+        video_doc = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            segment_doc["videos"][0]["segments"][0]["clip_filename"],
+            video_doc["segments"][0]["clip_filename"],
             new_clip.name,
         )
+
+    def test_legacy_segment_json_splits_and_junk_sidecars_are_removed(self) -> None:
+        second = self.task / "GX010002.MP4"
+        second.write_bytes(b"fake-mp4-2")
+        (self.task / "segment.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "main_task": "garment-folding-general",
+                    "videos": [
+                        {
+                            "source_video": "GX010001.MP4",
+                            "source_path": str(self.video),
+                            "parent_task": "garment-folding-general",
+                            "camera_serial": "CAM001",
+                            "duration_seconds": 10.0,
+                            "segments": [
+                                {
+                                    "id": 1,
+                                    "start": 1.0,
+                                    "end": 2.0,
+                                    "type": "subtask",
+                                    "label": "pick cloth",
+                                }
+                            ],
+                        },
+                        {
+                            "source_video": "GX010002.MP4",
+                            "source_path": str(second),
+                            "parent_task": "garment-folding-general",
+                            "duration_seconds": 10.0,
+                            "segments": [],
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.task / "GX010001.segments.txt").write_text("old\n", encoding="utf-8")
+        (self.task / "GX010001.segments.json").write_text("{}", encoding="utf-8")
+        (self.task / "GX010001.scaleai.json").write_text("{}", encoding="utf-8")
+        junk_dir = self.task / "pick-cloth-001"
+        junk_dir.mkdir()
+        (junk_dir / "CAM001-001-001.scaleai-source.json").write_text("{}", encoding="utf-8")
+        (junk_dir / "pick-cloth-001-stitched.manifest.json").write_text("{}", encoding="utf-8")
+
+        fifty_hour_store.load_annotation(self.video, root=self.root)
+
+        self.assertFalse((self.task / "segment.json").exists())
+        self.assertTrue((self.task / "GX010001.json").is_file())
+        self.assertTrue((self.task / "GX010002.json").is_file())
+        first = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
+        self.assertEqual(first["segments"][0]["label"], "pick cloth")
+        self.assertFalse((self.task / "GX010001.segments.txt").exists())
+        self.assertFalse((self.task / "GX010001.segments.json").exists())
+        self.assertFalse((self.task / "GX010001.scaleai.json").exists())
+        self.assertFalse((junk_dir / "CAM001-001-001.scaleai-source.json").exists())
+        self.assertFalse((junk_dir / "pick-cloth-001-stitched.manifest.json").exists())
+        self.assertTrue((self.task / "manifest.json").is_file())
+
+    def test_segments_json_promotes_when_no_segment_json(self) -> None:
+        (self.task / "GX010001.segments.json").write_text(
+            json.dumps(
+                {
+                    "source": "GX010001.MP4",
+                    "duration": 10.0,
+                    "segments": [
+                        {"start": 1.0, "end": 2.0, "kind": "work", "task": "pick cloth"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.task / "GX010001.segments.txt").write_text("old\n", encoding="utf-8")
+        fifty_hour_store.cleanup_task_folder_files(self.task, root=self.root)
+        self.assertTrue((self.task / "GX010001.json").is_file())
+        self.assertFalse((self.task / "GX010001.segments.json").exists())
+        self.assertFalse((self.task / "GX010001.segments.txt").exists())
+        data = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["source_video"], "GX010001.MP4")
+        self.assertEqual(data["segments"][0]["label"], "pick cloth")
 
 
 class FiftyHourScanSortTests(unittest.TestCase):

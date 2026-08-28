@@ -695,8 +695,9 @@ def create_eager_blueprint() -> Blueprint:
             sidecar = annotation_store.sidecar_path_for(source)
             text_sidecar = sidecar.with_suffix("").with_suffix(".segments.txt")
             legacy_scaleai = source.with_name(f"{source.stem}.scaleai.json")
+            fifty_sidecar = fifty_hour_store.sidecar_path_for(source)
             fifty_hour_store.remove_video_annotation(source)
-            for companion in (sidecar, text_sidecar, legacy_scaleai):
+            for companion in (sidecar, text_sidecar, legacy_scaleai, fifty_sidecar):
                 if companion.is_file():
                     move_to_trash(companion)
 
@@ -1381,7 +1382,7 @@ def create_eager_blueprint() -> Blueprint:
                     }
                 ):
                     # Rebuild a missing trim using the same serial already stored
-                    # in segment.json/manifest.json.
+                    # in this video's JSON / manifest.json.
                     filename = recorded_name
                 else:
                     filename = fifty_hour_store.next_clip_filename(
@@ -1476,7 +1477,7 @@ def create_eager_blueprint() -> Blueprint:
 
     @eager.post("/api/eager/scaleai/process-folder")
     def eager_scaleai_process_folder():
-        """Queue exports for every source listed in task-level segment.json files."""
+        """Queue exports for every source that has a per-video JSON sidecar."""
         payload = request.get_json(silent=True) or {}
         raw_root = str(payload.get("root") or payload.get("path") or "").strip()
         if not raw_root:

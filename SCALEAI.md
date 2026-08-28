@@ -6,8 +6,9 @@ Keyboard-first subtask labeling for folders shaped like:
 50-hour/
   garment-folding-general/
     GX010001.MP4
+    GX010001.json
     GX010002.MP4
-    segment.json
+    GX010002.json
     manifest.json
   gear-box-fitting/
     GX010002.MP4
@@ -43,10 +44,10 @@ Trims use stream-copy and fail closed if source GPMF would be lost.
 
 ## Files
 
-- `segment.json`: all source videos, camera/CL metadata, durations, timestamps,
-  and generated clip references for one main task.
+- `{video}.json`: that source video's camera/CL metadata, duration, timestamps,
+  and generated clip references.
 - `manifest.json`: subtask names, stable three-digit IDs, clip serial numbers,
-  camera serials, source video names, and total clip counts.
+  camera serials, source video names, and total clip counts for the whole task.
 - `_labeling/progress.json`: dataset progress (usable labeled hours; garbage excluded).
 
 There is no cycle / Stage 1–2 workflow on this branch.

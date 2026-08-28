@@ -308,6 +308,18 @@ def scan_mp4_files(
         ):
             candidates.append(path)
 
+    if mode == "scaleai":
+        from .fifty_hour_store import cleanup_task_folder_files
+
+        seen: set[str] = set()
+        for path in candidates:
+            task_dir = path.parent.resolve()
+            key = str(task_dir).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleanup_task_folder_files(task_dir, root=root)
+
     if mode == "label" and candidates:
         # Only finalized clips / wholes — hide sources still being trimmed and
         # any output path that is still a running/queued job target.

@@ -240,17 +240,19 @@ In the **task filter** field: ↑↓ move selection, **Enter** assign, **Esc** c
 
 ### ScaleAI 50-hour folder layout
 
-Each main-task folder shares one timestamp document and one subtask manifest.
-The subtasks defined while labeling the first video automatically appear for
-the later videos in the same task:
+Each main-task folder keeps one JSON per source video and one shared subtask
+manifest. The subtasks defined while labeling the first video automatically
+appear for the later videos in the same task:
 
 ```text
 50HoursVideos/
   PackagingBoxes/
     video1.mp4
+    video1.json
     video2.mp4
+    video2.json
     video3.mp4
-    segment.json
+    video3.json
     manifest.json
     Picking-up-box-001/
       CAM001-001-001.mp4
@@ -261,9 +263,9 @@ the later videos in the same task:
       Labeling-box-002-stitched.mp4
 ```
 
-`segment.json` contains each source video's metadata and timestamp segments.
-`manifest.json` contains only the stable subtask IDs and their generated clip
-records. Short clips use
+Each `{video}.json` contains that source video's metadata and timestamp
+segments. `manifest.json` contains the stable subtask IDs and generated clip
+records for the whole task. Short clips use
 `CAMERA.SUBTASK_ID.CLIP_SERIAL` information with the filename form
 `CAMERA-SUBTASK_ID-CLIP_SERIAL.mp4`. Every subtask has a shared
 `SUBTASK_NAME-SUBTASK_ID` folder across all source videos, and its stitched
