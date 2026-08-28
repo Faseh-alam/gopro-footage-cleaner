@@ -172,15 +172,6 @@ export function TaskPanel({
 
   return (
     <div className="grid gap-3 border-b border-border p-4">
-      <label className="flex items-center gap-2 text-xs">
-        <input
-          type="checkbox"
-          checked={c.scaleAiMode}
-          onChange={(e) => void c.setScaleAiMode(e.currentTarget.checked)}
-        />
-        <span className="font-medium">ScaleAI 50-hour mode</span>
-      </label>
-
       {c.scaleAiMode ? (
         <>
           <ScaleAiPanel

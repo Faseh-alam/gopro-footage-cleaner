@@ -3,63 +3,8 @@ import { Loader2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/wc/panel";
 import { Button } from "@/components/ui/button";
-import type { MediaMeta } from "./types";
 import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
-
-const MOTION_SENSORS: [RegExp, string][] = [
-  [/acceler/i, "Accel"],
-  [/gyro/i, "Gyro"],
-  [/gps/i, "GPS"],
-  [/magnet/i, "Mag"],
-];
-
-/** Compact IMU label: core motion sensors + a count for the remaining streams. */
-function imuSummary(sensors: string[]) {
-  const motion: string[] = [];
-  for (const [pattern, short] of MOTION_SENSORS) {
-    if (sensors.some((s) => pattern.test(s)) && !motion.includes(short)) motion.push(short);
-  }
-  const extra =
-    sensors.length - sensors.filter((s) => MOTION_SENSORS.some(([p]) => p.test(s))).length;
-  if (!motion.length) return `${sensors.length} streams`;
-  return extra > 0 ? `${motion.join(", ")} +${extra}` : motion.join(", ");
-}
-
-function MediaMetaStrip({ meta }: { meta?: MediaMeta | null }) {
-  if (!meta) return null;
-  const items: { label: string; value: string; title?: string }[] = [];
-
-  if (meta.camera_model) items.push({ label: "CAM", value: meta.camera_model });
-  if (meta.camera_serial) items.push({ label: "SN", value: meta.camera_serial });
-  if (meta.width && meta.height) {
-    const fps = meta.fps ? ` ${Math.round(meta.fps)}fps` : "";
-    items.push({ label: "VID", value: `${meta.width}×${meta.height}${fps}` });
-  }
-  if (meta.sensors?.length) {
-    items.push({ label: "IMU", value: imuSummary(meta.sensors), title: meta.sensors.join(" · ") });
-  } else if (meta.has_gpmf) {
-    items.push({ label: "IMU", value: "GPMF present" });
-  }
-
-  if (!items.length) return null;
-  return (
-    <div className="border-b border-border px-4 py-2">
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-x-5 gap-y-1 rounded-md border border-border bg-surface-2/60 px-3 py-2 font-mono text-[10px] text-muted-foreground">
-        {items.map((item) => (
-          <div
-            key={item.label}
-            title={item.title || item.value}
-            className="flex min-w-0 items-baseline gap-1.5"
-          >
-            <span className="shrink-0 uppercase tracking-[0.14em] opacity-60">{item.label}</span>
-            <span className="min-w-0 truncate text-foreground/80">{item.value}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 export function PlayerPanel({
   c,
@@ -149,8 +94,6 @@ export function PlayerPanel({
 
   return (
     <section className="panel-surface flex min-h-0 flex-col">
-      <MediaMetaStrip meta={ann?.mediaMeta ?? null} />
-
       <header className="flex items-start justify-between gap-4 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <div className="eyebrow mb-0.5">Now reviewing</div>

@@ -8,6 +8,8 @@ const ACTIVE = new Set(["queued", "running"]);
 
 /**
  * Floating dock for background trim jobs.
+ * Hidden on load (even if old completed jobs remain). Opens when a trim
+ * is queued — Trim this video / Trim whole folder — or if work is still running.
  * - Minimize collapses to a small pill that reopens the dock.
  * - Close (only once nothing is active) dismisses until new trims start.
  * - Cancel a single job, or cancel every active job at once.
@@ -15,9 +17,9 @@ const ACTIVE = new Set(["queued", "running"]);
 export function TrimDock({ c }: { c: ReviewController }) {
   const { active, jobs, etaTotal } = c.globalTrim;
   const [minimized, setMinimized] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
+  const [dismissed, setDismissed] = useState(true);
 
-  // A new batch of work re-opens the dock even after a previous dismiss.
+  // A new (or still-running) batch re-opens the dock after dismiss / reload.
   useEffect(() => {
     if (active > 0) setDismissed(false);
   }, [active]);

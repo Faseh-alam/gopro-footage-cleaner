@@ -4,11 +4,6 @@ import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
 import { UNLABELED_TASK_LABEL } from "./types";
 
-function hoursLabel(value: number | null | undefined): string {
-  if (value == null || Number.isNaN(value)) return "—";
-  return `${value.toFixed(2)}h`;
-}
-
 export function ScaleAiPanel({
   c,
   highlightedTask,
@@ -67,14 +62,6 @@ export function ScaleAiPanel({
           </span>
         </div>
         <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">CAMERA</span>
-          <span className="font-mono">{annotation?.camera_serial || "—"}</span>
-        </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">CL</span>
-          <span className="font-mono">{annotation?.cl_number || "—"}</span>
-        </div>
-        <div className="flex justify-between gap-2">
           <span className="text-muted-foreground">UNLABELED IN VIDEO</span>
           <span className={`font-mono ${unlabeledCount > 0 ? "text-accent" : ""}`}>
             {unlabeledCount}
@@ -82,28 +69,16 @@ export function ScaleAiPanel({
         </div>
       </div>
 
-      <div className="grid gap-1 rounded-sm border border-border bg-surface px-2 py-2 text-[11px]">
-        <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">TARGET</span>
-          <span className="font-mono">{hoursLabel(progress?.target_hours)}</span>
-        </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">COMPLETED</span>
-          <span className="font-mono">{hoursLabel(progress?.labeled_hours ?? 0)}</span>
-        </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">REMAINING</span>
-          <span className="font-mono">{hoursLabel(progress?.remaining_hours)}</span>
-        </div>
-        {progress?.percent_complete != null ? (
+      {progress?.percent_complete != null ? (
+        <div className="grid gap-1 rounded-sm border border-border bg-surface px-2 py-2 text-[11px]">
           <div className="flex justify-between gap-2">
             <span className="text-muted-foreground">PROGRESS</span>
             <span className={`font-mono ${progress.complete ? "text-success" : ""}`}>
               {progress.percent_complete.toFixed(0)}%{progress.complete ? " · GOAL" : ""}
             </span>
           </div>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
 
       {c.scaleAiPending ? (
         <div className="rounded-sm border border-accent/40 bg-accent/10 px-2 py-2 text-[11px]">
