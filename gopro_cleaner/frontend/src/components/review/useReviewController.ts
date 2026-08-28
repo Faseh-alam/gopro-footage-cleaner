@@ -1678,7 +1678,16 @@ export function useReviewController() {
       const rawAnchor = Math.max(coverage, Number(anchorByPathRef.current[video.path]) || 0);
       const anchor = coverage > 0 ? Math.round((rawAnchor + 0.01) * 1000) / 1000 : rawAnchor;
       if (end <= anchor + 0.05) {
-        setStatus("Move playhead past the last marking to start a segment", "error");
+        const target = Math.min(Math.max(0, known - 0.04), anchor + 0.1);
+        if (target <= anchor + 0.05) {
+          setStatus("No unlabeled footage remains after the last marking", "error");
+          return;
+        }
+        scheduleSeek(target, true);
+        setStatus(
+          `Moved to ${formatTime(target)} after the last marking — move forward, then press T`,
+          "ok",
+        );
         return;
       }
       setScaleAiPending({ start: anchor, end });
@@ -1738,6 +1747,7 @@ export function useReviewController() {
     loadAnnotationForPath,
     loadScaleAiForPath,
     safePause,
+    scheduleSeek,
     setStatus,
   ]);
 

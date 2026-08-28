@@ -97,6 +97,7 @@ export function ScaleAiPanel({
           {c.selectedTaskValue ? (
             <button
               type="button"
+              data-scaleai-highlight-control
               aria-pressed={highlightedTask === c.selectedTaskValue}
               title="Highlight this task in the labeled region"
               onClick={() => onHighlightTask?.(c.selectedTaskValue)}
@@ -146,6 +147,7 @@ export function ScaleAiPanel({
                   ) : (
                     <button
                       type="button"
+                      data-scaleai-highlight-control
                       aria-pressed={isHighlighted}
                       title={`Highlight ${segment.label} in the labeled region`}
                       onClick={() => onHighlightTask?.(segment.label)}

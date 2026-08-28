@@ -55,6 +55,27 @@ function ReviewPage() {
   const { refreshToday } = useAuth();
   const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
   const [highlightedScaleAiTask, setHighlightedScaleAiTask] = useState("");
+  const toggleScaleAiTaskHighlight = (task: string) => {
+    setHighlightedScaleAiTask((current) =>
+      current.trim().toLowerCase() === task.trim().toLowerCase() ? "" : task,
+    );
+  };
+
+  useEffect(() => {
+    if (!highlightedScaleAiTask) return;
+    const clearHighlight = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest("[data-scaleai-highlight-control]")
+      ) {
+        return;
+      }
+      setHighlightedScaleAiTask("");
+    };
+    document.addEventListener("pointerdown", clearHighlight, true);
+    return () => document.removeEventListener("pointerdown", clearHighlight, true);
+  }, [highlightedScaleAiTask]);
 
   // One-click updater: pull the checked-out branch from GitHub, let the backend
   // relaunch itself (run.bat / run.sh), then reload once it's back.
@@ -158,6 +179,18 @@ function ReviewPage() {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target;
       const inTaskSearch = target === c.taskSearchRef.current;
+
+      if (
+        event.key.toLowerCase() === "t" &&
+        c.scaleAiMode &&
+        c.scaleAiPending &&
+        (!inTaskSearch || !c.taskSearch.trim())
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        void c.undoSegment();
+        return;
+      }
 
       if (inTaskSearch) {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -359,7 +392,7 @@ function ReviewPage() {
           <TaskPanel
             c={c}
             highlightedScaleAiTask={highlightedScaleAiTask}
-            onHighlightScaleAiTask={setHighlightedScaleAiTask}
+            onHighlightScaleAiTask={toggleScaleAiTaskHighlight}
           />
           <FootageList c={c} />
           <details className="border-b border-border px-4 py-3">

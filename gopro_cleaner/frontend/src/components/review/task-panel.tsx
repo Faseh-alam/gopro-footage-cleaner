@@ -37,7 +37,7 @@ export function TaskPanel({
           onClick={() => {
             c.setSelectedTaskValue(task);
             c.touchRecentTask(task);
-            if (c.scaleAiMode) onHighlightScaleAiTask?.(task);
+            if (c.scaleAiMode) onHighlightScaleAiTask?.("");
             if (c.scaleAiMode && c.scaleAiPending) {
               void c.commitScaleAiSegment(task, "subtask");
             }
