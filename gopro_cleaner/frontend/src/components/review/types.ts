@@ -18,6 +18,8 @@ export interface Segment {
   task?: string | null;
 }
 
+export const UNLABELED_TASK_LABEL = "Unlabeled task";
+
 export interface PendingWork {
   start: number;
   end: number;

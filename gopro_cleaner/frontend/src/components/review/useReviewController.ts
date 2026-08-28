@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { toast } from "sonner";
 import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
+import { UNLABELED_TASK_LABEL } from "./types";
 import type {
   Annotation,
   BatchDetail,
@@ -884,7 +885,14 @@ export function useReviewController() {
 
   const orderedTaskGroups = useCallback(() => {
     const q = taskSearch.trim().toLowerCase();
-    const pool = q ? tasks.filter((t) => t.toLowerCase().includes(q)) : [...tasks];
+    const availableTasks =
+      scaleAiMode &&
+      !tasks.some((task) => task.toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase())
+        ? [UNLABELED_TASK_LABEL, ...tasks]
+        : tasks;
+    const pool = q
+      ? availableTasks.filter((t) => t.toLowerCase().includes(q))
+      : [...availableTasks];
     const recent: string[] = [];
     const others: string[] = [];
     for (const t of pool) {
@@ -894,7 +902,7 @@ export function useReviewController() {
     recent.sort((a, b) => recentTaskRank(a) - recentTaskRank(b));
     others.sort((a, b) => a.localeCompare(b));
     return { recent, others, matches: [...recent, ...others], filtering: Boolean(q) };
-  }, [taskSearch, tasks, recentTaskRank]);
+  }, [taskSearch, tasks, recentTaskRank, scaleAiMode]);
 
   const selectedTask = useCallback(() => {
     // Filter text must never become a task name — only an explicit list selection.
@@ -1594,6 +1602,41 @@ export function useReviewController() {
       }
     },
     [applyScaleAiPayload, currentVideo, setStatus],
+  );
+
+  const updateScaleAiSegmentLabel = useCallback(
+    async (segmentId: string | number, label: string) => {
+      const video = currentVideo();
+      const clean = String(label || "").trim();
+      if (!video || !clean) return false;
+      try {
+        const data = await api("/api/eager/scaleai/segments", {
+          method: "PATCH",
+          body: JSON.stringify({
+            path: video.path,
+            root: stateRef.current.scanRoot || "",
+            segment_id: segmentId,
+            label: clean,
+            type: "subtask",
+          }),
+        });
+        applyScaleAiPayload(video.path, data);
+        setSelectedTaskValue(clean);
+        setLastLabelTask(clean);
+        touchRecentTask(clean);
+        setTasks((prev) =>
+          prev.some((task) => task.toLowerCase() === clean.toLowerCase())
+            ? prev
+            : [clean, ...prev],
+        );
+        setStatus(`Assigned ${clean}`, "ok");
+        return true;
+      } catch (error: unknown) {
+        setStatus(error instanceof Error ? error.message : "Could not update segment label", "error");
+        return false;
+      }
+    },
+    [applyScaleAiPayload, currentVideo, setStatus, touchRecentTask],
   );
 
   const commitScaleAiSegment = useCallback(
@@ -3122,6 +3165,7 @@ export function useReviewController() {
     scaleAiTaskProgress,
     videosInCurrentParentTask,
     deleteScaleAiSegment,
+    updateScaleAiSegmentLabel,
     commitScaleAiSegment,
     nextScaleAiVideo,
     cancelTrim,

@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
+import { UNLABELED_TASK_LABEL } from "./types";
 
 function hoursLabel(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return "—";
@@ -23,6 +24,18 @@ export function ScaleAiPanel({
   const video = c.currentVideo();
   const videosInTask = c.videosInCurrentParentTask();
   const videoIndex = videosInTask.findIndex((item) => item.path === video?.path);
+  const unlabeledCount = segments.filter(
+    (segment) =>
+      segment.type === "subtask" &&
+      segment.label.trim().toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase(),
+  ).length;
+  const relabelOptions = c.tasks
+    .filter((task) => task.trim().toLowerCase() !== UNLABELED_TASK_LABEL.toLowerCase())
+    .filter(
+      (task, index, all) =>
+        all.findIndex((candidate) => candidate.toLowerCase() === task.toLowerCase()) === index,
+    )
+    .sort((a, b) => a.localeCompare(b));
   const normalizedHighlight = String(highlightedTask || "")
     .trim()
     .toLowerCase();
@@ -35,8 +48,8 @@ export function ScaleAiPanel({
           {annotation?.parent_task || "Open a 50-hour folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          T marks a segment · type a label · Enter assigns (creates if new) · G = garbage · N = next
-          · Trim when ready
+          T marks a segment · U saves it as Unlabeled task · type a label + Enter assigns · G =
+          garbage · Ctrl+Z = undo · N = next
         </p>
       </div>
 
@@ -60,6 +73,12 @@ export function ScaleAiPanel({
         <div className="flex justify-between gap-2">
           <span className="text-muted-foreground">CL</span>
           <span className="font-mono">{annotation?.cl_number || "—"}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-muted-foreground">UNLABELED IN VIDEO</span>
+          <span className={`font-mono ${unlabeledCount > 0 ? "text-accent" : ""}`}>
+            {unlabeledCount}
+          </span>
         </div>
       </div>
 
@@ -122,6 +141,11 @@ export function ScaleAiPanel({
           segments.map((segment) => {
             const color = taskColor(segment.label || segment.type);
             const isGarbage = segment.type === "garbage";
+            const isUnlabeled =
+              !isGarbage &&
+              String(segment.label || "")
+                .trim()
+                .toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase();
             const isHighlighted =
               !isGarbage &&
               normalizedHighlight.length > 0 &&
@@ -160,6 +184,24 @@ export function ScaleAiPanel({
                     {c.formatTime(segment.start)} → {c.formatTime(segment.end)} ·{" "}
                     {segment.duration.toFixed(2)}s
                   </div>
+                  {isUnlabeled ? (
+                    <select
+                      value=""
+                      aria-label={`Assign a label to segment ${segment.id}`}
+                      onChange={(event) => {
+                        const label = event.currentTarget.value;
+                        if (label) void c.updateScaleAiSegmentLabel(segment.id, label);
+                      }}
+                      className="mt-1 h-7 max-w-full rounded-sm border border-border bg-surface px-1.5 text-[10px] text-foreground"
+                    >
+                      <option value="">Assign label later…</option>
+                      {relabelOptions.map((task) => (
+                        <option key={task} value={task}>
+                          {task}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
                 </div>
                 <button
                   type="button"

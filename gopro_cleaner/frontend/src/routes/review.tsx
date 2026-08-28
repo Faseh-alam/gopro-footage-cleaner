@@ -9,6 +9,7 @@ import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
 import { Logo } from "@/components/wc/logo";
 import { useReviewController } from "@/components/review/useReviewController";
+import { UNLABELED_TASK_LABEL } from "@/components/review/types";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
 import { TaskPanel } from "@/components/review/task-panel";
@@ -44,7 +45,8 @@ const KEYS: [string, string][] = [
   ["T / D", "Mark segment end (pending)"],
   ["Enter", "Assign typed/selected label (creates if new)"],
   ["G", "Mark garbage"],
-  ["U", "Undo last / clear pending"],
+  ["U", "Save pending as Unlabeled task · otherwise undo"],
+  ["Ctrl+Z", "Undo last / clear pending"],
   ["N", "Next video (JSON autosaved)"],
   ["Home", "Jump to 0:00"],
 ];
@@ -65,10 +67,7 @@ function ReviewPage() {
     if (!highlightedScaleAiTask) return;
     const clearHighlight = (event: PointerEvent) => {
       const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest("[data-scaleai-highlight-control]")
-      ) {
+      if (target instanceof Element && target.closest("[data-scaleai-highlight-control]")) {
         return;
       }
       setHighlightedScaleAiTask("");
@@ -245,7 +244,11 @@ function ReviewPage() {
           c.leaveTaskSearch({ clear: true });
           return;
         }
-        if (event.key.length === 1 && !(event.key.toLowerCase() === "u" && !c.taskSearch.trim()))
+        if (
+          event.key.length === 1 &&
+          !(event.key.toLowerCase() === "u" && !c.taskSearch.trim()) &&
+          !(event.ctrlKey && event.key.toLowerCase() === "z")
+        )
           return;
       } else if (isField(target)) {
         return;
@@ -254,7 +257,9 @@ function ReviewPage() {
       const key = event.key.toLowerCase();
       let handled = true;
 
-      if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{")
+      if (event.ctrlKey && key === "z") {
+        void c.undoSegment();
+      } else if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{")
         c.bumpPlaybackRate(-0.5);
       else if (event.key === "ArrowRight" || event.key === "]" || event.key === "}")
         c.bumpPlaybackRate(0.5);
@@ -271,7 +276,11 @@ function ReviewPage() {
       } else if (key === "g") {
         c.markGarbage();
       } else if (key === "u") {
-        void c.undoSegment();
+        if (c.scaleAiMode && c.scaleAiPending) {
+          void c.commitScaleAiSegment(UNLABELED_TASK_LABEL, "subtask");
+        } else {
+          void c.undoSegment();
+        }
       } else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
       else if (key === "n") {

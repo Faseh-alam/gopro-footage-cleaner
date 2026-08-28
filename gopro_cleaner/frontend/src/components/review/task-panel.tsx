@@ -6,6 +6,7 @@ import { TextInput } from "@/components/wc/field";
 import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
 import { ScaleAiPanel } from "./scaleai-panel";
+import { UNLABELED_TASK_LABEL } from "./types";
 
 export function TaskPanel({
   c,
@@ -18,9 +19,18 @@ export function TaskPanel({
 }) {
   const [newTask, setNewTask] = useState("");
   const groups = c.orderedTaskGroups();
+  const unlabeledCount =
+    c
+      .currentScaleAi()
+      ?.segments.filter(
+        (segment) =>
+          segment.type === "subtask" &&
+          segment.label.trim().toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase(),
+      ).length ?? 0;
 
   const renderTask = (task: string) => {
-    const deletable = c.isUserDefinedTask(task);
+    const isUnlabeledTask = task.toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase();
+    const deletable = !isUnlabeledTask && c.isUserDefinedTask(task);
     const color = taskColor(task);
     return (
       <div
@@ -55,6 +65,14 @@ export function TaskPanel({
             aria-hidden
           />
           <span className="truncate">{task}</span>
+          {isUnlabeledTask ? (
+            <span
+              className="ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+              title="Unlabeled tasks in this video"
+            >
+              {unlabeledCount}
+            </span>
+          ) : null}
         </button>
         {deletable ? (
           <button
@@ -174,10 +192,12 @@ export function TaskPanel({
             <div className="eyebrow">Subtask labels</div>
             {taskPicker}
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              T → type label → Enter · G = garbage · U = undo · N = next
+              T → type label → Enter · T → U = Unlabeled task · G = garbage · Ctrl+Z = undo · N =
+              next
             </p>
             <Button size="sm" variant="outline" onClick={() => void c.undoSegment()}>
-              Undo last <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">U</kbd>
+              Undo last{" "}
+              <kbd className="ml-1 font-mono text-[10px] text-muted-foreground">Ctrl+Z</kbd>
             </Button>
           </div>
         </>
