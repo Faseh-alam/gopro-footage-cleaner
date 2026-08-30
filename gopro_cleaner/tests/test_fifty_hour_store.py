@@ -371,8 +371,506 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertEqual(data["source_video"], "GX010001.MP4")
         self.assertEqual(data["segments"][0]["label"], "pick cloth")
 
+    def test_retarget_clip_filename_keeps_camera_and_serial(self) -> None:
+        self.assertEqual(
+            fifty_hour_store.retarget_clip_filename(
+                "C3461325829225-001-053.mp4", "003"
+            ),
+            "C3461325829225-003-053.mp4",
+        )
+        self.assertEqual(
+            fifty_hour_store.retarget_clip_filename(
+                "C3461325829225-001-053.mp4",
+                "003",
+                occupied={"C3461325829225-003-053.mp4"},
+            ),
+            "C3461325829225-003-054.mp4",
+        )
+        self.assertEqual(
+            fifty_hour_store.retarget_clip_filename(
+                "C3531325142202-001-001.mp4",
+                "003",
+                occupied={"C3461325829225-003-001.mp4"},
+            ),
+            "C3531325142202-003-002.mp4",
+        )
+        self.assertTrue(
+            fifty_hour_store.clip_serial_taken_by_other_camera(
+                "C3531325142202-003-001.mp4",
+                {"C3461325829225-003-001.mp4"},
+            )
+        )
 
-class FiftyHourScanSortTests(unittest.TestCase):
+    def test_next_clip_serial_continues_after_other_camera(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="applying-sticker",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3531325142202"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        dest = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        dest.mkdir(parents=True, exist_ok=True)
+        subtask_id = fifty_hour_store.subtask_id_for_label(
+            self.video, "applying-sticker"
+        )
+        for serial in range(1, 21):
+            (
+                dest / f"C3461325829225-{subtask_id}-{serial:03d}.mp4"
+            ).write_bytes(b"other-camera")
+
+        name = fifty_hour_store.next_clip_filename(
+            self.video, "applying-sticker", dest
+        )
+        self.assertEqual(name, f"C3531325142202-{subtask_id}-021.mp4")
+        name2 = fifty_hour_store.next_clip_filename(
+            self.video,
+            "applying-sticker",
+            dest,
+            reserved={name},
+        )
+        self.assertEqual(name2, f"C3531325142202-{subtask_id}-022.mp4")
+
+    def test_next_clip_uses_next_free_serial_not_stale_manifest(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="applying-sticker",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3531325142202"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        dest = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        dest.mkdir(parents=True, exist_ok=True)
+        subtask_id = fifty_hour_store.subtask_id_for_label(
+            self.video, "applying-sticker"
+        )
+        for serial in range(1, 31):
+            (
+                dest / f"C3531325142202-{subtask_id}-{serial:03d}.mp4"
+            ).write_bytes(b"existing")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": f"C3461325829225-{subtask_id}-085.mp4",
+                    "source_video": "GX072170.MP4",
+                    "subtask": "applying-sticker",
+                    "camera_serial": "C3461325829225",
+                    "video_serial": 85,
+                }
+            ],
+        )
+        (dest / f"C3531325142202-{subtask_id}-086.mp4").write_bytes(b"gap")
+
+        name = fifty_hour_store.next_clip_filename(
+            self.video, "applying-sticker", dest
+        )
+        self.assertEqual(name, f"C3531325142202-{subtask_id}-031.mp4")
+
+    def test_relabel_unlabeled_clip_moves_file_and_updates_subtask_id(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"clip")
+        annotation["segments"][0]["clip_filename"] = old_name
+        annotation["segments"][0]["subtask_id"] = "001"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                }
+            ],
+        )
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "sticker placing"
+        )
+
+        updated = fifty_hour_store.update_segment(
+            self.video,
+            annotation["segments"][0]["id"],
+            label="sticker placing",
+            root=self.root,
+        )
+
+        new_id = fifty_hour_store.subtask_id_for_label(self.video, "sticker placing")
+        expected = f"C3461325829225-{new_id}-053.mp4"
+        new_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "sticker placing"
+        )
+        self.assertEqual(updated["segments"][0]["label"], "sticker placing")
+        self.assertEqual(updated["segments"][0]["clip_filename"], expected)
+        self.assertEqual(updated["segments"][0]["subtask_id"], new_id)
+        self.assertTrue((new_dir / expected).is_file())
+        self.assertFalse((unlabeled_dir / old_name).exists())
+        manifest = fifty_hour_store.load_manifest(self.task)
+        sticker = next(row for row in manifest["subtasks"] if row["name"] == "sticker placing")
+        self.assertEqual(sticker["clips"][0]["filename"], expected)
+
+    def test_relabel_moves_clip_without_stored_filename(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"clip")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                }
+            ],
+        )
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "sticker placing"
+        )
+
+        updated = fifty_hour_store.update_segment(
+            self.video,
+            annotation["segments"][0]["id"],
+            label="sticker placing",
+            root=self.root,
+        )
+
+        new_id = fifty_hour_store.subtask_id_for_label(self.video, "sticker placing")
+        expected = f"C3461325829225-{new_id}-053.mp4"
+        new_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "sticker placing"
+        )
+        self.assertEqual(updated["segments"][0]["clip_filename"], expected)
+        self.assertTrue((new_dir / expected).is_file())
+        self.assertFalse((unlabeled_dir / old_name).exists())
+        sidecar = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
+        self.assertEqual(sidecar["segments"][0]["clip_filename"], expected)
+        self.assertEqual(sidecar["segments"][0]["subtask_id"], new_id)
+
+    def test_relabel_removes_duplicate_copy_left_in_unlabeled(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"from-unlabeled")
+        annotation["segments"][0]["clip_filename"] = old_name
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                }
+            ],
+        )
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "sticker placing"
+        )
+        dest_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "sticker placing"
+        )
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / old_name).write_bytes(b"duplicate-copy")
+
+        fifty_hour_store.update_segment(
+            self.video,
+            annotation["segments"][0]["id"],
+            label="sticker placing",
+            root=self.root,
+        )
+
+        new_id = fifty_hour_store.subtask_id_for_label(self.video, "sticker placing")
+        expected = f"C3461325829225-{new_id}-053.mp4"
+        self.assertTrue((dest_dir / expected).is_file())
+        self.assertFalse((unlabeled_dir / old_name).exists())
+        self.assertFalse((dest_dir / old_name).exists())
+
+    def test_load_writes_missing_clip_filename_into_json(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-007.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"clip")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                    "source_start": "1.000",
+                    "source_end": "2.000",
+                }
+            ],
+        )
+
+        loaded = fifty_hour_store.load_annotation(self.video, root=self.root)
+        self.assertEqual(loaded["segments"][0]["clip_filename"], old_name)
+        sidecar = json.loads((self.task / "GX010001.json").read_text(encoding="utf-8"))
+        self.assertEqual(sidecar["segments"][0]["clip_filename"], old_name)
+
+    def test_opening_labeled_video_moves_unlabeled_clip(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "sticker placing"
+        )
+        annotation["segments"][0]["label"] = "sticker placing"
+        for key in ("clip_filename", "clip_path", "subtask_id", "clip_serial"):
+            annotation["segments"][0].pop(key, None)
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"clip")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                }
+            ],
+        )
+
+        loaded = fifty_hour_store.load_annotation(self.video, root=self.root)
+        new_id = fifty_hour_store.subtask_id_for_label(self.video, "sticker placing")
+        expected = f"C3461325829225-{new_id}-053.mp4"
+        dest_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "sticker placing"
+        )
+        self.assertEqual(loaded["segments"][0]["clip_filename"], expected)
+        self.assertTrue((dest_dir / expected).is_file())
+        self.assertFalse((unlabeled_dir / old_name).exists())
+
+    def test_labeled_folder_copy_renames_and_leaves_unlabeled(self) -> None:
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "applying-sticker"
+        )
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "Unlabeled task"
+        )
+        dest_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        old_name = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / old_name).write_bytes(b"from-unlabeled")
+        (dest_dir / old_name).write_bytes(b"from-applying")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3461325829225",
+                },
+                {
+                    "clip_filename": old_name,
+                    "source_video": self.video.name,
+                    "subtask": "applying-sticker",
+                    "camera_serial": "C3461325829225",
+                },
+            ],
+        )
+
+        loaded = fifty_hour_store.load_annotation(self.video, root=self.root)
+        new_id = fifty_hour_store.subtask_id_for_label(self.video, "applying-sticker")
+        expected = f"C3461325829225-{new_id}-053.mp4"
+        self.assertEqual(loaded["segments"][0]["label"], "applying-sticker")
+        self.assertEqual(loaded["segments"][0]["clip_filename"], expected)
+        self.assertTrue((dest_dir / expected).is_file())
+        self.assertFalse((unlabeled_dir / old_name).exists())
+        self.assertFalse((dest_dir / old_name).exists())
+        self.assertFalse(list(unlabeled_dir.glob("C346*.mp4")))
+
+    def test_other_camera_unlabeled_clip_stays_put(self) -> None:
+        other = self.task / "GX020399.MP4"
+        other.write_bytes(b"other")
+        fifty_hour_store.add_segment(
+            other,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation = fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="Unlabeled task",
+            root=self.root,
+        )
+        annotation["camera_serial"] = "C3461325829225"
+        fifty_hour_store.save_annotation(self.video, annotation, root=self.root)
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "applying-sticker"
+        )
+        unlabeled_dir = fifty_hour_store.subtask_export_directory(
+            other, "Unlabeled task"
+        )
+        dest_dir = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stay = "C3531325142202-001-001.mp4"
+        move = "C3461325829225-001-053.mp4"
+        (unlabeled_dir / stay).write_bytes(b"keep-unlabeled")
+        (unlabeled_dir / move).write_bytes(b"move-me")
+        (dest_dir / move).write_bytes(b"already-labeled")
+        fifty_hour_store.write_export_manifest(
+            other,
+            [
+                {
+                    "clip_filename": stay,
+                    "source_video": other.name,
+                    "subtask": "Unlabeled task",
+                    "camera_serial": "C3531325142202",
+                }
+            ],
+        )
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": move,
+                    "source_video": self.video.name,
+                    "subtask": "applying-sticker",
+                    "camera_serial": "C3461325829225",
+                }
+            ],
+        )
+
+        other_loaded = fifty_hour_store.load_annotation(other, root=self.root)
+        self.assertEqual(other_loaded["segments"][0]["label"], "Unlabeled task")
+        self.assertTrue((unlabeled_dir / stay).is_file())
+        fifty_hour_store.load_annotation(self.video, root=self.root)
+        self.assertFalse((unlabeled_dir / move).exists())
+
+    def test_same_serial_in_different_subtasks_is_not_deleted(self) -> None:
+        fifty_hour_store.add_label(self.root, "garment-folding-general", "opening-sticker")
+        fifty_hour_store.add_label(
+            self.root, "garment-folding-general", "applying-sticker"
+        )
+        opening_id = fifty_hour_store.subtask_id_for_label(
+            self.video, "opening-sticker"
+        )
+        applying_id = fifty_hour_store.subtask_id_for_label(
+            self.video, "applying-sticker"
+        )
+        opening = fifty_hour_store.subtask_export_directory(
+            self.video, "opening-sticker"
+        )
+        applying = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        opening.mkdir(parents=True, exist_ok=True)
+        applying.mkdir(parents=True, exist_ok=True)
+        left = f"C3531325142202-{opening_id}-001.mp4"
+        right = f"C3531325142202-{applying_id}-001.mp4"
+        (opening / left).write_bytes(b"opening-clip")
+        (applying / right).write_bytes(b"applying-clip")
+        fifty_hour_store.write_export_manifest(
+            self.video,
+            [
+                {
+                    "clip_filename": left,
+                    "source_video": self.video.name,
+                    "subtask": "opening-sticker",
+                    "camera_serial": "C3531325142202",
+                },
+                {
+                    "clip_filename": right,
+                    "source_video": self.video.name,
+                    "subtask": "applying-sticker",
+                    "camera_serial": "C3531325142202",
+                },
+            ],
+        )
+
+        fifty_hour_store.load_manifest(self.task)
+        self.assertTrue((opening / left).is_file())
+        self.assertTrue((applying / right).is_file())
+        self.assertEqual((opening / left).read_bytes(), b"opening-clip")
+        self.assertEqual((applying / right).read_bytes(), b"applying-clip")
+
     def test_scan_groups_by_parent_task(self) -> None:
         root = Path(tempfile.mkdtemp()) / "50-hour"
         a = root / "aaa-task"
@@ -390,6 +888,23 @@ class FiftyHourScanSortTests(unittest.TestCase):
             ),
         )
         self.assertEqual([p.parent.name for p in paths], ["aaa-task", "bbb-task"])
+
+    def test_add_segment_extends_when_too_close_to_previous_mark(self) -> None:
+        start, end = fifty_hour_store._resolve_non_overlapping_start(
+            2.0, 2.03, [{"id": 1, "start": 1.0, "end": 2.0}]
+        )
+        self.assertAlmostEqual(start, 2.01, places=3)
+        self.assertGreaterEqual(end - start, 0.05 - 1e-6)
+
+    def test_update_segment_matches_numeric_string_id(self) -> None:
+        self.assertEqual(fifty_hour_store._segment_id_key("51.0"), "51")
+        self.assertEqual(fifty_hour_store._segment_id_key(51), "51")
+        found = fifty_hour_store._find_segment(
+            {"segments": [{"id": 51, "label": "Unlabeled task"}]},
+            "51.0",
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["label"], "Unlabeled task")
 
 
 if __name__ == "__main__":

@@ -41,8 +41,9 @@ const KEYS: [string, string][] = [
   ["← →", "Speed −0.5× / +0.5× (up to 5× — no encoding, no waiting)"],
   ["[ ]", "Speed −0.5× / +0.5× (same range)"],
   [", .", "−0.1s / +0.1s in ScaleAI · Shift+,/. or < > = 1 frame"],
-  ["T / D", "Mark segment end (pending)"],
-  ["Enter", "Assign typed/selected label (creates if new)"],
+  ["T / D", "Mark segment end (one press; auto-nudges if too close)"],
+  ["↑ ↓", "Highlight a subtask in the list"],
+  ["Enter", "Assign highlighted / typed label (creates if new)"],
   ["G", "Mark garbage"],
   ["U", "Save pending as Unlabeled task · otherwise undo"],
   ["Ctrl+Z", "Undo last / clear pending"],
@@ -180,30 +181,13 @@ function ReviewPage() {
 
       // T is a shortcut only outside the name box. Inside it, T is just a letter
       // so names like "taking cloth" can be typed after marking a segment.
-      if (
-        event.key.toLowerCase() === "t" &&
-        c.scaleAiMode &&
-        c.scaleAiPending &&
-        !inTaskSearch
-      ) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        void c.undoSegment();
-        return;
-      }
-
+      // T always (re)marks. Undo pending with Ctrl+Z or U — a second T
+      // used to cancel the first mark and felt like "T does nothing".
       if (inTaskSearch) {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
           event.stopImmediatePropagation();
-          const matches = c.orderedTaskGroups().matches;
-          if (!matches.length) return;
-          const at = matches.indexOf(c.selectedTaskValue);
-          const next = Math.min(
-            matches.length - 1,
-            Math.max(0, (at < 0 ? 0 : at) + (event.key === "ArrowDown" ? 1 : -1)),
-          );
-          c.setSelectedTaskValue(matches[next] ?? "");
+          c.moveTaskHighlight(event.key === "ArrowDown" ? 1 : -1);
           return;
         }
         if (event.key === "Enter") {
@@ -212,9 +196,11 @@ function ReviewPage() {
           const query = c.taskSearch.trim();
           const matches = c.orderedTaskGroups().matches;
           const exact = matches.find((t) => t.toLowerCase() === query.toLowerCase());
-          // Arrow ↑/↓ selection wins over the raw filter text.
+          // Arrow ↑/↓ writes selectedTaskValue into a ref immediately so
+          // Down then Enter in the same frame still sees the highlight.
+          const highlightedRaw = c.selectedTask();
           const highlighted =
-            c.selectedTaskValue && matches.includes(c.selectedTaskValue) ? c.selectedTaskValue : "";
+            highlightedRaw && matches.includes(highlightedRaw) ? highlightedRaw : "";
           const task = c.scaleAiMode
             ? highlighted || exact || query || c.lastLabelTask.trim() || ""
             : exact || highlighted || (!query ? c.lastLabelTask.trim() : "") || "";
@@ -229,7 +215,7 @@ function ReviewPage() {
             );
             return;
           }
-          c.setSelectedTaskValue(task);
+          c.pickTaskValue(task);
           const hasPending = Boolean(c.scaleAiPending || c.currentAnnotation()?.pendingWork);
           if (hasPending) void c.labelCurrentClip(task);
           else if (c.scaleAiMode && query && !highlighted && !exact) {
@@ -258,7 +244,12 @@ function ReviewPage() {
       const key = event.key.toLowerCase();
       let handled = true;
 
-      if (event.ctrlKey && key === "z") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        if (c.scaleAiMode || c.taskSelectionMode) {
+          c.moveTaskHighlight(event.key === "ArrowDown" ? 1 : -1);
+          c.focusTaskSearch();
+        } else handled = false;
+      } else if (event.ctrlKey && key === "z") {
         void c.undoSegment();
       } else if (event.key === "ArrowLeft" || event.key === "[" || event.key === "{")
         c.bumpPlaybackRate(-0.5);

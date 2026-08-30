@@ -43,7 +43,7 @@ export function ScaleAiPanel({
           {annotation?.parent_task || "Open a 50-hour folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          T marks a segment · U saves it as Unlabeled task · type a label + Enter assigns · G =
+          T marks a segment · ↓/↑ then Enter assigns · U = Unlabeled task · G =
           garbage · Ctrl+Z = undo · N = next
         </p>
       </div>

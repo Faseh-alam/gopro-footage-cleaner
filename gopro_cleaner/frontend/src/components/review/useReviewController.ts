@@ -736,8 +736,11 @@ export function useReviewController() {
 
   const currentScrubTime = useCallback(() => {
     flushSeek();
-    return stateRef.current.scrubTime;
-  }, [flushSeek]);
+    // Use the media clock, not the throttled React scrub state. While playing,
+    // UI ticks only every 150ms, so T would otherwise land on a stale time
+    // and look like it "did nothing" until a second press.
+    return readOriginalTime();
+  }, [flushSeek, readOriginalTime]);
 
   const scheduleSeek = useCallback(
     (time: number, immediate = false) => {
@@ -908,6 +911,30 @@ export function useReviewController() {
     // Filter text must never become a task name — only an explicit list selection.
     return stateRef.current.selectedTaskValue?.trim() || "";
   }, []);
+
+  const pickTaskValue = useCallback((name: string) => {
+    const clean = String(name || "").trim();
+    stateRef.current.selectedTaskValue = clean;
+    setSelectedTaskValue(clean);
+    return clean;
+  }, []);
+
+  const moveTaskHighlight = useCallback(
+    (delta: number) => {
+      const matches = orderedTaskGroups().matches;
+      if (!matches.length) return "";
+      const current = String(stateRef.current.selectedTaskValue || "").trim();
+      const at = matches.indexOf(current);
+      let nextIdx: number;
+      if (at < 0) {
+        nextIdx = delta > 0 ? 0 : matches.length - 1;
+      } else {
+        nextIdx = Math.min(matches.length - 1, Math.max(0, at + delta));
+      }
+      return pickTaskValue(matches[nextIdx] || "");
+    },
+    [orderedTaskGroups, pickTaskValue],
+  );
 
   const focusTaskSearch = useCallback(() => {
     taskSearchRef.current?.focus();
@@ -1123,6 +1150,14 @@ export function useReviewController() {
           lowLatencyMode: false,
           backBufferLength: 30,
           startPosition: seekTo > 0.05 ? seekTo : -1,
+          // GoPro HEVC previews live on slow disks and share the machine with
+          // trim/ffmpeg. Default 10s HLS timeouts surface as levelLoadTimeOut.
+          manifestLoadingTimeOut: 60000,
+          manifestLoadingMaxRetry: 8,
+          levelLoadingTimeOut: 60000,
+          levelLoadingMaxRetry: 8,
+          fragLoadingTimeOut: 60000,
+          fragLoadingMaxRetry: 8,
         });
         hlsRef.current = hls;
         activeSourceRef.current = "preview";
@@ -1155,9 +1190,34 @@ export function useReviewController() {
           }, 800);
         });
         hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (!data.fatal || token !== previewTokenRef.current) return;
+          if (token !== previewTokenRef.current) return;
+          const detail = String(data.details || "");
+          const timedOut =
+            detail === "levelLoadTimeOut" ||
+            detail === "manifestLoadTimeOut" ||
+            detail === "fragLoadTimeOut" ||
+            detail === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
+            detail === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
+            detail === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT;
+          if (timedOut) {
+            try {
+              hls.startLoad();
+            } catch {
+              /* ignore */
+            }
+            if (!data.fatal) {
+              setStatus("Preview is still loading — retrying…");
+              return;
+            }
+          }
+          if (!data.fatal) return;
           setLoadingVideo(false);
-          setStatus(data.details || "Could not load compatible preview", "error");
+          setStatus(
+            timedOut
+              ? "Video preview timed out. Wait for encoding to finish, then click the video or refresh."
+              : "Could not load the video preview",
+            "error",
+          );
         });
         hls.loadSource(absolute);
         hls.attachMedia(v);
@@ -1627,10 +1687,16 @@ export function useReviewController() {
         applyScaleAiPayload(video.path, data);
         setStatus("Deleted segment", "ok");
       } catch (error: any) {
-        setStatus(error.message || "Could not delete segment", "error");
+        const message = error.message || "Could not delete segment";
+        if (String(message).toLowerCase().includes("segment not found")) {
+          await loadScaleAiForPath(video.path);
+          setStatus("That mark was out of date — list refreshed.", "error");
+          return;
+        }
+        setStatus(message, "error");
       }
     },
-    [applyScaleAiPayload, currentVideo, setStatus],
+    [applyScaleAiPayload, currentVideo, loadScaleAiForPath, setStatus],
   );
 
   const updateScaleAiSegmentLabel = useCallback(
@@ -1661,11 +1727,17 @@ export function useReviewController() {
         setStatus(`Assigned ${clean}`, "ok");
         return true;
       } catch (error: unknown) {
-        setStatus(error instanceof Error ? error.message : "Could not update segment label", "error");
+        const message = error instanceof Error ? error.message : "Could not update segment label";
+        if (String(message).toLowerCase().includes("segment not found")) {
+          await loadScaleAiForPath(video.path);
+          setStatus("That mark was out of date — list refreshed. Assign the label again.", "error");
+          return false;
+        }
+        setStatus(message, "error");
         return false;
       }
     },
-    [applyScaleAiPayload, currentVideo, setStatus, touchRecentTask],
+    [applyScaleAiPayload, currentVideo, loadScaleAiForPath, setStatus, touchRecentTask],
   );
 
   const commitScaleAiSegment = useCallback(
@@ -1747,7 +1819,7 @@ export function useReviewController() {
         Number(annotation?.duration_seconds) ||
         Number(video.duration) ||
         knownDurationSec();
-      const end = normalizeBoundary(currentScrubTime(), known);
+      let end = normalizeBoundary(currentScrubTime(), known);
       const segments = annotation?.segments || [];
       const coverage = segments.length
         ? Math.max(...segments.map((segment) => Number(segment.end) || 0))
@@ -1761,12 +1833,9 @@ export function useReviewController() {
           setStatus("No unlabeled footage remains after the last marking", "error");
           return;
         }
-        scheduleSeek(target, true);
-        setStatus(
-          `Moved to ${formatTime(target)} after the last marking — move forward, then press T`,
-          "ok",
-        );
-        return;
+        // One T is enough: nudge the playhead and open the pending mark.
+        end = normalizeBoundary(target, known);
+        scheduleSeek(end, true);
       }
       setScaleAiPending({ start: anchor, end });
       stateRef.current.scaleAiPending = { start: anchor, end };
@@ -3055,6 +3124,7 @@ export function useReviewController() {
       // Ignore transient pauses while a play attempt is still intentional.
       if (wantPlayingRef.current && playPromiseRef.current) return;
       setIsPlaying(false);
+      if (Number.isFinite(v.currentTime)) setScrubTime(v.currentTime);
     };
     const onEnded = () => {
       wantPlayingRef.current = false;
@@ -3123,7 +3193,9 @@ export function useReviewController() {
     taskSearch,
     setTaskSearch,
     selectedTaskValue,
-    setSelectedTaskValue,
+    setSelectedTaskValue: pickTaskValue,
+    pickTaskValue,
+    moveTaskHighlight,
     taskSelectionMode,
     status,
     setStatus,

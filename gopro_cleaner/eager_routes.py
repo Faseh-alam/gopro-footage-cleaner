@@ -1304,12 +1304,42 @@ def create_eager_blueprint() -> Blueprint:
             end = float(segment["end"])
             label = str(segment["label"]).strip()
             output_dir = fifty_hour_store.subtask_export_directory(source, label)
+            subtask_id = fifty_hour_store.subtask_id_for_label(source, label)
             recorded_name = str(segment.get("clip_filename") or "").strip()
             recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
-            if recorded_match and (output_dir / recorded_name).is_file():
+            claimed = reserved_names.setdefault(str(output_dir), set())
+            if recorded_match and recorded_match.group("subtask") != subtask_id:
+                occupied = set(claimed)
+                if output_dir.is_dir():
+                    occupied.update(
+                        path.name
+                        for path in output_dir.iterdir()
+                        if path.is_file()
+                    )
+                new_name = fifty_hour_store.retarget_clip_filename(
+                    recorded_name, subtask_id, occupied=occupied
+                )
+                fifty_hour_store.place_named_clip(
+                    source, recorded_name, output_dir, new_name
+                )
+                recorded_name = new_name
+                recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
+                segment["clip_filename"] = recorded_name
+                segment["clip_path"] = f"{output_dir.name}/{recorded_name}"
+                segment["subtask_id"] = subtask_id
+                if recorded_match:
+                    segment["clip_serial"] = int(recorded_match.group("clip"))
+            if (
+                recorded_match
+                and recorded_match.group("subtask") == subtask_id
+                and (output_dir / recorded_name).is_file()
+            ):
                 skipped += 1
                 segment["clip_path"] = f"{output_dir.name}/{recorded_name}"
-                reserved_names.setdefault(str(output_dir), set()).add(recorded_name)
+                claimed.add(recorded_name)
+                fifty_hour_store.place_named_clip(
+                    source, recorded_name, output_dir, recorded_name
+                )
                 manifest_rows.append(
                     {
                         "clip_filename": recorded_name,
@@ -1372,22 +1402,9 @@ def create_eager_blueprint() -> Blueprint:
             try:
                 dir_key = str(output_dir)
                 claimed = reserved_names.setdefault(dir_key, set())
-                recorded_name = str(segment.get("clip_filename") or "").strip()
-                recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
-                if (
-                    recorded_match
-                    and not (output_dir / recorded_name).exists()
-                    and recorded_name.lower() not in {
-                        reserved_name.lower() for reserved_name in claimed
-                    }
-                ):
-                    # Rebuild a missing trim using the same serial already stored
-                    # in this video's JSON / manifest.json.
-                    filename = recorded_name
-                else:
-                    filename = fifty_hour_store.next_clip_filename(
-                        source, label, output_dir, reserved=claimed
-                    )
+                filename = fifty_hour_store.next_clip_filename(
+                    source, label, output_dir, reserved=claimed
+                )
                 claimed.add(filename)
                 clip_match = fifty_hour_store.CLIP_NAME_RE.match(filename)
                 if clip_match:

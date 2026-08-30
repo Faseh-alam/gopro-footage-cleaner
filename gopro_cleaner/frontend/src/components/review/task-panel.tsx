@@ -183,8 +183,8 @@ export function TaskPanel({
             <div className="eyebrow">Subtask labels</div>
             {taskPicker}
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              T → type label → Enter · T → U = Unlabeled task · G = garbage · Ctrl+Z = undo · N =
-              next
+              T → ↓/↑ pick label → Enter · T → U = Unlabeled task · G = garbage · Ctrl+Z = undo ·
+              N = next
             </p>
             <Button size="sm" variant="outline" onClick={() => void c.undoSegment()}>
               Undo last{" "}
