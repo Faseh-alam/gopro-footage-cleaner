@@ -1288,6 +1288,7 @@ def create_eager_blueprint() -> Blueprint:
                 "path": str(source),
                 "queued": 0,
                 "skipped": 0,
+                "job_ids": [],
                 "errors": ["No subtask segments to export"],
                 "export_dir": str(fifty_hour_store.export_directory(source)),
                 "manifest": None,
@@ -1295,8 +1296,10 @@ def create_eager_blueprint() -> Blueprint:
 
         queued = 0
         skipped = 0
+        job_ids: list[str] = []
         errors: list[str] = []
         manifest_rows: list[dict] = []
+        pending_trims: list[tuple[float, float, str, Path, str]] = []
         export_root = fifty_hour_store.export_directory(source)
         reserved_names: dict[str, set[str]] = {}
         for segment in segments:
@@ -1308,22 +1311,51 @@ def create_eager_blueprint() -> Blueprint:
             recorded_name = str(segment.get("clip_filename") or "").strip()
             recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
             claimed = reserved_names.setdefault(str(output_dir), set())
-            if recorded_match and recorded_match.group("subtask") != subtask_id:
-                occupied = set(claimed)
-                if output_dir.is_dir():
-                    occupied.update(
-                        path.name
-                        for path in output_dir.iterdir()
-                        if path.is_file()
+            occupied = set(claimed)
+            if output_dir.is_dir():
+                occupied.update(
+                    path.name
+                    for path in output_dir.iterdir()
+                    if path.is_file()
+                )
+            reserved_serials = fifty_hour_store.serials_reserved_by_earlier_videos(
+                source, label
+            )
+            recorded_already_used = bool(
+                recorded_name
+                and recorded_name.lower() in {name.lower() for name in claimed}
+            )
+            file_exists = bool(recorded_name) and (output_dir / recorded_name).is_file()
+            needs_retarget = bool(file_exists and recorded_match) and (
+                recorded_match.group("subtask") != subtask_id
+                or recorded_already_used
+                or fifty_hour_store.clip_serial_taken_by_other_camera(
+                    recorded_name,
+                    occupied,
+                    reserved_serials=reserved_serials,
+                )
+            )
+            if needs_retarget:
+                if recorded_already_used:
+                    new_name = fifty_hour_store.next_clip_filename(
+                        source, label, output_dir, reserved=claimed
                     )
-                new_name = fifty_hour_store.retarget_clip_filename(
-                    recorded_name, subtask_id, occupied=occupied
-                )
-                fifty_hour_store.place_named_clip(
-                    source, recorded_name, output_dir, new_name
-                )
+                else:
+                    new_name = fifty_hour_store.retarget_clip_filename(
+                        recorded_name,
+                        subtask_id,
+                        occupied=occupied,
+                        reserved_serials=reserved_serials,
+                    )
+                    fifty_hour_store.place_named_clip(
+                        source, recorded_name, output_dir, new_name
+                    )
                 recorded_name = new_name
                 recorded_match = fifty_hour_store.CLIP_NAME_RE.match(recorded_name)
+                recorded_already_used = bool(
+                    recorded_name
+                    and recorded_name.lower() in {name.lower() for name in claimed}
+                )
                 segment["clip_filename"] = recorded_name
                 segment["clip_path"] = f"{output_dir.name}/{recorded_name}"
                 segment["subtask_id"] = subtask_id
@@ -1333,6 +1365,12 @@ def create_eager_blueprint() -> Blueprint:
                 recorded_match
                 and recorded_match.group("subtask") == subtask_id
                 and (output_dir / recorded_name).is_file()
+                and not recorded_already_used
+                and not fifty_hour_store.clip_serial_taken_by_other_camera(
+                    recorded_name,
+                    occupied,
+                    reserved_serials=reserved_serials,
+                )
             ):
                 skipped += 1
                 segment["clip_path"] = f"{output_dir.name}/{recorded_name}"
@@ -1402,6 +1440,8 @@ def create_eager_blueprint() -> Blueprint:
             try:
                 dir_key = str(output_dir)
                 claimed = reserved_names.setdefault(dir_key, set())
+                # Always take the next free serial. Reusing a JSON name when
+                # the file is gone kept stale 077–083 instead of filling 020–035.
                 filename = fifty_hour_store.next_clip_filename(
                     source, label, output_dir, reserved=claimed
                 )
@@ -1417,19 +1457,7 @@ def create_eager_blueprint() -> Blueprint:
                             "camera_serial": annotation.get("camera_serial"),
                         }
                     )
-                record = eager_trim_queue.submit(
-                    source,
-                    start,
-                    end,
-                    output_dir=output_dir,
-                    task=label,
-                    kind="fifty-subtask",
-                    output_filename=filename,
-                )
-                if record.source_has_gpmf is False:
-                    # Source genuinely has no GPMF — still export, but note it.
-                    pass
-                queued += 1
+                pending_trims.append((start, end, label, output_dir, filename))
                 manifest_rows.append(
                     {
                         "clip_filename": filename,
@@ -1446,6 +1474,9 @@ def create_eager_blueprint() -> Blueprint:
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
 
+        # Write clip names before ffmpeg starts. Repair used to see new
+        # applying files while JSON still named 077–083 and dump them into
+        # Unlabeled-task as 008-020.
         manifest_path = None
         if manifest_rows:
             try:
@@ -1456,10 +1487,31 @@ def create_eager_blueprint() -> Blueprint:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"manifest: {exc}")
 
+        for start, end, label, output_dir, filename in pending_trims:
+            try:
+                record = eager_trim_queue.submit(
+                    source,
+                    start,
+                    end,
+                    output_dir=output_dir,
+                    task=label,
+                    kind="fifty-subtask",
+                    output_filename=filename,
+                )
+                if record.source_has_gpmf is False:
+                    pass
+                queued += 1
+                job_id = str(getattr(record, "job_id", "") or "").strip()
+                if job_id:
+                    job_ids.append(job_id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+
         return {
             "path": str(source),
             "queued": queued,
             "skipped": skipped,
+            "job_ids": job_ids,
             "errors": errors,
             "export_dir": str(export_root),
             "manifest": manifest_path,
@@ -1481,10 +1533,18 @@ def create_eager_blueprint() -> Blueprint:
             return jsonify({"error": f"Not found: {raw_path}"}), 404
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
+        export_batch = eager_trim_queue.begin_export_batch(
+            result.get("job_ids") or [],
+            already_downloaded=int(result.get("skipped") or 0),
+            source_path=str(source),
+        )
+        snapshot = eager_trim_queue.status_all()
         return jsonify(
             {
                 "ok": not result["errors"],
                 **result,
+                **snapshot,
+                "export_batch": export_batch,
                 "message": (
                     f"Queued {result['queued']} subtask trim(s)"
                     + (f"; skipped {result['skipped']} existing" if result["skipped"] else "")
@@ -1508,12 +1568,22 @@ def create_eager_blueprint() -> Blueprint:
 
         queued = sum(int(result["queued"]) for result in results)
         skipped = sum(int(result["skipped"]) for result in results)
+        job_ids = [
+            str(job_id)
+            for result in results
+            for job_id in (result.get("job_ids") or [])
+            if job_id
+        ]
         errors = [
             f"{Path(result['path']).name}: {error}"
             for result in results
             for error in result.get("errors") or []
             if error != "No subtask segments to export"
         ]
+        export_batch = eager_trim_queue.begin_export_batch(
+            job_ids, already_downloaded=skipped, folder_wide=True
+        )
+        snapshot = eager_trim_queue.status_all()
         return jsonify(
             {
                 "ok": not errors and bool(sources),
@@ -1521,8 +1591,11 @@ def create_eager_blueprint() -> Blueprint:
                 "source_count": len(sources),
                 "queued": queued,
                 "skipped": skipped,
+                "job_ids": job_ids,
+                "export_batch": export_batch,
                 "errors": errors,
                 "results": results,
+                **snapshot,
             }
         )
 

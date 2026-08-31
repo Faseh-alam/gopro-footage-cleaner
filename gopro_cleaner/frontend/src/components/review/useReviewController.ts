@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { toast } from "sonner";
 import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
-import { SHARE_CLIP_MAX_SECONDS, UNLABELED_TASK_LABEL } from "./types";
+import { SHARE_CLIP_MAX_SECONDS, UNLABELED_TASK_LABEL, exportBatchBelongsToVideo } from "./types";
 import type {
   Annotation,
   BatchDetail,
@@ -17,6 +17,7 @@ import type {
   SdCard,
   Segment,
   StatusKind,
+  TrimExportBatch,
   TrimJob,
   VideoItem,
   Workspace,
@@ -131,6 +132,77 @@ function formatDurationShort(seconds: number) {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function parseExportBatch(data: any): TrimExportBatch | null {
+  const batch = data?.export_batch;
+  if (!batch || typeof batch !== "object") return null;
+  const rawAudit = batch.audit;
+  const audit =
+    rawAudit && typeof rawAudit === "object"
+      ? {
+          ok: Boolean(rawAudit.ok),
+          source_name: String(rawAudit.source_name || ""),
+          labeled: Number(rawAudit.labeled || 0),
+          downloaded: Number(rawAudit.downloaded || 0),
+          missing: Number(rawAudit.missing || 0),
+          extra: Number(rawAudit.extra || 0),
+        }
+      : null;
+  return {
+    downloaded: Number(batch.downloaded || 0),
+    not_downloaded: Number(batch.not_downloaded || 0),
+    failed: Number(batch.failed || 0),
+    cancelled: Number(batch.cancelled || 0),
+    total: Number(batch.total || 0),
+    all_done: Boolean(batch.all_done),
+    all_success: Boolean(batch.all_success),
+    source_path: String(batch.source_path || ""),
+    folder_wide: Boolean(batch.folder_wide),
+    audit,
+  };
+}
+
+function exportBatchStatusMessage(batch: TrimExportBatch): { message: string; kind: StatusKind } {
+  const audit = batch.audit;
+  const videoName = audit?.source_name || "";
+  if (batch.total <= 0) {
+    return { message: "No clips to export", kind: "error" };
+  }
+  if (batch.not_downloaded > 0) {
+    return {
+      message: `${batch.downloaded} downloaded, ${batch.not_downloaded} not downloaded`,
+      kind: "",
+    };
+  }
+  if (audit && !audit.ok) {
+    const bits = [`${audit.downloaded}/${audit.labeled} clips on disk`];
+    if (audit.missing) bits.push(`${audit.missing} missing`);
+    if (audit.extra) bits.push(`${audit.extra} extra`);
+    return { message: bits.join(" · "), kind: "error" };
+  }
+  if (batch.failed > 0) {
+    return {
+      message: `${batch.downloaded} downloaded, ${batch.failed} failed`,
+      kind: "error",
+    };
+  }
+  if (batch.cancelled > 0) {
+    return {
+      message: `${batch.downloaded} downloaded, ${batch.cancelled} cancelled`,
+      kind: "",
+    };
+  }
+  if (batch.all_success || (audit && audit.ok)) {
+    const n = audit?.labeled ?? batch.total;
+    return {
+      message: videoName
+        ? `All ${n} labeled clips for ${videoName} are on disk`
+        : `All ${n} labeled clips for this video are on disk`,
+      kind: "ok",
+    };
+  }
+  return { message: "Trim finished", kind: "" };
 }
 
 function basenamePath(path?: string | null) {
@@ -280,13 +352,20 @@ export function useReviewController() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [loadingVideo, setLoadingVideo] = useState(false);
 
-  const [globalTrim, setGlobalTrim] = useState<{ active: number; jobs: TrimJob[]; etaTotal: number }>({
+  const [globalTrim, setGlobalTrim] = useState<{
+    active: number;
+    jobs: TrimJob[];
+    etaTotal: number;
+    exportBatch: TrimExportBatch | null;
+  }>({
     active: 0,
     jobs: [],
     etaTotal: 0,
+    exportBatch: null,
   });
 
   const [busy, setBusy] = useState(false);
+  const [trimBusy, setTrimBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [ffmpegHint, setFfmpegHint] = useState<string | null>(null);
@@ -344,6 +423,8 @@ export function useReviewController() {
   const swapCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const trimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const globalTrimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** True after Trim until this batch is fully saved or failed. */
+  const trimWatchRef = useRef(false);
   const [previewNote, setPreviewNote] = useState("");
 
   // Keep latest state accessible inside stable callbacks / keyboard handler.
@@ -376,8 +457,11 @@ export function useReviewController() {
   };
 
   const setStatus = useCallback((message: string, kind: StatusKind = "") => {
-    setStatusState({ message: message || "", kind });
-    if (kind === "error" && message) toast.error(message);
+    const text = String(message || "");
+    // Player "Ready" must not hide trim download counts.
+    if (trimWatchRef.current && /^ready\b/i.test(text)) return;
+    setStatusState({ message: text, kind });
+    if (kind === "error" && text) toast.error(text);
   }, []);
 
   const currentVideo = useCallback((): VideoItem | null => {
@@ -1736,6 +1820,10 @@ export function useReviewController() {
   }, [isVideoFullyDone, loadVideo, nextIncompleteIndex, setStatus]);
 
   const nextScaleAiVideo = useCallback(async () => {
+    if (trimWatchRef.current) {
+      setStatus("Stay on this video until every labeled clip is on disk", "error");
+      return;
+    }
     const s = stateRef.current;
     if (!s.videos.length) return;
     const next = s.index + 1;
@@ -2601,8 +2689,37 @@ export function useReviewController() {
   const applyGlobalTrimUi = useCallback((data: any) => {
     const active = Number(data?.active || 0);
     const jobs: TrimJob[] = Array.isArray(data?.jobs) ? data.jobs : [];
-    setGlobalTrim({ active, jobs, etaTotal: Number(data?.eta_total_seconds || 0) });
-  }, []);
+    const exportBatch = parseExportBatch(data);
+    setGlobalTrim({
+      active,
+      jobs,
+      etaTotal: Number(data?.eta_total_seconds || 0),
+      exportBatch,
+    });
+    if (!exportBatch || exportBatch.total <= 0) return;
+    if (!trimWatchRef.current && exportBatch.not_downloaded === 0) return;
+    const currentPath = currentVideo()?.path || "";
+    const batchForCurrent = exportBatchBelongsToVideo(exportBatch, currentPath);
+    const next = exportBatchStatusMessage(exportBatch);
+    if (exportBatch.not_downloaded > 0 || batchForCurrent) {
+      setStatus(next.message, next.kind);
+    }
+    if (exportBatch.not_downloaded > 0) {
+      trimWatchRef.current = true;
+      return;
+    }
+    if (trimWatchRef.current && exportBatch.all_success && batchForCurrent) {
+      const n = exportBatch.audit?.labeled ?? exportBatch.total;
+      const name = exportBatch.audit?.source_name;
+      toast.success(
+        name
+          ? `All ${n} labeled clips for ${name} are on disk`
+          : `All ${n} labeled clips for this video are on disk`,
+      );
+    }
+    trimWatchRef.current = false;
+    setTrimBusy(false);
+  }, [currentVideo, setStatus]);
 
   const pollGlobalTrims = useCallback(async () => {
     try {
@@ -2627,8 +2744,9 @@ export function useReviewController() {
           method: "POST",
           body: JSON.stringify({ job_id: jobId }),
         });
+        const watching = trimWatchRef.current;
         applyGlobalTrimUi(data);
-        setStatus("Cancelled trim", "ok");
+        if (!watching) setStatus("Cancelled trim", "ok");
       } catch (error: any) {
         setStatus(error.message, "error");
       }
@@ -2639,8 +2757,9 @@ export function useReviewController() {
   const cancelAllTrims = useCallback(async () => {
     try {
       const data = await api("/api/eager/trim/cancel-all", { method: "POST" });
+      const watching = trimWatchRef.current;
       applyGlobalTrimUi(data);
-      setStatus(`Cancelled ${data.cancelled_count || 0} trim(s)`, "ok");
+      if (!watching) setStatus(`Cancelled ${data.cancelled_count || 0} trim(s)`, "ok");
     } catch (error: any) {
       setStatus(error.message, "error");
     }
@@ -2935,6 +3054,8 @@ export function useReviewController() {
   const processScaleAiVideo = useCallback(async () => {
     const current = currentVideo();
     if (!current) return;
+    setStatus("Starting trim…");
+    setTrimBusy(true);
     try {
       const data = await api("/api/eager/scaleai/process-video", {
         method: "POST",
@@ -2943,13 +3064,26 @@ export function useReviewController() {
           root: stateRef.current.scanRoot || "",
         }),
       });
-      setStatus(data.message || `Queued ${data.queued || 0} trim(s)`, "ok");
+      const queued = Number(data.queued || 0);
+      const skipped = Number(data.skipped || 0);
+      if (Array.isArray(data.errors) && data.errors.length && queued + skipped === 0) {
+        trimWatchRef.current = false;
+        setTrimBusy(false);
+        setStatus(String(data.errors[0] || data.message || "Could not trim"), "error");
+        return;
+      }
+      trimWatchRef.current = queued + skipped > 0;
+      applyGlobalTrimUi(data);
       startGlobalTrimPolling();
       await pollGlobalTrims();
     } catch (error: any) {
+      trimWatchRef.current = false;
+      setTrimBusy(false);
       setStatus(error.message, "error");
+    } finally {
+      if (!trimWatchRef.current) setTrimBusy(false);
     }
-  }, [currentVideo, pollGlobalTrims, setStatus, startGlobalTrimPolling]);
+  }, [applyGlobalTrimUi, currentVideo, pollGlobalTrims, setStatus, startGlobalTrimPolling]);
 
   const processCurrentVideoScaleAi = processScaleAiVideo;
 
@@ -2959,21 +3093,33 @@ export function useReviewController() {
       setStatus("Open a 50-hour folder first", "error");
       return;
     }
+    setStatus("Starting trim…");
+    setTrimBusy(true);
     try {
       const data = await api("/api/eager/scaleai/process-folder", {
         method: "POST",
         body: JSON.stringify({ root }),
       });
-      setStatus(
-        `Queued ${data.queued || 0} subtask trims across ${data.source_count || 0} video(s)`,
-        data.errors?.length ? "error" : "ok",
-      );
+      const queued = Number(data.queued || 0);
+      const skipped = Number(data.skipped || 0);
+      if (Array.isArray(data.errors) && data.errors.length && queued + skipped === 0) {
+        trimWatchRef.current = false;
+        setTrimBusy(false);
+        setStatus(String(data.errors[0] || "Could not process ScaleAI folder"), "error");
+        return;
+      }
+      trimWatchRef.current = queued + skipped > 0;
+      applyGlobalTrimUi(data);
       startGlobalTrimPolling();
       await pollGlobalTrims();
     } catch (error: any) {
+      trimWatchRef.current = false;
+      setTrimBusy(false);
       setStatus(error.message || "Could not process ScaleAI folder", "error");
+    } finally {
+      if (!trimWatchRef.current) setTrimBusy(false);
     }
-  }, [pollGlobalTrims, setStatus, startGlobalTrimPolling]);
+  }, [applyGlobalTrimUi, pollGlobalTrims, setStatus, startGlobalTrimPolling]);
 
   const stitchScaleAiVideo = useCallback(async () => {
     const current = currentVideo();
@@ -3383,6 +3529,7 @@ export function useReviewController() {
     loadingVideo,
     previewNote,
     globalTrim,
+    trimBusy,
     busy,
     scanning,
     detecting,

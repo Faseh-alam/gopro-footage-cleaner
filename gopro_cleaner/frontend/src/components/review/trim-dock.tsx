@@ -15,14 +15,16 @@ const ACTIVE = new Set(["queued", "running"]);
  * - Cancel a single job, or cancel every active job at once.
  */
 export function TrimDock({ c }: { c: ReviewController }) {
-  const { active, jobs, etaTotal } = c.globalTrim;
+  const { active, jobs, etaTotal, exportBatch } = c.globalTrim;
   const [minimized, setMinimized] = useState(false);
   const [dismissed, setDismissed] = useState(true);
 
   // A new (or still-running) batch re-opens the dock after dismiss / reload.
   useEffect(() => {
-    if (active > 0) setDismissed(false);
-  }, [active]);
+    if (active > 0 || (exportBatch && exportBatch.not_downloaded > 0)) {
+      setDismissed(false);
+    }
+  }, [active, exportBatch]);
 
   const hasJobs = jobs.length > 0;
   if (!hasJobs || dismissed) return null;
@@ -34,7 +36,30 @@ export function TrimDock({ c }: { c: ReviewController }) {
     ? jobs.reduce((a, j) => a + (j.status === "completed" ? 100 : Number(j.progress) || 0), 0) /
       jobs.length
     : 0;
-  const allDone = active === 0;
+  const downloaded = exportBatch?.downloaded ?? done;
+  const notDownloaded = exportBatch?.not_downloaded ?? active;
+  const allSuccess = Boolean(exportBatch?.all_success);
+  const audit = exportBatch?.audit;
+  const countLabel =
+    active > 0 || (exportBatch && !exportBatch.all_done)
+      ? `${downloaded} downloaded · ${notDownloaded} not downloaded`
+      : allSuccess
+        ? audit?.source_name
+          ? `All ${audit.labeled} clips for ${audit.source_name} are on disk`
+          : "All labeled clips for this video are on disk"
+        : audit && !audit.ok
+          ? `${audit.downloaded}/${audit.labeled} on disk`
+          : "All done";
+  const pillLabel =
+    active > 0 || (exportBatch && exportBatch.not_downloaded > 0)
+      ? `${downloaded}/${exportBatch?.total ?? jobs.length} downloaded`
+      : allSuccess
+        ? audit?.source_name
+          ? `All ${audit.labeled} clips for ${audit.source_name} are on disk`
+          : "All labeled clips for this video are on disk"
+        : "Trims finished";
+
+  const allDone = active === 0 && (!exportBatch || exportBatch.all_done);
 
   if (minimized) {
     return (
@@ -49,7 +74,7 @@ export function TrimDock({ c }: { c: ReviewController }) {
         ) : (
           <Scissors className="size-3.5 text-muted-foreground" />
         )}
-        {active > 0 ? `Trimming ${active}… ${Math.round(overall)}%` : "Trims finished"}
+        {pillLabel}
       </button>
     );
   }
@@ -113,7 +138,8 @@ export function TrimDock({ c }: { c: ReviewController }) {
       <div className="px-3 py-2">
         <div className="mb-1.5 flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
           <span>
-            {active > 0 ? `${active} active · ~${c.formatDurationShort(etaTotal)}` : "All done"}
+            {countLabel}
+            {active > 0 ? ` · ~${c.formatDurationShort(etaTotal)}` : ""}
           </span>
           <span>
             {done ? `${done} done` : ""}
@@ -141,12 +167,12 @@ export function TrimDock({ c }: { c: ReviewController }) {
                         job.status === "completed" && "text-success",
                         job.status === "cancelled" && "text-muted-foreground/60",
                       )}
-                      title={job.error || job.message || undefined}
-                    >
-                      {job.status === "running"
-                        ? `${Math.round(Number(job.progress) || 0)}%`
-                        : job.status}
-                    </span>
+                    title={job.error || job.message || undefined}
+                  >
+                    {job.status === "running"
+                      ? `${Math.round(Number(job.progress) || 0)}%`
+                      : job.status}
+                  </span>
                     {isActive && (
                       <button
                         type="button"
@@ -161,6 +187,11 @@ export function TrimDock({ c }: { c: ReviewController }) {
                   </span>
                 </div>
                 {job.status === "running" && <ProgressBar value={Number(job.progress) || 0} />}
+                {job.status === "failed" && job.error ? (
+                  <p className="truncate text-[10px] text-destructive" title={job.error}>
+                    {job.error}
+                  </p>
+                ) : null}
               </li>
             );
           })}

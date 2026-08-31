@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -216,6 +217,36 @@ def _run_ffmpeg(command: list[str], duration_seconds: float, job_id: str) -> Non
         raise RuntimeError(f"ffmpeg failed while trimming the clip:\n{details}")
 
 
+def _copy_finished_clip(src: Path, dest: Path, attempts: int = 8) -> None:
+    """Copy a finished encode into the task folder, retrying OneDrive locks."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            if dest.exists():
+                dest.unlink()
+            shutil.copy2(src, dest)
+            if dest.is_file() and dest.stat().st_size > 0:
+                return
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.2 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Could not write finished clip to {dest}")
+
+
+def _probe_output(path: Path) -> MediaInfo:
+    last_exc: Exception | None = None
+    for attempt in range(6):
+        try:
+            return probe_media(path)
+        except (RuntimeError, OSError) as exc:
+            last_exc = exc
+            time.sleep(0.2 * (attempt + 1))
+    raise RuntimeError(str(last_exc) if last_exc else f"Could not inspect {path.name}")
+
+
 def _execute_trim(job: TrimJob) -> None:
     temp_path: Path | None = None
     try:
@@ -250,13 +281,17 @@ def _execute_trim(job: TrimJob) -> None:
                 ),
             )
 
-        # Keep a real media extension last — ffmpeg picks the muxer from the
-        # suffix, so ".MP4.partial" fails with "Unable to choose an output format".
+        # Encode on the local disk first. Writing `.partial.mp4` into a
+        # OneDrive task folder often makes the file vanish before we can
+        # rename it (WinError 2) or leaves a cloud placeholder ffprobe
+        # cannot inspect.
         ext = job.output_path.suffix or ".MP4"
+        local_tmp = Path(tempfile.gettempdir()) / "gopro-cleaner-trims"
+        local_tmp.mkdir(parents=True, exist_ok=True)
         temp_fd, temp_name = tempfile.mkstemp(
             suffix=f".partial{ext}",
             prefix=f"{job.output_path.stem}_",
-            dir=output_dir,
+            dir=local_tmp,
         )
         os.close(temp_fd)
         temp_path = Path(temp_name)
@@ -305,12 +340,14 @@ def _execute_trim(job: TrimJob) -> None:
             else:
                 raise
 
-        if temp_path.stat().st_size == 0:
+        if not temp_path.is_file() or temp_path.stat().st_size == 0:
             raise RuntimeError("ffmpeg produced an empty output file")
 
-        if job.output_path.exists():
-            job.output_path.unlink()
-        temp_path.replace(job.output_path)
+        _copy_finished_clip(temp_path, job.output_path)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         temp_path = None
 
         if media.has_gpmf:
@@ -330,7 +367,7 @@ def _execute_trim(job: TrimJob) -> None:
                     ),
                 )
 
-        trimmed = probe_media(job.output_path)
+        trimmed = _probe_output(job.output_path)
         if media.has_gpmf and not trimmed.has_gpmf:
             # Don't leave a lookalike finalized clip that label mode would pick up.
             try:

@@ -54,6 +54,11 @@ class EagerTrimQueue:
         self._pending_finish: dict[str, bool] = {}
         self._finish_errors: dict[str, str] = {}
         self._cancelled: set[str] = set()
+        # Last ScaleAI trim click — counts for "X downloaded, Y not downloaded".
+        self._export_job_ids: list[str] = []
+        self._export_already: int = 0
+        self._export_source_path: str = ""
+        self._export_folder_wide: bool = False
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._workers = [
@@ -294,7 +299,96 @@ class EagerTrimQueue:
             "active": active,
             "eta_total_seconds": round(eta_total, 1),
             "jobs": jobs_out,
+            "export_batch": self.export_batch_status(),
         }
+
+    def begin_export_batch(
+        self,
+        job_ids: list[str] | None,
+        *,
+        already_downloaded: int = 0,
+        source_path: str = "",
+        folder_wide: bool = False,
+    ) -> dict:
+        """Start counting this Trim click: skipped files + newly queued jobs."""
+        ids = [str(job_id) for job_id in (job_ids or []) if job_id]
+        with self._lock:
+            self._export_job_ids = ids
+            try:
+                already = max(0, int(already_downloaded))
+            except (TypeError, ValueError):
+                already = 0
+            self._export_already = already
+            self._export_source_path = str(source_path or "")
+            self._export_folder_wide = bool(folder_wide)
+        return self.export_batch_status()
+
+    def export_batch_status(self) -> dict:
+        """Exact downloaded vs still-pending counts for the last Trim click."""
+        with self._lock:
+            ids = list(self._export_job_ids)
+            already = self._export_already
+            records = self._records
+            pending = 0
+            downloaded = already
+            failed = 0
+            cancelled = 0
+            for job_id in ids:
+                record = records.get(job_id)
+                status = record.status if record is not None else "queued"
+                if status in {"queued", "running"}:
+                    pending += 1
+                elif status == "completed":
+                    output_s = (
+                        str(record.output or "").strip() if record is not None else ""
+                    )
+                    if output_s and not (
+                        Path(output_s).is_file() and Path(output_s).stat().st_size > 0
+                    ):
+                        failed += 1
+                    else:
+                        downloaded += 1
+                elif status == "failed":
+                    failed += 1
+                elif status == "cancelled":
+                    cancelled += 1
+                else:
+                    pending += 1
+            total = already + len(ids)
+            all_done = pending == 0
+            source_path = self._export_source_path
+            folder_wide = self._export_folder_wide
+            payload = {
+                "downloaded": downloaded,
+                "not_downloaded": pending,
+                "failed": failed,
+                "cancelled": cancelled,
+                "queued": len(ids),
+                "already": already,
+                "total": total,
+                "all_done": all_done,
+                "all_success": all_done and failed == 0 and cancelled == 0 and total > 0,
+                "source_path": source_path,
+                "folder_wide": folder_wide,
+                "audit": None,
+            }
+        audit = None
+        if source_path and Path(source_path).is_file():
+            try:
+                from . import fifty_hour_store
+
+                audit = fifty_hour_store.clip_download_audit(Path(source_path))
+            except Exception:
+                audit = None
+        payload["audit"] = audit
+        if audit is not None:
+            payload["all_success"] = bool(
+                payload["all_done"]
+                and payload["failed"] == 0
+                and payload["cancelled"] == 0
+                and audit.get("ok")
+            )
+        return payload
 
     def schedule_source_finish(self, source: Path, *, delete_source: bool = False) -> dict:
         """Optionally delete the raw file after its trims finish.
@@ -444,6 +538,37 @@ class EagerTrimQueue:
                 output_path = Path(record.output) if record.output else build_output_path(
                     source, clip_number, source.parent
                 )
+                if record.kind == "fifty-subtask" and record.task:
+                    from . import fifty_hour_store
+
+                    dest_dir = fifty_hour_store.subtask_export_directory(
+                        source, str(record.task)
+                    )
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest_id = fifty_hour_store.subtask_id_for_label(
+                        source, str(record.task)
+                    )
+                    parsed = fifty_hour_store.CLIP_NAME_RE.match(output_path.name)
+                    if (
+                        output_path.parent.resolve() != dest_dir.resolve()
+                        or parsed is None
+                        or parsed.group("subtask") != dest_id
+                    ):
+                        reserved = {
+                            Path(r.output).name
+                            for r in self.jobs_for_source(source)
+                            if r.output
+                            and Path(r.output).parent.resolve() == dest_dir.resolve()
+                            and r.job_id != record.job_id
+                        }
+                        filename = fifty_hour_store.next_clip_filename(
+                            source,
+                            str(record.task),
+                            dest_dir,
+                            reserved=reserved,
+                        )
+                        output_path = dest_dir / filename
+                        record.output = str(output_path)
                 if output_path.exists():
                     # Rare race with a leftover file — pick a free name instead of failing.
                     # Keep numeric 000N naming for fifty-hour subtask exports.
@@ -505,8 +630,15 @@ class EagerTrimQueue:
                 if finished is None or finished.status != "completed":
                     raise RuntimeError(finished.error if finished else "Trim failed")
 
+                actual = Path(finished.output_path)
+                record.output = str(actual)
+                if not actual.is_file() or actual.stat().st_size <= 0:
+                    raise RuntimeError(
+                        f"Trim finished but the clip is missing: {actual.name}"
+                    )
+
                 try:
-                    record.output_has_gpmf = probe_media(output_path).has_gpmf
+                    record.output_has_gpmf = probe_media(actual).has_gpmf
                 except (RuntimeError, OSError):
                     record.output_has_gpmf = False
 
@@ -517,7 +649,7 @@ class EagerTrimQueue:
 
                 with self._condition:
                     record.status = "completed"
-                    record.output = str(output_path)
+                    record.output = str(actual)
                     self._condition.notify_all()
             except _JobCancelled:
                 # Remove any partial output the cancelled encode may have left.

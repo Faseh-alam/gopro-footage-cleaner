@@ -152,6 +152,86 @@ class FiftyHourRouteTests(unittest.TestCase):
         )
         self.assertEqual(call.kwargs["output"].parent, subtask_dir)
 
+    def test_process_video_counts_not_downloaded_until_complete(self) -> None:
+        self._add_segment(self.first, "Picking up the box", 1.0)
+        queued = SimpleNamespace(source_has_gpmf=True, job_id="trim-watch-1")
+        with patch(
+            "gopro_cleaner.eager_routes.eager_trim_queue.submit",
+            return_value=queued,
+        ):
+            response = self.client.post(
+                "/api/eager/scaleai/process-video",
+                json={"path": str(self.first), "root": str(self.root)},
+            )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["job_ids"], ["trim-watch-1"])
+        batch = payload["export_batch"]
+        self.assertEqual(batch["downloaded"], 0)
+        self.assertEqual(batch["not_downloaded"], 1)
+        self.assertFalse(batch["all_success"])
+        active = self.client.get("/api/eager/trim/active").get_json()
+        self.assertEqual(active["export_batch"]["not_downloaded"], 1)
+        self.assertFalse(active["export_batch"]["all_success"])
+        self.assertEqual(active["export_batch"]["source_path"], str(self.first.resolve()))
+
+    def test_duplicate_clip_filename_queues_a_second_file(self) -> None:
+        self._add_segment(self.first, "Picking up the box", 1.0)
+        self._add_segment(self.first, "Picking up the box", 3.0)
+        sidecar = self.task / "video1.json"
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["segments"][0]["clip_filename"] = "CAM001-001-001.mp4"
+        payload["segments"][1]["clip_filename"] = "CAM001-001-001.mp4"
+        sidecar.write_text(json.dumps(payload), encoding="utf-8")
+        dest = self.task / "Picking-up-the-box-001"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "CAM001-001-001.mp4").write_bytes(b"first-clip")
+        queued = SimpleNamespace(source_has_gpmf=True, job_id="trim-dup-2")
+        with patch(
+            "gopro_cleaner.eager_routes.eager_trim_queue.submit",
+            return_value=queued,
+        ) as submit:
+            response = self.client.post(
+                "/api/eager/scaleai/process-video",
+                json={"path": str(self.first), "root": str(self.root)},
+            )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["skipped"], 1)
+        self.assertEqual(payload["queued"], 1)
+        self.assertEqual(
+            submit.call_args.kwargs["output_filename"],
+            "CAM001-001-002.mp4",
+        )
+        saved = json.loads(sidecar.read_text(encoding="utf-8"))
+        names = [row["clip_filename"] for row in saved["segments"]]
+        self.assertEqual(names, ["CAM001-001-001.mp4", "CAM001-001-002.mp4"])
+
+    def test_process_video_writes_json_before_submit(self) -> None:
+        self._add_segment(self.first, "Picking up the box", 1.0)
+        sidecar = self.task / "video1.json"
+        names_at_submit: list[str] = []
+
+        def _submit(*_args, **_kwargs):
+            saved = json.loads(sidecar.read_text(encoding="utf-8"))
+            names_at_submit.extend(
+                str(row.get("clip_filename") or "") for row in saved["segments"]
+            )
+            return SimpleNamespace(source_has_gpmf=True, job_id="trim-named")
+
+        with patch(
+            "gopro_cleaner.eager_routes.eager_trim_queue.submit",
+            side_effect=_submit,
+        ):
+            response = self.client.post(
+                "/api/eager/scaleai/process-video",
+                json={"path": str(self.first), "root": str(self.root)},
+            )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["queued"], 1)
+        self.assertEqual(names_at_submit, ["CAM001-001-001.mp4"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import type { ReviewController } from "./useReviewController";
 import {
   SHARE_CLIP_MAX_SECONDS,
   UNLABELED_TASK_LABEL,
+  exportBatchBelongsToVideo,
   scaleAiSegmentInFocus,
   scaleAiSubtaskCountRows,
   type ScaleAiFocusRange,
@@ -260,19 +261,82 @@ export function ScaleAiPanel({
         )}
       </div>
 
+      {(() => {
+        const batch = c.globalTrim.exportBatch;
+        const videoPath = video?.path || "";
+        const belongs = exportBatchBelongsToVideo(batch, videoPath);
+        const starting = Boolean(c.trimBusy) && (!batch || batch.total <= 0);
+        const pending = Boolean(batch && batch.not_downloaded > 0);
+        if (!starting && !pending && (!belongs || !batch || batch.total <= 0)) return null;
+        const text = starting
+          ? "Starting trim…"
+          : pending
+            ? `${batch!.downloaded} downloaded, ${batch!.not_downloaded} not downloaded`
+            : batch!.audit && !batch!.audit.ok
+              ? `${batch!.audit.downloaded}/${batch!.audit.labeled} clips on disk`
+                + (batch!.audit.missing ? ` · ${batch!.audit.missing} missing` : "")
+                + (batch!.audit.extra ? ` · ${batch!.audit.extra} extra` : "")
+            : batch!.all_success
+              ? batch!.audit?.source_name
+                ? `All ${batch!.audit.labeled} labeled clips for ${batch!.audit.source_name} are on disk`
+                : "All labeled clips for this video are on disk"
+              : batch!.failed > 0
+                ? `${batch!.downloaded} downloaded, ${batch!.failed} failed`
+                : `${batch!.downloaded} downloaded, ${batch!.cancelled} cancelled`;
+        return (
+          <div
+            className={cn(
+              "rounded-sm border px-2 py-2 text-[11px] leading-snug",
+              pending || starting
+                ? "border-accent/40 bg-accent/10 text-foreground"
+                : batch?.all_success
+                  ? "border-success/40 bg-success/10 text-success"
+                  : "border-destructive/40 bg-destructive/10 text-destructive",
+            )}
+          >
+            {text}
+          </div>
+        );
+      })()}
       <div className="grid grid-cols-2 gap-2">
-        <Button size="sm" variant="accent" onClick={() => void c.processScaleAiVideo()}>
-          Trim this video
+        <Button
+          size="sm"
+          variant="accent"
+          disabled={Boolean(
+            c.trimBusy ||
+              (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
+          )}
+          onClick={() => void c.processScaleAiVideo()}
+        >
+          {c.trimBusy || (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0)
+            ? "Trimming…"
+            : "Trim this video"}
         </Button>
         <Button size="sm" variant="outline" onClick={() => void c.stitchScaleAiVideo()}>
           Stitch each subtask
         </Button>
       </div>
       <div className="grid grid-cols-2 gap-2">
-        <Button size="sm" variant="outline" onClick={() => void c.nextScaleAiVideo()}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={Boolean(
+            c.trimBusy ||
+              (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
+          )}
+          onClick={() => void c.nextScaleAiVideo()}
+        >
           Next video
         </Button>
-        <Button size="sm" variant="outline" onClick={() => void c.processScaleAiFolder()}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={Boolean(
+            c.trimBusy ||
+              (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
+          )}
+          onClick={() => void c.processScaleAiFolder()}
+        >
           Trim whole folder
         </Button>
       </div>

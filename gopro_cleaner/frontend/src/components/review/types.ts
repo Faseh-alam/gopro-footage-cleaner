@@ -181,6 +181,44 @@ export interface TrimJob {
   end_seconds?: number;
 }
 
+/** Counts for the last Trim click, plus labeled-vs-disk audit for this video. */
+export interface ClipDownloadAudit {
+  ok: boolean;
+  source_name: string;
+  labeled: number;
+  downloaded: number;
+  missing: number;
+  extra: number;
+}
+
+export interface TrimExportBatch {
+  downloaded: number;
+  not_downloaded: number;
+  failed: number;
+  cancelled: number;
+  total: number;
+  all_done: boolean;
+  all_success: boolean;
+  source_path?: string;
+  folder_wide?: boolean;
+  audit?: ClipDownloadAudit | null;
+}
+
+export function sameMediaPath(left: string, right: string): boolean {
+  const norm = (value: string) =>
+    value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return Boolean(left) && Boolean(right) && norm(left) === norm(right);
+}
+
+export function exportBatchBelongsToVideo(
+  batch: TrimExportBatch | null | undefined,
+  videoPath: string | undefined,
+): boolean {
+  if (!batch) return false;
+  if (batch.folder_wide) return true;
+  return sameMediaPath(String(batch.source_path || ""), String(videoPath || ""));
+}
+
 export interface Workspace {
   id: string;
   title: string;
