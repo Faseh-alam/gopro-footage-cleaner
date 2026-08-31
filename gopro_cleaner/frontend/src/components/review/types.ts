@@ -19,6 +19,8 @@ export interface Segment {
 }
 
 export const UNLABELED_TASK_LABEL = "Unlabeled task";
+/** WhatsApp share clips cannot be longer than this (matches backend MAX_SHARE_SECONDS). */
+export const SHARE_CLIP_MAX_SECONDS = 300;
 
 export type ScaleAiFocusRange = { start: number; end: number };
 

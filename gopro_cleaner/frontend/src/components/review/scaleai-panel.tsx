@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
 import {
+  SHARE_CLIP_MAX_SECONDS,
   UNLABELED_TASK_LABEL,
   scaleAiSegmentInFocus,
   scaleAiSubtaskCountRows,
@@ -169,6 +170,10 @@ export function ScaleAiPanel({
                 .trim()
                 .toLowerCase() === normalizedHighlight &&
               scaleAiSegmentInFocus(segment, highlightedRange);
+            const tooLongForWhatsApp =
+              Number(segment.end) - Number(segment.start) > SHARE_CLIP_MAX_SECONDS;
+            const encodingThis =
+              c.shareClipBusy && String(c.shareClipBusySegmentId) === String(segment.id);
             return (
               <div
                 key={String(segment.id)}
@@ -209,28 +214,43 @@ export function ScaleAiPanel({
                     {segment.duration.toFixed(2)}s
                   </div>
                   {isUnlabeled ? (
-                    <select
-                      value=""
-                      aria-label={`Assign a label to segment ${segment.id}`}
-                      onChange={(event) => {
-                        const label = event.currentTarget.value;
-                        if (label) void c.updateScaleAiSegmentLabel(segment.id, label);
-                      }}
-                      className="mt-1 h-7 max-w-full rounded-sm border border-border bg-surface px-1.5 text-[10px] text-foreground"
-                    >
-                      <option value="">Assign label later…</option>
-                      {relabelOptions.map((task) => (
-                        <option key={task} value={task}>
-                          {task}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                      <select
+                        value=""
+                        aria-label={`Assign a label to segment ${segment.id}`}
+                        onChange={(event) => {
+                          const label = event.currentTarget.value;
+                          if (label) void c.updateScaleAiSegmentLabel(segment.id, label);
+                        }}
+                        className="h-7 min-w-0 flex-1 rounded-sm border border-border bg-surface px-1.5 text-[10px] text-foreground"
+                      >
+                        <option value="">Assign label later…</option>
+                        {relabelOptions.map((task) => (
+                          <option key={task} value={task}>
+                            {task}
+                          </option>
+                        ))}
+                      </select>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={c.shareClipBusy || tooLongForWhatsApp}
+                        title={
+                          tooLongForWhatsApp
+                            ? "This unlabeled clip is over 5 minutes — too long for a WhatsApp download"
+                            : "Download this unlabeled clip to send on WhatsApp"
+                        }
+                        onClick={() => void c.downloadUnlabeledSegment(segment)}
+                      >
+                        {encodingThis ? "Encoding…" : "Download"}
+                      </Button>
+                    </div>
                   ) : null}
                 </div>
                 <button
                   type="button"
                   onClick={() => void c.deleteScaleAiSegment(segment.id)}
-                  className="text-[10px] text-muted-foreground hover:text-destructive"
+                  className="shrink-0 self-start text-[10px] text-muted-foreground hover:text-destructive"
                 >
                   Delete
                 </button>

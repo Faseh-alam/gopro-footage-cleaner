@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { toast } from "sonner";
 import { api, formatClock, host, openDownloadUrl } from "@/lib/api";
-import { UNLABELED_TASK_LABEL } from "./types";
+import { SHARE_CLIP_MAX_SECONDS, UNLABELED_TASK_LABEL } from "./types";
 import type {
   Annotation,
   BatchDetail,
@@ -296,6 +296,8 @@ export function useReviewController() {
   const [shareClipIn, setShareClipIn] = useState<number | null>(null);
   const [shareClipOut, setShareClipOut] = useState<number | null>(null);
   const [shareClipBusy, setShareClipBusy] = useState(false);
+  const [shareClipBusySegmentId, setShareClipBusySegmentId] = useState<string | number | null>(null);
+  const shareClipBusyRef = useRef(false);
   const [shareClipQuality, setShareClipQuality] = useState<"720p" | "1080p">("1080p");
   const [appVersion, setAppVersion] = useState("");
   const [perf, setPerf] = useState<{ trim_poll_ms: number }>({ trim_poll_ms: 1200 });
@@ -3033,46 +3035,76 @@ export function useReviewController() {
     setStatus("Cleared share clip marks", "ok");
   }, [setStatus]);
 
+  const downloadShareClipRange = useCallback(
+    async (start: number, end: number, segmentId?: string | number | null) => {
+      const video = currentVideo();
+      if (!video) return;
+      if (end <= start + 0.05) {
+        setStatus("Clip end must be after start", "error");
+        return;
+      }
+      const clipSeconds = end - start;
+      if (clipSeconds > SHARE_CLIP_MAX_SECONDS) {
+        setStatus(
+          `This clip is ${Math.round(clipSeconds)}s. WhatsApp downloads must be under ${SHARE_CLIP_MAX_SECONDS}s.`,
+          "error",
+        );
+        return;
+      }
+      if (shareClipBusyRef.current) {
+        setStatus("Already encoding a WhatsApp clip…", "error");
+        return;
+      }
+      shareClipBusyRef.current = true;
+      setShareClipBusy(true);
+      setShareClipBusySegmentId(segmentId ?? null);
+      setStatus(`Encoding WhatsApp clip (${shareClipQuality})…`, "ok");
+      try {
+        // POST encodes + returns a short-lived GET URL. Opening that GET lets
+        // IDM/browser download managers re-request the same file (POST body cannot).
+        const prepared = await api<{
+          download_url: string;
+          filename?: string;
+          quality?: string;
+        }>("/api/eager/share-clip", {
+          method: "POST",
+          body: JSON.stringify({
+            path: video.path,
+            start,
+            end,
+            quality: shareClipQuality,
+          }),
+        });
+        if (!prepared?.download_url) {
+          throw new Error("Encode succeeded but no download URL was returned");
+        }
+        openDownloadUrl(prepared.download_url);
+        setStatus(`WhatsApp clip ready (${prepared.quality || shareClipQuality})`, "ok");
+      } catch (error: any) {
+        setStatus(error.message || "Share clip failed", "error");
+      } finally {
+        shareClipBusyRef.current = false;
+        setShareClipBusy(false);
+        setShareClipBusySegmentId(null);
+      }
+    },
+    [currentVideo, setStatus, shareClipQuality],
+  );
+
   const downloadShareClip = useCallback(async () => {
-    const video = currentVideo();
-    if (!video) return;
     if (shareClipIn == null || shareClipOut == null) {
       setStatus("Mark share in (I) and out (O) first", "error");
       return;
     }
-    if (shareClipOut <= shareClipIn + 0.05) {
-      setStatus("Share out must be after in", "error");
-      return;
-    }
-    setShareClipBusy(true);
-    setStatus(`Encoding WhatsApp clip (${shareClipQuality})…`, "ok");
-    try {
-      // POST encodes + returns a short-lived GET URL. Opening that GET lets
-      // IDM/browser download managers re-request the same file (POST body cannot).
-      const prepared = await api<{
-        download_url: string;
-        filename?: string;
-        quality?: string;
-      }>("/api/eager/share-clip", {
-        method: "POST",
-        body: JSON.stringify({
-          path: video.path,
-          start: shareClipIn,
-          end: shareClipOut,
-          quality: shareClipQuality,
-        }),
-      });
-      if (!prepared?.download_url) {
-        throw new Error("Encode succeeded but no download URL was returned");
-      }
-      openDownloadUrl(prepared.download_url);
-      setStatus(`WhatsApp clip ready (${prepared.quality || shareClipQuality})`, "ok");
-    } catch (error: any) {
-      setStatus(error.message || "Share clip failed", "error");
-    } finally {
-      setShareClipBusy(false);
-    }
-  }, [currentVideo, setStatus, shareClipIn, shareClipOut, shareClipQuality]);
+    await downloadShareClipRange(shareClipIn, shareClipOut);
+  }, [downloadShareClipRange, setStatus, shareClipIn, shareClipOut]);
+
+  const downloadUnlabeledSegment = useCallback(
+    async (segment: { id: string | number; start: number; end: number }) => {
+      await downloadShareClipRange(Number(segment.start), Number(segment.end), segment.id);
+    },
+    [downloadShareClipRange],
+  );
 
   // Persist playhead so reload resumes at the same timeline position.
   useEffect(() => {
@@ -3360,12 +3392,14 @@ export function useReviewController() {
     shareClipIn,
     shareClipOut,
     shareClipBusy,
+    shareClipBusySegmentId,
     shareClipQuality,
     setShareClipQuality,
     markShareIn,
     markShareOut,
     clearShareClip,
     downloadShareClip,
+    downloadUnlabeledSegment,
     deleteSegmentAt,
     updateRecordedAt,
     appVersion,
