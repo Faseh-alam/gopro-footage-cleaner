@@ -87,6 +87,19 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertAlmostEqual(row["labeled_hours"], 1.5 / 3600.0, places=4)
         self.assertFalse(row["complete"])
 
+    def test_add_segment_writes_progress_without_manual_refresh(self) -> None:
+        fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.5,
+            label="pick-cloth",
+            segment_type="subtask",
+            root=self.root,
+        )
+        progress = fifty_hour_store.load_progress(self.root, refresh=False)
+        row = progress["tasks"][0]
+        self.assertAlmostEqual(row["labeled_hours"], 1.5 / 3600.0, places=4)
+
     def test_overlap_auto_bumps_start_by_10ms(self) -> None:
         fifty_hour_store.add_segment(
             self.video,

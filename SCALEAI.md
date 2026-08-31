@@ -130,7 +130,7 @@ The page title is **Review Station**. Scale AI 50-hour mode is already on.
 - Playback speed and time
 - A coverage percentage (how much of this video is already marked as work)
 
-A thin bar may say **Building preview**. That means the program is making a smoother copy so you can play at high speed. You can still label while it builds. Until the preview is ready, speed may stay at **2×**.
+A thin bar may say **Preparing browser-compatible preview**. That means the program is making a copy Chromium can play (many GoPro files are HEVC). You can still label while it builds. Speed goes from **0.5× to 5×**.
 
 ### Right side
 
@@ -151,7 +151,7 @@ Work from the **start** of the video toward the end. Cover the whole timeline: e
 
 ### Mark a useful action
 
-1. Press **Space** to play. Use **←** and **→** to change speed (up to 5× once the preview is ready).
+1. Press **Space** to play. Use **←** and **→** to change speed (0.5× to 5×).
 2. Watch until the action **ends**.
 3. Press **T** once. ( **D** does the same thing.)
 4. The panel shows a **pending** range, for example `0:12 → 0:18 — type a label and press Enter`.
@@ -180,9 +180,11 @@ When this video is done:
 - Click **Next video** in the ScaleAI panel, or
 - Click another file in the **Footage** list.
 
-Labels are already saved. You do not wait for a save.
+If a mark is still **pending** (you pressed **T** but have not assigned a name), **N** and the Footage list stay on this video. Press **Enter** or **U** to save, or **Ctrl+Z** to clear, then change videos.
 
-You cannot press **N** while **Trim** or **Stitch** is still running.
+Labels are already saved after **Enter** / **U** / **G**. You do not wait for a save.
+
+You cannot press **N** while **Trim** or **Stitch** is still running. The status line at the bottom explains why.
 
 ---
 
@@ -205,7 +207,7 @@ Print this table and keep it next to the monitor.
 | **G** | Mark garbage up to the playhead |
 | **U** | If a mark is pending: save it as **Unlabeled task**. Otherwise: undo |
 | **Ctrl+Z** | Undo the last mark, or clear a pending mark |
-| **N** | Next video |
+| **N** | Next video (blocked while a mark is pending, or while Trim/Stitch is running) |
 | **Home** | Jump to the start of the video |
 | **Esc** | Leave the name box without assigning |
 | **I** | Set WhatsApp clip **in** point (see section 9) |
@@ -310,8 +312,8 @@ Your labels are already on disk. Tomorrow, open `run.bat` again, open the same 5
 | Page will not load | The black window is not running. Start `run.bat` again. |
 | Black window closed | Start `run.bat` again. Do not work in an old browser tab until it is running. |
 | Empty Footage list | You opened a folder that has no task folders with MP4s. Open the **parent** 50-hour folder. |
-| **Building preview** for a long time | Wait. Large files take time. If it never finishes, restart `run.bat` and click **Scan**. |
-| Playback is stuck at 2× | Preview is not ready yet. You can still mark; speed increases when the preview finishes. |
+| **Preparing browser-compatible preview** for a long time | Wait. Large files take time. If it never finishes, restart `run.bat` and click **Scan**. |
+| Video is black or will not play | Wait for the compatible preview. If it never starts, restart `run.bat` and click **Scan**. |
 | **T** seems to do nothing | You may be typing in the name box. Click the player, then press **T**. If a mark is already pending, assign it with **Enter** or undo with **Ctrl+Z**. |
 | Typed a name with **T** in it and something jumped | Click in the name box first; **T** is then just a letter. |
 | Wrong folder / wrong task | Click **Open 50-hour folder** again. |

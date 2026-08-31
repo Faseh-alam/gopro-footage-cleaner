@@ -232,6 +232,25 @@ class FiftyHourRouteTests(unittest.TestCase):
         self.assertEqual(payload["queued"], 1)
         self.assertEqual(names_at_submit, ["CAM001-001-001.mp4"])
 
+    def test_add_segment_returns_refreshed_progress(self) -> None:
+        response = self.client.post(
+            "/api/eager/scaleai/segments",
+            json={
+                "path": str(self.first),
+                "root": str(self.root),
+                "start": 1.0,
+                "end": 2.5,
+                "label": "Picking up the box",
+                "type": "subtask",
+            },
+        )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        tasks = (payload.get("progress") or {}).get("tasks") or []
+        self.assertTrue(tasks)
+        row = next(item for item in tasks if item.get("task") == "PackagingBoxes")
+        self.assertAlmostEqual(row["labeled_hours"], 1.5 / 3600.0, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

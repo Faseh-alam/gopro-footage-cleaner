@@ -663,8 +663,10 @@ def add_segment(
         annotation["segments"].sort(key=lambda s: (float(s["start"]), float(s["end"])))
         annotation["updated_at"] = _now_iso()
         save_annotation(source, annotation, root=None, cleanup=False)
-    if root is not None and seg_type == "subtask":
-        add_label(root, annotation["parent_task"], clean_label)
+    if root is not None:
+        if seg_type == "subtask":
+            add_label(root, annotation["parent_task"], clean_label)
+        refresh_progress(Path(root))
     return annotation
 
 

@@ -47,7 +47,7 @@ const KEYS: [string, string][] = [
   ["G", "Mark garbage"],
   ["U", "Save pending as Unlabeled task · otherwise undo"],
   ["Ctrl+Z", "Undo last / clear pending"],
-  ["N", "Next video (JSON autosaved)"],
+  ["N", "Next video (blocked if a mark is pending, or while Trim/Stitch runs)"],
   ["Home", "Jump to 0:00"],
 ];
 
@@ -277,10 +277,10 @@ function ReviewPage() {
       } else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
       else if (key === "n") {
-        if (c.trimBusy || c.stitchBusy || (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0)) {
+        if (c.scaleAiMode) void c.nextScaleAiVideo();
+        else if (c.trimBusy || c.stitchBusy || (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0)) {
           handled = true;
-        } else if (c.scaleAiMode) void c.nextScaleAiVideo();
-        else void c.finishCleaningFile();
+        } else void c.finishCleaningFile();
       } else if (event.key === " ") c.togglePlay();
       else if (event.key === "Enter" && !isField(target)) {
         void c.labelCurrentClip();

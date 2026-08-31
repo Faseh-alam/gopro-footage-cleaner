@@ -430,6 +430,8 @@ export function useReviewController() {
   const globalTrimPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /** True after Trim until this batch is fully saved or failed. */
   const trimWatchRef = useRef(false);
+  /** In-flight ScaleAI JSON writes so undo / next-video wait for disk. */
+  const scaleAiWritesRef = useRef<Promise<unknown>[]>([]);
   const [previewNote, setPreviewNote] = useState("");
 
   // Keep latest state accessible inside stable callbacks / keyboard handler.
@@ -459,7 +461,23 @@ export function useReviewController() {
     scaleAiByPath,
     scaleAiPending,
     scaleAiProgress,
+    trimBusy,
+    stitchBusy,
+    globalTrim,
   };
+
+  const trackScaleAiWrite = useCallback((work: Promise<unknown>) => {
+    scaleAiWritesRef.current.push(work);
+    void work.finally(() => {
+      scaleAiWritesRef.current = scaleAiWritesRef.current.filter((row) => row !== work);
+    });
+    return work;
+  }, []);
+
+  const waitForScaleAiWrites = useCallback(async () => {
+    const pending = scaleAiWritesRef.current.slice();
+    if (pending.length) await Promise.allSettled(pending);
+  }, []);
 
   const setStatus = useCallback((message: string, kind: StatusKind = "") => {
     const text = String(message || "");
@@ -957,14 +975,15 @@ export function useReviewController() {
   const setPlaybackRate = useCallback((rate: number, announce = true) => {
     const v = videoRef.current;
     const max = PLAYBACK_RATE_MAX;
+    const min = stateRef.current.scaleAiMode ? PLAYBACK_RATE_STEP : PLAYBACK_RATE_MIN;
     let clamped = Math.round(rate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP;
-    clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
+    clamped = Math.min(max, Math.max(min, clamped));
     // Skip 0× — stepping ←/→ through zero continues into reverse / forward.
     if (Math.abs(clamped) < PLAYBACK_RATE_STEP / 2) {
       clamped = rate < 0 || (rate === 0 && (playbackRateRef.current || 1) > 0)
         ? -PLAYBACK_RATE_STEP
         : PLAYBACK_RATE_STEP;
-      clamped = Math.min(max, Math.max(PLAYBACK_RATE_MIN, clamped));
+      clamped = Math.min(max, Math.max(min, clamped));
     }
     playbackRateRef.current = clamped;
     setPlaybackRateState(clamped);
@@ -1578,7 +1597,7 @@ export function useReviewController() {
   );
 
   const loadVideo = useCallback(
-    async (i: number, opts: { force?: boolean } = {}) => {
+    async (i: number, opts: { force?: boolean; ignorePending?: boolean } = {}) => {
       const s = stateRef.current;
       if (i < 0 || i >= s.videos.length) return;
       const video: VideoItem = s.videos[i];
@@ -1587,6 +1606,23 @@ export function useReviewController() {
       if (!opts.force && !stateRef.current.scaleAiMode && i !== s.index && !isVideoFullyDone(video.path)) {
         setStatus("Only finished (100% covered) videos can be opened from the list", "error");
         return;
+      }
+
+      const switchingAway = i !== s.index && s.index >= 0;
+      if (
+        stateRef.current.scaleAiMode &&
+        switchingAway &&
+        !opts.ignorePending &&
+        stateRef.current.scaleAiPending
+      ) {
+        setStatus(
+          "Assign the pending mark (Enter / U) or undo it (Ctrl+Z) before changing videos",
+          "error",
+        );
+        return;
+      }
+      if (stateRef.current.scaleAiMode && switchingAway) {
+        await waitForScaleAiWrites();
       }
 
       const previous = s.index >= 0 ? s.videos[s.index] : null;
@@ -1804,6 +1840,7 @@ export function useReviewController() {
       stopCompatiblePreview,
       stopFastPoll,
       updateScrubUiFromEl,
+      waitForScaleAiWrites,
       warmFastSources,
     ],
   );
@@ -1825,20 +1862,33 @@ export function useReviewController() {
   }, [isVideoFullyDone, loadVideo, nextIncompleteIndex, setStatus]);
 
   const nextScaleAiVideo = useCallback(async () => {
-    if (trimWatchRef.current) {
+    const s = stateRef.current;
+    const exportBatch = s.globalTrim?.exportBatch;
+    if (trimWatchRef.current || s.trimBusy || s.stitchBusy) {
+      setStatus("Stay on this video until trim or stitch finishes", "error");
+      return;
+    }
+    if (exportBatch && exportBatch.not_downloaded > 0) {
       setStatus("Stay on this video until every labeled clip is on disk", "error");
       return;
     }
-    const s = stateRef.current;
+    if (s.scaleAiPending) {
+      setStatus(
+        "Assign the pending mark (Enter / U) or undo it (Ctrl+Z) before the next video",
+        "error",
+      );
+      return;
+    }
+    await waitForScaleAiWrites();
     if (!s.videos.length) return;
     const next = s.index + 1;
     if (next >= s.videos.length) {
-      setStatus("All videos in this task folder are marked", "ok");
+      setStatus("This is the last video in the footage list", "ok");
       return;
     }
     await loadVideo(next, { force: true });
     setStatus("Moved to next video — JSON saved", "ok");
-  }, [loadVideo, setStatus]);
+  }, [loadVideo, setStatus, waitForScaleAiWrites]);
 
   const deleteScaleAiSegment = useCallback(
     async (segmentId: string | number) => {
@@ -1987,60 +2037,62 @@ export function useReviewController() {
         setStatus(`Saved garbage ${formatTime(fitted.start)} → ${formatTime(fitted.end)}`, "ok");
       }
       leaveTaskSearch();
-      void api("/api/eager/scaleai/segments", {
-        method: "POST",
-        body: JSON.stringify({
-          path: video.path,
-          root: stateRef.current.scanRoot || "",
-          start: fitted.start,
-          end: fitted.end,
-          label: savedLabel,
-          type: segmentType,
-        }),
-      })
-        .then((data) => {
-          applyScaleAiPayload(video.path, data);
-          if (segmentType === "subtask") {
-            const canonical =
-              (data.labels || []).find(
-                (name: string) => name.toLowerCase() === clean.toLowerCase(),
-              ) || clean;
-            setSelectedTaskValue(canonical);
-            setLastLabelTask(canonical);
-            const saved = (data.annotation?.segments || []).find(
-              (row: { start?: number; end?: number; label?: string; type?: string }) =>
-                String(row.type || "subtask").toLowerCase() === "subtask" &&
-                String(row.label || "")
-                  .trim()
-                  .toLowerCase() === canonical.toLowerCase() &&
-                Math.abs(Number(row.start) - fitted.start) <= 0.2 &&
-                Math.abs(Number(row.end) - fitted.end) <= 0.2,
-            );
-            showScaleAiTaskInLabeledRegion(canonical, {
-              keepOn: true,
-              seek: false,
-              focusStart: Number(saved?.start ?? fitted.start),
-              focusEnd: Number(saved?.end ?? fitted.end),
-            });
-          }
+      trackScaleAiWrite(
+        api("/api/eager/scaleai/segments", {
+          method: "POST",
+          body: JSON.stringify({
+            path: video.path,
+            root: stateRef.current.scanRoot || "",
+            start: fitted.start,
+            end: fitted.end,
+            label: savedLabel,
+            type: segmentType,
+          }),
         })
-        .catch((error: any) => {
-          setScaleAiByPath((prev) => {
-            const cur = prev[video.path];
-            if (!cur) return prev;
-            return {
-              ...prev,
-              [video.path]: {
-                ...cur,
-                segments: (cur.segments || []).filter((row) => String(row.id) !== optimisticId),
-              },
-            };
-          });
-          setScaleAiPending(fitted);
-          stateRef.current.scaleAiPending = fitted;
-          setTaskSelectionMode(true);
-          setStatus(error.message || "Could not save segment", "error");
-        });
+          .then((data) => {
+            applyScaleAiPayload(video.path, data);
+            if (segmentType === "subtask") {
+              const canonical =
+                (data.labels || []).find(
+                  (name: string) => name.toLowerCase() === clean.toLowerCase(),
+                ) || clean;
+              setSelectedTaskValue(canonical);
+              setLastLabelTask(canonical);
+              const saved = (data.annotation?.segments || []).find(
+                (row: { start?: number; end?: number; label?: string; type?: string }) =>
+                  String(row.type || "subtask").toLowerCase() === "subtask" &&
+                  String(row.label || "")
+                    .trim()
+                    .toLowerCase() === canonical.toLowerCase() &&
+                  Math.abs(Number(row.start) - fitted.start) <= 0.2 &&
+                  Math.abs(Number(row.end) - fitted.end) <= 0.2,
+              );
+              showScaleAiTaskInLabeledRegion(canonical, {
+                keepOn: true,
+                seek: false,
+                focusStart: Number(saved?.start ?? fitted.start),
+                focusEnd: Number(saved?.end ?? fitted.end),
+              });
+            }
+          })
+          .catch((error: any) => {
+            setScaleAiByPath((prev) => {
+              const cur = prev[video.path];
+              if (!cur) return prev;
+              return {
+                ...prev,
+                [video.path]: {
+                  ...cur,
+                  segments: (cur.segments || []).filter((row) => String(row.id) !== optimisticId),
+                },
+              };
+            });
+            setScaleAiPending(fitted);
+            stateRef.current.scaleAiPending = fitted;
+            setTaskSelectionMode(true);
+            setStatus(error.message || "Could not save segment", "error");
+          }),
+      );
       return true;
     },
     [
@@ -2053,6 +2105,7 @@ export function useReviewController() {
       setStatus,
       showScaleAiTaskInLabeledRegion,
       touchRecentTask,
+      trackScaleAiWrite,
     ],
   );
 
@@ -2387,14 +2440,24 @@ export function useReviewController() {
         setStatus("Cleared pending segment", "ok");
         return;
       }
+      await waitForScaleAiWrites();
+      if (stateRef.current.scaleAiPending) {
+        setScaleAiPending(null);
+        setTaskSelectionMode(false);
+        leaveTaskSearch({ clear: true });
+        setStatus("Cleared pending segment", "ok");
+        return;
+      }
       try {
-        const data = await api("/api/eager/scaleai/segments/undo", {
+        const undoReq = api("/api/eager/scaleai/segments/undo", {
           method: "POST",
           body: JSON.stringify({
             path: video.path,
             root: stateRef.current.scanRoot || "",
           }),
         });
+        trackScaleAiWrite(undoReq);
+        const data = await undoReq;
         applyScaleAiPayload(video.path, data);
         setStatus("Undid last segment", "ok");
       } catch (error: any) {
@@ -2427,6 +2490,8 @@ export function useReviewController() {
     deleteSegmentAt,
     leaveTaskSearch,
     setStatus,
+    trackScaleAiWrite,
+    waitForScaleAiWrites,
   ]);
 
   const labelCurrentClip = useCallback(
@@ -2583,7 +2648,7 @@ export function useReviewController() {
         );
       }
 
-      await loadVideo(openAt, { force: true });
+      await loadVideo(openAt, { force: true, ignorePending: true });
       // Keep the next unfinished clips warm so N opens instantly.
       warmFastSources(openAt, freshVideos, 3);
       const resumed = savedIdx >= 0 && (session?.scrubTime || 0) > 0;
@@ -3396,7 +3461,12 @@ export function useReviewController() {
           setStatus("Batch workflow ready — insert matching card and annotate contiguously", "ok");
         } else {
           startGlobalTrimPolling();
-          setStatus("No active batch — import CSV to start batch workflow", "ok");
+          setStatus(
+            stateRef.current.scaleAiMode
+              ? "Open a 50-hour folder to start labeling"
+              : "No active batch — import CSV to start batch workflow",
+            "ok",
+          );
         }
         if (health.ffmpeg_ok === false) {
           setFfmpegHint(health.ffmpeg_hint || "FFmpeg missing — install and restart");
