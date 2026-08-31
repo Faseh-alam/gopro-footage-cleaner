@@ -150,7 +150,7 @@ class FiftyHourRouteTests(unittest.TestCase):
             call.kwargs["output"].name,
             "Picking-up-the-box-001-stitched.mp4",
         )
-        self.assertEqual(call.kwargs["output"].parent, subtask_dir)
+        self.assertEqual(call.kwargs["output"].parent, self.task)
 
     def test_process_video_counts_not_downloaded_until_complete(self) -> None:
         self._add_segment(self.first, "Picking up the box", 1.0)

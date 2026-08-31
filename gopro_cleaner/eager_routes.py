@@ -1629,7 +1629,10 @@ def create_eager_blueprint() -> Blueprint:
                         subtask_dir,
                         task_name=task_name,
                         clips=clips,
-                        output=subtask_dir / f"{subtask['folder']}-stitched.mp4",
+                        output=fifty_hour_store.stitched_output_path(
+                            fifty_hour_store.export_directory(source),
+                            subtask,
+                        ),
                         overwrite=overwrite,
                         write_manifest=False,
                     )

@@ -366,6 +366,11 @@ export function useReviewController() {
 
   const [busy, setBusy] = useState(false);
   const [trimBusy, setTrimBusy] = useState(false);
+  const [stitchBusy, setStitchBusy] = useState(false);
+  const [stitchNotice, setStitchNotice] = useState<{
+    kind: "running" | "ok" | "error";
+    message: string;
+  } | null>(null);
   const [scanning, setScanning] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [ffmpegHint, setFfmpegHint] = useState<string | null>(null);
@@ -3123,8 +3128,13 @@ export function useReviewController() {
 
   const stitchScaleAiVideo = useCallback(async () => {
     const current = currentVideo();
-    if (!current) return;
-    setStatus(`Creating one stitched video per subtask for this main task…`);
+    if (!current || stitchBusy) return;
+    setStitchBusy(true);
+    setStitchNotice({
+      kind: "running",
+      message: "Stitching started — one video per subtask, next to manifest.json.",
+    });
+    setStatus("Stitching started — one video per subtask…", "ok");
     try {
       const data = await api("/api/eager/scaleai/stitch-video", {
         method: "POST",
@@ -3134,22 +3144,27 @@ export function useReviewController() {
           overwrite: true,
         }),
       });
-      const gpmfOk = (data.results || []).every(
-        (row: any) => !row.ok || row.has_gpmf !== false,
-      );
-      setStatus(
-        data.message ||
-          `Stitched ${data.stitched || 0}/${data.task_count || 0} subtask(s)` +
-            (gpmfOk ? " · GPMF/IMU preserved" : " · check GPMF warnings"),
-        data.errors?.length ? "error" : "ok",
-      );
+      const okCount = Number(data.stitched || 0);
+      const total = Number(data.task_count || 0);
+      const failed = Boolean(data.errors?.length) || okCount < total;
+      const message = failed
+        ? `Stitch finished with errors: ${okCount}/${total} subtask(s) saved next to manifest.json.`
+        : total
+          ? `Stitched ${okCount}/${total} subtask(s) successfully next to manifest.json.`
+          : "No subtask clips to stitch — trim first.";
+      setStitchNotice({ kind: failed ? "error" : "ok", message });
+      setStatus(message, failed ? "error" : "ok");
       if (data.errors?.length) {
         toast.error(String(data.errors[0]));
       }
     } catch (error: any) {
-      setStatus(error.message || "Could not stitch task subtasks", "error");
+      const message = error.message || "Could not stitch task subtasks";
+      setStitchNotice({ kind: "error", message });
+      setStatus(message, "error");
+    } finally {
+      setStitchBusy(false);
     }
-  }, [currentVideo, setStatus]);
+  }, [currentVideo, setStatus, stitchBusy]);
 
   const markShareIn = useCallback(() => {
     if (!currentVideo()) return;
@@ -3530,6 +3545,8 @@ export function useReviewController() {
     previewNote,
     globalTrim,
     trimBusy,
+    stitchBusy,
+    stitchNotice,
     busy,
     scanning,
     detecting,

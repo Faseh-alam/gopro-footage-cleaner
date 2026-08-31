@@ -277,7 +277,7 @@ function ReviewPage() {
       } else if (key === "a") c.focusNewTask();
       else if (event.key === "Home") c.jumpToClipStart();
       else if (key === "n") {
-        if (c.trimBusy || (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0)) {
+        if (c.trimBusy || c.stitchBusy || (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0)) {
           handled = true;
         } else if (c.scaleAiMode) void c.nextScaleAiVideo();
         else void c.finishCleaningFile();

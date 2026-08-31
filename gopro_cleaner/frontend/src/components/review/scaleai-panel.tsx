@@ -298,12 +298,27 @@ export function ScaleAiPanel({
           </div>
         );
       })()}
+      {c.stitchNotice ? (
+        <div
+          className={cn(
+            "rounded-sm border px-2 py-2 text-[11px] leading-snug",
+            c.stitchNotice.kind === "running"
+              ? "border-accent/40 bg-accent/10 text-foreground"
+              : c.stitchNotice.kind === "ok"
+                ? "border-success/40 bg-success/10 text-success"
+                : "border-destructive/40 bg-destructive/10 text-destructive",
+          )}
+        >
+          {c.stitchNotice.message}
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-2">
         <Button
           size="sm"
           variant="accent"
           disabled={Boolean(
             c.trimBusy ||
+              c.stitchBusy ||
               (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
           )}
           onClick={() => void c.processScaleAiVideo()}
@@ -312,8 +327,19 @@ export function ScaleAiPanel({
             ? "Trimming…"
             : "Trim this video"}
         </Button>
-        <Button size="sm" variant="outline" onClick={() => void c.stitchScaleAiVideo()}>
-          Stitch each subtask
+        <Button
+          size="sm"
+          variant="outline"
+          loading={c.stitchBusy}
+          disabled={Boolean(
+            c.stitchBusy ||
+              c.trimBusy ||
+              (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
+          )}
+          className="hover:border-accent hover:bg-accent/15"
+          onClick={() => void c.stitchScaleAiVideo()}
+        >
+          {c.stitchBusy ? "Stitching…" : "Stitch each subtask"}
         </Button>
       </div>
       <div className="grid grid-cols-2 gap-2">
@@ -322,6 +348,7 @@ export function ScaleAiPanel({
           variant="outline"
           disabled={Boolean(
             c.trimBusy ||
+              c.stitchBusy ||
               (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
           )}
           onClick={() => void c.nextScaleAiVideo()}
@@ -333,6 +360,7 @@ export function ScaleAiPanel({
           variant="outline"
           disabled={Boolean(
             c.trimBusy ||
+              c.stitchBusy ||
               (c.globalTrim.exportBatch && c.globalTrim.exportBatch.not_downloaded > 0),
           )}
           onClick={() => void c.processScaleAiFolder()}

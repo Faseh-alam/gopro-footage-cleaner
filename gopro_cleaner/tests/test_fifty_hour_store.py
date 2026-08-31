@@ -182,8 +182,7 @@ class FiftyHourStoreTests(unittest.TestCase):
         self.assertAlmostEqual(data["subtasks"][0]["duration_seconds"], 2.5)
         self.assertAlmostEqual(data["total_duration_seconds"], 2.5)
         folder = data["subtasks"][0]["folder"]
-        stitched = self.task / folder / f"{folder}-stitched.mp4"
-        stitched.parent.mkdir(parents=True, exist_ok=True)
+        stitched = self.task / f"{folder}-stitched.mp4"
         stitched.write_bytes(b"stitched")
         updated = fifty_hour_store.update_stitch_durations(
             self.video,
@@ -1591,6 +1590,30 @@ class FiftyHourStoreTests(unittest.TestCase):
         )
         self.assertEqual(unlabeled, [b"real-applying-clip", b"unique-leftover"])
         self.assertEqual((dest / compacted).read_bytes(), b"real-applying-clip")
+
+    def test_nested_stitched_file_moves_next_to_manifest(self) -> None:
+        fifty_hour_store.add_segment(
+            self.video,
+            start=1.0,
+            end=2.0,
+            label="applying-sticker",
+            root=self.root,
+        )
+        dest = fifty_hour_store.subtask_export_directory(
+            self.video, "applying-sticker"
+        )
+        dest.mkdir(parents=True, exist_ok=True)
+        folder = dest.name
+        nested = dest / f"{folder}-stitched.mp4"
+        nested.write_bytes(b"stitched-body")
+
+        fifty_hour_store.load_manifest(self.task)
+
+        target = self.task / f"{folder}-stitched.mp4"
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"stitched-body")
+        self.assertFalse(nested.exists())
+        self.assertFalse(fifty_hour_store._is_source_video_file(target))
 
     def test_scan_groups_by_parent_task(self) -> None:
         root = Path(tempfile.mkdtemp()) / "50-hour"

@@ -2756,12 +2756,24 @@ def _migrate_clip_layout(task_dir: Path, manifest: dict) -> bool:
                 changed = True
 
         stitched_name = f"{folder}-stitched.mp4"
-        stitched_target = target_dir / stitched_name
+        stitched_target = task_dir / stitched_name
+        nested_stitched = target_dir / stitched_name
+        if nested_stitched.is_file() and (
+            not stitched_target.exists()
+            or nested_stitched.resolve() == stitched_target.resolve()
+        ):
+            if nested_stitched.resolve() != stitched_target.resolve():
+                nested_stitched.replace(stitched_target)
+                changed = True
         for old_stitched in (
             task_dir / f"{safe_label_name(subtask['name'])}-stitched.mp4",
             task_dir / f"{safe_label_name(subtask['name'])}__stitched.MP4",
         ):
-            if old_stitched.is_file() and not stitched_target.exists():
+            if (
+                old_stitched.is_file()
+                and old_stitched.resolve() != stitched_target.resolve()
+                and not stitched_target.exists()
+            ):
                 old_stitched.replace(stitched_target)
                 changed = True
                 break
@@ -2818,17 +2830,33 @@ def _labeled_seconds_by_subtask(task_dir: Path) -> dict[str, float]:
     return totals
 
 
+def stitched_output_path(task_dir: Path, subtask: dict) -> Path:
+    """Stitched MP4 sits in the main-task folder, next to manifest.json."""
+    folder = str(
+        subtask.get("folder") or subtask_folder_name(subtask["name"], subtask["id"])
+    )
+    return Path(task_dir) / f"{folder}-stitched.mp4"
+
+
 def _stitched_path(task_dir: Path, subtask: dict) -> Path:
-    folder = str(subtask.get("folder") or subtask_folder_name(subtask["name"], subtask["id"]))
+    preferred = stitched_output_path(task_dir, subtask)
+    if preferred.is_file():
+        return preferred
+    folder = str(
+        subtask.get("folder") or subtask_folder_name(subtask["name"], subtask["id"])
+    )
     stored = str(subtask.get("stitched_filename") or "").strip()
     if stored:
-        nested = Path(task_dir) / folder / stored
-        if nested.is_file():
-            return nested
         loose = Path(task_dir) / stored
         if loose.is_file():
             return loose
-    return Path(task_dir) / folder / f"{folder}-stitched.mp4"
+        nested = Path(task_dir) / folder / stored
+        if nested.is_file():
+            return nested
+    nested_default = Path(task_dir) / folder / f"{folder}-stitched.mp4"
+    if nested_default.is_file():
+        return nested_default
+    return preferred
 
 
 def _attach_manifest_durations(task_dir: Path, manifest: dict) -> dict:
@@ -2884,7 +2912,6 @@ def update_stitch_durations(source: Path, results: list[dict]) -> dict:
         if output:
             path = Path(str(output))
             row["stitched_filename"] = path.name
-            row["folder"] = row.get("folder") or path.parent.name
         duration = _as_seconds(result.get("duration"))
         if duration is None and output:
             duration = _as_seconds(resolve_media_duration(Path(str(output))))
