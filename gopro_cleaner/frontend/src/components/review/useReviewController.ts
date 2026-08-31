@@ -2590,7 +2590,10 @@ export function useReviewController() {
       setIdentityFromSelectedCard();
 
       if (!freshVideos.length) {
-        setStatus("No footage found", "error");
+        setStatus(
+          "No source GX….MP4 files in that folder. In Finder, open the PARENT 50-hour folder — the one that contains the task folders (each task folder has the videos). Do not pick one video, one task folder, or a clips/stitched folder.",
+          "error",
+        );
         return;
       }
 
@@ -2707,31 +2710,64 @@ export function useReviewController() {
   );
 
 
+  const openFootagePath = useCallback(
+    async (rawPath: string) => {
+      const path = String(rawPath || "")
+        .trim()
+        .replace(/^['"]+|['"]+$/g, "")
+        .replace(/[/\\]+$/, "");
+      if (!path) {
+        setStatus("No folder path given", "error");
+        return;
+      }
+      const folderName = path.split(/[/\\]/).filter(Boolean).pop() || "Footage";
+      applySelectedPath(path);
+      stateRef.current.scanRoot = path;
+      stateRef.current.labelRoot = path;
+      stateRef.current.sdCardValue = "";
+      setStatus(`Scanning ${folderName}…`);
+      await scanSource(path);
+    },
+    [applySelectedPath, scanSource, setStatus],
+  );
+
   const chooseFootageFolder = useCallback(async () => {
     setStatus(
       stateRef.current.scaleAiMode
-        ? "Choose the 50 hours folder (contains Google Drive and AWS)…"
+        ? "Choose the 50-hour PARENT folder (the one that contains the task folders)…"
         : "Choose footage on this computer or an external drive…",
     );
     try {
       const initial = stateRef.current.scanRoot || stateRef.current.sdCardValue || "";
       const query = initial ? `?initial=${encodeURIComponent(initial)}` : "";
       const data = await api(`/api/eager/pick-folder${query}`, { method: "POST" });
-      if (data.cancelled) {
-        setStatus("Folder selection cancelled");
-        return;
+      let path = String(data.path || "").trim();
+      if (data.cancelled || !path) {
+        const hint = String(data.error || "").trim();
+        const pasted =
+          typeof window !== "undefined"
+            ? window.prompt(
+                [
+                  hint || "Finder did not return a folder.",
+                  "",
+                  "Paste the folder path instead.",
+                  "In Finder: click the 50-hour PARENT folder, hold Option, right-click, Copy as Pathname.",
+                  "Example: /Volumes/SSD/50-hour",
+                ].join("\n"),
+                "/Volumes/",
+              )
+            : null;
+        path = String(pasted || "").trim();
+        if (!path) {
+          setStatus(hint || "Folder selection cancelled", "error");
+          return;
+        }
       }
-      const folderName = data.path.split(/[/\\]/).filter(Boolean).pop() || "Footage";
-      applySelectedPath(data.path);
-      stateRef.current.scanRoot = data.path;
-      stateRef.current.labelRoot = data.path;
-      stateRef.current.sdCardValue = "";
-      setStatus(`Scanning ${folderName}…`);
-      await scanSource(data.path);
+      await openFootagePath(path);
     } catch (error: any) {
       setStatus(error.message, "error");
     }
-  }, [applySelectedPath, scanSource, setStatus]);
+  }, [openFootagePath, setStatus]);
 
   // ---------------------------------------------------------------------
   // Trim polling

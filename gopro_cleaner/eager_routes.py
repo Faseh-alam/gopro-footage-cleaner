@@ -20,7 +20,7 @@ from .core.eager import (
     task_output_directory,
 )
 from .core.eager_trim_queue import eager_trim_queue
-from .core.folder_picker import pick_folder
+from .core.folder_picker import pick_folder_result
 from .core.preview_proxy import (
     cancel_other_previews,
     cancel_preview,
@@ -96,12 +96,18 @@ def create_eager_blueprint() -> Blueprint:
             except (OSError, RuntimeError):
                 initial = None
         try:
-            chosen = pick_folder(initial)
+            picked = pick_folder_result(initial)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 500
-        if chosen is None:
-            return jsonify({"ok": True, "cancelled": True})
-        return jsonify({"ok": True, "path": str(chosen), "cancelled": False})
+        if picked.path is None:
+            return jsonify(
+                {
+                    "ok": True,
+                    "cancelled": True,
+                    "error": picked.error or "",
+                }
+            )
+        return jsonify({"ok": True, "path": str(picked.path), "cancelled": False})
 
     @eager.get("/api/eager/tasks")
     def eager_tasks():

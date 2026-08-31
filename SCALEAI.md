@@ -51,6 +51,8 @@ A supervisor or IT person should do this once. Labellers do not need to repeat i
 
 You do **not** need Node.js, GitHub, or a login for normal labeling on this version.
 
+On a **Mac**, use **`run.sh`** in Terminal instead of `run.bat` (see the Mac note in section 2).
+
 ### First launch
 
 1. Open the project folder in File Explorer.
@@ -78,6 +80,31 @@ If the black window closes with an error, read the message, take a photo, and se
 5. Wait until videos appear in the **Footage** list on the right. The first video loads in the player.
 
 You do not log in on this version.
+
+### Mac (external drive)
+
+1. Copy or sync this project folder onto the Mac (the folder that contains `run.sh`). The footage drive alone is not the program.
+2. Plug in the drive. In Finder it appears under **Locations** (path like `/Volumes/YourDriveName`).
+3. Open Terminal, go to the project folder, run:
+
+   `chmod +x run.sh` (first time only), then `./run.sh`
+
+4. Leave Terminal open. Click **Open 50-hour folder**.
+5. In the Finder window, go to the **drive**, then select the **parent** folder:
+
+```text
+YourDrive / 50-hour /          ← select THIS
+  applying-sticker /           ← not this
+    GX072170.MP4
+  garment-folding-general /
+    GX010001.MP4
+```
+
+If a Finder dialog does not appear, a box will ask you to **paste the folder path**. In Finder: click the 50-hour parent folder, hold **Option**, right-click it, choose **Copy as Pathname**, then paste into the box (it looks like `/Volumes/YourDrive/50-hour`).
+
+If macOS asks for permission to the volume, click Allow.
+
+Wait until the footer says it found files and the **Footage** list on the right fills. Then use **Trim this video** / **Trim whole folder**.
 
 ### The black window
 
@@ -315,7 +342,9 @@ Your labels are already on disk. Tomorrow, open `run.bat` again, open the same 5
 | Browser did not open | Open Chrome or Edge and go to `http://127.0.0.1:8765/review` |
 | Page will not load | The black window is not running. Start `run.bat` again. |
 | Black window closed | Start `run.bat` again. Do not work in an old browser tab until it is running. |
-| Empty Footage list | You opened a folder that has no task folders with MP4s. Open the **parent** 50-hour folder. |
+| Empty Footage list | You opened a folder that has no source `GX….MP4` files. Open the **parent** 50-hour folder (the one that contains the task folders). Do not pick one video, one task folder, or a clips folder. |
+| Mac: folder picker never appears | Finder dialogs from this app often stay hidden. When the paste box appears, paste `/Volumes/YourDrive/50-hour`. Or click Terminal, then try **Open 50-hour folder** again. Grant disk access if macOS asks. |
+| Mac: **Folder selection cancelled** | Same as above: paste the path. Do not pick one task folder or one video. |
 | **Preparing browser-compatible preview** for a long time | Wait. Large files take time. If it never finishes, restart `run.bat` and click **Scan**. |
 | Video is black or will not play | Wait for the compatible preview. If it never starts, restart `run.bat` and click **Scan**. |
 | **T** seems to do nothing | You may be typing in the name box. Click the player, then press **T**. If a mark is already pending, assign it with **Enter** or undo with **Ctrl+Z**. |
