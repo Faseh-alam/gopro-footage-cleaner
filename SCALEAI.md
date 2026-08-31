@@ -240,6 +240,8 @@ The panel shows **UNLABELED IN VIDEO** with a count. Click that row to highlight
 
 Click a subtask name (in the task list or in the ScaleAI counts). Matching pieces light up under the player. Click the same name on a **segment row** to jump the playhead to that piece. Click elsewhere on the page to clear the highlight.
 
+Pressing **T** and assigning a name does **not** leave the labeled-region bar highlighted. That glow is only for when you click a name or count to find a mark.
+
 ---
 
 ## 8. Trim and stitch

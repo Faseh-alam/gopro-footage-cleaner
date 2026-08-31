@@ -2027,12 +2027,7 @@ export function useReviewController() {
         });
         setTaskSearch("");
         setStatus(`Saved ${clean} ${formatTime(fitted.start)} → ${formatTime(fitted.end)}`, "ok");
-        showScaleAiTaskInLabeledRegion(clean, {
-          keepOn: true,
-          seek: false,
-          focusStart: fitted.start,
-          focusEnd: fitted.end,
-        });
+        clearScaleAiHighlight();
       } else {
         setStatus(`Saved garbage ${formatTime(fitted.start)} → ${formatTime(fitted.end)}`, "ok");
       }
@@ -2058,21 +2053,6 @@ export function useReviewController() {
                 ) || clean;
               setSelectedTaskValue(canonical);
               setLastLabelTask(canonical);
-              const saved = (data.annotation?.segments || []).find(
-                (row: { start?: number; end?: number; label?: string; type?: string }) =>
-                  String(row.type || "subtask").toLowerCase() === "subtask" &&
-                  String(row.label || "")
-                    .trim()
-                    .toLowerCase() === canonical.toLowerCase() &&
-                  Math.abs(Number(row.start) - fitted.start) <= 0.2 &&
-                  Math.abs(Number(row.end) - fitted.end) <= 0.2,
-              );
-              showScaleAiTaskInLabeledRegion(canonical, {
-                keepOn: true,
-                seek: false,
-                focusStart: Number(saved?.start ?? fitted.start),
-                focusEnd: Number(saved?.end ?? fitted.end),
-              });
             }
           })
           .catch((error: any) => {
@@ -2097,13 +2077,13 @@ export function useReviewController() {
     },
     [
       applyScaleAiPayload,
+      clearScaleAiHighlight,
       currentScaleAi,
       currentVideo,
       focusTaskSearch,
       knownDurationSec,
       leaveTaskSearch,
       setStatus,
-      showScaleAiTaskInLabeledRegion,
       touchRecentTask,
       trackScaleAiWrite,
     ],
