@@ -4,6 +4,8 @@ This is the instruction manual for the **Scale AI 50-hour labeling program** (Re
 
 You do not need to know programming. You do not need to edit any files by hand.
 
+For how the frontend, backend, APIs, and files on disk work, see **[SCALEAI-SYSTEM.md](SCALEAI-SYSTEM.md)**.
+
 ---
 
 ## What this program is for
