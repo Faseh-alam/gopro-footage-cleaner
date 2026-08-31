@@ -212,7 +212,7 @@ def stitch_task_clips(
     output: Path | None = None,
     clips: list[Path] | None = None,
     overwrite: bool = False,
-    write_manifest: bool = True,
+    write_manifest: bool = False,
 ) -> StitchResult:
     """Concatenate all clips in a task folder into one MP4 with GPMF mapped."""
     with _lock:

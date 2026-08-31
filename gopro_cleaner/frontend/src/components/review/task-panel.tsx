@@ -6,50 +6,63 @@ import { TextInput } from "@/components/wc/field";
 import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
 import { ScaleAiPanel } from "./scaleai-panel";
-import { UNLABELED_TASK_LABEL } from "./types";
+import {
+  UNLABELED_TASK_LABEL,
+  scaleAiSubtaskCountsByLabel,
+  type ScaleAiFocusRange,
+  type ScaleAiHighlightOptions,
+} from "./types";
 
 export function TaskPanel({
   c,
   highlightedScaleAiTask,
+  highlightedScaleAiRange,
   onHighlightScaleAiTask,
 }: {
   c: ReviewController;
   highlightedScaleAiTask?: string;
-  onHighlightScaleAiTask?: (task: string) => void;
+  highlightedScaleAiRange?: ScaleAiFocusRange | null;
+  onHighlightScaleAiTask?: (task: string, options?: ScaleAiHighlightOptions) => void;
 }) {
   const [newTask, setNewTask] = useState("");
   const groups = c.orderedTaskGroups();
-  const unlabeledCount =
-    c
-      .currentScaleAi()
-      ?.segments.filter(
-        (segment) =>
-          segment.type === "subtask" &&
-          segment.label.trim().toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase(),
-      ).length ?? 0;
+  const subtaskCounts = scaleAiSubtaskCountsByLabel(c.currentScaleAi()?.segments);
 
   const renderTask = (task: string) => {
     const isUnlabeledTask = task.toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase();
     const deletable = !isUnlabeledTask && c.isUserDefinedTask(task);
     const color = taskColor(task);
+    const count = subtaskCounts.get(task.trim().toLowerCase()) || 0;
+    const isHighlightedTask =
+      c.scaleAiMode &&
+      String(highlightedScaleAiTask || "")
+        .trim()
+        .toLowerCase() === task.trim().toLowerCase();
     return (
       <div
         key={task}
         className={cn(
           "flex min-w-0 items-center gap-0.5 rounded-sm border pr-0.5 transition-colors",
-          task === c.selectedTaskValue
+          task === c.selectedTaskValue || isHighlightedTask
             ? "border-accent/50 bg-accent/10"
             : "border-transparent hover:bg-surface-2",
         )}
       >
         <button
           type="button"
+          {...(c.scaleAiMode ? { "data-scaleai-highlight-control": true } : {})}
+          title={
+            c.scaleAiMode
+              ? `Show “${task}” in the labeled region (${count} in this video)`
+              : undefined
+          }
           onClick={() => {
             c.setSelectedTaskValue(task);
             c.touchRecentTask(task);
-            if (c.scaleAiMode) onHighlightScaleAiTask?.("");
             if (c.scaleAiMode && c.scaleAiPending) {
               void c.commitScaleAiSegment(task, "subtask");
+            } else if (c.scaleAiMode) {
+              onHighlightScaleAiTask?.(task, { keepOn: true, seek: false });
             }
           }}
           className={cn(
@@ -65,12 +78,17 @@ export function TaskPanel({
             aria-hidden
           />
           <span className="truncate">{task}</span>
-          {isUnlabeledTask ? (
+          {c.scaleAiMode ? (
             <span
-              className="ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-              title="Unlabeled tasks in this video"
+              className={cn(
+                "ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px]",
+                count > 0 && (isUnlabeledTask || isHighlightedTask)
+                  ? "text-accent"
+                  : "text-muted-foreground",
+              )}
+              title={`${count} in this video`}
             >
-              {unlabeledCount}
+              {count}
             </span>
           ) : null}
         </button>
@@ -176,15 +194,16 @@ export function TaskPanel({
         <>
           <ScaleAiPanel
             c={c}
-            highlightedTask={highlightedScaleAiTask}
-            onHighlightTask={onHighlightScaleAiTask}
+            highlightedTask={highlightedScaleAiTask ?? ""}
+            highlightedRange={highlightedScaleAiRange}
+            {...(onHighlightScaleAiTask ? { onHighlightTask: onHighlightScaleAiTask } : {})}
           />
           <div className="grid gap-3">
             <div className="eyebrow">Subtask labels</div>
             {taskPicker}
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              T → ↓/↑ pick label → Enter · T → U = Unlabeled task · G = garbage · Ctrl+Z = undo ·
-              N = next
+              T → ↓/↑ pick label → Enter · T → U = Unlabeled task · G = garbage · Ctrl+Z = undo · N
+              = next
             </p>
             <Button size="sm" variant="outline" onClick={() => void c.undoSegment()}>
               Undo last{" "}

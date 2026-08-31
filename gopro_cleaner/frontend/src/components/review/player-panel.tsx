@@ -5,13 +5,16 @@ import { Badge } from "@/components/wc/panel";
 import { Button } from "@/components/ui/button";
 import type { ReviewController } from "./useReviewController";
 import { taskColor } from "./task-color";
+import { scaleAiSegmentInFocus, type ScaleAiFocusRange } from "./types";
 
 export function PlayerPanel({
   c,
   highlightedScaleAiTask,
+  highlightedScaleAiRange,
 }: {
   c: ReviewController;
   highlightedScaleAiTask?: string;
+  highlightedScaleAiRange?: ScaleAiFocusRange | null;
 }) {
   const video = c.currentVideo();
   const ann = c.currentAnnotation();
@@ -26,6 +29,25 @@ export function PlayerPanel({
 
   const scaleAiSegments = scaleAi?.segments || [];
   const pendingRange = ann?.pendingWork || c.scaleAiPending || null;
+  const highlightedTask = String(highlightedScaleAiTask || "")
+    .trim()
+    .toLowerCase();
+  const highlightedSegments = highlightedTask
+    ? scaleAiSegments.filter(
+        (segment) =>
+          segment.type === "subtask" &&
+          String(segment.label || "")
+            .trim()
+            .toLowerCase() === highlightedTask &&
+          scaleAiSegmentInFocus(segment, highlightedScaleAiRange),
+      )
+    : [];
+  const hasHighlightedSegments = highlightedSegments.length > 0;
+  const hasFocusRange = Boolean(
+    highlightedScaleAiRange &&
+      Number.isFinite(Number(highlightedScaleAiRange.start)) &&
+      Number.isFinite(Number(highlightedScaleAiRange.end)),
+  );
   const covered = c.scaleAiMode
     ? scaleAiSegments
         .filter((segment) => segment.type === "subtask")
@@ -36,15 +58,25 @@ export function PlayerPanel({
   const shareReady =
     c.shareClipIn != null && c.shareClipOut != null && c.shareClipOut > c.shareClipIn;
 
-  // Zoom window around labeled work so 0.5–1s clips stay readable without lying about end times.
+  // Zoom around labeled work. A just-assigned mark zooms to that span only,
+  // not every earlier clip that happens to share the same task name.
   const zoomBounds = (() => {
     if (!c.scaleAiMode || duration <= 0) return null;
     const points: number[] = [];
-    for (const segment of scaleAiSegments) {
-      points.push(Number(segment.start) || 0, Number(segment.end) || 0);
-    }
-    if (pendingRange) {
-      points.push(pendingRange.start, pendingRange.end);
+    if (hasFocusRange && highlightedScaleAiRange) {
+      points.push(highlightedScaleAiRange.start, highlightedScaleAiRange.end);
+      for (const segment of highlightedSegments) {
+        points.push(Number(segment.start) || 0, Number(segment.end) || 0);
+      }
+    } else if (hasHighlightedSegments) {
+      for (const segment of highlightedSegments) {
+        points.push(Number(segment.start) || 0, Number(segment.end) || 0);
+      }
+    } else {
+      for (const segment of scaleAiSegments) {
+        points.push(Number(segment.start) || 0, Number(segment.end) || 0);
+      }
+      if (pendingRange) points.push(pendingRange.start, pendingRange.end);
     }
     if (!points.length) return null;
     const rawStart = Math.min(...points);
@@ -61,18 +93,6 @@ export function PlayerPanel({
     zoomBounds && zoomSpan > 0 ? ((t - zoomBounds.start) / zoomSpan) * 100 : 0;
   const zoomWidth = (start: number, end: number) =>
     zoomBounds && zoomSpan > 0 ? Math.max(0.15, ((end - start) / zoomSpan) * 100) : 0;
-  const highlightedTask = String(highlightedScaleAiTask || "")
-    .trim()
-    .toLowerCase();
-  const hasHighlightedSegments =
-    highlightedTask.length > 0 &&
-    scaleAiSegments.some(
-      (segment) =>
-        segment.type === "subtask" &&
-        String(segment.label || "")
-          .trim()
-          .toLowerCase() === highlightedTask,
-    );
 
   const seekInZoom = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!zoomBounds || zoomSpan <= 0) return;
@@ -223,12 +243,17 @@ export function PlayerPanel({
         {c.scaleAiMode && zoomBounds ? (
           <div className="border-t border-border bg-surface px-3 py-2">
             <div className="mb-1 flex items-baseline justify-between gap-2 font-mono text-[10px] text-muted-foreground">
-              <span className="eyebrow text-[9px]">Labeled region (zoomed)</span>
+              <span className="eyebrow text-[9px]">
+                {hasHighlightedSegments || hasFocusRange
+                  ? `Labeled region · ${highlightedScaleAiTask}`
+                  : "Labeled region (zoomed)"}
+              </span>
               <span>
                 {c.formatTime(zoomBounds.start)} → {c.formatTime(zoomBounds.end)}
               </span>
             </div>
             <div
+              data-scaleai-highlight-control
               className="relative h-10 touch-none select-none overflow-hidden rounded-sm border border-border bg-surface-2 cursor-ew-resize"
               onPointerDown={beginZoomScrub}
               onPointerMove={continueZoomScrub}
@@ -252,10 +277,12 @@ export function PlayerPanel({
                 const width = zoomWidth(segment.start, segment.end);
                 const isHighlighted =
                   !isGarbage &&
-                  hasHighlightedSegments &&
+                  highlightedTask.length > 0 &&
                   String(segment.label || "")
                     .trim()
-                    .toLowerCase() === highlightedTask;
+                    .toLowerCase() === highlightedTask &&
+                  scaleAiSegmentInFocus(segment, highlightedScaleAiRange);
+                const dimOthers = (hasHighlightedSegments || hasFocusRange) && !isHighlighted;
                 return (
                   <div key={`zoom-${segment.id}`}>
                     <div
@@ -263,7 +290,7 @@ export function PlayerPanel({
                       className={cn(
                         "absolute top-2 bottom-2 rounded-[2px] border border-black/50 transition-[opacity,filter,box-shadow]",
                         isGarbage && "bg-destructive/70",
-                        hasHighlightedSegments && !isHighlighted && "opacity-25",
+                        dimOthers && "opacity-25",
                         isHighlighted && "z-10 brightness-150 outline outline-2 outline-white",
                       )}
                       style={{

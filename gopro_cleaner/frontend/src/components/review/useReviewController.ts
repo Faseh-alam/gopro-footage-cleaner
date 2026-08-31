@@ -10,6 +10,8 @@ import type {
   MediaMeta,
   PendingWork,
   ScaleAiAnnotation,
+  ScaleAiFocusRange,
+  ScaleAiHighlightOptions,
   ScaleAiProgress,
   ScaleAiTaskProgress,
   SdCard,
@@ -155,6 +157,9 @@ function coverageEnd(segments: Segment[]) {
   return segments.reduce((max, segment) => Math.max(max, Number(segment.end) || 0), 0);
 }
 
+const MIN_SEGMENT_SEC = 0.05;
+const BOUNDARY_GAP_SEC = 0.01;
+
 function normalizeBoundary(value: number, duration?: number | null) {
   let next = Math.max(0, Number(value) || 0);
   if (duration != null && Number(duration) > 0) {
@@ -163,6 +168,25 @@ function normalizeBoundary(value: number, duration?: number | null) {
     next = Math.min(next, dur);
   }
   return next;
+}
+
+/** Start after the last mark (+10ms gap) and keep at least 50ms of footage. */
+function fitScaleAiPending(
+  playhead: number,
+  coverage: number,
+  duration: number,
+  existing?: { start: number; end: number } | null,
+): { start: number; end: number } | null {
+  const covered = Math.max(0, Number(coverage) || 0);
+  const start =
+    covered > 0 ? Math.round((covered + BOUNDARY_GAP_SEC) * 1000) / 1000 : 0;
+  const known = Number(duration) > 0 ? Number(duration) : 0;
+  let end = Math.max(Number(playhead) || 0, Number(existing?.end) || 0);
+  if (end <= start + MIN_SEGMENT_SEC) end = start + 0.1;
+  if (known > 0) end = Math.min(end, known);
+  end = normalizeBoundary(end, known || null);
+  if (end - start < MIN_SEGMENT_SEC - 1e-6) return null;
+  return { start, end };
 }
 
 function loadRecentTasks(): string[] {
@@ -285,6 +309,12 @@ export function useReviewController() {
   });
   const [scaleAiByPath, setScaleAiByPath] = useState<Record<string, ScaleAiAnnotation>>({});
   const [scaleAiPending, setScaleAiPending] = useState<PendingWork | null>(null);
+  const [highlightedScaleAiTask, setHighlightedScaleAiTask] = useState("");
+  const [highlightedScaleAiRange, setHighlightedScaleAiRange] = useState<ScaleAiFocusRange | null>(
+    null,
+  );
+  const highlightedScaleAiTaskRef = useRef("");
+  highlightedScaleAiTaskRef.current = highlightedScaleAiTask;
   const [scaleAiProgress, setScaleAiProgress] = useState<ScaleAiProgress | null>(null);
   const [scaleAiGoalShown, setScaleAiGoalShown] = useState<Record<string, boolean>>({});
 
@@ -571,10 +601,12 @@ export function useReviewController() {
   const knownDurationSec = useCallback(() => {
     const v = videoRef.current;
     const video = currentVideo();
+    const path = video?.path || "";
     const el = v && Number.isFinite(v.duration) ? v.duration : 0;
     const knownFile = Number(video?.duration) || 0;
-    const knownAnn = Number(stateRef.current.annotationsByPath[video?.path || ""]?.duration) || 0;
-    return Math.max(el, knownFile, knownAnn) || 0;
+    const knownAnn = Number(stateRef.current.annotationsByPath[path]?.duration) || 0;
+    const knownScale = Number(stateRef.current.scaleAiByPath[path]?.duration_seconds) || 0;
+    return Math.max(el, knownFile, knownAnn, knownScale) || 0;
   }, [currentVideo]);
 
   // Guard against "play() interrupted by pause()" and hung play() promises.
@@ -764,6 +796,48 @@ export function useReviewController() {
     },
     [flushSeek, knownDurationSec],
   );
+
+  const showScaleAiTaskInLabeledRegion = useCallback(
+    (task: string, options?: ScaleAiHighlightOptions) => {
+      const clean = String(task || "").trim();
+      if (!clean) return;
+      const same = highlightedScaleAiTaskRef.current.trim().toLowerCase() === clean.toLowerCase();
+      const focused =
+        options?.focusStart != null &&
+        options?.focusEnd != null &&
+        Number.isFinite(Number(options.focusStart)) &&
+        Number.isFinite(Number(options.focusEnd));
+      if (!options?.keepOn && options?.seekTo == null && same && !focused) {
+        setHighlightedScaleAiTask("");
+        setHighlightedScaleAiRange(null);
+        return;
+      }
+      setHighlightedScaleAiTask(clean);
+      setHighlightedScaleAiRange(
+        focused ? { start: Number(options.focusStart), end: Number(options.focusEnd) } : null,
+      );
+      if (options?.seek === false && options?.seekTo == null) return;
+      const wanted = clean.toLowerCase();
+      const seekTo =
+        options?.seekTo ??
+        currentScaleAi()?.segments.find(
+          (segment) =>
+            segment.type === "subtask" &&
+            String(segment.label || "")
+              .trim()
+              .toLowerCase() === wanted,
+        )?.start;
+      if (seekTo != null && Number.isFinite(Number(seekTo))) {
+        scheduleSeek(Number(seekTo), true);
+      }
+    },
+    [currentScaleAi, scheduleSeek],
+  );
+
+  const clearScaleAiHighlight = useCallback(() => {
+    setHighlightedScaleAiTask("");
+    setHighlightedScaleAiRange(null);
+  }, []);
 
   // Scrubber clicks are disabled in the UI — keep this as a no-op so nothing
   // can jump the playhead by clicking the timeline.
@@ -1761,51 +1835,128 @@ export function useReviewController() {
         focusTaskSearch();
         return false;
       }
-      try {
-        const data = await api("/api/eager/scaleai/segments", {
-          method: "POST",
-          body: JSON.stringify({
-            path: video.path,
-            root: stateRef.current.scanRoot || "",
-            start: pending.start,
-            end: pending.end,
-            label: segmentType === "garbage" ? "garbage" : clean,
-            type: segmentType,
-          }),
-        });
-        applyScaleAiPayload(video.path, data);
+      const annotation = currentScaleAi();
+      const segments = annotation?.segments || [];
+      const coverage = segments.length
+        ? Math.max(...segments.map((segment) => Number(segment.end) || 0))
+        : 0;
+      const known =
+        Number(annotation?.duration_seconds) ||
+        Number(video.duration) ||
+        knownDurationSec();
+      const fitted = fitScaleAiPending(pending.end, coverage, known, pending);
+      if (!fitted) {
         setScaleAiPending(null);
-        setTaskSelectionMode(false);
-        if (segmentType === "subtask") {
-          const canonical =
-            (data.labels || []).find(
-              (name: string) => name.toLowerCase() === clean.toLowerCase(),
-            ) || clean;
-          setSelectedTaskValue(canonical);
-          setLastLabelTask(canonical);
-          touchRecentTask(canonical);
-          setTasks((prev) => {
-            if (prev.some((t) => t.toLowerCase() === canonical.toLowerCase())) return prev;
-            return [canonical, ...prev];
-          });
-          setTaskSearch("");
-          setStatus(`Saved ${canonical} ${formatTime(pending.start)} → ${formatTime(pending.end)}`, "ok");
-        } else {
-          setStatus(`Saved garbage ${formatTime(pending.start)} → ${formatTime(pending.end)}`, "ok");
-        }
-        leaveTaskSearch();
-        return true;
-      } catch (error: any) {
-        setStatus(error.message || "Could not save segment", "error");
+        stateRef.current.scaleAiPending = null;
+        setStatus("No unlabeled footage remains after the last marking", "error");
         return false;
       }
+      const savedLabel = segmentType === "garbage" ? "garbage" : clean;
+      const optimisticId = `local-${Date.now()}`;
+      const optimistic = {
+        id: optimisticId,
+        start: fitted.start,
+        end: fitted.end,
+        duration: Math.round((fitted.end - fitted.start) * 1000) / 1000,
+        type: segmentType,
+        label: savedLabel,
+      };
+      setScaleAiPending(null);
+      stateRef.current.scaleAiPending = null;
+      setTaskSelectionMode(false);
+      setScaleAiByPath((prev) => {
+        const cur = prev[video.path];
+        if (!cur) return prev;
+        const nextSegments = [...(cur.segments || []), optimistic].sort(
+          (a, b) => Number(a.start) - Number(b.start) || Number(a.end) - Number(b.end),
+        );
+        return { ...prev, [video.path]: { ...cur, segments: nextSegments } };
+      });
+      if (segmentType === "subtask") {
+        setSelectedTaskValue(clean);
+        setLastLabelTask(clean);
+        touchRecentTask(clean);
+        setTasks((prev) => {
+          if (prev.some((t) => t.toLowerCase() === clean.toLowerCase())) return prev;
+          return [clean, ...prev];
+        });
+        setTaskSearch("");
+        setStatus(`Saved ${clean} ${formatTime(fitted.start)} → ${formatTime(fitted.end)}`, "ok");
+        showScaleAiTaskInLabeledRegion(clean, {
+          keepOn: true,
+          seek: false,
+          focusStart: fitted.start,
+          focusEnd: fitted.end,
+        });
+      } else {
+        setStatus(`Saved garbage ${formatTime(fitted.start)} → ${formatTime(fitted.end)}`, "ok");
+      }
+      leaveTaskSearch();
+      void api("/api/eager/scaleai/segments", {
+        method: "POST",
+        body: JSON.stringify({
+          path: video.path,
+          root: stateRef.current.scanRoot || "",
+          start: fitted.start,
+          end: fitted.end,
+          label: savedLabel,
+          type: segmentType,
+        }),
+      })
+        .then((data) => {
+          applyScaleAiPayload(video.path, data);
+          if (segmentType === "subtask") {
+            const canonical =
+              (data.labels || []).find(
+                (name: string) => name.toLowerCase() === clean.toLowerCase(),
+              ) || clean;
+            setSelectedTaskValue(canonical);
+            setLastLabelTask(canonical);
+            const saved = (data.annotation?.segments || []).find(
+              (row: { start?: number; end?: number; label?: string; type?: string }) =>
+                String(row.type || "subtask").toLowerCase() === "subtask" &&
+                String(row.label || "")
+                  .trim()
+                  .toLowerCase() === canonical.toLowerCase() &&
+                Math.abs(Number(row.start) - fitted.start) <= 0.2 &&
+                Math.abs(Number(row.end) - fitted.end) <= 0.2,
+            );
+            showScaleAiTaskInLabeledRegion(canonical, {
+              keepOn: true,
+              seek: false,
+              focusStart: Number(saved?.start ?? fitted.start),
+              focusEnd: Number(saved?.end ?? fitted.end),
+            });
+          }
+        })
+        .catch((error: any) => {
+          setScaleAiByPath((prev) => {
+            const cur = prev[video.path];
+            if (!cur) return prev;
+            return {
+              ...prev,
+              [video.path]: {
+                ...cur,
+                segments: (cur.segments || []).filter((row) => String(row.id) !== optimisticId),
+              },
+            };
+          });
+          setScaleAiPending(fitted);
+          stateRef.current.scaleAiPending = fitted;
+          setTaskSelectionMode(true);
+          setStatus(error.message || "Could not save segment", "error");
+        });
+      return true;
     },
     [
       applyScaleAiPayload,
+      currentScaleAi,
       currentVideo,
       focusTaskSearch,
+      knownDurationSec,
       leaveTaskSearch,
       setStatus,
+      showScaleAiTaskInLabeledRegion,
       touchRecentTask,
     ],
   );
@@ -1819,32 +1970,26 @@ export function useReviewController() {
         Number(annotation?.duration_seconds) ||
         Number(video.duration) ||
         knownDurationSec();
-      let end = normalizeBoundary(currentScrubTime(), known);
       const segments = annotation?.segments || [];
       const coverage = segments.length
         ? Math.max(...segments.map((segment) => Number(segment.end) || 0))
         : 0;
-      // Leave a 10ms gap after the previous segment so shared boundaries never overlap.
-      const rawAnchor = Math.max(coverage, Number(anchorByPathRef.current[video.path]) || 0);
-      const anchor = coverage > 0 ? Math.round((rawAnchor + 0.01) * 1000) / 1000 : rawAnchor;
-      if (end <= anchor + 0.05) {
-        const target = Math.min(Math.max(0, known - 0.04), anchor + 0.1);
-        if (target <= anchor + 0.05) {
-          setStatus("No unlabeled footage remains after the last marking", "error");
-          return;
-        }
-        // One T is enough: nudge the playhead and open the pending mark.
-        end = normalizeBoundary(target, known);
-        scheduleSeek(end, true);
+      const fitted = fitScaleAiPending(currentScrubTime(), coverage, known);
+      if (!fitted) {
+        setStatus("No unlabeled footage remains after the last marking", "error");
+        return;
       }
-      setScaleAiPending({ start: anchor, end });
-      stateRef.current.scaleAiPending = { start: anchor, end };
+      if (Math.abs(fitted.end - currentScrubTime()) > 0.02) {
+        scheduleSeek(fitted.end, true);
+      }
+      setScaleAiPending(fitted);
+      stateRef.current.scaleAiPending = fitted;
       setTaskSelectionMode(true);
       const last = stateRef.current.lastLabelTask || stateRef.current.selectedTaskValue;
       setStatus(
         last
-          ? `Pending ${formatTime(anchor)} → ${formatTime(end)} — Enter for ${last}, or type a new label`
-          : `Pending ${formatTime(anchor)} → ${formatTime(end)} — type a label and press Enter`,
+          ? `Pending ${formatTime(fitted.start)} → ${formatTime(fitted.end)} — Enter for ${last}, or type a new label`
+          : `Pending ${formatTime(fitted.start)} → ${formatTime(fitted.end)} — type a label and press Enter`,
         "ok",
       );
       focusTaskSearch();
@@ -3268,6 +3413,10 @@ export function useReviewController() {
     setScaleAiMode,
     scaleAiByPath,
     scaleAiPending,
+    highlightedScaleAiTask,
+    highlightedScaleAiRange,
+    showScaleAiTaskInLabeledRegion,
+    clearScaleAiHighlight,
     scaleAiProgress,
     currentScaleAi,
     scaleAiTaskProgress,

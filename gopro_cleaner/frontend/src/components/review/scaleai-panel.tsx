@@ -2,16 +2,24 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { taskColor } from "./task-color";
 import type { ReviewController } from "./useReviewController";
-import { UNLABELED_TASK_LABEL } from "./types";
+import {
+  UNLABELED_TASK_LABEL,
+  scaleAiSegmentInFocus,
+  scaleAiSubtaskCountRows,
+  type ScaleAiFocusRange,
+  type ScaleAiHighlightOptions,
+} from "./types";
 
 export function ScaleAiPanel({
   c,
   highlightedTask,
+  highlightedRange,
   onHighlightTask,
 }: {
   c: ReviewController;
   highlightedTask?: string;
-  onHighlightTask?: (task: string) => void;
+  highlightedRange?: ScaleAiFocusRange | null;
+  onHighlightTask?: (task: string, options?: ScaleAiHighlightOptions) => void;
 }) {
   const annotation = c.currentScaleAi();
   const segments = annotation?.segments || [];
@@ -19,11 +27,13 @@ export function ScaleAiPanel({
   const video = c.currentVideo();
   const videosInTask = c.videosInCurrentParentTask();
   const videoIndex = videosInTask.findIndex((item) => item.path === video?.path);
-  const unlabeledCount = segments.filter(
-    (segment) =>
-      segment.type === "subtask" &&
-      segment.label.trim().toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase(),
-  ).length;
+  const subtaskRows = scaleAiSubtaskCountRows(segments);
+  const unlabeledCount =
+    subtaskRows.find((row) => row.label.toLowerCase() === UNLABELED_TASK_LABEL.toLowerCase())
+      ?.count ?? 0;
+  const otherSubtaskCounts = subtaskRows
+    .filter((row) => row.label.toLowerCase() !== UNLABELED_TASK_LABEL.toLowerCase())
+    .sort((a, b) => a.label.localeCompare(b.label));
   const relabelOptions = c.tasks
     .filter((task) => task.trim().toLowerCase() !== UNLABELED_TASK_LABEL.toLowerCase())
     .filter(
@@ -43,8 +53,8 @@ export function ScaleAiPanel({
           {annotation?.parent_task || "Open a 50-hour folder"}
         </div>
         <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-          T marks a segment · ↓/↑ then Enter assigns · U = Unlabeled task · G =
-          garbage · Ctrl+Z = undo · N = next
+          T marks a segment · ↓/↑ then Enter assigns · U = Unlabeled task · G = garbage · Ctrl+Z =
+          undo · N = next
         </p>
       </div>
 
@@ -61,11 +71,42 @@ export function ScaleAiPanel({
               : `— / ${videosInTask.length}`}
           </span>
         </div>
-        <div className="flex justify-between gap-2">
-          <span className="text-muted-foreground">UNLABELED IN VIDEO</span>
-          <span className={`font-mono ${unlabeledCount > 0 ? "text-accent" : ""}`}>
-            {unlabeledCount}
-          </span>
+        <div className="grid max-h-32 gap-1 overflow-auto">
+          <button
+            type="button"
+            data-scaleai-highlight-control
+            title="Show unlabeled tasks in the labeled region"
+            onClick={() => onHighlightTask?.(UNLABELED_TASK_LABEL, { keepOn: true })}
+            className={`flex w-full justify-between gap-2 rounded-sm text-left hover:bg-surface-2 ${
+              normalizedHighlight === UNLABELED_TASK_LABEL.toLowerCase() ? "bg-accent/10" : ""
+            }`}
+          >
+            <span className="text-muted-foreground">UNLABELED IN VIDEO</span>
+            <span className={`font-mono ${unlabeledCount > 0 ? "text-accent" : ""}`}>
+              {unlabeledCount}
+            </span>
+          </button>
+          {otherSubtaskCounts.map((row) => (
+            <button
+              key={row.label}
+              type="button"
+              data-scaleai-highlight-control
+              title={`Show “${row.label}” in the labeled region`}
+              onClick={() => onHighlightTask?.(row.label, { keepOn: true })}
+              className={`flex w-full justify-between gap-2 rounded-sm text-left hover:bg-surface-2 ${
+                normalizedHighlight === row.label.toLowerCase() ? "bg-accent/10" : ""
+              }`}
+            >
+              <span className="truncate text-muted-foreground">{row.label.toUpperCase()}</span>
+              <span
+                className={`shrink-0 font-mono ${
+                  normalizedHighlight === row.label.toLowerCase() ? "text-accent" : ""
+                }`}
+              >
+                {row.count}
+              </span>
+            </button>
+          ))}
         </div>
       </div>
 
@@ -93,7 +134,7 @@ export function ScaleAiPanel({
               type="button"
               data-scaleai-highlight-control
               aria-pressed={highlightedTask === c.selectedTaskValue}
-              title="Highlight this task in the labeled region"
+              title="Show this task in the labeled region under the video"
               onClick={() => onHighlightTask?.(c.selectedTaskValue)}
               className={`rounded-sm px-1 font-medium text-foreground underline decoration-dotted underline-offset-2 transition-colors hover:bg-surface ${
                 highlightedTask === c.selectedTaskValue ? "bg-accent/15 text-accent" : ""
@@ -126,7 +167,8 @@ export function ScaleAiPanel({
               normalizedHighlight.length > 0 &&
               String(segment.label || "")
                 .trim()
-                .toLowerCase() === normalizedHighlight;
+                .toLowerCase() === normalizedHighlight &&
+              scaleAiSegmentInFocus(segment, highlightedRange);
             return (
               <div
                 key={String(segment.id)}
@@ -148,8 +190,15 @@ export function ScaleAiPanel({
                       type="button"
                       data-scaleai-highlight-control
                       aria-pressed={isHighlighted}
-                      title={`Highlight ${segment.label} in the labeled region`}
-                      onClick={() => onHighlightTask?.(segment.label)}
+                      title={`Show ${segment.label} in the labeled region`}
+                      onClick={() =>
+                        onHighlightTask?.(segment.label, {
+                          seekTo: Number(segment.start) || 0,
+                          keepOn: true,
+                          focusStart: Number(segment.start) || 0,
+                          focusEnd: Number(segment.end) || 0,
+                        })
+                      }
                       className="block max-w-full truncate rounded-sm text-left text-xs font-medium underline decoration-dotted underline-offset-2 hover:text-accent"
                     >
                       {segment.label}

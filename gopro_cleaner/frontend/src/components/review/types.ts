@@ -20,6 +20,20 @@ export interface Segment {
 
 export const UNLABELED_TASK_LABEL = "Unlabeled task";
 
+export type ScaleAiFocusRange = { start: number; end: number };
+
+export type ScaleAiHighlightOptions = {
+  /** Jump the playhead to this time. When set, the highlight stays on. */
+  seekTo?: number;
+  /** Keep the highlight on even if this task is already selected. */
+  keepOn?: boolean;
+  /** When false, highlight without moving the playhead. */
+  seek?: boolean;
+  /** Zoom/highlight only this span (the mark just assigned), not every clip with the same label. */
+  focusStart?: number;
+  focusEnd?: number;
+};
+
 export interface PendingWork {
   start: number;
   end: number;
@@ -36,6 +50,50 @@ export interface ScaleAiSegment {
   clip_serial?: number;
   clip_filename?: string;
   camera_serial?: string;
+}
+
+/** Per-video subtask counts, keyed by lowercased label. */
+export function scaleAiSubtaskCountsByLabel(
+  segments: ScaleAiSegment[] | undefined | null,
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const segment of segments || []) {
+    if (String(segment.type || "").toLowerCase() !== "subtask") continue;
+    const label = String(segment.label || "").trim();
+    if (!label) continue;
+    const key = label.toLowerCase();
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
+}
+
+/** True when this segment is the focused mark (or no focus range is set). */
+export function scaleAiSegmentInFocus(
+  segment: { start: number; end: number },
+  range: ScaleAiFocusRange | null | undefined,
+): boolean {
+  if (!range) return true;
+  return (
+    Math.abs(Number(segment.start) - range.start) <= 0.15 &&
+    Math.abs(Number(segment.end) - range.end) <= 0.15
+  );
+}
+
+/** Distinct subtask labels in this video with their segment counts. */
+export function scaleAiSubtaskCountRows(
+  segments: ScaleAiSegment[] | undefined | null,
+): { label: string; count: number }[] {
+  const rows = new Map<string, { label: string; count: number }>();
+  for (const segment of segments || []) {
+    if (String(segment.type || "").toLowerCase() !== "subtask") continue;
+    const label = String(segment.label || "").trim();
+    if (!label) continue;
+    const key = label.toLowerCase();
+    const existing = rows.get(key);
+    if (existing) existing.count += 1;
+    else rows.set(key, { label, count: 1 });
+  }
+  return Array.from(rows.values());
 }
 
 export interface ScaleAiAnnotation {

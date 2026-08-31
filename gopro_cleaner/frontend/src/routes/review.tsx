@@ -9,7 +9,7 @@ import { Dropdown } from "@/components/wc/dropdown";
 import { cn } from "@/lib/utils";
 import { Logo } from "@/components/wc/logo";
 import { useReviewController } from "@/components/review/useReviewController";
-import { UNLABELED_TASK_LABEL } from "@/components/review/types";
+import { UNLABELED_TASK_LABEL, type ScaleAiHighlightOptions } from "@/components/review/types";
 import { useCardTracking } from "@/components/review/useSheetsIntegration";
 import { PlayerPanel } from "@/components/review/player-panel";
 import { TaskPanel } from "@/components/review/task-panel";
@@ -56,25 +56,21 @@ function ReviewPage() {
   const cards = useCardTracking(c.setStatus);
   const { refreshToday } = useAuth();
   const [updateState, setUpdateState] = useState<"idle" | "pulling" | "restarting">("idle");
-  const [highlightedScaleAiTask, setHighlightedScaleAiTask] = useState("");
-  const toggleScaleAiTaskHighlight = (task: string) => {
-    setHighlightedScaleAiTask((current) =>
-      current.trim().toLowerCase() === task.trim().toLowerCase() ? "" : task,
-    );
-  };
+  const showScaleAiTaskInLabeledRegion = (task: string, options?: ScaleAiHighlightOptions) =>
+    c.showScaleAiTaskInLabeledRegion(task, options);
 
   useEffect(() => {
-    if (!highlightedScaleAiTask) return;
+    if (!c.highlightedScaleAiTask) return;
     const clearHighlight = (event: PointerEvent) => {
       const target = event.target;
       if (target instanceof Element && target.closest("[data-scaleai-highlight-control]")) {
         return;
       }
-      setHighlightedScaleAiTask("");
+      c.clearScaleAiHighlight();
     };
     document.addEventListener("pointerdown", clearHighlight, true);
     return () => document.removeEventListener("pointerdown", clearHighlight, true);
-  }, [highlightedScaleAiTask]);
+  }, [c.highlightedScaleAiTask, c.clearScaleAiHighlight]);
 
   // One-click updater: pull the checked-out branch from GitHub, let the backend
   // relaunch itself (run.bat / run.sh), then reload once it's back.
@@ -216,9 +212,11 @@ function ReviewPage() {
             return;
           }
           c.pickTaskValue(task);
-          const hasPending = Boolean(c.scaleAiPending || c.currentAnnotation()?.pendingWork);
-          if (hasPending) void c.labelCurrentClip(task);
-          else if (c.scaleAiMode && query && !highlighted && !exact) {
+          const pending = c.scaleAiPending;
+          const hasPending = Boolean(pending || c.currentAnnotation()?.pendingWork);
+          if (hasPending && pending) {
+            void c.labelCurrentClip(task);
+          } else if (c.scaleAiMode && query && !highlighted && !exact) {
             void c.addTask(task);
           } else {
             c.leaveTaskSearch({ clear: false });
@@ -233,7 +231,10 @@ function ReviewPage() {
         }
         if (
           event.key.length === 1 &&
-          !(event.key.toLowerCase() === "u" && !c.taskSearch.trim()) &&
+          !(
+            !c.taskSearch.trim() &&
+            ["t", "d", "u", "g"].includes(event.key.toLowerCase())
+          ) &&
           !(event.ctrlKey && event.key.toLowerCase() === "z")
         )
           return;
@@ -385,14 +386,19 @@ function ReviewPage() {
 
       <main className="grid min-h-0 flex-1 gap-4 p-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)]">
         <div className="grid min-h-0 content-start gap-4">
-          <PlayerPanel c={c} highlightedScaleAiTask={highlightedScaleAiTask} />
+          <PlayerPanel
+            c={c}
+            highlightedScaleAiTask={c.highlightedScaleAiTask}
+            highlightedScaleAiRange={c.highlightedScaleAiRange}
+          />
         </div>
 
         <aside className="panel-surface flex min-h-0 flex-col">
           <TaskPanel
             c={c}
-            highlightedScaleAiTask={highlightedScaleAiTask}
-            onHighlightScaleAiTask={toggleScaleAiTaskHighlight}
+            highlightedScaleAiTask={c.highlightedScaleAiTask}
+            highlightedScaleAiRange={c.highlightedScaleAiRange}
+            onHighlightScaleAiTask={showScaleAiTaskInLabeledRegion}
           />
           <FootageList c={c} />
           <details className="border-b border-border px-4 py-3">

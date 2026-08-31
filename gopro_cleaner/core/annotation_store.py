@@ -27,6 +27,14 @@ def sidecar_path_for(video: Path) -> Path:
     return video.with_name(f"{video.stem}{_SIDECAR_SUFFIX}")
 
 
+def _has_fifty_hour_json(video: Path) -> bool:
+    """50-hour footage already uses ``VIDEO.json`` + ``manifest.json``."""
+    video = Path(video)
+    if (video.parent / "manifest.json").is_file():
+        return True
+    return video.with_name(f"{video.stem}.json").is_file()
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -336,6 +344,8 @@ def save_annotation(video: Path, annotation: dict, *, require_complete: bool = F
     payload["complete"] = summary["complete"]
 
     with _lock:
+        if _has_fifty_hour_json(video):
+            return {"annotation": payload, "summary": summary}
         _atomic_write(sidecar_path_for(video), payload)
         # Human-readable companion
         txt = sidecar_path_for(video).with_suffix("").with_suffix(".segments.txt")

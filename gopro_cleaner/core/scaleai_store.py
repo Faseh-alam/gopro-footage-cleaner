@@ -37,6 +37,13 @@ def sidecar_path_for(video: Path) -> Path:
     return path.with_name(f"{path.stem}{SIDECAR_SUFFIX}")
 
 
+def _has_fifty_hour_json(video: Path) -> bool:
+    video = Path(video)
+    if (video.parent / "manifest.json").is_file():
+        return True
+    return video.with_name(f"{video.stem}.json").is_file()
+
+
 SOURCE_BUCKET_NAMES = {"aws", "google drive"}
 
 
@@ -286,7 +293,8 @@ def save_annotation(video: Path, payload: dict) -> dict:
     source = Path(video).expanduser().resolve(strict=True)
     with _lock:
         normalized = _normalize(payload, source)
-        _atomic_write(sidecar_path_for(source), normalized)
+        if not _has_fifty_hour_json(source):
+            _atomic_write(sidecar_path_for(source), normalized)
         return normalized
 
 

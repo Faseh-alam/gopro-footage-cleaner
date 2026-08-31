@@ -8,8 +8,8 @@ generated short clips. Free-form subtask / garbage gaps are allowed.
 from __future__ import annotations
 
 import json
+import os
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -53,20 +53,18 @@ def _now_iso() -> str:
 
 
 def _atomic_write(path: Path, payload: dict | list) -> None:
+    """Replace ``path`` in place. Never leave a sibling temp JSON behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        suffix=".tmp",
-        prefix=f".{path.name}.",
-        dir=str(path.parent),
-        delete=False,
-    ) as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
-        handle.flush()
-        temp = Path(handle.name)
-    temp.replace(path)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> dict | list:
@@ -329,10 +327,13 @@ def cleanup_task_folder_files(task_dir: Path, *, root: Path | None = None) -> No
         if LABELING_DIR in path.parts:
             continue
         if path.name.startswith("._"):
-            if path.suffix.lower() in {".json", ".txt"}:
+            if path.suffix.lower() in {".json", ".txt", ".tmp"}:
                 path.unlink(missing_ok=True)
             continue
         lower = path.name.lower()
+        if lower.endswith(".tmp"):
+            path.unlink(missing_ok=True)
+            continue
         if any(lower.endswith(suffix) for suffix in JUNK_TXT_SUFFIXES):
             path.unlink(missing_ok=True)
             continue
@@ -371,8 +372,18 @@ def normalize_annotation(raw: dict, video: Path, *, root: Path | None = None) ->
     if not isinstance(raw, dict):
         return base
 
-    duration = resolve_media_duration(
-        source, raw.get("duration_seconds", raw.get("duration"))
+    claimed = raw.get("duration_seconds", raw.get("duration"))
+    try:
+        claimed_f = float(claimed) if claimed is not None else None
+        if claimed_f is not None and claimed_f <= 0:
+            claimed_f = None
+    except (TypeError, ValueError):
+        claimed_f = None
+    # Skip ffprobe on every T/Enter when JSON already has a duration.
+    duration = (
+        claimed_f
+        if claimed_f is not None
+        else resolve_media_duration(source, claimed)
     )
     segments: list[dict] = []
     for index, item in enumerate(raw.get("segments") or [], start=1):
@@ -446,11 +457,14 @@ def normalize_annotation(raw: dict, video: Path, *, root: Path | None = None) ->
     }
 
 
-def load_annotation(video: Path, *, root: Path | None = None) -> dict:
+def load_annotation(
+    video: Path, *, root: Path | None = None, repair: bool = True
+) -> dict:
     source = Path(video).expanduser().resolve()
     sidecar = sidecar_path_for(source)
     with _lock:
-        cleanup_task_folder_files(task_directory(source), root=root)
+        if repair:
+            cleanup_task_folder_files(task_directory(source), root=root)
         if not sidecar.is_file():
             return empty_annotation(source, root=root)
         try:
@@ -460,7 +474,7 @@ def load_annotation(video: Path, *, root: Path | None = None) -> dict:
         annotation = normalize_annotation(
             raw if isinstance(raw, dict) else {}, source, root=root
         )
-        _ensure_manifest_from_annotation(source, annotation)
+        _ensure_manifest_from_annotation(source, annotation, repair=repair)
         # Manifest loading may migrate clip files into subtask folders and update
         # clip references in this video's JSON. Return that migrated annotation.
         if sidecar.is_file():
@@ -471,18 +485,25 @@ def load_annotation(video: Path, *, root: Path | None = None) -> dict:
             annotation = normalize_annotation(
                 refreshed if isinstance(refreshed, dict) else {}, source, root=root
             )
-        if _sync_segment_clips(source, annotation):
+        if repair and _sync_segment_clips(source, annotation):
             annotation["updated_at"] = _now_iso()
             _atomic_write(sidecar, annotation)
         return annotation
 
 
-def save_annotation(video: Path, annotation: dict, *, root: Path | None = None) -> dict:
+def save_annotation(
+    video: Path,
+    annotation: dict,
+    *,
+    root: Path | None = None,
+    cleanup: bool = True,
+) -> dict:
     source = Path(video).expanduser().resolve()
     normalized = normalize_annotation(annotation, source, root=root)
     normalized["updated_at"] = _now_iso()
     with _lock:
-        cleanup_task_folder_files(task_directory(source), root=root)
+        if cleanup:
+            cleanup_task_folder_files(task_directory(source), root=root)
         _atomic_write(sidecar_path_for(source), normalized)
     if root is not None:
         refresh_progress(Path(root))
@@ -608,7 +629,7 @@ def add_segment(
 ) -> dict:
     source = Path(video).expanduser().resolve()
     with _lock:
-        annotation = load_annotation(source, root=root)
+        annotation = load_annotation(source, root=root, repair=False)
         duration = annotation.get("duration_seconds")
         start_n = normalize_boundary(float(start), duration)
         end_n = normalize_boundary(float(end), duration)
@@ -639,12 +660,9 @@ def add_segment(
         annotation["segments"] = list(annotation.get("segments") or []) + [segment]
         annotation["segments"].sort(key=lambda s: (float(s["start"]), float(s["end"])))
         annotation["updated_at"] = _now_iso()
-        save_annotation(source, annotation, root=root)
-    if root is not None:
-        if seg_type == "subtask":
-            add_label(root, annotation["parent_task"], clean_label)
-        refresh_progress(Path(root))
-    refresh_manifest_durations(task_directory(source))
+        save_annotation(source, annotation, root=None, cleanup=False)
+    if root is not None and seg_type == "subtask":
+        add_label(root, annotation["parent_task"], clean_label)
     return annotation
 
 
@@ -708,15 +726,17 @@ def update_segment(
         if new_type == "subtask" and not new_label:
             raise ValueError("label is required for subtask segments")
         old_label = str(found.get("label") or "").strip()
-        new_start, new_end = _resolve_non_overlapping_start(
-            new_start,
-            new_end,
-            list(annotation.get("segments") or []),
-            ignore_id=target,
-            duration=duration,
-        )
-        if new_end - new_start < MIN_SEGMENT - EPSILON:
-            raise ValueError(f"Segment too short (min {MIN_SEGMENT}s)")
+        times_changed = start is not None or end is not None
+        if times_changed:
+            new_start, new_end = _resolve_non_overlapping_start(
+                new_start,
+                new_end,
+                list(annotation.get("segments") or []),
+                ignore_id=target,
+                duration=duration,
+            )
+            if new_end - new_start < MIN_SEGMENT - EPSILON:
+                raise ValueError(f"Segment too short (min {MIN_SEGMENT}s)")
         found["start"] = round(new_start, 3)
         found["end"] = round(new_end, 3)
         found["duration"] = round(new_end - new_start, 3)
@@ -728,6 +748,9 @@ def update_segment(
             if root is not None:
                 add_label(root, annotation["parent_task"], new_label)
             _rehome_segment_clip(source, found, old_label, new_label, annotation)
+            manifest = load_manifest(task_directory(source), repair=False)
+            renamed = _compact_labeled_clip_serials(task_directory(source), manifest)
+            _apply_renamed_clip_filenames(annotation, renamed, manifest)
         annotation["segments"].sort(key=lambda s: (float(s["start"]), float(s["end"])))
         annotation["updated_at"] = _now_iso()
         save_annotation(source, annotation, root=root)
@@ -763,7 +786,9 @@ def iter_sidecars(root: Path):
         if not path.is_file() or LABELING_DIR in path.parts:
             continue
         name = path.name.lower()
-        if name == MANIFEST_FILE.lower():
+        if name.endswith(".tmp") or any(name.endswith(suffix) for suffix in JUNK_JSON_SUFFIXES):
+            continue
+        if name.endswith(".manifest.json") or name == MANIFEST_FILE.lower():
             continue
         key = str(path.resolve()).lower()
         if key in seen:
@@ -951,6 +976,26 @@ def _subtask_by_label(manifest: dict, label: str) -> dict | None:
     )
 
 
+def _ensure_unlabeled_subtask(manifest: dict) -> dict:
+    existing = _subtask_by_label(manifest, UNLABELED_TASK_LABEL)
+    if existing is not None:
+        return existing
+    used = {str(row.get("id") or "") for row in manifest.get("subtasks") or []}
+    next_id = 1
+    while f"{next_id:03d}" in used:
+        next_id += 1
+    subtask_id = f"{next_id:03d}"
+    row = {
+        "id": subtask_id,
+        "name": UNLABELED_TASK_LABEL,
+        "folder": subtask_folder_name(UNLABELED_TASK_LABEL, subtask_id),
+        "total_clips": 0,
+        "clips": [],
+    }
+    manifest.setdefault("subtasks", []).append(row)
+    return row
+
+
 def _subtask_by_id(manifest: dict, subtask_id: str) -> dict | None:
     wanted = str(subtask_id or "").zfill(3)
     return next(
@@ -979,8 +1024,7 @@ def retarget_clip_filename(
     """Keep camera + clip serial; swap only the middle subtask id.
 
     ``C346-001-053.mp4`` + subtask ``003`` → ``C346-003-053.mp4``.
-    If another camera already uses that serial in the same folder, bump
-    (053 → 054, …) so numbers stay unique in the folder.
+    Only bump the serial when this camera already has that filename.
     """
     match = CLIP_NAME_RE.match(str(filename or "").strip())
     if not match:
@@ -990,12 +1034,10 @@ def retarget_clip_filename(
     serial = int(match.group("clip"))
     claimed = {name.lower() for name in (occupied or set())}
     claimed.discard(str(filename).lower())
-    holders = _cameras_holding_serials(occupied or set())
     candidate = serial
     while True:
         name = f"{camera}-{target_id}-{candidate:03d}.mp4"
-        others = holders.get(candidate, set()) - {camera.upper()}
-        if name.lower() not in claimed and not others:
+        if name.lower() not in claimed:
             return name
         candidate += 1
 
@@ -1412,6 +1454,85 @@ def _resolve_clip_filename(
     return ""
 
 
+def _json_claimed_clip_homes(
+    task_dir: Path, manifest: dict
+) -> tuple[dict[str, str], set[tuple[str, str, int]]]:
+    """JSON is the source of truth for which file belongs in which subtask folder.
+
+    Returns lowercase clip_filename → dest id, and (camera, dest id, serial)
+    identities. Serials are reused across subtasks, so camera+serial alone is
+    not a claim.
+    """
+    unlabeled_id = str(
+        (_subtask_by_label(manifest, UNLABELED_TASK_LABEL) or {}).get("id") or ""
+    )
+    by_name: dict[str, str] = {}
+    identities: set[tuple[str, str, int]] = set()
+    for raw in _task_annotations(task_dir):
+        fallback_cam = _camera_token(raw.get("camera_serial") or raw.get("cl_number"))
+        for segment in raw.get("segments") or []:
+            if str(segment.get("type") or "").lower() != "subtask":
+                continue
+            label = str(segment.get("label") or "").strip()
+            if not label:
+                continue
+            sub = _subtask_by_label(manifest, label)
+            if sub is None:
+                continue
+            dest_id = str(sub.get("id") or "")
+            if not dest_id:
+                continue
+            filename = str(segment.get("clip_filename") or "").strip()
+            if filename:
+                key = filename.lower()
+                previous = by_name.get(key)
+                if previous is None or previous == unlabeled_id or dest_id != unlabeled_id:
+                    by_name[key] = dest_id
+            parsed = CLIP_NAME_RE.match(filename) if filename else None
+            cam = (
+                parsed.group("camera").upper()
+                if parsed is not None
+                else (_camera_token(segment.get("camera_serial")) or fallback_cam)
+            )
+            serial: int | None = None
+            if parsed is not None:
+                serial = int(parsed.group("clip"))
+            else:
+                raw_serial = segment.get("clip_serial")
+                if raw_serial not in (None, ""):
+                    try:
+                        serial = int(raw_serial)
+                    except (TypeError, ValueError):
+                        serial = None
+            if cam and serial is not None:
+                identities.add((cam, dest_id, serial))
+    return by_name, identities
+
+
+def _clip_belongs_in_dest(
+    path: Path,
+    dest_id: str,
+    by_name: dict[str, str],
+) -> bool:
+    return by_name.get(path.name.lower()) == dest_id
+
+
+def _remove_clip_filename_from_subtasks(manifest: dict, filename: str) -> None:
+    key = str(filename or "").strip().lower()
+    if not key:
+        return
+    for subtask in manifest.get("subtasks") or []:
+        clips = subtask.get("clips") or []
+        kept = [
+            clip
+            for clip in clips
+            if str(clip.get("filename") or "").strip().lower() != key
+        ]
+        if len(kept) != len(clips):
+            subtask["clips"] = kept
+            subtask["total_clips"] = len(kept)
+
+
 def _clip_needs_rehome(
     task_dir: Path, segment: dict, manifest: dict
 ) -> tuple[bool, str]:
@@ -1436,106 +1557,12 @@ def _clip_needs_rehome(
     return (wrong_id or wrong_folder), old_label
 
 
-def _relabel_segments_from_clip_homes(
-    source: Path, annotation: dict, manifest: dict
-) -> bool:
-    """If Unlabeled JSON still has clips sitting in a real subtask folder, adopt that label."""
-    source_key = source.name.lower()
-    camera = _camera_token(
-        annotation.get("camera_serial") or annotation.get("cl_number")
-    )
-    unlabeled_key = UNLABELED_TASK_LABEL.lower()
-    homes: list[tuple[dict, dict]] = []
-    for subtask in manifest.get("subtasks") or []:
-        if str(subtask.get("name") or "").strip().lower() == unlabeled_key:
-            continue
-        folder = task_directory(source) / str(subtask.get("folder") or "")
-        for clip in subtask.get("clips") or []:
-            clip_source = str(clip.get("source_video") or "").strip().lower()
-            ident = _clip_identity_from_name(clip.get("filename"))
-            clip_cam = _camera_token(clip.get("camera_serial")) or (
-                ident[0] if ident else ""
-            )
-            if clip_source and clip_source != source_key:
-                continue
-            if not clip_source and camera and clip_cam and clip_cam != camera:
-                continue
-            if not clip_source and not camera:
-                continue
-            homes.append((subtask, clip))
-        if folder.is_dir() and camera:
-            for path in folder.iterdir():
-                parsed = CLIP_NAME_RE.match(path.name)
-                if parsed is None or parsed.group("camera").upper() != camera:
-                    continue
-                homes.append(
-                    (
-                        subtask,
-                        {
-                            "filename": path.name,
-                            "camera_serial": parsed.group("camera"),
-                            "video_serial": int(parsed.group("clip")),
-                            "source_video": source.name,
-                        },
-                    )
-                )
-    unique_subs: list[dict] = []
-    seen: set[str] = set()
-    for subtask, _clip in homes:
-        key = str(subtask.get("name") or "").strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            unique_subs.append(subtask)
-    changed = False
-    for segment in annotation.get("segments") or []:
-        if str(segment.get("type") or "").lower() != "subtask":
-            continue
-        if str(segment.get("label") or "").strip().lower() != unlabeled_key:
-            continue
-        recorded = str(segment.get("clip_filename") or "").strip()
-        ident = _clip_identity_from_name(recorded)
-        start = _as_seconds(segment.get("start"))
-        hit_sub: dict | None = None
-        hit_clip: dict | None = None
-        for subtask, clip in homes:
-            clip_name = str(clip.get("filename") or "").strip()
-            clip_ident = _clip_identity_from_name(clip_name)
-            if recorded and clip_name.lower() == recorded.lower():
-                hit_sub, hit_clip = subtask, clip
-                break
-            if ident is not None and clip_ident == ident:
-                hit_sub, hit_clip = subtask, clip
-                break
-            row_start = _as_seconds(clip.get("source_start"))
-            if (
-                start is not None
-                and row_start is not None
-                and abs(row_start - start) <= 0.12
-            ):
-                hit_sub, hit_clip = subtask, clip
-                break
-        if hit_sub is None and len(unique_subs) == 1:
-            hit_sub = unique_subs[0]
-        if hit_sub is None:
-            continue
-        segment["label"] = str(hit_sub["name"])
-        if hit_clip is not None:
-            _assign_clip_row(segment, hit_clip, hit_sub)
-        else:
-            segment["subtask_id"] = hit_sub["id"]
-        changed = True
-    return changed
-
-
 def _sync_segment_clips(source: Path, annotation: dict) -> bool:
     """Write missing clip names into JSON and move files that belong to a new label."""
     task_dir = task_directory(source)
-    manifest = load_manifest(task_dir)
-    changed = _relabel_segments_from_clip_homes(source, annotation, manifest)
-    if changed:
-        manifest = load_manifest(task_dir)
+    manifest = load_manifest(task_dir, repair=False)
     bound = _bind_missing_clip_filenames(source, annotation, manifest)
-    changed = changed or bound
+    changed = bound
     for segment in annotation.get("segments") or []:
         needs_move, old_label = _clip_needs_rehome(task_dir, segment, manifest)
         if not needs_move:
@@ -1547,18 +1574,24 @@ def _sync_segment_clips(source: Path, annotation: dict) -> bool:
             str(segment.get("label") or ""),
             annotation,
         )
-        manifest = load_manifest(task_dir)
+        manifest = load_manifest(task_dir, repair=False)
         changed = True
+    if changed:
+        manifest = load_manifest(task_dir, repair=False)
+        renamed = _compact_labeled_clip_serials(task_dir, manifest)
+        _apply_renamed_clip_filenames(annotation, renamed, manifest)
     return changed
 
 
-def _adopt_wrong_id_clips_in_labeled_folders(task_dir: Path, manifest: dict) -> bool:
-    """Rename CAMERA-001-SERIAL files that already live in a labeled subtask folder.
+def _restore_unlabeled_clips_from_labeled_folders(task_dir: Path, manifest: dict) -> bool:
+    """Keep labeled folders for JSON-named clips only.
 
-    Copies left in Unlabeled-task are deleted. Manifest rows follow the file.
+    Same-size copies of a kept file are deleted. Every other unclaimed file
+    in a labeled folder goes to Unlabeled-task.
     """
     unlabeled = _subtask_by_label(manifest, UNLABELED_TASK_LABEL)
     unlabeled_id = str(unlabeled.get("id") or "") if unlabeled else ""
+    by_name, _identities = _json_claimed_clip_homes(task_dir, manifest)
     changed = False
     for subtask in manifest.get("subtasks") or []:
         dest_id = str(subtask.get("id") or "")
@@ -1567,46 +1600,119 @@ def _adopt_wrong_id_clips_in_labeled_folders(task_dir: Path, manifest: dict) -> 
         folder = Path(task_dir) / str(subtask.get("folder") or "")
         if not folder.is_dir():
             continue
-        occupied = _occupied_clip_names(
+        dest_occupied = _occupied_clip_names(
             folder,
             [str(row.get("filename") or "") for row in subtask.get("clips") or []],
         )
-        for path in list(folder.iterdir()):
+        files = []
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            lower = path.name.lower()
+            if lower.endswith("-stitched.mp4") or ".partial." in lower:
+                if ".partial." in lower:
+                    path.unlink(missing_ok=True)
+                    changed = True
+                continue
+            files.append(path)
+        for path in files:
             if not path.is_file():
                 continue
             parsed = CLIP_NAME_RE.match(path.name)
-            if parsed is None or parsed.group("subtask") == dest_id:
+            if parsed is None:
                 continue
             camera = parsed.group("camera").upper()
             serial = int(parsed.group("clip"))
-            new_name = retarget_clip_filename(path.name, dest_id, occupied=occupied)
-            new_path = folder / new_name
-            if path.resolve() != new_path.resolve():
-                if new_path.exists():
-                    path.unlink(missing_ok=True)
-                else:
-                    path.replace(new_path)
-            occupied.add(new_name.lower())
-            occupied.discard(path.name.lower())
-            keep = new_path if new_path.is_file() else None
-            _delete_identity_copies(
-                task_dir, camera, serial, keep, manifest, old_id=parsed.group("subtask")
-            )
-            old_row: dict | None = None
-            old_id = parsed.group("subtask")
+            file_id = parsed.group("subtask")
+            if _clip_belongs_in_dest(path, dest_id, by_name):
+                if file_id == dest_id:
+                    continue
+                new_name = retarget_clip_filename(
+                    path.name, dest_id, occupied=dest_occupied
+                )
+                new_path = folder / new_name
+                if path.resolve() != new_path.resolve():
+                    if new_path.exists():
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.replace(new_path)
+                dest_occupied.add(new_name.lower())
+                dest_occupied.discard(path.name.lower())
+                keep = new_path if new_path.is_file() else None
+                _delete_identity_copies(
+                    task_dir,
+                    camera,
+                    serial,
+                    keep,
+                    manifest,
+                    old_id=file_id,
+                )
+                old_row: dict | None = None
+                for other in manifest.get("subtasks") or []:
+                    for clip in other.get("clips") or []:
+                        ident = _clip_identity_from_name(clip.get("filename"))
+                        clip_parsed = CLIP_NAME_RE.match(str(clip.get("filename") or ""))
+                        if ident == (camera, serial) and (
+                            clip_parsed is None or clip_parsed.group("subtask") == file_id
+                        ):
+                            old_row = dict(clip)
+                            break
+                    if old_row is not None:
+                        break
+                _remove_clip_identity_from_subtasks(
+                    manifest, camera, serial, old_id=file_id
+                )
+                row = old_row or {
+                    "camera_serial": camera,
+                    "video_serial": serial,
+                    "filename": new_name,
+                    "source_video": "",
+                }
+                parsed_new = CLIP_NAME_RE.match(new_name)
+                row["filename"] = new_name
+                row["camera_serial"] = camera
+                row["video_serial"] = (
+                    int(parsed_new.group("clip")) if parsed_new else serial
+                )
+                _upsert_clip_row(subtask, row)
+                changed = True
+                continue
+
+            unlabeled = _ensure_unlabeled_subtask(manifest)
+            unlabeled_id = str(unlabeled.get("id") or "")
+            unlabeled_dir = Path(task_dir) / str(unlabeled.get("folder") or "")
+            unlabeled_dir.mkdir(parents=True, exist_ok=True)
+            preferred = f"{camera}-{unlabeled_id}-{serial:03d}.mp4"
+            preferred_path = unlabeled_dir / preferred
+            old_name = path.name
+            if preferred_path.is_file() and preferred_path.resolve() != path.resolve():
+                path.unlink(missing_ok=True)
+                new_name = preferred
+                new_path = preferred_path
+            else:
+                unlabeled_occupied = _occupied_clip_names(unlabeled_dir)
+                unlabeled_occupied.discard(path.name.lower())
+                new_name = retarget_clip_filename(
+                    path.name, unlabeled_id, occupied=unlabeled_occupied
+                )
+                new_path = unlabeled_dir / new_name
+                if path.resolve() != new_path.resolve():
+                    if new_path.exists():
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.replace(new_path)
+            dest_occupied.discard(old_name.lower())
+            old_row = None
             for other in manifest.get("subtasks") or []:
                 for clip in other.get("clips") or []:
-                    ident = _clip_identity_from_name(clip.get("filename"))
-                    clip_parsed = CLIP_NAME_RE.match(str(clip.get("filename") or ""))
-                    if ident == (camera, serial) and (
-                        clip_parsed is None or clip_parsed.group("subtask") == old_id
-                    ):
+                    if str(clip.get("filename") or "").strip().lower() == old_name.lower():
                         old_row = dict(clip)
                         break
                 if old_row is not None:
                     break
+            _remove_clip_filename_from_subtasks(manifest, old_name)
             _remove_clip_identity_from_subtasks(
-                manifest, camera, serial, old_id=old_id
+                manifest, camera, serial, old_id=file_id
             )
             row = old_row or {
                 "camera_serial": camera,
@@ -1617,12 +1723,127 @@ def _adopt_wrong_id_clips_in_labeled_folders(task_dir: Path, manifest: dict) -> 
             parsed_new = CLIP_NAME_RE.match(new_name)
             row["filename"] = new_name
             row["camera_serial"] = camera
-            row["video_serial"] = (
-                int(parsed_new.group("clip")) if parsed_new else serial
-            )
-            _upsert_clip_row(subtask, row)
+            row["video_serial"] = int(parsed_new.group("clip")) if parsed_new else serial
+            _upsert_clip_row(unlabeled, row)
             changed = True
     return changed
+
+
+def _rewrite_json_clip_filenames(task_dir: Path, renamed: dict[str, str], manifest: dict) -> bool:
+    if not renamed:
+        return False
+    changed = False
+    folder_by_id = {
+        str(row.get("id") or ""): str(row.get("folder") or "")
+        for row in manifest.get("subtasks") or []
+    }
+    for video in source_videos_in_task(task_dir):
+        sidecar = sidecar_path_for(video)
+        if not sidecar.is_file():
+            continue
+        try:
+            raw = _read_json(sidecar)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        wrote = False
+        for segment in raw.get("segments") or []:
+            name = str(segment.get("clip_filename") or "").strip()
+            new_name = renamed.get(name.lower())
+            if not new_name:
+                continue
+            segment["clip_filename"] = new_name
+            parsed = CLIP_NAME_RE.match(new_name)
+            if parsed is not None:
+                segment["clip_serial"] = int(parsed.group("clip"))
+                segment["subtask_id"] = parsed.group("subtask")
+                folder = folder_by_id.get(parsed.group("subtask")) or ""
+                if folder:
+                    segment["clip_path"] = f"{folder}/{new_name}"
+            wrote = True
+        if wrote:
+            _atomic_write(sidecar, raw)
+            changed = True
+    return changed
+
+
+def _compact_labeled_clip_serials(task_dir: Path, manifest: dict) -> dict[str, str]:
+    """Renumber each camera in a labeled folder to 001, 002, 003… with no gaps."""
+    unlabeled_id = str(
+        (_subtask_by_label(manifest, UNLABELED_TASK_LABEL) or {}).get("id") or ""
+    )
+    renamed: dict[str, str] = {}
+    changed = False
+    for subtask in manifest.get("subtasks") or []:
+        dest_id = str(subtask.get("id") or "")
+        if not dest_id or dest_id == unlabeled_id:
+            continue
+        folder = Path(task_dir) / str(subtask.get("folder") or "")
+        if not folder.is_dir():
+            continue
+        by_camera: dict[str, list[Path]] = {}
+        for path in list(folder.iterdir()):
+            if not path.is_file():
+                continue
+            parsed = CLIP_NAME_RE.match(path.name)
+            if parsed is None:
+                continue
+            if parsed.group("subtask") != dest_id:
+                continue
+            by_camera.setdefault(parsed.group("camera").upper(), []).append(path)
+        for camera, paths in by_camera.items():
+            paths.sort(key=lambda item: int(CLIP_NAME_RE.match(item.name).group("clip")))
+            serials = [
+                int(CLIP_NAME_RE.match(path.name).group("clip")) for path in paths
+            ]
+            if serials == list(range(1, len(serials) + 1)):
+                continue
+            temps: list[tuple[Path, Path, str]] = []
+            for index, path in enumerate(paths, start=1):
+                new_name = f"{camera}-{dest_id}-{index:03d}.mp4"
+                if path.name.lower() == new_name.lower():
+                    continue
+                temp = path.with_name(f".{path.name}.renum")
+                if temp.exists():
+                    temp.unlink()
+                path.replace(temp)
+                temps.append((temp, folder / new_name, path.name))
+            for temp, final_path, old_name in temps:
+                if final_path.exists() and final_path.resolve() != temp.resolve():
+                    temp.unlink(missing_ok=True)
+                    continue
+                temp.replace(final_path)
+                renamed[old_name.lower()] = final_path.name
+                changed = True
+    if renamed:
+        _rewrite_json_clip_filenames(task_dir, renamed, manifest)
+    return renamed
+
+
+def _apply_renamed_clip_filenames(
+    annotation: dict, renamed: dict[str, str], manifest: dict
+) -> None:
+    if not renamed:
+        return
+    folder_by_id = {
+        str(row.get("id") or ""): str(row.get("folder") or "")
+        for row in manifest.get("subtasks") or []
+    }
+    for segment in annotation.get("segments") or []:
+        name = str(segment.get("clip_filename") or "").strip()
+        new_name = renamed.get(name.lower())
+        if not new_name:
+            continue
+        segment["clip_filename"] = new_name
+        parsed = CLIP_NAME_RE.match(new_name)
+        if parsed is None:
+            continue
+        segment["clip_serial"] = int(parsed.group("clip"))
+        segment["subtask_id"] = parsed.group("subtask")
+        folder = folder_by_id.get(parsed.group("subtask")) or ""
+        if folder:
+            segment["clip_path"] = f"{folder}/{new_name}"
 
 
 def _iter_named_clip_files(task_dir: Path, manifest: dict) -> list[Path]:
@@ -1652,9 +1873,11 @@ def _dedupe_misplaced_clip_copies(task_dir: Path, manifest: dict) -> bool:
             parsed = CLIP_NAME_RE.match(path.name)
             file_id = parsed.group("subtask") if parsed else ""
             parent_id = _folder_subtask_id(path.parent.name) or ""
-            labeled_folder = 1 if parent_id and parent_id != unlabeled_id else 0
             id_matches_folder = 1 if parent_id == file_id else 0
-            return (labeled_folder, id_matches_folder, -len(str(path)))
+            unlabeled_home = (
+                1 if file_id == unlabeled_id and parent_id == unlabeled_id else 0
+            )
+            return (id_matches_folder, unlabeled_home, -len(str(path)))
 
         paths.sort(key=_keep_score, reverse=True)
         keep = paths[0]
@@ -1662,6 +1885,97 @@ def _dedupe_misplaced_clip_copies(task_dir: Path, manifest: dict) -> bool:
             if extra.is_file() and extra.resolve() != keep.resolve():
                 extra.unlink(missing_ok=True)
                 changed = True
+    return changed
+
+
+def _json_clip_file_meta(
+    task_dir: Path,
+) -> tuple[dict[str, dict], dict[tuple[str, int], dict], dict[str, str]]:
+    """Map clip filename / (camera, serial) to source times from video JSON."""
+    by_name: dict[str, dict] = {}
+    by_ident: dict[tuple[str, int], dict] = {}
+    camera_source: dict[str, str] = {}
+    for raw in _task_annotations(task_dir):
+        source_video = str(raw.get("source_video") or "").strip()
+        fallback_cam = _camera_token(raw.get("camera_serial") or raw.get("cl_number"))
+        if fallback_cam and source_video:
+            camera_source[fallback_cam] = source_video
+        for segment in raw.get("segments") or []:
+            if str(segment.get("type") or "").lower() != "subtask":
+                continue
+            filename = str(segment.get("clip_filename") or "").strip()
+            start = _as_seconds(segment.get("start"))
+            end = _as_seconds(segment.get("end"))
+            duration = _as_seconds(segment.get("duration"))
+            if duration is None and start is not None and end is not None:
+                duration = round(end - start, 3)
+            cam = _camera_token(segment.get("camera_serial")) or fallback_cam
+            parsed = CLIP_NAME_RE.match(filename)
+            if parsed:
+                cam = parsed.group("camera").upper()
+            meta = {
+                "source_video": source_video,
+                "camera_serial": cam,
+                "source_start": start,
+                "source_end": end,
+                "duration_seconds": duration,
+            }
+            if filename:
+                by_name[filename.lower()] = meta
+            if parsed:
+                by_ident[(parsed.group("camera").upper(), int(parsed.group("clip")))] = meta
+    return by_name, by_ident, camera_source
+
+
+def _rebuild_manifest_clips_from_disk(task_dir: Path, manifest: dict) -> bool:
+    """Clip rows follow files on disk. Drop stale names; attach JSON times when present."""
+    by_name, by_ident, camera_source = _json_clip_file_meta(task_dir)
+    changed = False
+    for subtask in manifest.get("subtasks") or []:
+        folder = Path(task_dir) / str(subtask.get("folder") or "")
+        old_by_name = {
+            str(clip.get("filename") or "").strip().lower(): dict(clip)
+            for clip in subtask.get("clips") or []
+            if str(clip.get("filename") or "").strip()
+        }
+        rows: list[dict] = []
+        if folder.is_dir():
+            for path in sorted(folder.iterdir(), key=lambda item: item.name.lower()):
+                if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                if path.name.lower().endswith("-stitched.mp4"):
+                    continue
+                parsed = CLIP_NAME_RE.match(path.name)
+                if parsed is None:
+                    continue
+                camera = parsed.group("camera").upper()
+                serial = int(parsed.group("clip"))
+                old = old_by_name.get(path.name.lower()) or {}
+                js = by_name.get(path.name.lower()) or by_ident.get((camera, serial)) or {}
+                row = {
+                    "camera_serial": camera,
+                    "video_serial": serial,
+                    "filename": path.name,
+                    "source_video": str(
+                        js.get("source_video")
+                        or old.get("source_video")
+                        or camera_source.get(camera)
+                        or ""
+                    ),
+                }
+                for key in ("duration_seconds", "source_start", "source_end"):
+                    value = js.get(key)
+                    if value is None:
+                        value = old.get(key)
+                    if value is not None:
+                        row[key] = value
+                rows.append(row)
+        old_names = [str(clip.get("filename") or "") for clip in subtask.get("clips") or []]
+        new_names = [clip["filename"] for clip in rows]
+        if old_names != new_names or int(subtask.get("total_clips") or 0) != len(rows):
+            changed = True
+        subtask["clips"] = rows
+        subtask["total_clips"] = len(rows)
     return changed
 
 
@@ -1674,7 +1988,7 @@ def _rehome_segment_clip(
 ) -> None:
     """Move a trimmed clip when its segment is assigned a different subtask."""
     task_dir = task_directory(source)
-    manifest = load_manifest(task_dir)
+    manifest = load_manifest(task_dir, repair=False)
     rows = annotation if annotation is not None else {"segments": [segment]}
     recorded = _resolve_clip_filename(source, segment, old_label, rows, manifest)
     match = CLIP_NAME_RE.match(recorded)
@@ -1786,7 +2100,7 @@ def place_named_clip(
 ) -> Path | None:
     """Move CAMERA-ID-SERIAL into dest_dir and delete Unlabeled / duplicate copies."""
     task_dir = task_directory(source)
-    manifest = load_manifest(task_dir)
+    manifest = load_manifest(task_dir, repair=False)
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     target = dest / new_name
@@ -1953,7 +2267,18 @@ def _migrate_clip_layout(task_dir: Path, manifest: dict) -> bool:
                 folder_name = str(other.get("folder") or "")
                 if folder_name:
                     candidates.append(task_dir / folder_name / old_name)
+            unlabeled_row = _subtask_by_label(manifest, UNLABELED_TASK_LABEL)
+            unlabeled_folder = str((unlabeled_row or {}).get("folder") or "")
+            unlabeled_sub_id = str((unlabeled_row or {}).get("id") or "")
             old_path = next((path for path in candidates if path.is_file()), None)
+            if (
+                old_path is not None
+                and unlabeled_folder
+                and old_path.parent.name == unlabeled_folder
+                and str(subtask.get("id") or "") != unlabeled_sub_id
+            ):
+                # JSON-driven rehome moves unlabeled clips; do not steal them here.
+                old_path = None
             if old_path is not None and old_path != new_path and not new_path.exists():
                 old_path.replace(new_path)
             wrong_in_dest = target_dir / old_name
@@ -2146,12 +2471,13 @@ def refresh_manifest_durations(task_dir: Path) -> dict:
     return _save_manifest(path, load_manifest(path))
 
 
-def load_manifest(path: Path) -> dict:
+def load_manifest(path: Path, *, repair: bool = True) -> dict:
     manifest_path = Path(path)
     if manifest_path.is_dir():
         manifest_path = manifest_path / MANIFEST_FILE
     task_dir = manifest_path.parent
-    cleanup_task_folder_files(task_dir)
+    if repair:
+        cleanup_task_folder_files(task_dir)
     if not manifest_path.is_file():
         return _empty_manifest()
     try:
@@ -2159,14 +2485,25 @@ def load_manifest(path: Path) -> dict:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return _empty_manifest()
     manifest = _normalize_manifest(raw if isinstance(raw, dict) else None)
-    adopted = _adopt_wrong_id_clips_in_labeled_folders(task_dir, manifest)
-    changed = _migrate_clip_layout(task_dir, manifest)
-    deduped = _dedupe_misplaced_clip_copies(task_dir, manifest)
-    _attach_manifest_durations(task_dir, manifest)
+    restored = changed = compacted = deduped = rebuilt = False
+    if repair:
+        restored = _restore_unlabeled_clips_from_labeled_folders(task_dir, manifest)
+        compacted = bool(_compact_labeled_clip_serials(task_dir, manifest))
+        changed = _migrate_clip_layout(task_dir, manifest)
+        deduped = _dedupe_misplaced_clip_copies(task_dir, manifest)
+        rebuilt = _rebuild_manifest_clips_from_disk(task_dir, manifest)
+        _attach_manifest_durations(task_dir, manifest)
     raw_missing_durations = not (
         isinstance(raw, dict) and "total_duration_seconds" in raw
     )
-    if changed or adopted or deduped or raw_missing_durations:
+    if (
+        changed
+        or restored
+        or compacted
+        or deduped
+        or rebuilt
+        or (repair and raw_missing_durations)
+    ):
         manifest["updated_at"] = _now_iso()
         _atomic_write(manifest_path, manifest)
     return manifest
@@ -2182,7 +2519,9 @@ def _save_manifest(task_dir: Path, manifest: dict) -> dict:
     return normalized
 
 
-def _ensure_manifest_from_annotation(source: Path, annotation: dict) -> dict:
+def _ensure_manifest_from_annotation(
+    source: Path, annotation: dict, *, repair: bool = True
+) -> dict:
     """Create stable subtask IDs when opening an old per-video annotation."""
     labels: list[str] = []
     seen: set[str] = set()
@@ -2194,7 +2533,7 @@ def _ensure_manifest_from_annotation(source: Path, annotation: dict) -> dict:
             labels.append(label)
             seen.add(label.lower())
     task_dir = task_directory(source)
-    manifest = load_manifest(task_dir)
+    manifest = load_manifest(task_dir, repair=repair)
     existing = {row["name"].lower() for row in manifest["subtasks"]}
     changed = False
     next_id = max(
@@ -2223,7 +2562,7 @@ def labels_for_task(root: Path, parent_task: str) -> list[str]:
     task_dir = _task_dir_for_name(root, parent_task)
     if task_dir is None:
         return []
-    return [row["name"] for row in load_manifest(task_dir)["subtasks"]]
+    return [row["name"] for row in load_manifest(task_dir, repair=False)["subtasks"]]
 
 
 def add_label(root: Path, parent_task: str, label: str) -> list[str]:
@@ -2235,7 +2574,7 @@ def add_label(root: Path, parent_task: str, label: str) -> list[str]:
         task_dir = _task_dir_for_name(root, task)
         if task_dir is None:
             raise ValueError(f"Could not find folder for main task: {task}")
-        manifest = load_manifest(task_dir)
+        manifest = load_manifest(task_dir, repair=False)
         if not any(row["name"].lower() == clean.lower() for row in manifest["subtasks"]):
             next_id = max(
                 (int(row["id"]) for row in manifest["subtasks"] if str(row["id"]).isdigit()),
@@ -2425,13 +2764,13 @@ def next_clip_filename(
     reserved: set[str] | None = None,
 ) -> str:
     """``CAMERASERIAL-SUBTASKID-CLIPSERIAL.mp4`` in the subtask folder."""
-    annotation = load_annotation(source)
+    annotation = load_annotation(source, repair=False)
     camera = re.sub(
         r"[^A-Za-z0-9]+",
         "",
         str(annotation.get("camera_serial") or annotation.get("cl_number") or "UNKNOWN"),
     ).upper() or "UNKNOWN"
-    manifest = load_manifest(manifest_path_for(source))
+    manifest = load_manifest(manifest_path_for(source), repair=False)
     subtask = next(
         (row for row in manifest["subtasks"] if row["name"].lower() == label.strip().lower()),
         None,
@@ -2454,16 +2793,12 @@ def next_clip_filename(
         int(match.group("clip"))
         for name in claimed
         if (match := CLIP_NAME_RE.match(name))
+        and match.group("camera").upper() == camera
     }
     candidate = 1
     while True:
         filename = f"{prefix}{candidate:03d}.mp4"
-        others = holders.get(candidate, set()) - {camera}
-        if (
-            candidate not in used_serials
-            and filename.lower() not in claimed
-            and not others
-        ):
+        if candidate not in used_serials and filename.lower() not in claimed:
             return filename
         candidate += 1
 
@@ -2501,7 +2836,7 @@ def clips_by_subtask(source: Path) -> list[tuple[dict, list[Path]]]:
 
 def write_export_manifest(source: Path, rows: list[dict]) -> Path:
     task_dir = export_directory(source)
-    manifest = load_manifest(task_dir)
+    manifest = load_manifest(task_dir, repair=False)
     for row in rows:
         label = str(row.get("subtask") or "").strip()
         subtask = next(
