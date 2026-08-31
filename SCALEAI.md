@@ -352,6 +352,7 @@ Your labels are already on disk. Tomorrow, open `run.bat` again, open the same 5
 | Wrong folder / wrong task | Click **Open 50-hour folder** again. |
 | Trim failed | Read the red status at the bottom. Do not delete videos. Tell your supervisor. |
 | **Update** asked for confirmation | Only continue if a supervisor told you to. The app restarts itself; wait for the page to reload. |
+| **Update** failed / local code changes | The machine had leftover code edits, so the old Update button stopped. In Terminal, in the project folder, run: `git fetch origin` then `git reset --hard origin/scaleai-50h-testing` then `./run.sh` (Mac) or `run.bat` (Windows). Videos and labels are not deleted. |
 
 If nothing above helps: leave the black window open, take a screenshot of the **full screen** including the bottom status line, and send it to your supervisor.
 

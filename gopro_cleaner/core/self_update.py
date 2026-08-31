@@ -21,17 +21,45 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRESERVE_FILES = ("sd_offloader/config.json",)
 
 
+def _git_env() -> dict[str, str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    return env
+
+
+def _friendly_git_error(detail: str) -> str:
+    text = (detail or "git failed").strip()
+    lowered = text.lower()
+    if (
+        "could not read username" in lowered
+        or "authentication failed" in lowered
+        or "permission denied (publickey)" in lowered
+        or "could not read password" in lowered
+    ):
+        return (
+            "GitHub login is missing on this computer. Open Terminal in the project folder, "
+            "run: git fetch origin — sign in if asked — then click Update again."
+        )
+    if "could not resolve host" in lowered or "failed to connect" in lowered:
+        return "Could not reach GitHub. Check the internet connection, then click Update again."
+    if "couldn't find remote ref" in lowered or "couldn't find remote" in lowered:
+        return "This branch is not on GitHub yet. Push it from the developer PC, then click Update."
+    return text[-500:]
+
+
 def _git(*args: str) -> str:
     result = subprocess.run(
         ["git", *args],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
+        env=_git_env(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "git failed").strip()
-        raise RuntimeError(detail[-500:])
+        raise RuntimeError(_friendly_git_error(detail))
     return (result.stdout or "").strip()
 
 
@@ -68,19 +96,16 @@ def current_branch() -> str:
 
 
 def pull_latest_current_branch() -> dict:
-    """Fetch and hard-reset the current branch to ``origin/<branch>``."""
+    """Fetch and hard-reset the current branch to match GitHub.
+
+    Local code edits in this project folder are overwritten on purpose — that is
+    what the Update button is for. Footage, labels, and clips live outside git
+    and are not touched. Machine-local ``sd_offloader/config.json`` is restored.
+    """
     if not shutil.which("git"):
-        raise RuntimeError("git is not installed on this computer — install Git for Windows first")
+        raise RuntimeError("git is not installed on this computer — install Git, then click Update again")
     if not (PROJECT_ROOT / ".git").exists():
         raise RuntimeError("This folder is not a git checkout — reinstall from GitHub")
-
-    dirty = _dirty_tracked_files()
-    if dirty:
-        preview = ", ".join(dirty[:5]) + ("…" if len(dirty) > 5 else "")
-        raise RuntimeError(
-            f"Local code changes detected ({preview}) — update refused so nothing is lost. "
-            "Ask the developer to update this machine."
-        )
 
     preserved: dict[str, bytes] = {}
     for rel in PRESERVE_FILES:
@@ -90,8 +115,15 @@ def pull_latest_current_branch() -> dict:
 
     branch = current_branch()
     before = _git("rev-parse", "HEAD")
-    _git("fetch", "origin", branch)
-    _git("reset", "--hard", f"origin/{branch}")
+    refspec = f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+    try:
+        _git("fetch", "origin", refspec)
+    except RuntimeError:
+        _git("fetch", "origin", branch)
+    try:
+        _git("reset", "--hard", f"origin/{branch}")
+    except RuntimeError:
+        _git("reset", "--hard", "FETCH_HEAD")
     after = _git("rev-parse", "HEAD")
 
     for rel, data in preserved.items():

@@ -111,7 +111,9 @@ function ReviewPage() {
       );
     } catch (error: any) {
       setUpdateState("idle");
-      c.setStatus(error?.message || "Update failed", "error");
+      const message = error?.message || "Update failed";
+      c.setStatus(message, "error");
+      toast.error("Update failed", { description: message, duration: 12_000 });
     }
   };
 

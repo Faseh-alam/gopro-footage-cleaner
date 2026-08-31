@@ -24,7 +24,6 @@ class SelfUpdateTests(unittest.TestCase):
             with (
                 patch.object(self_update, "PROJECT_ROOT", root),
                 patch.object(self_update.shutil, "which", return_value="/usr/bin/git"),
-                patch.object(self_update, "_dirty_tracked_files", return_value=[]),
                 patch.object(self_update, "_git", side_effect=lambda *args: next(responses)) as git,
             ):
                 result = self_update.pull_latest_current_branch()
@@ -38,11 +37,34 @@ class SelfUpdateTests(unittest.TestCase):
             [
                 call("symbolic-ref", "--quiet", "--short", "HEAD"),
                 call("rev-parse", "HEAD"),
-                call("fetch", "origin", "testing"),
+                call("fetch", "origin", "+refs/heads/testing:refs/remotes/origin/testing"),
                 call("reset", "--hard", "origin/testing"),
                 call("rev-parse", "HEAD"),
             ],
         )
+
+    def test_pull_overwrites_local_code_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            responses = iter(["testing", "aaaaaaa111", "", "", "bbbbbbb222"])
+
+            with (
+                patch.object(self_update, "PROJECT_ROOT", root),
+                patch.object(self_update.shutil, "which", return_value="/usr/bin/git"),
+                patch.object(self_update, "_dirty_tracked_files", return_value=["SCALEAI.md"]),
+                patch.object(self_update, "_git", side_effect=lambda *args: next(responses)),
+            ):
+                result = self_update.pull_latest_current_branch()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["branch"], "testing")
+
+    def test_friendly_github_login_error(self) -> None:
+        msg = self_update._friendly_git_error(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        )
+        self.assertIn("GitHub login", msg)
 
 
 if __name__ == "__main__":
