@@ -209,6 +209,27 @@ def _hwaccel_input_args() -> list[str]:
     return []
 
 
+def _input_open_args(source: Path) -> list[str]:
+    """MPEG-TS needs a deeper probe than GoPro MP4s or ffmpeg sees no video."""
+    if source.suffix.lower() == ".ts":
+        return [
+            "-fflags",
+            "+genpts",
+            "-probesize",
+            "5M",
+            "-analyzeduration",
+            "5M",
+        ]
+    return [
+        "-fflags",
+        "+genpts+fastseek",
+        "-probesize",
+        "32k",
+        "-analyzeduration",
+        "0",
+    ]
+
+
 def _vf_filter() -> str:
     # Speed timeline by 5× then emit 30fps — output duration ≈ T/5 regardless of
     # source fps. Scale after the drop so we only resize kept frames.
@@ -258,12 +279,7 @@ def _build_skim(source: Path, dest: Path, job_key: str, process_holder: list) ->
         "-loglevel",
         "error",
         "-y",
-        "-fflags",
-        "+genpts+fastseek",
-        "-probesize",
-        "32k",
-        "-analyzeduration",
-        "0",
+        *_input_open_args(source),
         *_hwaccel_input_args(),
         "-i",
         str(source),

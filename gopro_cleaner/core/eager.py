@@ -17,6 +17,8 @@ LABELED_FOLDER = "Labeled"  # legacy folder name — no longer created for new l
 TRIMMED_SUFFIX_RE = re.compile(r"-\d+$", re.IGNORECASE)
 CAMERA_FOLDER_RE = re.compile(r"^C\d{4}$", re.IGNORECASE)
 GOPRO_MEDIA_DIR_RE = re.compile(r"^\d{3}GOPRO$", re.IGNORECASE)
+SOURCE_VIDEO_EXTENSIONS = {".MP4", ".TS"}
+_HLS_SEGMENT_RE = re.compile(r"^seg\d{5}\.ts$", re.IGNORECASE)
 SKIP_DIR_NAMES = {
     LABELED_FOLDER.lower(),
     "labeled",
@@ -121,6 +123,15 @@ def is_hidden_or_temp_mp4(path: Path) -> bool:
     return ".partial" in lower
 
 
+def _is_source_video_suffix(path: Path) -> bool:
+    """True for source footage we list (.MP4 / .TS). Skips HLS preview chunks."""
+    if path.suffix.upper() not in SOURCE_VIDEO_EXTENSIONS:
+        return False
+    if is_hidden_or_temp_mp4(path):
+        return False
+    return not _HLS_SEGMENT_RE.match(path.name)
+
+
 def is_trimmed_clip(path: Path) -> bool:
     return (
         path.suffix.upper() == ".MP4"
@@ -131,13 +142,13 @@ def is_trimmed_clip(path: Path) -> bool:
 
 def is_labelable_footage(path: Path, *, root: Path | None = None) -> bool:
     """Candidate for the label list (temps excluded; active trims filtered at scan)."""
-    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
+    if not _is_source_video_suffix(path):
         return False
     return not _footage_blocked(path, root)
 
 
 def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
-    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
+    if not _is_source_video_suffix(path):
         return False
     if is_trimmed_clip(path):
         return False
@@ -145,12 +156,12 @@ def is_raw_footage(path: Path, *, root: Path | None = None) -> bool:
 
 
 def is_scaleai_source_footage(path: Path, *, root: Path | None = None) -> bool:
-    """Source MP4s under a 50-hour dataset root (``<root>/<parent-task>/…``).
+    """Source MP4/TS files under a 50-hour dataset root (``<root>/<parent-task>/…``).
 
     Parent-task folders are source containers — not textile trim destinations —
     so they stay visible. Per-video export folders are skipped.
     """
-    if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
+    if not _is_source_video_suffix(path):
         return False
     if is_trimmed_clip(path):
         return False
@@ -236,7 +247,7 @@ def label_progress(root: Path, *, recursive: bool = True) -> dict:
     unlabeled_names: list[str] = []
 
     for path in _iter_mp4_files(root, recursive=recursive):
-        if path.suffix.upper() != ".MP4" or is_hidden_or_temp_mp4(path):
+        if not _is_source_video_suffix(path):
             continue
         if any(part.lower() in SKIP_DIR_NAMES for part in path.parts):
             skipped += 1
@@ -301,11 +312,7 @@ def scan_mp4_files(
         elif mode == "scaleai":
             if is_scaleai_source_footage(path, root=root):
                 candidates.append(path)
-        elif (
-            mode == "all"
-            and path.suffix.upper() == ".MP4"
-            and not is_hidden_or_temp_mp4(path)
-        ):
+        elif mode == "all" and _is_source_video_suffix(path):
             candidates.append(path)
 
     if mode == "scaleai":

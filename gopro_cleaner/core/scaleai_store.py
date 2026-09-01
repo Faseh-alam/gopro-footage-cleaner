@@ -425,7 +425,7 @@ def source_for_sidecar(sidecar: Path) -> Path | None:
     if not name.endswith(SIDECAR_SUFFIX):
         return None
     stem = name[: -len(SIDECAR_SUFFIX)]
-    for suffix in (".MP4", ".mp4", ".MOV", ".mov"):
+    for suffix in (".MP4", ".mp4", ".MOV", ".mov", ".TS", ".ts"):
         candidate = sidecar.with_name(f"{stem}{suffix}")
         if candidate.is_file():
             return candidate.resolve()

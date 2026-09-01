@@ -27,7 +27,7 @@ SIDECAR_SUFFIX = ".json"
 LABELING_DIR = "_labeling"
 TASKS_FILE = "tasks.json"
 PROGRESS_FILE = "progress.json"
-VIDEO_EXTENSIONS = {".mp4", ".mov"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".ts"}
 UNLABELED_TASK_LABEL = "Unlabeled task"
 JUNK_JSON_SUFFIXES = (
     ".segments.json",

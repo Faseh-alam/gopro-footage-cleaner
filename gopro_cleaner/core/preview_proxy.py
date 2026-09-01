@@ -205,6 +205,27 @@ def _hwaccel_input_args() -> list[str]:
     return []
 
 
+def _input_open_args(source: Path) -> list[str]:
+    """MPEG-TS needs a deeper probe than GoPro MP4s or ffmpeg sees no video."""
+    if source.suffix.lower() == ".ts":
+        return [
+            "-fflags",
+            "+genpts",
+            "-probesize",
+            "5M",
+            "-analyzeduration",
+            "5M",
+        ]
+    return [
+        "-fflags",
+        "+genpts+fastseek",
+        "-probesize",
+        "32k",
+        "-analyzeduration",
+        "0",
+    ]
+
+
 def _hls_output_args(dest_dir: Path) -> list[str]:
     """Write the preview as 1s HLS segments — playable almost immediately."""
     return [
@@ -250,13 +271,7 @@ def _build_preview(source: Path, dest_dir: Path, job_key: str, process_holder: l
         "-loglevel",
         "error",
         "-y",
-        # Fast open on huge MP4s — skip deep analyze before first frames.
-        "-fflags",
-        "+genpts+fastseek",
-        "-probesize",
-        "32k",
-        "-analyzeduration",
-        "0",
+        *_input_open_args(source),
         *_hwaccel_input_args(),
         "-i",
         str(source),

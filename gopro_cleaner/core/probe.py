@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".360", ".mkv"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".360", ".mkv", ".ts"}
 GOPRO_PREFIXES = ("GOPR", "GP", "GX", "GL", "GH")
 
 # Cache ffprobe results keyed by (path, mtime, size) — probing the same file

@@ -84,7 +84,10 @@ export function PlayerPanel({
     const span = Math.max(0.01, rawEnd - rawStart);
     const pad = Math.max(1.5, span * 0.35);
     const start = Math.max(0, rawStart - pad);
-    const end = Math.min(duration, rawEnd + pad);
+    // HLS previews of .ts files often report ~1s while labels are much longer.
+    // Only clamp to duration when it actually covers the labeled span.
+    const unclampedEnd = rawEnd + pad;
+    const end = duration > rawEnd + 0.05 ? Math.min(duration, unclampedEnd) : unclampedEnd;
     if (end - start < 0.05) return null;
     return { start, end };
   })();
@@ -288,7 +291,7 @@ export function PlayerPanel({
                     <div
                       title={`${segment.label} · ${c.formatTime(segment.start)} → ${c.formatTime(segment.end)} · ${segment.duration.toFixed(2)}s`}
                       className={cn(
-                        "absolute top-2 bottom-2 rounded-[2px] border border-black/50 transition-[opacity,filter,box-shadow]",
+                        "absolute inset-y-1 rounded-sm transition-[opacity,filter,box-shadow]",
                         isGarbage && "bg-destructive/70",
                         dimOthers && "opacity-25",
                         isHighlighted && "z-10 brightness-150 outline outline-2 outline-white",
@@ -309,7 +312,7 @@ export function PlayerPanel({
               })}
               {pendingRange ? (
                 <div
-                  className="absolute top-2 bottom-2 rounded-[2px] border border-warning bg-warning/40"
+                  className="absolute inset-y-1 rounded-sm border border-warning bg-warning/40"
                   style={{
                     left: `${zoomLeft(pendingRange.start)}%`,
                     width: `${zoomWidth(pendingRange.start, pendingRange.end)}%`,
