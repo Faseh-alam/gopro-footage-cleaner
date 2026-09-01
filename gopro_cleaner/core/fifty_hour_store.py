@@ -3225,9 +3225,10 @@ def clip_download_audit(source: Path) -> dict:
     """
     source = Path(source).expanduser().resolve()
     annotation = load_annotation(source, repair=False)
+    # Match next_clip_filename — trim writes UNKNOWN-* when metadata has no serial.
     camera = _camera_token(
-        annotation.get("camera_serial") or annotation.get("cl_number")
-    )
+        annotation.get("camera_serial") or annotation.get("cl_number") or "UNKNOWN"
+    ) or "UNKNOWN"
     labeled_by: dict[str, int] = {}
     for segment in annotation.get("segments") or []:
         if str(segment.get("type") or "").lower() != "subtask":
