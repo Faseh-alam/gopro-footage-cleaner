@@ -1,11 +1,25 @@
 {
   "s3_uri": "",
-  "ssd1": "",
+  "ssd1": "C:\\",
   "ssd2": "",
-  "last_batch": "",
+  "last_batch": "batch01",
   "mode": "ssd_only",
   "port": 8877,
   "s5cmd_numworkers": 20,
   "aws_upload_retries": 5,
-  "max_parallel_cards": 3
+  "max_parallel_cards": 3,
+  "card_readers": {
+    "1": {
+      "usb_id": "LETTER:D",
+      "letter": "D",
+      "label": "Reader 1",
+      "path": "D:\\"
+    },
+    "2": {
+      "usb_id": "USBSTOR\\DISK&VEN_GENERIC&PROD_MASSSTORAGECLASS&REV_2962\\000000002962&0",
+      "letter": "F",
+      "label": "Reader 2",
+      "path": "F:\\"
+    }
+  }
 }

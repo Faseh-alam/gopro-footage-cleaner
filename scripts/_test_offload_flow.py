@@ -63,6 +63,15 @@ def make_card(root: Path, *, with_sidecar: dict | None, legacy: bool = False) ->
         folder = gopro / "pipe-welding"
         folder.mkdir()
         make_mp4(folder / "GX019999.MP4")
+        nested = gopro / "100GOPRO"
+        nested.mkdir()
+        make_mp4(nested / "GX101.MP4")
+        gx101 = nested / "GX101.MP4"
+        (nested / "GX101.json").write_text(
+            json.dumps({"source": "GX101.MP4", "complete": True, "segments": [],
+                        "size_bytes": gx101.stat().st_size}),
+            encoding="utf-8",
+        )
         (gopro / "GX010001.THM").write_bytes(b"junk")
         (gopro / "GX010001.LRV").write_bytes(b"junk")
     return gopro
@@ -77,7 +86,8 @@ def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dic
         engine._resolve_dest_names(files, dest, prog, card_id)
     for item in files:
         src = Path(item["source"])
-        dest_rel = item.get("dest_rel") or item["rel"]
+        dest_rel = engine._flat_name(item.get("dest_rel") or item["rel"])
+        item["dest_rel"] = dest_rel
         dest_file = dest / dest_rel
         if progress.is_file_done(prog, item["rel"], int(item["size"]), dest_file):
             item["dest_size"] = dest_file.stat().st_size
@@ -144,9 +154,12 @@ def main() -> int:
     print("\n[1] inventory + detect")
     files_a = inventory.list_transfer_files(card_a)
     rels = sorted(f["rel"] for f in files_a)
-    check("finds root MP4s + sidecar + legacy", rels == [
-        "GX010001.MP4", "GX010001.segments.json", "GX010002.MP4", "pipe-welding/GX019999.MP4",
-    ], str(rels))
+    check("finds root MP4s + sidecar + nested/legacy",
+          [r.lower() for r in rels] == [
+              "100gopro/gx101.json", "100gopro/gx101.mp4",
+              "gx010001.mp4", "gx010001.segments.json", "gx010002.mp4",
+              "pipe-welding/gx019999.mp4",
+          ], str(rels))
     check("root-level MP4s make card candidate", detect._looks_like_sd_card(card_a, "NO NAME"))
 
     print("\n[2] card A → flat batch folder (no card subfolder)")
@@ -155,8 +168,15 @@ def main() -> int:
     check("sidecar sits directly in batch folder",
           (batch_dest / "GX010001.segments.json").is_file())
     check("no C1234 subfolder created", not (batch_dest / "C1234").exists())
-    check("legacy task folder kept as folder",
-          (batch_dest / "pipe-welding" / "GX019999.MP4").is_file())
+    nested_mp4 = next(f for f in files_a if f["rel"].endswith("GX101.MP4"))
+    check("nested 100GOPRO clip is flattened",
+          nested_mp4.get("dest_rel") == "GX101.MP4"
+          and (batch_dest / "GX101.MP4").is_file(),
+          str(nested_mp4.get("dest_rel")))
+    check("nested sidecar is flattened", (batch_dest / "GX101.json").is_file())
+    check("legacy clip is flattened", (batch_dest / "GX019999.MP4").is_file())
+    check("no 100GOPRO subfolder on SSD", not (batch_dest / "100GOPRO").exists())
+    check("no task subfolder on SSD", not (batch_dest / "pipe-welding").exists())
     embedded = embed_meta.read_embedded_segments(batch_dest / "GX010001.MP4")
     check("embedded payload reads back", embedded == full_sidecar)
     check("embedded payload has camera serial + device + IMU sensors",

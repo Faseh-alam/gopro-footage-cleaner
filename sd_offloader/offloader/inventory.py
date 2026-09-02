@@ -94,8 +94,7 @@ def list_transfer_files(card_root: Path) -> list[dict]:
                 size = item.stat().st_size
             except OSError:
                 continue
-            # Keep flat batch names; disambiguate if the same file appears in
-            # more than one ###GOPRO folder on the same card.
+            # Always a filename in the batch folder (never DCIM/100GOPRO/…).
             rel = item.name
             if rel in seen_rel:
                 rel = f"{Path(item.name).stem}__{gopro.name}{Path(item.name).suffix}"
@@ -131,6 +130,7 @@ def list_transfer_files(card_root: Path) -> list[dict]:
                     continue
                 if item.suffix.upper() != ".MP4":
                     continue
+                # Keep a unique *source* key; destination is flattened in the engine.
                 rel = f"{task_dir.name}/{item.name}"
                 if rel in seen_rel:
                     rel = f"{gopro.name}/{task_dir.name}/{item.name}"

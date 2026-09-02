@@ -1175,18 +1175,52 @@ def _update_card(card_id: str, **kwargs) -> None:
     _save_snapshot(force=False)
 
 
+def _flat_name(rel: str) -> str:
+    """Batch destination is always a filename — never ``100GOPRO/…`` or a task folder."""
+    text = str(rel or "").replace("\\", "/").strip().rstrip("/")
+    if not text:
+        return ""
+    return Path(text).name
+
+
 def _is_sidecar_rel(rel: str) -> bool:
-    lower = rel.lower()
+    lower = _flat_name(rel).lower()
     return lower.endswith(".segments.json") or lower.endswith(".json")
 
 
 def _sidecar_stem(rel: str) -> str:
-    lower = rel.lower()
+    name = _flat_name(rel)
+    lower = name.lower()
     if lower.endswith(".segments.json"):
-        return rel[: -len(".segments.json")]
-    if lower.endswith(".json"):
-        return rel[: -len(Path(rel).suffix)]
-    return Path(rel).stem
+        return name[: -len(".segments.json")]
+    return Path(name).stem
+
+
+def _claim_flat_name(
+    claimed: set[str], dest: Path, base: str, suffix: str, card_id: str, rel: str
+) -> str:
+    """Pick a unique filename in the batch folder (suffix on clash, never a subfolder)."""
+    cid = str(card_id or "").strip().upper()
+    parent = Path(str(rel or "").replace("\\", "/")).parent.name
+    candidates = [f"{base}{suffix}"]
+    if cid:
+        candidates.append(f"{base}__{cid}{suffix}")
+    if parent and parent not in {".", ""}:
+        candidates.append(f"{base}__{parent}{suffix}")
+    for cand in candidates:
+        if cand.lower() in claimed:
+            continue
+        if (dest / cand).is_file() or (dest / f"{cand}.partial").is_file():
+            continue
+        claimed.add(cand.lower())
+        return cand
+    n = 2
+    while True:
+        cand = f"{base}__{cid or 'DUP'}_{n}{suffix}"
+        if cand.lower() not in claimed and not (dest / cand).is_file():
+            claimed.add(cand.lower())
+            return cand
+        n += 1
 
 
 def _dest_batch_lock(dest: Path) -> threading.Lock:
@@ -1200,47 +1234,46 @@ def _dest_batch_lock(dest: Path) -> threading.Lock:
 def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str) -> None:
     """Assign collision-safe destination names into the flat batch folder.
 
-    GoPro numbering repeats across cards (every card has a GX010001.MP4), so
-    when another card already parked a *different* video under the same name,
-    the incoming pair is renamed to ``<stem>__<CARDID><ext>``. When the batch
-    already holds the same video (size + sidecar identity), the existing name
-    is reused so re-offloads do not create duplicates.
+    Every file is ``Batches/<batch>/<filename>`` — never ``100GOPRO/`` or a
+    task subfolder. GoPro numbering repeats across cards, so when another card
+    already parked a *different* video under the same name, the incoming pair
+    is renamed to ``<stem>__<CARDID><ext>``. When the batch already holds the
+    same video (size + sidecar identity), the existing name is reused.
     """
     entries = prog.get("files") or {}
     stem_map: dict[str, str] = {}  # source MP4 stem -> final stem
+    claimed: set[str] = set()
 
     def assign_one(item: dict, *, sidecar_pass: bool) -> None:
         rel = item["rel"]
-        if item.get("task"):
-            item["dest_rel"] = rel  # legacy task folders keep their layout
-            return
-
-        recorded = (entries.get(rel) or {}).get("dest_rel")
+        recorded = _flat_name((entries.get(rel) or {}).get("dest_rel") or "")
         is_sidecar = _is_sidecar_rel(rel)
         if is_sidecar != sidecar_pass:
             return
 
-        base = _sidecar_stem(rel) if is_sidecar else Path(rel).stem
-        suffix = Path(rel).suffix
-        if rel.lower().endswith(".segments.json"):
+        name = _flat_name(rel)
+        base = _sidecar_stem(rel) if is_sidecar else Path(name).stem
+        suffix = Path(name).suffix
+        if _flat_name(rel).lower().endswith(".segments.json"):
             suffix = ".segments.json"
 
         if is_sidecar:
-            final_base = stem_map.get(base, base)
+            final_base = _flat_name(stem_map.get(base, base)) or base
             if recorded:
                 item["dest_rel"] = recorded
             elif suffix.lower() == ".segments.json":
                 item["dest_rel"] = f"{final_base}.segments.json"
             else:
                 item["dest_rel"] = f"{final_base}{suffix}"
+            claimed.add(str(item["dest_rel"]).lower())
             return
 
         if recorded:
             item["dest_rel"] = recorded
             stem_map[base] = Path(recorded).stem
+            claimed.add(recorded.lower())
             return
 
-        name = Path(rel).name
         card_size = int(item.get("size") or 0)
         sidecar_payload = (
             pairing.load_sidecar(item["embed_json"]) if item.get("embed_json") else None
@@ -1249,17 +1282,15 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
             dest, name, card_mp4_size=card_size, sidecar=sidecar_payload
         )
         if existing:
-            item["dest_rel"] = existing
-            stem_map[base] = Path(existing).stem
+            flat = _flat_name(existing)
+            item["dest_rel"] = flat
+            stem_map[base] = Path(flat).stem
+            claimed.add(flat.lower())
             return
 
-        if (dest / name).exists():
-            final_base = f"{base}__{card_id.upper()}"
-            item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
-            stem_map[base] = final_base
-        else:
-            item["dest_rel"] = name
-            stem_map[base] = base
+        dest_rel = _claim_flat_name(claimed, dest, base, suffix or Path(name).suffix, card_id, rel)
+        item["dest_rel"] = dest_rel
+        stem_map[base] = Path(dest_rel).stem
 
     # MP4s first so sidecar rename can follow collision suffixes.
     for item in files:
@@ -1364,17 +1395,13 @@ def _copy_card_worker(
             rel = item["rel"]
             src = Path(item["source"])
             size = int(item["size"])
-            dest_rel = item.get("dest_rel") or rel
+            dest_rel = _flat_name(item.get("dest_rel") or rel)
+            item["dest_rel"] = dest_rel
             dest_file = dest / dest_rel
-            if dest_rel != rel and not (prog.get("files") or {}).get(rel):
-                if Path(rel).name == dest_rel:
-                    _log_line(
-                        f"{card_id}: {rel} already in batch — reusing {dest_rel} (no duplicate)"
-                    )
-                else:
-                    _log_line(
-                        f"{card_id}: {rel} already in batch from another card — saving as {dest_rel}"
-                    )
+            if dest_rel != _flat_name(rel) and not (prog.get("files") or {}).get(rel):
+                _log_line(
+                    f"{card_id}: {_flat_name(rel)} already in batch from another card — saving as {dest_rel}"
+                )
             if progress.is_file_done(prog, rel, size, dest_file):
                 try:
                     item["dest_size"] = dest_file.stat().st_size
@@ -1473,15 +1500,15 @@ def _copy_card_worker(
         for item in files:
             if _is_cancel_requested(card_id):
                 raise CopyCancelled(f"{card_id}: cancelled by operator")
-            dest_file = dest / (item.get("dest_rel") or item["rel"])
+            dest_file = dest / _flat_name(item.get("dest_rel") or item["rel"])
             expected = int(item.get("dest_size") or item["size"])
             if not dest_file.exists() or dest_file.stat().st_size != expected:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
         for item in files:
             rel = str(item.get("rel") or "")
-            if Path(rel).suffix.upper() != ".MP4":
+            if Path(_flat_name(rel)).suffix.upper() != ".MP4":
                 continue
-            dest_mp4 = dest / (item.get("dest_rel") or rel)
+            dest_mp4 = dest / _flat_name(item.get("dest_rel") or rel)
             sidecar = inventory.sidecar_for_mp4(dest_mp4)
             if sidecar is None:
                 raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_mp4.name}")
