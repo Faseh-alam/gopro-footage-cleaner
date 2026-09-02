@@ -583,7 +583,7 @@ def _scan_for_cards() -> None:
                         "mount": str(card_root),
                         "volume_serial": serial,
                         "status": "completed",
-                        "message": f"Already on SSD: {dest_hint}",
+                        "message": f"Already on SSD: {dest_hint} — SD card not wiped",
                         "dest": str(dest_hint),
                         "bytes_done": prog.get("bytes_total") or 0,
                         "bytes_total": prog.get("bytes_total") or 0,
@@ -1248,11 +1248,13 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
     task subfolder. GoPro numbering repeats across cards, so when another card
     already parked a *different* video under the same name, the incoming pair
     is renamed to ``<stem>__<CARDID><ext>``. When the batch already holds the
-    same video (size + sidecar identity), the existing name is reused.
+    same video (sidecar/embed identity), the existing name is reused and the
+    card file is not copied or wiped.
     """
     entries = prog.get("files") or {}
-    stem_map: dict[str, str] = {}  # source MP4 stem -> final stem
+    stem_map: dict[str, str] = {}  # pair key -> dest stem
     claimed: set[str] = set()
+    already_pairs: set[str] = set()
 
     def assign_one(item: dict, *, sidecar_pass: bool) -> None:
         rel = item["rel"]
@@ -1276,6 +1278,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
                 item["dest_rel"] = f"{final_base}.segments.json"
             else:
                 item["dest_rel"] = f"{final_base}{suffix}"
+            if pair in already_pairs:
+                item["already_in_batch"] = True
             claimed.add(str(item["dest_rel"]).lower())
             return
 
@@ -1295,6 +1299,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         flat_existing = _flat_name(existing) if existing else ""
         if existing and flat_existing.lower() not in claimed:
             item["dest_rel"] = flat_existing
+            item["already_in_batch"] = True
+            already_pairs.add(pair)
             stem_map[pair] = Path(flat_existing).stem
             claimed.add(flat_existing.lower())
             return
@@ -1356,6 +1362,8 @@ def _copy_card_worker(
     done_bytes = 0
     files_done = 0
     files_verified = 0
+    files_already = 0
+    files_copied = 0
     with _dest_batch_lock(dest):
         _resolve_dest_names(files, dest, prog, card_id)
     last_ui = 0.0
@@ -1391,6 +1399,8 @@ def _copy_card_worker(
             "files_done": files_done,
             "files_total": len(files),
             "files_verified": files_verified,
+            "files_already_in_batch": files_already,
+            "files_copied": files_copied,
             "speed_mbps": round(speed, 2),
             "eta_seconds": eta,
         }
@@ -1411,14 +1421,35 @@ def _copy_card_worker(
             item["dest_rel"] = dest_rel
             dest_file = dest / dest_rel
             if dest_rel != _flat_name(rel) and not (prog.get("files") or {}).get(rel):
-                _log_line(
-                    f"{card_id}: {_flat_name(rel)} already in batch from another card — saving as {dest_rel}"
+                if item.get("already_in_batch"):
+                    _log_line(
+                        f"{card_id}: {_flat_name(rel)} already in this batch as {dest_rel} — not copied"
+                    )
+                else:
+                    _log_line(
+                        f"{card_id}: {_flat_name(rel)} already in batch from another card — saving as {dest_rel}"
+                    )
+            if item.get("already_in_batch") and dest_file.is_file():
+                try:
+                    item["dest_size"] = dest_file.stat().st_size
+                except OSError:
+                    item["dest_size"] = size
+                item["copied"] = False
+                done_bytes += size
+                files_done += 1
+                files_already += 1
+                _publish(
+                    0,
+                    message=f"Already in batch (not copied): {dest_rel} · {files_already} skipped",
+                    force=True,
                 )
+                continue
             if progress.is_file_done(prog, rel, size, dest_file):
                 try:
                     item["dest_size"] = dest_file.stat().st_size
                 except OSError:
                     item["dest_size"] = size
+                item["copied"] = True
                 done_bytes += size
                 files_done += 1
                 saw_disk_write = True
@@ -1492,18 +1523,20 @@ def _copy_card_worker(
                         kind="error",
                     )
             item["dest_size"] = dest_size
+            item["copied"] = True
 
             progress.mark_file_done(
                 card_root, prog, rel, size, dest_size=dest_size, dest_rel=dest_rel
             )
             done_bytes += size
             files_done += 1
+            files_copied += 1
             _publish(0, message=f"Copied {rel}", force=True)
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        if not saw_disk_write and files:
+        if not saw_disk_write and files and files_already < len(files):
             raise RuntimeError(
                 f"No files were written under {dest} — check SSD path and card folders"
             )
@@ -1532,6 +1565,8 @@ def _copy_card_worker(
                 raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_file.name}")
             if not verified:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing or wrong size under {dest}")
+            copied = bool(item.get("copied"))
+            already = bool(item.get("already_in_batch")) and not copied
             manifest.append(
                 {
                     "source": str(item.get("source") or ""),
@@ -1542,10 +1577,20 @@ def _copy_card_worker(
                     "dest_size": expected,
                     "kind": kind,
                     "verified": True,
+                    "wipe": copied,
+                    "already_in_batch": already,
                 }
             )
         files_verified = len(manifest)
-        verify_msg = f"{files_verified} / {len(files)} files verified"
+        files_already = sum(1 for r in manifest if r.get("already_in_batch"))
+        files_copied = sum(1 for r in manifest if r.get("wipe"))
+        if files_already:
+            verify_msg = (
+                f"{files_copied} / {len(files)} new files copied · "
+                f"{files_already} already in this batch"
+            )
+        else:
+            verify_msg = f"{files_verified} / {len(files)} files verified"
         _update_card(
             card_id,
             status="verifying",
@@ -1554,51 +1599,82 @@ def _copy_card_worker(
             files_verified=files_verified,
             files_total=len(files),
             files_done=files_verified,
+            files_already_in_batch=files_already,
+            files_copied=files_copied,
         )
         _log_line(f"{card_id}: {verify_msg}", kind="ok")
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        eject.assert_wipe_allowed(card_root, manifest)
-
-        prog["status"] = "complete"
-        progress.save_progress(card_root, prog)
-
-        _update_card(
-            card_id,
-            status="wiping",
-            message=f"{verify_msg} — wiping verified files on card…",
-            dest=str(dest),
-            files_verified=files_verified,
-            files_total=len(files),
-            speed_mbps=0,
-            eta_seconds=0,
-            bytes_done=total_bytes,
-        )
-        eject.wipe_verified_sources(
-            card_root, [str(row["source"]) for row in manifest if row.get("source")]
-        )
+        wipe_sources = [
+            str(row["source"]) for row in manifest if row.get("wipe") and row.get("source")
+        ]
+        if wipe_sources:
+            eject.assert_wipe_allowed(card_root, manifest)
+            prog["status"] = "complete"
+            progress.save_progress(card_root, prog)
+            _update_card(
+                card_id,
+                status="wiping",
+                message=f"{verify_msg} — wiping verified files on card…",
+                dest=str(dest),
+                files_verified=files_verified,
+                files_total=len(files),
+                files_already_in_batch=files_already,
+                files_copied=files_copied,
+                speed_mbps=0,
+                eta_seconds=0,
+                bytes_done=total_bytes,
+            )
+            eject.wipe_verified_sources(card_root, wipe_sources)
+        else:
+            prog["status"] = "complete"
+            progress.save_progress(card_root, prog)
+            _log_line(
+                f"{card_id}: nothing new copied — SD card not wiped",
+                kind="ok",
+            )
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        try:
-            _update_card(card_id, status="ejecting", message="Ejecting card…")
-            eject.eject_volume(card_root)
-        except Exception as eject_exc:  # noqa: BLE001
-            _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
+        leftover_mp4s = inventory.list_card_mp4_paths(card_root)
+        if not leftover_mp4s:
+            try:
+                _update_card(card_id, status="ejecting", message="Ejecting card…")
+                eject.eject_volume(card_root)
+            except Exception as eject_exc:  # noqa: BLE001
+                _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
+        else:
+            _log_line(
+                f"{card_id}: {len(leftover_mp4s)} MP4(s) remain on the card — not ejecting",
+                kind="ok",
+            )
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
         port = reader_slot or ""
         label = reader_label or (f"Reader {port}" if port else "card reader")
-        done_msg = (
-            f"Offloading of {label} has completed, insert a new card in port {port}"
-            if port
-            else "Ready — card ejected"
-        )
+        leftover_n = len(leftover_mp4s)
+        if files_copied == 0 and files_already:
+            done_msg = (
+                f"0 / {len(files)} new files — {files_already} already in this batch — "
+                "SD card not wiped"
+            )
+        elif leftover_n:
+            done_msg = (
+                f"{files_copied} / {len(files)} new files copied · "
+                f"{files_already} already in this batch — "
+                f"{leftover_n} file(s) left on SD (not wiped)"
+            )
+        elif port:
+            done_msg = (
+                f"Offloading of {label} has completed, insert a new card in port {port}"
+            )
+        else:
+            done_msg = "Ready — card ejected"
         _update_card(
             card_id,
             status="completed",
@@ -1608,6 +1684,8 @@ def _copy_card_worker(
             bytes_done=total_bytes,
             files_verified=files_verified,
             files_total=len(files),
+            files_already_in_batch=files_already,
+            files_copied=files_copied,
             reader_slot=port,
             reader_label=label,
         )

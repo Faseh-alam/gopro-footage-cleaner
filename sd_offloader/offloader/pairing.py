@@ -89,9 +89,9 @@ def batch_file_is_same_video(
     card_mp4_size: int,
     sidecar: dict,
 ) -> bool:
-    """True when the SSD already holds this exact card video."""
+    """True when the SSD already holds this exact card video (identity, not name)."""
     dest_mp4 = Path(dest_mp4)
-    if not dest_mp4.is_file():
+    if not dest_mp4.is_file() or not sidecar:
         return False
 
     if sidecar.get("size_bytes") is not None:
@@ -105,10 +105,13 @@ def batch_file_is_same_video(
     if embedded:
         return payloads_equivalent(embedded, sidecar)
 
-    try:
-        return dest_mp4.stat().st_size == int(card_mp4_size)
-    except OSError:
-        return False
+    from . import inventory as _inventory
+
+    dest_side = _inventory.sidecar_for_mp4(dest_mp4)
+    dest_payload = load_sidecar(dest_side) if dest_side else None
+    if dest_payload:
+        return payloads_equivalent(dest_payload, sidecar)
+    return False
 
 
 def find_existing_dest_name(
@@ -118,18 +121,33 @@ def find_existing_dest_name(
     card_mp4_size: int,
     sidecar: dict | None,
 ) -> str | None:
-    """Return the batch-relative MP4 name when this video is already stored."""
-    candidate = dest / mp4_name
-    if not candidate.is_file():
-        return None
-    if sidecar and batch_file_is_same_video(
-        candidate, card_mp4_size=card_mp4_size, sidecar=sidecar
-    ):
-        return mp4_name
+    """Reuse a batch MP4 only when sidecar/embed identity matches — never size-only."""
     if not sidecar:
-        try:
-            if candidate.stat().st_size == int(card_mp4_size):
-                return mp4_name
-        except OSError:
-            return None
+        return None
+    dest = Path(dest)
+    mp4_name = Path(str(mp4_name)).name
+    stem = Path(mp4_name).stem
+    suffix = Path(mp4_name).suffix.lower()
+    candidates: list[Path] = []
+    exact = dest / mp4_name
+    if exact.is_file():
+        candidates.append(exact)
+    try:
+        for path in dest.iterdir():
+            if not path.is_file():
+                continue
+            if path.suffix.lower() != suffix:
+                continue
+            if path.name == mp4_name:
+                continue
+            pstem = path.stem
+            if pstem == stem or pstem.startswith(f"{stem}__"):
+                candidates.append(path)
+    except OSError:
+        pass
+    for path in candidates:
+        if batch_file_is_same_video(
+            path, card_mp4_size=card_mp4_size, sidecar=sidecar
+        ):
+            return path.name
     return None

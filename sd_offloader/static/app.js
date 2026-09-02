@@ -488,8 +488,12 @@ function renderCards(cards) {
           : card.status || "";
     const total = Number(card.files_total || 0);
     const verified = Number(card.files_verified || 0);
+    const already = Number(card.files_already_in_batch || 0);
+    const copied = Number(card.files_copied || 0);
     const fileLabel = ["verifying", "wiping", "ejecting", "completed"].includes(card.status)
-      ? `${verified || card.files_done || 0} / ${total} files verified`
+      ? already > 0
+        ? `${copied} / ${total} new · ${already} already in batch`
+        : `${verified || card.files_done || 0} / ${total} files verified`
       : `${card.files_done || 0}/${total} files`;
     const div = document.createElement("div");
     div.className =

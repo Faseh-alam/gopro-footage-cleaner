@@ -54,6 +54,23 @@ def _card_with_mp4s(root: Path, specs: list[tuple[str, bytes | None]]) -> Path:
     return gopro
 
 
+def _copy_files(files: list[dict], dest: Path, card_id: str) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    with engine._dest_batch_lock(dest):
+        engine._resolve_dest_names(files, dest, {"files": {}}, card_id)
+    for item in files:
+        dest_rel = engine._flat_name(item.get("dest_rel") or item["rel"])
+        item["dest_rel"] = dest_rel
+        dest_file = dest / dest_rel
+        if item.get("already_in_batch") and dest_file.is_file():
+            item["copied"] = False
+            item["dest_size"] = dest_file.stat().st_size
+            continue
+        copy_file(Path(item["source"]), dest_file)
+        item["copied"] = True
+        item["dest_size"] = dest_file.stat().st_size
+
+
 def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None) -> list[dict]:
     rows = []
     for item in files:
@@ -65,6 +82,8 @@ def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None
                 ok = dest_file.stat().st_size == int(item.get("dest_size") or item["size"])
             except OSError:
                 ok = False
+        copied = bool(item.get("copied", True))
+        already = bool(item.get("already_in_batch")) and not copied
         rows.append(
             {
                 "source": item["source"],
@@ -75,21 +94,11 @@ def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None
                 "dest_size": int(item.get("dest_size") or item["size"]),
                 "kind": item.get("kind") or "mp4",
                 "verified": bool(ok),
+                "wipe": copied,
+                "already_in_batch": already,
             }
         )
     return rows
-
-
-def _copy_files(files: list[dict], dest: Path, card_id: str) -> None:
-    dest.mkdir(parents=True, exist_ok=True)
-    with engine._dest_batch_lock(dest):
-        engine._resolve_dest_names(files, dest, {"files": {}}, card_id)
-    for item in files:
-        dest_rel = engine._flat_name(item.get("dest_rel") or item["rel"])
-        item["dest_rel"] = dest_rel
-        dest_file = dest / dest_rel
-        copy_file(Path(item["source"]), dest_file)
-        item["dest_size"] = dest_file.stat().st_size
 
 
 def test_six_copied_wipe_allowed() -> None:
@@ -304,6 +313,113 @@ def test_no_rmtree_on_gopro_folder() -> None:
         check("file inside was unlinked", not (nested / "GX101.MP4").exists())
 
 
+def _stamp_identity(mp4: Path, serial: str) -> None:
+    side = mp4.with_suffix(".json")
+    side.write_text(
+        json.dumps(
+            {
+                "source": mp4.name,
+                "size_bytes": mp4.stat().st_size,
+                "complete": True,
+                "device_id": serial,
+                "card_badge": serial,
+                "media_meta": {
+                    "camera_serial": serial,
+                    "recorded_at": "2026-01-01T00:00:00+00:00",
+                },
+                "segments": [{"kind": "work", "task": "x", "start": 0, "end": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_duplicate_card_skips_copy_and_wipe() -> None:
+    print("\n[9] duplicate card (same videos already in batch) — skip copy, do not wipe")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        card1 = Path(tmp) / "card1"
+        card2 = Path(tmp) / "card2"
+        specs = [
+            ("GX010001.MP4", b"same-video-body-1111"),
+            ("GX010002.MP4", b"same-video-body-2222"),
+        ]
+        gopro1 = _card_with_mp4s(card1, specs)
+        gopro2 = _card_with_mp4s(card2, specs)
+        _stamp_identity(gopro1 / "GX010001.MP4", "CAM-A")
+        _stamp_identity(gopro1 / "GX010002.MP4", "CAM-A")
+        _stamp_identity(gopro2 / "GX010001.MP4", "CAM-A")
+        _stamp_identity(gopro2 / "GX010002.MP4", "CAM-A")
+        files1 = inventory.list_transfer_files(card1)
+        _copy_files(files1, dest, "SD-1")
+        dest_mp4s_before = sorted(p.name for p in dest.iterdir() if p.suffix.upper() == ".MP4")
+        eject.wipe_verified_sources(card1, [f["source"] for f in files1])
+        files2 = inventory.list_transfer_files(card2)
+        _copy_files(files2, dest, "SD-2")
+        mp4s2 = [f for f in files2 if f.get("kind") == "mp4"]
+        check("both MP4s marked already_in_batch", all(f.get("already_in_batch") for f in mp4s2))
+        check("second card did not copy", all(f.get("copied") is False for f in mp4s2))
+        dest_mp4s_after = sorted(p.name for p in dest.iterdir() if p.suffix.upper() == ".MP4")
+        check(
+            "SSD still has only the original two MP4s",
+            dest_mp4s_before == dest_mp4s_after,
+            str(dest_mp4s_after),
+        )
+        check("no suffix copy for the duplicate card", not any("__SD-2" in n for n in dest_mp4s_after))
+        manifest2 = _manifest_for(files2, dest)
+        wipe_sources = [r["source"] for r in manifest2 if r.get("wipe")]
+        check("wipe list is empty", wipe_sources == [])
+        snapshot = list(inventory.list_card_mp4_paths(card2))
+        check("duplicate card still has both MP4s", len(snapshot) == 2, str(snapshot))
+        check(
+            "duplicate card still has JSON sidecars",
+            (gopro2 / "GX010001.json").is_file() and (gopro2 / "GX010002.json").is_file(),
+        )
+
+
+def test_same_name_different_identity_suffix_copy() -> None:
+    print("\n[10] same filename, different sidecar identity → suffix copy + wipe the new card")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        card1 = Path(tmp) / "card1"
+        card2 = Path(tmp) / "card2"
+        gopro1 = _card_with_mp4s(card1, [("GX010001.MP4", b"video-from-card-AAAA")])
+        gopro2 = _card_with_mp4s(card2, [("GX010001.MP4", b"video-from-card-BBBB")])
+        _stamp_identity(gopro1 / "GX010001.MP4", "CAM-A")
+        _stamp_identity(gopro2 / "GX010001.MP4", "CAM-B")
+        files1 = inventory.list_transfer_files(card1)
+        _copy_files(files1, dest, "SD-A")
+        eject.wipe_verified_sources(card1, [f["source"] for f in files1])
+        files2 = inventory.list_transfer_files(card2)
+        _copy_files(files2, dest, "SD-B")
+        mp4_b = next(f for f in files2 if f.get("kind") == "mp4")
+        check("second video is not treated as already in batch", not mp4_b.get("already_in_batch"))
+        check(
+            "second video saved with card suffix",
+            mp4_b.get("dest_rel") == "GX010001__SD-B.MP4",
+            str(mp4_b.get("dest_rel")),
+        )
+        check(
+            "both dest MP4s exist",
+            (dest / "GX010001.MP4").is_file() and (dest / "GX010001__SD-B.MP4").is_file(),
+        )
+        check(
+            "dest bodies differ",
+            (dest / "GX010001.MP4").read_bytes() != (dest / "GX010001__SD-B.MP4").read_bytes(),
+        )
+        manifest2 = _manifest_for(files2, dest)
+        try:
+            eject.assert_wipe_allowed(card2, manifest2)
+            blocked = False
+            msg = ""
+        except eject.WipeBlocked as exc:
+            blocked = True
+            msg = str(exc)
+        check("wipe allowed for the new identity", not blocked, msg)
+        eject.wipe_verified_sources(card2, [r["source"] for r in manifest2 if r.get("wipe")])
+        check("second card wiped after suffix copy", inventory.list_card_mp4_paths(card2) == [])
+
+
 def main() -> int:
     test_six_copied_wipe_allowed()
     test_four_of_six_wipe_blocked()
@@ -313,6 +429,8 @@ def main() -> int:
     test_wrong_size_blocks_wipe()
     test_non_mp4_does_not_block()
     test_no_rmtree_on_gopro_folder()
+    test_duplicate_card_skips_copy_and_wipe()
+    test_same_name_different_identity_suffix_copy()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
 

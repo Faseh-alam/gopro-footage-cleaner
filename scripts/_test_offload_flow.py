@@ -91,6 +91,11 @@ def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dic
         dest_file = dest / dest_rel
         if progress.is_file_done(prog, item["rel"], int(item["size"]), dest_file):
             item["dest_size"] = dest_file.stat().st_size
+            item["copied"] = True
+            continue
+        if item.get("already_in_batch") and dest_file.is_file():
+            item["dest_size"] = dest_file.stat().st_size
+            item["copied"] = False
             continue
         copy_file(src, dest_file)
         dest_size = int(item["size"])
@@ -100,6 +105,7 @@ def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dic
                 embed_meta.embed_segments_json(dest_file, payload)
                 dest_size = dest_file.stat().st_size
         item["dest_size"] = dest_size
+        item["copied"] = True
         progress.mark_file_done(card_root, prog, item["rel"], int(item["size"]),
                                 dest_size=dest_size, dest_rel=dest_rel)
     return files, prog
@@ -186,6 +192,23 @@ def main() -> int:
           and embedded["device_type"] == "gopro"
           and len(embedded["media_meta"]["sensors"]) == 3)
 
+    print("\n[2b] duplicate card — same identity skipped, card not wiped")
+    card_dup = tmp / "cardDup"
+    gopro_dup = make_card(card_dup, with_sidecar=full_sidecar)
+    before_dup_dest = {p.name for p in batch_dest.iterdir()}
+    files_dup, _ = simulate_worker(card_dup, batch_dest, "CDUP")
+    mp4_dup = next(f for f in files_dup if f["rel"] == "GX010001.MP4")
+    check("duplicate MP4 marked already_in_batch", bool(mp4_dup.get("already_in_batch")))
+    check("duplicate reuses original dest name", mp4_dup.get("dest_rel") == "GX010001.MP4",
+          str(mp4_dup.get("dest_rel")))
+    check("duplicate was not copied", mp4_dup.get("copied") is False)
+    check("no extra dest file for duplicate card",
+          before_dup_dest == {p.name for p in batch_dest.iterdir()}
+          and not (batch_dest / "GX010001__CDUP.MP4").exists())
+    check("duplicate card still has its MP4", (gopro_dup / "GX010001.MP4").is_file())
+    check("duplicate card still has its sidecar",
+          (gopro_dup / "GX010001.segments.json").is_file())
+
     print("\n[3] card B same filename → collision suffix")
     files_b, prog_b = simulate_worker(card_b, batch_dest, "C5678")
     mp4_b = next(f for f in files_b if f["rel"] == "GX010001.MP4")
@@ -211,13 +234,16 @@ def main() -> int:
     check("re-run reuses same names (no dupes)",
           not any("__C5678__" in p.name for p in batch_dest.iterdir()))
     progress.clear_progress(card_a)
-    before_a = {p.name for p in batch_dest.iterdir()}
     simulate_worker(card_a, batch_dest, "C1234")
-    after_a = {p.name for p in batch_dest.iterdir()}
-    check("re-offload same card reuses batch file (no duplicate)",
-          before_a == after_a
-          and (batch_dest / "GX010001.MP4").is_file()
-          and not (batch_dest / "GX010001__C1234.MP4").exists())
+    names = {p.name for p in batch_dest.iterdir()}
+    check(
+        "re-offload same card reuses labeled dest (no duplicate)",
+        (batch_dest / "GX010001.MP4").is_file()
+        and not (batch_dest / "GX010001__C1234.MP4").exists()
+        and (batch_dest / "GX101.MP4").is_file()
+        and not any(n.startswith("GX101__C1234") for n in names),
+        str(sorted(n for n in names if "__C1234" in n and n.upper().endswith(".MP4"))),
+    )
 
     print("\n[5] metadata pairing checks")
     check("full sidecar passes", engine._missing_metadata(full_sidecar) == [])

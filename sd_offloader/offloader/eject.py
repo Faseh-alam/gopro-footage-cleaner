@@ -32,14 +32,17 @@ def assert_wipe_allowed(card_root: Path, manifest: list[dict] | None) -> None:
     rows = list(manifest or [])
     if not rows:
         raise WipeBlocked("Wipe blocked: empty transfer manifest — SD card was not wiped")
-    unverified = [r for r in rows if not r.get("verified")]
+    to_wipe = [
+        r for r in rows if (bool(r.get("wipe")) if "wipe" in r else True)
+    ]
+    unverified = [r for r in to_wipe if not r.get("verified")]
     if unverified:
         raise WipeBlocked(
             f"Wipe blocked: {len(unverified)} file(s) not verified on SSD — "
             "SD card was not wiped"
         )
-    sources = [str(r.get("source") or "") for r in rows if r.get("source")]
-    leftover = inventory.leftover_mp4s(card_root, sources)
+    accounted = [str(r.get("source") or "") for r in rows if r.get("source")]
+    leftover = inventory.leftover_mp4s(card_root, accounted)
     if leftover:
         preview = ", ".join(p.name for p in leftover[:6])
         extra = "…" if len(leftover) > 6 else ""
