@@ -26,6 +26,7 @@ const el = {
 
 let updateState = "idle";
 const UPDATE_POPUP_KEY = "sdOffloaderUpdatePopup";
+let noticeSeq = 0;
 
 function setUpdateState(state) {
   updateState = state;
@@ -35,21 +36,55 @@ function setUpdateState(state) {
     state === "idle" ? "Update" : state === "pulling" ? "Updating…" : "Restarting…";
 }
 
-function showUpdatePopup(message, kind = "ok") {
-  const popup = document.getElementById("update-popup");
-  const text = document.getElementById("update-popup-message");
-  if (!popup || !text) {
-    window.alert(message);
-    return;
-  }
-  text.textContent = message;
-  popup.classList.toggle("ok", kind !== "error");
-  popup.classList.toggle("error", kind === "error");
-  popup.classList.remove("hidden");
+function showNotice(message, kind = "ok", actions = []) {
+  const stack = document.getElementById("notice-stack");
+  if (!stack) return;
+  const id = `notice-${++noticeSeq}`;
+  const card = document.createElement("div");
+  card.className = `notice ${kind === "error" ? "error" : kind === "ok" ? "ok" : ""}`.trim();
+  card.id = id;
+  const actionHtml = actions.length
+    ? `<div class="notice-actions">${actions
+        .map(
+          (a, i) =>
+            `<button type="button" class="${a.primary ? "primary" : "secondary"}" data-action="${i}">${escapeHtml(
+              a.label,
+            )}</button>`,
+        )
+        .join("")}</div>`
+    : "";
+  card.innerHTML = `
+    <div class="notice-head">
+      <p>${escapeHtml(message)}</p>
+      <div class="notice-tools">
+        <button type="button" class="notice-min" title="Minimize">–</button>
+        <button type="button" class="notice-close" title="Close">×</button>
+      </div>
+    </div>
+    ${actionHtml}
+  `;
+  card.querySelector(".notice-close")?.addEventListener("click", () => card.remove());
+  card.querySelector(".notice-min")?.addEventListener("click", () => {
+    const minimized = card.classList.toggle("minimized");
+    const btn = card.querySelector(".notice-min");
+    if (btn) {
+      btn.textContent = minimized ? "+" : "–";
+      btn.title = minimized ? "Expand" : "Minimize";
+    }
+  });
+  card.querySelectorAll("[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const fn = actions[Number(btn.getAttribute("data-action"))]?.onClick;
+      card.remove();
+      if (typeof fn === "function") fn();
+    });
+  });
+  stack.appendChild(card);
+  return id;
 }
 
-function hideUpdatePopup() {
-  document.getElementById("update-popup")?.classList.add("hidden");
+function showUpdatePopup(message, kind = "ok") {
+  showNotice(message, kind);
 }
 
 function showPendingUpdatePopup() {
@@ -69,13 +104,18 @@ function sleep(ms) {
 
 async function runUpdate() {
   if (updateState !== "idle") return;
-  if (
-    !window.confirm(
-      "Pull the latest code from this PC's GitHub branch and restart the offloader?",
-    )
-  ) {
-    return;
-  }
+  showNotice(
+    "Pull the latest code from this PC's GitHub branch and restart the offloader?",
+    "",
+    [
+      { label: "Cancel" },
+      { label: "Update", primary: true, onClick: () => { void performUpdate(); } },
+    ],
+  );
+}
+
+async function performUpdate() {
+  if (updateState !== "idle") return;
   setUpdateState("pulling");
   setStatus("Checking GitHub for updates…");
   try {
@@ -678,8 +718,6 @@ function sessionPayload() {
     s3_uri: el.s3Uri.value.trim(),
   };
 }
-
-document.getElementById("update-popup-ok")?.addEventListener("click", hideUpdatePopup);
 
 async function bootstrap() {
   showPendingUpdatePopup();

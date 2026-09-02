@@ -56,11 +56,28 @@ def current_branch() -> str:
 
 
 def pull_latest_current_branch() -> dict:
-    """Fetch and hard-reset the current branch to ``origin/<branch>``."""
+    """Fetch origin/<current-branch> and reset to it only when GitHub is ahead.
+
+    Local uncommitted files are never a reason to refuse. They are also not
+    inspected: if origin already matches HEAD, the working tree is left as-is.
+    If origin has new commits, this hard-resets to that (config.json kept).
+    """
     if not shutil.which("git"):
         raise RuntimeError("git is not installed on this computer — install Git for Windows first")
     if not (PROJECT_ROOT / ".git").exists():
         raise RuntimeError("This folder is not a git checkout — reinstall from GitHub")
+
+    branch = current_branch()
+    before = _git("rev-parse", "HEAD")
+    _git("fetch", "origin", branch)
+    remote = _git("rev-parse", f"origin/{branch}")
+    if before == remote:
+        return {
+            "branch": branch,
+            "before": before[:7],
+            "after": remote[:7],
+            "changed": False,
+        }
 
     preserved: dict[str, bytes] = {}
     for rel in PRESERVE_FILES:
@@ -68,9 +85,6 @@ def pull_latest_current_branch() -> dict:
         if path.is_file():
             preserved[rel] = path.read_bytes()
 
-    branch = current_branch()
-    before = _git("rev-parse", "HEAD")
-    _git("fetch", "origin", branch)
     _git("reset", "--hard", f"origin/{branch}")
     after = _git("rev-parse", "HEAD")
 
@@ -84,7 +98,7 @@ def pull_latest_current_branch() -> dict:
         "branch": branch,
         "before": before[:7],
         "after": after[:7],
-        "changed": before != after,
+        "changed": True,
     }
 
 
