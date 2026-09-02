@@ -536,9 +536,29 @@ button.danger {
   color: var(--accent);
 }
 
+.reader-map {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.reader-row {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr minmax(12rem, 2fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.reader-slot {
+  font-weight: 700;
+}
+
 @media (max-width: 900px) {
   .grid-2,
   .grid-2-panels {
+    grid-template-columns: 1fr;
+  }
+
+  .reader-row {
     grid-template-columns: 1fr;
   }
 }

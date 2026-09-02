@@ -22,11 +22,14 @@ const el = {
   updateApp: document.getElementById("update-app"),
   maxParallel: document.getElementById("max-parallel"),
   capacityPanel: document.getElementById("capacity-panel"),
+  readerMap: document.getElementById("reader-map"),
+  diskState: document.getElementById("disk-state"),
 };
 
 let updateState = "idle";
 const UPDATE_POPUP_KEY = "sdOffloaderUpdatePopup";
 let noticeSeq = 0;
+const seenNoticeKeys = new Set();
 
 function setUpdateState(state) {
   updateState = state;
@@ -36,9 +39,17 @@ function setUpdateState(state) {
     state === "idle" ? "Update" : state === "pulling" ? "Updating…" : "Restarting…";
 }
 
-function showNotice(message, kind = "ok", actions = []) {
+function showNotice(message, kind = "ok", actions = [], key = "") {
   const stack = document.getElementById("notice-stack");
   if (!stack) return;
+  if (key) {
+    if (seenNoticeKeys.has(key)) return null;
+    seenNoticeKeys.add(key);
+    if (seenNoticeKeys.size > 80) {
+      const first = seenNoticeKeys.values().next().value;
+      seenNoticeKeys.delete(first);
+    }
+  }
   const id = `notice-${++noticeSeq}`;
   const card = document.createElement("div");
   card.className = `notice ${kind === "error" ? "error" : kind === "ok" ? "ok" : ""}`.trim();
@@ -314,7 +325,105 @@ async function refreshVolumes() {
   fillVolumeSelect(el.ssd1, data.volumes || [], el.ssd1.value);
   fillVolumeSelect(el.ssd2, data.volumes || [], el.ssd2.value);
   await refreshBatches();
+  await refreshReaders();
   return data.volumes || [];
+}
+
+async function refreshReaders() {
+  if (!el.readerMap) return;
+  try {
+    const data = await api("/api/readers", { timeoutMs: 20000 });
+    renderReaders(data);
+  } catch {
+    /* mapping is optional */
+  }
+}
+
+function renderReaders(data) {
+  const box = el.readerMap;
+  if (!box) return;
+  const mapped = (data && data.mapped) || {};
+  const volumes = (data && data.volumes) || [];
+  box.innerHTML = [1, 2, 3]
+    .map((slot) => {
+      const row = mapped[String(slot)] || {};
+      const options = volumes
+        .map((v) => {
+          const path = v.path || "";
+          const label = `${path}${v.label ? ` · ${v.label}` : ""}${
+            v.reader_slot ? ` (Reader ${v.reader_slot})` : ""
+          }`;
+          return `<option value="${escapeHtml(path)}">${escapeHtml(label)}</option>`;
+        })
+        .join("");
+      const status = row.usb_id
+        ? `Mapped${row.letter ? ` · ${row.letter}:` : ""}`
+        : "Not mapped";
+      return `<div class="reader-row">
+        <span class="reader-slot">Reader ${slot}</span>
+        <span class="hint">${escapeHtml(status)}</span>
+        <select data-reader-slot="${slot}">
+          <option value="">Pick inserted card drive…</option>
+          ${options}
+        </select>
+        <button type="button" class="secondary reader-map-btn" data-reader-slot="${slot}">Map</button>
+      </div>`;
+    })
+    .join("");
+  box.querySelectorAll(".reader-map-btn").forEach((btn) => {
+    btn.addEventListener("click", () => mapReader(btn.getAttribute("data-reader-slot")));
+  });
+}
+
+async function mapReader(slot) {
+  const select = el.readerMap?.querySelector(`select[data-reader-slot="${slot}"]`);
+  const path = select?.value || "";
+  if (!path) {
+    setStatus("Pick the drive of the card in that reader first", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/readers/map", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot, path }),
+    });
+    renderReaders(data);
+    showNotice(`Mapped Reader ${slot}`, "ok");
+    setStatus(`Reader ${slot} mapped`, "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+    showNotice(error.message || "Reader map failed", "error");
+  }
+}
+
+function renderDiskState(diskBatches, frozenDisks, session) {
+  if (!el.diskState) return;
+  const batches = diskBatches || {};
+  const frozen = frozenDisks || {};
+  const ssd1 = session?.ssd1 || "";
+  const ssd2 = session?.ssd2 || "";
+  const parts = [];
+  const describe = (label, path) => {
+    if (!path) return;
+    const key = Object.keys(batches).find((k) => k.toLowerCase() === path.toLowerCase()) || path.toLowerCase();
+    const batch = batches[key] || batches[path] || "";
+    const isFrozen = Boolean(frozen[key] || frozen[path]);
+    parts.push(
+      `${label}: ${batch || "no live batch"}${isFrozen ? " (uploading / frozen)" : ""}`,
+    );
+  };
+  describe("SSD1", ssd1);
+  describe("SSD2", ssd2);
+  el.diskState.textContent = parts.length ? parts.join(" · ") : "";
+}
+
+function consumeServerNotices(notices) {
+  for (const note of notices || []) {
+    const key = note.id || "";
+    if (!note.message) continue;
+    showNotice(note.message, note.kind || "ok", [], key);
+  }
 }
 
 function renderCapacity(cap, parallel) {
@@ -382,7 +491,11 @@ function renderCards(cards) {
       "card" + (canRetry ? " card-error" : "") + (card.status === "removed" ? " card-removed" : "");
     div.innerHTML = `
       <div class="card-top">
-        <span class="card-id">${card.card_id || "?"}</span>
+        <span class="card-id">${escapeHtml(card.card_id || "?")}${
+          card.reader_slot
+            ? ` · ${escapeHtml(card.reader_label || `Reader ${card.reader_slot}`)}`
+            : ""
+        }</span>
         <span class="phase ${card.status || ""}">${phaseLabel}</span>
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
@@ -704,6 +817,8 @@ async function pollStatus() {
     renderAwsJobs(data.aws_jobs || []);
     renderLog(data.log || []);
     renderCapacity(data.capacity, data.parallel);
+    renderDiskState(data.disk_batches, data.frozen_disks, session);
+    consumeServerNotices(data.notices);
   } catch {
     /* ignore transient */
   }

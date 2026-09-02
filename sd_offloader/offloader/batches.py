@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .config import BATCHES_SUBDIR
@@ -74,6 +75,41 @@ def list_batches(ssd1: str = "", ssd2: str = "") -> list[dict]:
 
     rows = sorted(found.values(), key=lambda r: r["name"].lower())
     return rows
+
+
+_BATCH_NUM_RE = re.compile(r"(\d+)\s*$")
+
+
+def batch_number(name: str) -> int | None:
+    text = (name or "").strip()
+    match = _BATCH_NUM_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def used_batch_names(ssd1: str = "", ssd2: str = "") -> set[str]:
+    return {str(row.get("name") or "") for row in list_batches(ssd1, ssd2) if row.get("name")}
+
+
+def next_batch_name(ssd1: str, ssd2: str, *, seed: str = "", extra: set[str] | None = None) -> str:
+    """Next unique name like ``batch 28`` that is not on either SSD or in extra."""
+    used = used_batch_names(ssd1, ssd2)
+    if extra:
+        used |= {str(x) for x in extra if x}
+    seed = (seed or "").strip()
+    if seed and seed not in used:
+        return seed
+    numbers = [n for n in (batch_number(name) for name in used) if n is not None]
+    nxt = max(numbers + [0]) + 1
+    prefix = "batch "
+    if seed:
+        stripped = _BATCH_NUM_RE.sub("", seed).rstrip()
+        prefix = f"{stripped} " if stripped else "batch "
+    return f"{prefix}{nxt}".replace("  ", " ").strip()
 
 
 def describe_ssd(ssd: str) -> dict | None:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from . import __version__, aws_upload, batches, engine
+from . import __version__, aws_upload, batches, engine, readers
 from .config import load_config, save_config
 from .detect import list_volumes
 
@@ -247,6 +247,19 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify(result)
+
+    @app.get("/api/readers")
+    def api_readers():
+        return jsonify(readers.card_reader_status())
+
+    @app.post("/api/readers/map")
+    def api_readers_map():
+        payload = request.get_json(silent=True) or {}
+        try:
+            mapped = readers.map_slot(payload.get("slot"), str(payload.get("path") or "").strip())
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "mapped": mapped, **readers.card_reader_status()})
 
     @app.get("/api/update/check")
     def update_check():

@@ -46,7 +46,7 @@ def _slug(name: str) -> str:
 KNOWN_TASK_SLUGS = _task_slugs_from_cleaner()
 
 
-def _embed_sidecar_for(mp4: Path) -> Path | None:
+def sidecar_for_mp4(mp4: Path) -> Path | None:
     """Prefer Cleaner ``.segments.json``, else plain ``.JSON`` / ``.json``."""
     preferred = [
         mp4.with_name(f"{mp4.stem}.segments.json"),
@@ -57,6 +57,10 @@ def _embed_sidecar_for(mp4: Path) -> Path | None:
         if path.is_file():
             return path
     return None
+
+
+def _embed_sidecar_for(mp4: Path) -> Path | None:
+    return sidecar_for_mp4(mp4)
 
 
 def list_transfer_files(card_root: Path) -> list[dict]:
@@ -137,17 +141,50 @@ def list_transfer_files(card_root: Path) -> list[dict]:
                     size = item.stat().st_size
                 except OSError:
                     continue
+                sidecar = _embed_sidecar_for(item)
                 files.append(
                     {
                         "rel": rel,
                         "source": str(item.resolve()),
                         "size": size,
                         "task": task_dir.name,
+                        "embed_json": str(sidecar.resolve()) if sidecar else "",
                     }
                 )
+                if sidecar is not None:
+                    srel = f"{task_dir.name}/{sidecar.name}"
+                    if srel in seen_rel:
+                        srel = f"{gopro.name}/{task_dir.name}/{sidecar.name}"
+                    if srel not in seen_rel:
+                        seen_rel.add(srel)
+                        try:
+                            ssize = sidecar.stat().st_size
+                        except OSError:
+                            ssize = 0
+                        files.append(
+                            {
+                                "rel": srel,
+                                "source": str(sidecar.resolve()),
+                                "size": ssize,
+                                "task": task_dir.name,
+                            }
+                        )
 
     return files
 
 
 def total_bytes(files: list[dict]) -> int:
     return sum(int(f.get("size") or 0) for f in files)
+
+
+def unpaired_mp4s(files: list[dict]) -> list[str]:
+    """MP4s that have no JSON / segments.json sidecar on the card."""
+    missing: list[str] = []
+    for item in files:
+        rel = str(item.get("rel") or "")
+        if Path(rel).suffix.upper() != ".MP4":
+            continue
+        if item.get("embed_json"):
+            continue
+        missing.append(rel)
+    return missing

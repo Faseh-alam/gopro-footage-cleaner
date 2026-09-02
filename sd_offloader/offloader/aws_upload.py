@@ -28,6 +28,7 @@ from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs, load_config
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+_on_batch_deleted = None
 _monitor_started = False
 JOBS_FILE = STATE_DIR / "aws_jobs.json"
 LOG_DIR = STATE_DIR / "aws_logs"
@@ -246,6 +247,7 @@ def start_batch_upload(
     card_id: str | None = None,
     external_window: bool = True,
     show_console: bool | None = None,
+    auto_delete: bool = False,
 ) -> dict:
     """Start s5cmd/aws sync in an external console (survives server restart).
 
@@ -286,6 +288,8 @@ def start_batch_upload(
                 job["pending_resync_s3_uri"] = s3_uri
                 if card_id:
                     job["pending_resync_card_id"] = card_id
+                if auto_delete:
+                    job["auto_delete"] = True
                 job["message"] = (
                     (job.get("message") or "Uploading")
                     + f" · will resync after finish"
@@ -300,7 +304,7 @@ def start_batch_upload(
         _persist_jobs()
         return get_job(running["id"]) or running
 
-    return _launch_upload_job(
+    job = _launch_upload_job(
         sources=sources,
         dest=dest,
         batch_name=batch_name,
@@ -308,6 +312,14 @@ def start_batch_upload(
         s3_uri=s3_uri,
         tool=tool,
     )
+    if auto_delete:
+        with _lock:
+            live = _jobs.get(job.get("id") or "")
+            if live:
+                live["auto_delete"] = True
+        _persist_jobs()
+        job = get_job(job.get("id") or "") or job
+    return job
 
 
 def cancel_job(job_id: str) -> dict:
@@ -565,7 +577,15 @@ def verify_job_sizes(job_id: str) -> dict:
     if not dest.startswith("s3://"):
         raise RuntimeError("No S3 destination on this job")
 
-    result = _compare_local_s3_sizes(sources, dest)
+    first = _compare_local_s3_sizes(sources, dest)
+    second = _compare_local_s3_sizes(sources, dest)
+    result = dict(second)
+    result["ok"] = bool(
+        first.get("ok")
+        and second.get("ok")
+        and int(first.get("s3_bytes") or 0) == int(second.get("s3_bytes") or 0)
+        and int(first.get("local_bytes") or 0) == int(second.get("local_bytes") or 0)
+    )
     with _lock:
         job = _jobs.get(job_id)
         if not job:
@@ -644,6 +664,17 @@ def delete_local_after_verify(job_id: str, *, confirmed: bool = False) -> dict:
     _persist_jobs()
     if errors and not deleted:
         raise RuntimeError("; ".join(errors))
+    batch_name = str(snap.get("batch") or "")
+    if _on_batch_deleted:
+        try:
+            _on_batch_deleted([str(p) for p in sources], batch_name)
+        except Exception:  # noqa: BLE001
+            pass
+    with _lock:
+        live = _jobs.get(job_id)
+        if live:
+            live["delete_hooked"] = True
+    _persist_jobs()
     return get_job(job_id) or {"ok": True, "deleted": deleted, "errors": errors}
 
 
@@ -745,6 +776,7 @@ def _launch_upload_job(
             "transferred": 0,
             "verified": False,
             "progress_via_s3": True,
+            "auto_delete": bool((prev or {}).get("auto_delete")),
         }
     _persist_jobs()
     _ensure_monitor()
@@ -1260,8 +1292,13 @@ def _compare_local_s3_sizes(sources: list[Path], dest: str) -> dict:
     }
 
 
+def set_batch_deleted_hook(fn) -> None:
+    global _on_batch_deleted
+    _on_batch_deleted = fn
+
+
 def _auto_verify_job(job_id: str) -> None:
-    """Background size check after a successful sync exit."""
+    """Background size check after a successful sync exit; optional auto-delete."""
     try:
         verify_job_sizes(job_id)
     except Exception:  # noqa: BLE001
@@ -1273,6 +1310,69 @@ def _auto_verify_job(job_id: str) -> None:
                     + " — click Verify sizes to confirm before deleting local"
                 )
         _persist_jobs()
+        return
+    with _lock:
+        job = dict(_jobs.get(job_id) or {})
+    if not job.get("verified") or not job.get("auto_delete"):
+        return
+    try:
+        delete_local_after_verify(job_id, confirmed=True)
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            live = _jobs.get(job_id)
+            if live:
+                live["message"] = f"Verified but delete refused: {exc}"
+        _persist_jobs()
+
+
+def watchdog_pass() -> list[str]:
+    """Resume failed/interrupted uploads; verify completed; never stop a healthy job."""
+    notes: list[str] = []
+    jobs = list_jobs()
+    for job in jobs:
+        jid = str(job.get("id") or "")
+        status = str(job.get("status") or "")
+        if not jid:
+            continue
+        if status in {"running", "checking", "cancelling"}:
+            continue
+        if status in {"error", "mismatch", "interrupted"}:
+            try:
+                restart_job(jid)
+                notes.append(f"resumed AWS {jid} ({status})")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"AWS {jid} resume skipped: {exc}")
+            continue
+        if status == "completed" and not job.get("verified"):
+            try:
+                _auto_verify_job(jid)
+                notes.append(f"verified AWS {jid}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"AWS {jid} verify failed: {exc}")
+            continue
+        if status == "verified" and job.get("auto_delete"):
+            try:
+                delete_local_after_verify(jid, confirmed=True)
+                notes.append(f"deleted verified AWS {jid}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"AWS {jid} delete skipped: {exc}")
+            continue
+        if status == "deleted_local" and not job.get("delete_hooked"):
+            if _on_batch_deleted:
+                try:
+                    _on_batch_deleted(
+                        [str(p) for p in (job.get("sources") or [])],
+                        str(job.get("batch") or ""),
+                    )
+                    with _lock:
+                        live = _jobs.get(jid)
+                        if live:
+                            live["delete_hooked"] = True
+                    _persist_jobs()
+                    notes.append(f"unfroze disk after AWS {jid}")
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"AWS {jid} unfreeze failed: {exc}")
+    return notes
 
 
 def _run_pending_resync(

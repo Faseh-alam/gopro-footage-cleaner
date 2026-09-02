@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, embed_meta, inventory, pairing, progress, space
+from . import aws_upload, batches, eject, embed_meta, inventory, pairing, progress, readers, space
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -21,6 +21,8 @@ _session: dict = {
     "ssd2": "",
     "s3_uri": "",
     "started_at": None,
+    "disk_batches": {},
+    "frozen_disks": {},
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
 _copy_threads: dict[str, threading.Thread] = {}
@@ -29,6 +31,9 @@ _cancel_requested: set[str] = set()
 _waiting_queue: list[dict] = []  # queued starts when at max parallel
 _watcher_started = False
 _log: list[dict] = []
+_notices: list[dict] = []
+_watchdog_started = False
+WATCHDOG_SECONDS = 30 * 60
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
 _last_snapshot_at = 0.0
 ACTIVE_COPY_STATUSES = {
@@ -59,6 +64,19 @@ def _log_line(message: str, *, kind: str = "info") -> None:
     _save_snapshot(force=False)
 
 
+def push_notice(message: str, *, kind: str = "ok") -> None:
+    with _lock:
+        _notices.append(
+            {
+                "id": f"{time.time():.6f}-{len(_notices)}",
+                "message": message,
+                "kind": kind,
+            }
+        )
+        if len(_notices) > 40:
+            del _notices[:-40]
+
+
 def _save_snapshot(*, force: bool = False) -> None:
     """Persist session/cards/log so reopening the UI still shows live transfers."""
     global _last_snapshot_at
@@ -82,54 +100,58 @@ def _save_snapshot(*, force: bool = False) -> None:
 
 def restore_ui_state() -> None:
     """Load last SD→SSD snapshot and AWS jobs after server start / browser reopen."""
+    aws_upload.set_batch_deleted_hook(on_batch_deleted)
     aws_upload.restore_jobs_from_disk()
-    if not SNAPSHOT_FILE.exists():
-        return
     try:
-        data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    if not isinstance(data, dict):
-        return
-    with _lock:
-        session = data.get("session")
-        if isinstance(session, dict):
-            _session.update(session)
-            # Watcher must be re-armed after process restart.
-            if _session.get("active"):
-                _session["active"] = True
-        cards = data.get("cards")
-        if isinstance(cards, list):
-            for row in cards:
-                if not isinstance(row, dict):
-                    continue
-                card_id = str(row.get("card_id") or "").upper()
-                if not card_id:
-                    continue
-                status = row.get("status") or ""
-                if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
-                    # In-flight copy threads died with the old process.
-                    if status in {"copying", "verifying"}:
-                        row = dict(row)
-                        row["status"] = "interrupted"
-                        row["message"] = (
-                            "Server restarted mid-copy — re-insert card or Start session "
-                            "to resume (completed files are skipped)"
-                        )
-                        row["speed_mbps"] = 0.0
-                _cards[card_id] = dict(row)
-        lines = data.get("log")
-        if isinstance(lines, list):
-            _log.clear()
-            _log.extend(line for line in lines if isinstance(line, dict))
-    if _session.get("active"):
-        # Do NOT auto-resume the SD watcher on startup — scanning drives during
-        # boot was freezing the web UI on hung card readers. User clicks Start.
-        _session["active"] = False
-        _log_line(
-            "Previous session was active — click Start SD → SSD to resume watching",
-            kind="ok",
-        )
+        if not SNAPSHOT_FILE.exists():
+            return
+        try:
+            data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, dict):
+            return
+        with _lock:
+            session = data.get("session")
+            if isinstance(session, dict):
+                _session.update(session)
+                # Watcher must be re-armed after process restart.
+                if _session.get("active"):
+                    _session["active"] = True
+            cards = data.get("cards")
+            if isinstance(cards, list):
+                for row in cards:
+                    if not isinstance(row, dict):
+                        continue
+                    card_id = str(row.get("card_id") or "").upper()
+                    if not card_id:
+                        continue
+                    status = row.get("status") or ""
+                    if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
+                        # In-flight copy threads died with the old process.
+                        if status in {"copying", "verifying"}:
+                            row = dict(row)
+                            row["status"] = "interrupted"
+                            row["message"] = (
+                                "Server restarted mid-copy — re-insert card or Start session "
+                                "to resume (completed files are skipped)"
+                            )
+                            row["speed_mbps"] = 0.0
+                    _cards[card_id] = dict(row)
+            lines = data.get("log")
+            if isinstance(lines, list):
+                _log.clear()
+                _log.extend(line for line in lines if isinstance(line, dict))
+        if _session.get("active"):
+            # Do NOT auto-resume the SD watcher on startup — scanning drives during
+            # boot was freezing the web UI on hung card readers. User clicks Start.
+            _session["active"] = False
+            _log_line(
+                "Previous session was active — click Start SD → SSD to resume watching",
+                kind="ok",
+            )
+    finally:
+        _ensure_watchdog()
 
 
 def get_status() -> dict:
@@ -149,6 +171,10 @@ def get_status() -> dict:
             },
             "capacity": _capacity_estimates(),
             "hotplug_armed": bool(_session.get("active")),
+            "notices": list(_notices[-12:]),
+            "readers": readers.saved_readers(),
+            "disk_batches": dict(_session.get("disk_batches") or {}),
+            "frozen_disks": dict(_session.get("frozen_disks") or {}),
         }
     _save_snapshot(force=False)
     return status
@@ -227,6 +253,8 @@ def start_session(
                 "ssd2": ssd2_path,
                 "s3_uri": s3_uri.strip(),
                 "started_at": time.time(),
+                "disk_batches": {},
+                "frozen_disks": {},
             }
         )
         # Allow previously cancelled cards to be picked up again on Start.
@@ -243,15 +271,11 @@ def start_session(
             "s3_uri": s3_uri.strip(),
         }
     )
-    # Ensure batch folders exist on available SSDs
-    for ssd in (ssd1_path, ssd2_path):
-        if ssd:
-            space.batch_root(ssd, batch).mkdir(parents=True, exist_ok=True)
-
     _ensure_watcher()
+    _ensure_watchdog()
     _log_line(
         f"Session started: {batch} ({mode}) — hotplug armed "
-        "(insert/remove SDs anytime; new cards auto SD→SSD→AWS)"
+        "(insert/remove SDs anytime; unique batch per disk; 10 GB SSD reserve)"
     )
     # Immediately scan once
     _scan_for_cards()
@@ -357,6 +381,72 @@ def _ensure_watcher() -> None:
             return
         _watcher_started = True
     threading.Thread(target=_watcher_loop, daemon=True, name="sd-watcher").start()
+
+
+def _ensure_watchdog() -> None:
+    global _watchdog_started
+    with _lock:
+        if _watchdog_started:
+            return
+        _watchdog_started = True
+    threading.Thread(target=_watchdog_loop, daemon=True, name="offloader-watchdog").start()
+
+
+def _watchdog_loop() -> None:
+    try:
+        run_watchdog_once()
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"Watchdog startup: {exc}", kind="error")
+    while True:
+        time.sleep(WATCHDOG_SECONDS)
+        try:
+            run_watchdog_once()
+        except Exception as exc:  # noqa: BLE001
+            _log_line(f"Watchdog: {exc}", kind="error")
+
+
+def run_watchdog_once() -> None:
+    """Resume interrupted work; never kill a healthy copy or upload."""
+    notes: list[str] = []
+    with _lock:
+        cards = [dict(c) for c in _cards.values()]
+        threads = dict(_copy_threads)
+    now = time.time()
+    for card in cards:
+        cid = str(card.get("card_id") or "").upper()
+        if not cid:
+            continue
+        status = str(card.get("status") or "")
+        thread = threads.get(cid)
+        if thread is not None and thread.is_alive():
+            continue
+        stale_copy = (
+            status in {"copying", "verifying"}
+            and now - float(card.get("started_at") or 0) > 20
+        )
+        if status != "interrupted" and not stale_copy:
+            continue
+        mount = str(card.get("mount") or "")
+        if not mount or not Path(mount).exists():
+            continue
+        try:
+            if stale_copy:
+                _update_card(
+                    cid,
+                    status="interrupted",
+                    message="Watchdog: copy thread died — resuming",
+                    speed_mbps=0.0,
+                )
+            retry_card_job(cid)
+            notes.append(f"resumed SD {cid}")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"SD {cid}: {exc}")
+    try:
+        notes.extend(aws_upload.watchdog_pass())
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"AWS pass: {exc}")
+    for line in notes:
+        _log_line(f"Watchdog: {line}", kind="ok")
 
 
 def _watcher_loop() -> None:
@@ -598,6 +688,237 @@ def _active_copy_count() -> int:
         return sum(1 for t in _copy_threads.values() if t and t.is_alive())
 
 
+def _ssd_holding_path(dest: Path, ssd1: str, ssd2: str) -> str:
+    """Return which configured SSD contains dest, or ''."""
+    try:
+        dest_key = space.path_key(dest)
+    except OSError:
+        dest_key = str(dest).lower()
+    for raw in (ssd1, ssd2):
+        if not raw:
+            continue
+        try:
+            root = space.path_key(raw)
+        except OSError:
+            root = str(raw).lower()
+        if dest_key == root or dest_key.startswith(root.rstrip("\\/") + "\\") or dest_key.startswith(
+            root.rstrip("/") + "/"
+        ):
+            return str(Path(raw).expanduser().resolve())
+    return ""
+
+
+def _committed_bytes_by_ssd(*, exclude_card: str = "") -> dict[str, int]:
+    """Remaining SD→SSD bytes already assigned to each SSD (not yet on disk)."""
+    exclude = exclude_card.upper()
+    committed: dict[str, int] = {}
+
+    def _add(ssd: str, nbytes: int) -> None:
+        if not ssd or nbytes <= 0:
+            return
+        try:
+            key = space.path_key(ssd)
+        except OSError:
+            key = str(ssd).lower()
+        committed[key] = committed.get(key, 0) + int(nbytes)
+
+    with _lock:
+        rows = list(_cards.values())
+    for card in rows:
+        if str(card.get("card_id") or "").upper() == exclude:
+            continue
+        status = str(card.get("status") or "")
+        ssd = str(card.get("ssd") or "")
+        total = int(card.get("bytes_total") or 0)
+        done = int(card.get("bytes_done") or 0)
+        if status in {"waiting", "queued"}:
+            _add(ssd, total)
+        elif status in {"copying", "scanning"}:
+            _add(ssd, max(0, total - done))
+    return committed
+
+
+def _is_frozen(ssd_path: str) -> bool:
+    if not ssd_path:
+        return False
+    with _lock:
+        frozen = _session.get("frozen_disks") or {}
+    return bool(frozen.get(space.path_key(ssd_path)))
+
+
+def _live_batches() -> set[str]:
+    with _lock:
+        values = (_session.get("disk_batches") or {}).values()
+    return {str(v) for v in values if v}
+
+
+def _other_ssd(ssd_path: str, ssd1: str, ssd2: str) -> str:
+    if not ssd_path:
+        return ""
+    key = space.path_key(ssd_path)
+    if ssd1 and space.path_key(ssd1) == key:
+        return ssd2
+    if ssd2 and space.path_key(ssd2) == key:
+        return ssd1
+    return ""
+
+
+def _batch_for_ssd(ssd_path: str, *, seed: str) -> str:
+    """Unique live batch on this SSD; never the same number as the other disk."""
+    key = space.path_key(ssd_path)
+    with _lock:
+        disk_batches = dict(_session.get("disk_batches") or {})
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+        current = str(disk_batches.get(key) or "")
+    if current:
+        return current
+    live = _live_batches()
+    other = _other_ssd(ssd_path, ssd1, ssd2)
+    seed = (seed or "").strip()
+    name = ""
+    if seed and seed not in live:
+        other_has = bool(other and space.batch_root(other, seed).is_dir())
+        if not other_has:
+            name = seed
+    if not name:
+        extra = set(live)
+        if other:
+            extra |= batches.used_batch_names(other, "")
+        name = batches.next_batch_name(ssd1, ssd2, seed=seed, extra=extra)
+    with _lock:
+        disk_batches = dict(_session.get("disk_batches") or {})
+        disk_batches[key] = name
+        _session["disk_batches"] = disk_batches
+    space.batch_root(ssd_path, name).mkdir(parents=True, exist_ok=True)
+    _log_line(f"Opened {name} on {ssd_path}")
+    return name
+
+
+def _maybe_auto_upload_disk(ssd_path: str) -> None:
+    """SSD+AWS: freeze this disk's batch and s5cmd-sync it (copy-full)."""
+    with _lock:
+        mode = str(_session.get("mode") or "")
+        s3_uri = str(_session.get("s3_uri") or "")
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+        if mode != "ssd_and_aws" or not s3_uri or not ssd_path:
+            return
+        key = space.path_key(ssd_path)
+        frozen = dict(_session.get("frozen_disks") or {})
+        if frozen.get(key):
+            return
+        batch = str((_session.get("disk_batches") or {}).get(key) or "")
+    if not batch:
+        return
+    folder = space.batch_root(ssd_path, batch)
+    try:
+        has_files = folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        has_files = False
+    if not has_files:
+        return
+    with _lock:
+        frozen = dict(_session.get("frozen_disks") or {})
+        frozen[key] = batch
+        _session["frozen_disks"] = frozen
+    key = space.path_key(ssd_path)
+    only1 = ssd_path if ssd1 and space.path_key(ssd1) == key else ""
+    only2 = ssd_path if ssd2 and space.path_key(ssd2) == key else ""
+    if not only1 and not only2:
+        only1 = ssd_path
+        only2 = ""
+    try:
+        job = aws_upload.start_batch_upload(
+            s3_uri=s3_uri,
+            batch_name=batch,
+            ssd1=only1 or (ssd_path if not only2 else ""),
+            ssd2=only2,
+            card_id=None,
+            auto_delete=True,
+        )
+        _log_line(f"Auto AWS {batch} on {ssd_path} ({job.get('id')})", kind="ok")
+        push_notice(f"SSD copy-full — uploading {batch} with s5cmd", kind="ok")
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            frozen = dict(_session.get("frozen_disks") or {})
+            frozen.pop(key, None)
+            _session["frozen_disks"] = frozen
+        _log_line(f"Auto AWS failed for {batch}: {exc}", kind="error")
+
+
+def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
+    """Unfreeze disk(s) after verified delete so the next unique batch can open."""
+    del ssd_paths  # job sources are batch folders; unfreeze by unique batch name
+    with _lock:
+        frozen = dict(_session.get("frozen_disks") or {})
+        disk_batches = dict(_session.get("disk_batches") or {})
+        for key, name in list(disk_batches.items()):
+            if name == batch_name:
+                disk_batches.pop(key, None)
+                frozen.pop(key, None)
+        for key, name in list(frozen.items()):
+            if name == batch_name:
+                frozen.pop(key, None)
+        _session["frozen_disks"] = frozen
+        _session["disk_batches"] = disk_batches
+    _log_line(f"Deleted verified {batch_name} — disk free for next batch", kind="ok")
+    push_notice(f"{batch_name} verified on AWS and deleted locally", kind="ok")
+
+
+def _assign_ssd_and_batch(
+    *,
+    needed: int,
+    ssd1: str,
+    ssd2: str,
+    seed: str,
+    exclude_card: str,
+    resume_dest: Path | None,
+) -> tuple[str, Path, str]:
+    """Pick one SSD (10 GB reserve, skip frozen), unique batch, never split."""
+    if resume_dest:
+        ssd_path = _ssd_holding_path(resume_dest, ssd1, ssd2)
+        if ssd_path:
+            batch = resume_dest.name if resume_dest.name else _batch_for_ssd(ssd_path, seed=seed)
+            with _lock:
+                disk_batches = dict(_session.get("disk_batches") or {})
+                disk_batches[space.path_key(ssd_path)] = batch
+                _session["disk_batches"] = disk_batches
+            dest = space.batch_root(ssd_path, batch)
+            dest.mkdir(parents=True, exist_ok=True)
+            return ssd_path, dest, batch
+
+    reserved = _committed_bytes_by_ssd(exclude_card=exclude_card)
+
+    # Prefer SSD1 when it fits and is not uploading.
+    picked = ""
+    if ssd1 and not _is_frozen(ssd1):
+        try:
+            space.pick_ssd_for_bytes(
+                ssd1=ssd1, ssd2="", needed_bytes=needed, reserved_bytes=reserved
+            )
+            picked = ssd1
+        except RuntimeError:
+            _maybe_auto_upload_disk(ssd1)
+    if not picked and ssd2 and not _is_frozen(ssd2):
+        try:
+            space.pick_ssd_for_bytes(
+                ssd1="", ssd2=ssd2, needed_bytes=needed, reserved_bytes=reserved
+            )
+            picked = ssd2
+        except RuntimeError:
+            _maybe_auto_upload_disk(ssd2)
+    if not picked:
+        raise RuntimeError(
+            "No SSD can take this card with 10 GB reserve "
+            "(wait for AWS verify/delete, or free space)"
+        )
+    batch = _batch_for_ssd(picked, seed=seed)
+    dest = space.batch_root(picked, batch)
+    dest.mkdir(parents=True, exist_ok=True)
+    return picked, dest, batch
+
+
 def _pump_waiting_queue() -> None:
     """Start waiting card jobs when a parallel slot frees up."""
     while True:
@@ -620,6 +941,8 @@ def _pump_waiting_queue() -> None:
                 ssd_path=job["ssd_path"],
                 total=job["total"],
                 volume_serial=str(job.get("volume_serial") or ""),
+                reader_slot=str(job.get("reader_slot") or ""),
+                reader_label=str(job.get("reader_label") or ""),
             )
         except Exception as exc:  # noqa: BLE001
             cid = str(job.get("card_id") or "?")
@@ -662,9 +985,46 @@ def _start_card_job(
             }
         return
 
+    missing = inventory.unpaired_mp4s(files)
+    if missing:
+        preview = ", ".join(missing[:6]) + ("…" if len(missing) > 6 else "")
+        msg = f"MP4 missing JSON sidecar: {preview}"
+        _log_line(f"{card_id}: {msg}", kind="error")
+        with _lock:
+            _cards[card_id] = {
+                "card_id": card_id,
+                "mount": str(card_root),
+                "volume_serial": volume_serial,
+                "status": "error",
+                "message": f"{msg} — click Retry after labeling",
+                "bytes_done": 0,
+                "bytes_total": total,
+                "speed_mbps": 0,
+                "eta_seconds": None,
+                "started_at": time.time(),
+            }
+        return
+
     try:
-        ssd_path, _ = space.pick_ssd_for_bytes(ssd1=ssd1, ssd2=ssd2, needed_bytes=total)
-        dest = space.batch_root(ssd_path, batch)
+        ssd_path = ""
+        dest: Path | None = None
+        batch_name = batch
+        ident = readers.match_reader(str(card_root))
+        reader_slot = str(ident.get("slot") or "")
+        reader_label = str(ident.get("label") or "")
+        resume_dest = None
+        if existing_progress:
+            prev = Path(str(existing_progress.get("dest") or ""))
+            if prev:
+                resume_dest = prev
+        ssd_path, dest, batch_name = _assign_ssd_and_batch(
+            needed=total,
+            ssd1=ssd1,
+            ssd2=ssd2,
+            seed=batch,
+            exclude_card=card_id,
+            resume_dest=resume_dest,
+        )
         dest.mkdir(parents=True, exist_ok=True)
     except Exception as exc:  # noqa: BLE001
         _log_line(f"{card_id}: {exc}", kind="error")
@@ -684,7 +1044,7 @@ def _start_card_job(
         return
 
     prog = existing_progress or {
-        "batch": batch,
+        "batch": batch_name,
         "card_id": card_id,
         "dest": str(dest),
         "files": {},
@@ -693,7 +1053,7 @@ def _start_card_job(
     }
     prog.update(
         {
-            "batch": batch,
+            "batch": batch_name,
             "card_id": card_id,
             "dest": str(dest),
             "status": "in_progress",
@@ -705,7 +1065,7 @@ def _start_card_job(
     payload = {
         "card_root": card_root,
         "card_id": card_id,
-        "batch": batch,
+        "batch": batch_name,
         "mode": mode,
         "s3_uri": s3_uri,
         "files": files,
@@ -714,6 +1074,8 @@ def _start_card_job(
         "ssd_path": ssd_path,
         "total": total,
         "volume_serial": volume_serial,
+        "reader_slot": reader_slot,
+        "reader_label": reader_label,
     }
 
     if _active_copy_count() >= _max_parallel_cards():
@@ -734,6 +1096,8 @@ def _start_card_job(
                 "message": f"Waiting for free slot ({active}/{limit} active) → {dest}",
                 "dest": str(dest),
                 "ssd": ssd_path,
+                "reader_slot": payload.get("reader_slot") or "",
+                "reader_label": payload.get("reader_label") or "",
                 "bytes_done": 0,
                 "bytes_total": total,
                 "speed_mbps": 0.0,
@@ -765,6 +1129,8 @@ def _launch_copy_thread(
     ssd_path: str,
     total: int,
     volume_serial: str = "",
+    reader_slot: str = "",
+    reader_label: str = "",
 ) -> None:
     with _lock:
         _cards[card_id] = {
@@ -775,6 +1141,8 @@ def _launch_copy_thread(
             "message": f"Queued → {dest}",
             "dest": str(dest),
             "ssd": ssd_path,
+            "reader_slot": reader_slot,
+            "reader_label": reader_label,
             "bytes_done": 0,
             "bytes_total": total,
             "speed_mbps": 0.0,
@@ -784,10 +1152,13 @@ def _launch_copy_thread(
             "started_at": time.time(),
         }
 
-    _log_line(f"{card_id}: starting copy → {dest} ({len(files)} files, {total} bytes)")
+    _log_line(
+        f"{card_id}: starting copy → {dest} ({len(files)} files, "
+        f"{total / (1024**3):.2f} GB, 10 GB SSD reserve)"
+    )
     thread = threading.Thread(
         target=_copy_card_worker,
-        args=(card_root, card_id, batch, mode, s3_uri, files, dest, prog),
+        args=(card_root, card_id, batch, mode, s3_uri, files, dest, prog, reader_slot, reader_label),
         daemon=True,
         name=f"copy-{card_id}",
     )
@@ -922,6 +1293,8 @@ def _copy_card_worker(
     files: list[dict],
     dest: Path,
     prog: dict,
+    reader_slot: str = "",
+    reader_label: str = "",
 ) -> None:
     total_bytes = inventory.total_bytes(files)
     _update_card(
@@ -1104,6 +1477,14 @@ def _copy_card_worker(
             expected = int(item.get("dest_size") or item["size"])
             if not dest_file.exists() or dest_file.stat().st_size != expected:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
+        for item in files:
+            rel = str(item.get("rel") or "")
+            if Path(rel).suffix.upper() != ".MP4":
+                continue
+            dest_mp4 = dest / (item.get("dest_rel") or rel)
+            sidecar = inventory.sidecar_for_mp4(dest_mp4)
+            if sidecar is None:
+                raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_mp4.name}")
 
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
@@ -1141,52 +1522,25 @@ def _copy_card_worker(
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        if mode == "ssd_and_aws" and s3_uri:
-            _update_card(card_id, status="uploading", message="Syncing batch folder to AWS…")
-            with _lock:
-                ssd1 = _session.get("ssd1") or ""
-                ssd2 = _session.get("ssd2") or ""
-            try:
-                # Flat batch layout: always sync whole Batches/<batch>/ (not a
-                # per-card subfolder). card_id is only a trigger label.
-                job = aws_upload.start_batch_upload(
-                    s3_uri=s3_uri,
-                    batch_name=batch,
-                    ssd1=ssd1,
-                    ssd2=ssd2,
-                    card_id=card_id,
-                    show_console=True,
-                )
-                coalesced = bool(job.get("pending_resync")) or "resync" in str(job.get("message") or "").lower()
-                _update_card(
-                    card_id,
-                    status="completed",
-                    message=(
-                        f"Ready — batch AWS upload already running; resync queued ({job.get('id')})"
-                        if coalesced
-                        else f"Ready — batch AWS upload live in UI ({job.get('id')})"
-                    ),
-                    speed_mbps=0,
-                    eta_seconds=0,
-                    bytes_done=total_bytes,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _update_card(
-                    card_id,
-                    status="completed",
-                    message=f"SSD copy done; AWS failed to start: {exc}",
-                )
-                _log_line(f"{card_id}: AWS enqueue failed: {exc}", kind="error")
-        else:
-            _update_card(
-                card_id,
-                status="completed",
-                message="Ready — card ejected (SSD only)",
-                speed_mbps=0,
-                eta_seconds=0,
-                bytes_done=total_bytes,
-            )
-
+        port = reader_slot or ""
+        label = reader_label or (f"Reader {port}" if port else "card reader")
+        done_msg = (
+            f"Offloading of {label} has completed, insert a new card in port {port}"
+            if port
+            else "Ready — card ejected"
+        )
+        _update_card(
+            card_id,
+            status="completed",
+            message=done_msg,
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+            reader_slot=port,
+            reader_label=label,
+        )
+        if port:
+            push_notice(done_msg, kind="ok")
         _log_line(f"{card_id}: complete → {dest}", kind="ok")
     except CopyCancelled as exc:
         _clear_cancel_requested(card_id)

@@ -15,7 +15,8 @@
           <p class="hint">
             Detects GoPro cards by <strong>DCIM/xxxGOPRO + MP4 + JSON</strong> (any volume name) ·
             up to <strong>3 cards in parallel</strong> · copy to dual SSDs ·
-            <strong>SSD + AWS</strong> after each card · target ~40×120&nbsp;GB / day
+            <strong>10 GB reserve</strong> · unique batch per disk ·
+            <strong>SSD + AWS ping-pong</strong> when a disk is copy-full
           </p>
         </div>
         <div class="header-meta">
@@ -58,8 +59,8 @@
           <label>
             Mode
             <select id="mode">
-              <option value="ssd_and_aws">SSD + AWS (auto upload after each card · recommended)</option>
-              <option value="ssd_only">SSD only (upload to AWS later)</option>
+              <option value="ssd_and_aws">SSD + AWS (upload a disk when it is copy-full · recommended)</option>
+              <option value="ssd_only">SSD only (keep Upload this batch to AWS for night runs)</option>
             </select>
           </label>
           <label>
@@ -85,7 +86,18 @@
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
+        <div id="disk-state" class="hint"></div>
         <div id="capacity-panel" class="capacity"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Card readers (ports 1–3)</h2>
+        <p class="hint">
+          One-time USB map. Insert a card, pick that drive, Map as Reader 1 / 2 / 3.
+          When a port finishes, a corner notice says to insert the next card in that port —
+          the other readers keep copying.
+        </p>
+        <div id="reader-map" class="reader-map"></div>
       </section>
 
       <section class="panel">
@@ -95,9 +107,8 @@
         </div>
         <p class="hint">
           After <strong>Start auto offload</strong>, keep the session running — new SD cards are
-          detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
-          and enter <strong>SD → SSD → AWS</strong> without starting again.
-          Plug up to your parallel limit at once; extras wait for a free slot.
+          detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name.
+          A card never splits across SSDs. Each disk uses its own batch number.
           Failures stay on screen with <strong>Retry</strong> (resumes; already-copied files are skipped).
           Mid-copy removal marks the card interrupted (Retry after re-insert).
           <strong>Cancel</strong> stops without wiping the card.
@@ -109,10 +120,12 @@
         <div>
           <h2>AWS uploads (batches)</h2>
           <p class="hint">
-            In <strong>SSD + AWS</strong> mode, each finished card triggers a batch sync to S3
-            (coalesced if one upload is already running). Prefers <strong>s5cmd</strong> with auto-retry.
-            Use <strong>Retry</strong> on errors (resume-safe), <strong>Verify sizes</strong>, then
-            <strong>Delete local</strong> only when verified.
+            In <strong>SSD + AWS</strong> mode, when a disk cannot take the next card with the
+            10&nbsp;GB reserve, that disk’s batch is frozen and <strong>s5cmd</strong> syncs it
+            while the other disk keeps ingesting. After two matching size checks, that batch is
+            deleted on that disk only and the next unique batch number opens.
+            <strong>Upload this batch to AWS</strong> still works for batches that are not full
+            (night). Verify, then <strong>Delete local</strong> only when verified.
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>
