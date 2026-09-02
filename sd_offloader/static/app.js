@@ -19,9 +19,129 @@ const el = {
   log: document.getElementById("log"),
   awsCliStatus: document.getElementById("aws-cli-status"),
   appVersion: document.getElementById("app-version"),
+  updateApp: document.getElementById("update-app"),
   maxParallel: document.getElementById("max-parallel"),
   capacityPanel: document.getElementById("capacity-panel"),
 };
+
+let updateState = "idle";
+const UPDATE_POPUP_KEY = "sdOffloaderUpdatePopup";
+
+function setUpdateState(state) {
+  updateState = state;
+  if (!el.updateApp) return;
+  el.updateApp.disabled = state !== "idle";
+  el.updateApp.textContent =
+    state === "idle" ? "Update" : state === "pulling" ? "Updating…" : "Restarting…";
+}
+
+function showUpdatePopup(message, kind = "ok") {
+  const popup = document.getElementById("update-popup");
+  const text = document.getElementById("update-popup-message");
+  if (!popup || !text) {
+    window.alert(message);
+    return;
+  }
+  text.textContent = message;
+  popup.classList.toggle("ok", kind !== "error");
+  popup.classList.toggle("error", kind === "error");
+  popup.classList.remove("hidden");
+}
+
+function hideUpdatePopup() {
+  document.getElementById("update-popup")?.classList.add("hidden");
+}
+
+function showPendingUpdatePopup() {
+  try {
+    const pending = sessionStorage.getItem(UPDATE_POPUP_KEY);
+    if (pending !== "success") return;
+    sessionStorage.removeItem(UPDATE_POPUP_KEY);
+    showUpdatePopup("Updated successfully", "ok");
+  } catch {
+    /* private mode / blocked storage */
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runUpdate() {
+  if (updateState !== "idle") return;
+  if (
+    !window.confirm(
+      "Pull the latest code from this PC's GitHub branch and restart the offloader?",
+    )
+  ) {
+    return;
+  }
+  setUpdateState("pulling");
+  setStatus("Checking GitHub for updates…");
+  try {
+    const res = await api("/api/update", { method: "POST", timeoutMs: 180000 });
+    if (!res.restarting) {
+      setUpdateState("idle");
+      setStatus(`Already up to date (${res.branch} @ ${res.after})`, "ok");
+      showUpdatePopup("Already up to date", "ok");
+      return;
+    }
+    setUpdateState("restarting");
+    setStatus(
+      `Updated ${res.branch}: ${res.before} → ${res.after} — restarting…`,
+      "ok",
+    );
+    try {
+      sessionStorage.setItem(UPDATE_POPUP_KEY, "success");
+    } catch {
+      /* ignore */
+    }
+    await sleep(4000);
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      try {
+        await api("/api/ping", { timeoutMs: 3000 });
+        window.location.reload();
+        return;
+      } catch {
+        await sleep(1500);
+      }
+    }
+    try {
+      sessionStorage.removeItem(UPDATE_POPUP_KEY);
+    } catch {
+      /* ignore */
+    }
+    setUpdateState("idle");
+    setStatus("Server did not come back — start it with run.bat, then reload this page", "error");
+    showUpdatePopup("Failed", "error");
+  } catch (error) {
+    setUpdateState("idle");
+    setStatus(error.message || "Update failed", "error");
+    showUpdatePopup("Failed", "error");
+  }
+}
+
+async function checkForUpdates() {
+  if (!el.updateApp) return;
+  try {
+    const check = await api("/api/update/check", { timeoutMs: 30000 });
+    if (check.branch) {
+      el.updateApp.title = check.behind
+        ? `New code on ${check.branch}: ${check.local} → ${check.remote}`
+        : `Pull latest ${check.branch} from GitHub and restart`;
+    }
+    el.updateApp.classList.toggle("behind", Boolean(check.behind));
+    if (check.behind) {
+      setStatus(
+        `New version on ${check.branch} (${check.local} → ${check.remote}) — press Update`,
+        "ok",
+      );
+    }
+  } catch {
+    /* offline / git missing — button still works if they retry */
+  }
+}
 
 async function api(url, options = {}) {
   const { timeoutMs = 15000, ...fetchOptions } = options;
@@ -559,7 +679,10 @@ function sessionPayload() {
   };
 }
 
+document.getElementById("update-popup-ok")?.addEventListener("click", hideUpdatePopup);
+
 async function bootstrap() {
+  showPendingUpdatePopup();
   setStatus("Connecting to offloader…");
   try {
     const health = await api("/api/ping", { timeoutMs: 5000 });
@@ -619,6 +742,7 @@ async function bootstrap() {
 
   pollStatus().catch(() => {});
   setInterval(() => pollStatus().catch(() => {}), 1000);
+  checkForUpdates().catch(() => {});
 }
 
 el.refreshVolumes.addEventListener("click", async () => {
@@ -710,6 +834,10 @@ el.uploadBatch.addEventListener("click", async () => {
   } catch (error) {
     setStatus(error.message, "error");
   }
+});
+
+el.updateApp?.addEventListener("click", () => {
+  runUpdate().catch((error) => setStatus(error.message, "error"));
 });
 
 el.testAws?.addEventListener("click", async () => {

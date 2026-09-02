@@ -248,6 +248,28 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify(result)
 
+    @app.get("/api/update/check")
+    def update_check():
+        """Return whether origin has commits the local checkout does not."""
+        from .self_update import check_for_updates
+
+        result = check_for_updates()
+        result["version"] = __version__
+        return jsonify(result)
+
+    @app.post("/api/update")
+    def self_update():
+        """Pull the checked-out GitHub branch and restart the offloader."""
+        from .self_update import pull_latest_current_branch, relaunch_and_exit
+
+        try:
+            result = pull_latest_current_branch()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        if result.get("changed"):
+            relaunch_and_exit()
+        return jsonify({"ok": True, "restarting": bool(result.get("changed")), **result})
+
     return app
 
 

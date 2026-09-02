@@ -24,5 +24,7 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 echo "Starting SD Card Offloader on port $PORT..."
-(sleep 2 && open "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 || true) &
+if [[ "${SD_OFFLOADER_OPEN_BROWSER:-1}" != "0" ]]; then
+  (sleep 2 && open "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 || true) &
+fi
 "$VENV_PY" -m offloader

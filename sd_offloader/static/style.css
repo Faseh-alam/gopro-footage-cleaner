@@ -36,6 +36,79 @@ header {
   align-items: start;
 }
 
+.header-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.45rem;
+}
+
+.header-update {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+}
+
+#update-app {
+  padding: 0.4rem 0.8rem;
+}
+
+#update-app.behind {
+  background: var(--accent);
+  border-color: transparent;
+  color: #041018;
+  font-weight: 700;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.update-popup {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 10, 16, 0.72);
+}
+
+.update-popup.hidden {
+  display: none;
+}
+
+.update-popup-card {
+  min-width: 280px;
+  max-width: 90vw;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1.15rem 1.25rem 1rem;
+  text-align: center;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+}
+
+.update-popup-card p {
+  margin: 0 0 1rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.update-popup.ok .update-popup-card p {
+  color: var(--ok);
+}
+
+.update-popup.error .update-popup-card p {
+  color: var(--danger);
+}
+
+.update-popup-card button {
+  min-width: 5.5rem;
+}
+
 .eyebrow {
   margin: 0;
   color: var(--accent);

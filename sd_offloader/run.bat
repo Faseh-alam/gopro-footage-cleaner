@@ -36,7 +36,7 @@ if errorlevel 1 (
 )
 
 set "PYTHONPATH=%CD%"
-set "SD_OFFLOADER_OPEN_BROWSER=1"
+if not defined SD_OFFLOADER_OPEN_BROWSER set "SD_OFFLOADER_OPEN_BROWSER=1"
 
 echo.
 echo === SD Card Offloader ===

@@ -20,7 +20,17 @@
         </div>
         <div class="header-meta">
           <span id="aws-cli-status" class="pill">Uploader…</span>
-          <span id="app-version" class="pill">v{{ version }}</span>
+          <div class="header-update">
+            <span id="app-version" class="pill">v{{ version }}</span>
+            <button
+              id="update-app"
+              type="button"
+              class="secondary"
+              title="Pull the latest code from this PC's GitHub branch and restart"
+            >
+              Update
+            </button>
+          </div>
         </div>
       </header>
 
@@ -111,6 +121,12 @@
           <div id="log" class="log"></div>
         </div>
       </section>
+    </div>
+    <div id="update-popup" class="update-popup hidden" role="dialog" aria-modal="true" aria-labelledby="update-popup-message">
+      <div class="update-popup-card">
+        <p id="update-popup-message"></p>
+        <button id="update-popup-ok" type="button" class="primary">OK</button>
+      </div>
     </div>
     <script src="/static/app.js?v={{ version }}"></script>
   </body>
