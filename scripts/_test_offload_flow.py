@@ -287,14 +287,32 @@ def main() -> int:
         print("  SKIP  ffmpeg/ffprobe not on PATH")
 
     print("\n[7] wipe transferred files on card A")
-    task_names = sorted({f["task"] for f in files_a if f.get("task")})
-    root_rels = sorted(f["rel"] for f in files_a if not f.get("task"))
-    eject.wipe_transferred_tasks(card_a, task_names, root_rels)
+    manifest = []
+    for f in files_a:
+        dest_rel = engine._flat_name(f.get("dest_rel") or f["rel"])
+        dest_file = batch_dest / dest_rel
+        manifest.append(
+            {
+                "source": f["source"],
+                "rel": f["rel"],
+                "dest_rel": dest_rel,
+                "dest": str(dest_file),
+                "size": int(f["size"]),
+                "dest_size": dest_file.stat().st_size if dest_file.is_file() else 0,
+                "kind": f.get("kind") or "mp4",
+                "verified": dest_file.is_file(),
+            }
+        )
+    eject.assert_wipe_allowed(card_a, manifest)
+    eject.wipe_verified_sources(card_a, [m["source"] for m in manifest])
     check("root MP4s + sidecar removed",
           not (gopro_a / "GX010001.MP4").exists()
           and not (gopro_a / "GX010001.segments.json").exists()
           and not (gopro_a / "GX010002.MP4").exists())
-    check("legacy task folder removed", not (gopro_a / "pipe-welding").exists())
+    check("legacy nested MP4 removed (folder may remain)",
+          not (gopro_a / "pipe-welding" / "GX019999.MP4").exists())
+    check("nested 100GOPRO MP4 removed",
+          not (gopro_a / "100GOPRO" / "GX101.MP4").exists())
     check("junk untouched (THM/LRV stay)", (gopro_a / "GX010001.THM").exists())
     check("progress file cleared", progress.load_progress(card_a) is None)
 

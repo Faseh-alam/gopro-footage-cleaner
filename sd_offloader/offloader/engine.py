@@ -1149,6 +1149,7 @@ def _launch_copy_thread(
             "eta_seconds": None,
             "files_total": len(files),
             "files_done": 0,
+            "files_verified": 0,
             "started_at": time.time(),
         }
 
@@ -1186,6 +1187,15 @@ def _flat_name(rel: str) -> str:
 def _is_sidecar_rel(rel: str) -> bool:
     lower = _flat_name(rel).lower()
     return lower.endswith(".segments.json") or lower.endswith(".json")
+
+
+def _pair_key(rel: str) -> str:
+    """Stable per-source pairing key (folder + stem), not the flattened dest name."""
+    text = str(rel or "").replace("\\", "/").strip()
+    lower = text.lower()
+    if lower.endswith(".segments.json"):
+        return text[: -len(".segments.json")]
+    return str(Path(text).with_suffix("")).replace("\\", "/")
 
 
 def _sidecar_stem(rel: str) -> str:
@@ -1252,13 +1262,14 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
             return
 
         name = _flat_name(rel)
+        pair = _pair_key(rel)
         base = _sidecar_stem(rel) if is_sidecar else Path(name).stem
         suffix = Path(name).suffix
         if _flat_name(rel).lower().endswith(".segments.json"):
             suffix = ".segments.json"
 
         if is_sidecar:
-            final_base = _flat_name(stem_map.get(base, base)) or base
+            final_base = _flat_name(stem_map.get(pair, base)) or base
             if recorded:
                 item["dest_rel"] = recorded
             elif suffix.lower() == ".segments.json":
@@ -1270,7 +1281,7 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
 
         if recorded:
             item["dest_rel"] = recorded
-            stem_map[base] = Path(recorded).stem
+            stem_map[pair] = Path(recorded).stem
             claimed.add(recorded.lower())
             return
 
@@ -1281,16 +1292,16 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         existing = pairing.find_existing_dest_name(
             dest, name, card_mp4_size=card_size, sidecar=sidecar_payload
         )
-        if existing:
-            flat = _flat_name(existing)
-            item["dest_rel"] = flat
-            stem_map[base] = Path(flat).stem
-            claimed.add(flat.lower())
+        flat_existing = _flat_name(existing) if existing else ""
+        if existing and flat_existing.lower() not in claimed:
+            item["dest_rel"] = flat_existing
+            stem_map[pair] = Path(flat_existing).stem
+            claimed.add(flat_existing.lower())
             return
 
         dest_rel = _claim_flat_name(claimed, dest, base, suffix or Path(name).suffix, card_id, rel)
         item["dest_rel"] = dest_rel
-        stem_map[base] = Path(dest_rel).stem
+        stem_map[pair] = Path(dest_rel).stem
 
     # MP4s first so sidecar rename can follow collision suffixes.
     for item in files:
@@ -1337,14 +1348,14 @@ def _copy_card_worker(
         bytes_total=total_bytes,
         files_done=0,
         files_total=len(files),
+        files_verified=0,
         speed_mbps=0.0,
         eta_seconds=None,
     )
     started = time.time()
     done_bytes = 0
     files_done = 0
-    task_names = sorted({f["task"] for f in files if f.get("task")})
-    root_rels = sorted(f["rel"] for f in files if not f.get("task"))
+    files_verified = 0
     with _dest_batch_lock(dest):
         _resolve_dest_names(files, dest, prog, card_id)
     last_ui = 0.0
@@ -1379,6 +1390,7 @@ def _copy_card_worker(
             "bytes_total": total_bytes,
             "files_done": files_done,
             "files_total": len(files),
+            "files_verified": files_verified,
             "speed_mbps": round(speed, 2),
             "eta_seconds": eta,
         }
@@ -1497,45 +1509,76 @@ def _copy_card_worker(
             )
 
         _update_card(card_id, status="verifying", message=f"Verifying {dest}…", dest=str(dest))
+        manifest: list[dict] = []
         for item in files:
             if _is_cancel_requested(card_id):
                 raise CopyCancelled(f"{card_id}: cancelled by operator")
-            dest_file = dest / _flat_name(item.get("dest_rel") or item["rel"])
+            dest_rel = _flat_name(item.get("dest_rel") or item["rel"])
+            dest_file = dest / dest_rel
             expected = int(item.get("dest_size") or item["size"])
-            if not dest_file.exists() or dest_file.stat().st_size != expected:
-                raise RuntimeError(f"Verify failed: {item['rel']} missing under {dest}")
-        for item in files:
-            rel = str(item.get("rel") or "")
-            if Path(_flat_name(rel)).suffix.upper() != ".MP4":
-                continue
-            dest_mp4 = dest / _flat_name(item.get("dest_rel") or rel)
-            sidecar = inventory.sidecar_for_mp4(dest_mp4)
-            if sidecar is None:
-                raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_mp4.name}")
-
-        prog["status"] = "complete"
-        progress.save_progress(card_root, prog)
-
-        # Mark DONE before wipe/eject so a mid-wipe watcher pass cannot flip us to ERROR.
+            kind = str(item.get("kind") or "")
+            if not kind:
+                kind = (
+                    "mp4"
+                    if Path(dest_rel).suffix.upper() == ".MP4"
+                    else "json"
+                )
+            verified = False
+            try:
+                verified = dest_file.is_file() and dest_file.stat().st_size == expected
+            except OSError:
+                verified = False
+            if kind == "mp4" and verified and inventory.sidecar_for_mp4(dest_file) is None:
+                raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_file.name}")
+            if not verified:
+                raise RuntimeError(f"Verify failed: {item['rel']} missing or wrong size under {dest}")
+            manifest.append(
+                {
+                    "source": str(item.get("source") or ""),
+                    "rel": item.get("rel"),
+                    "dest_rel": dest_rel,
+                    "dest": str(dest_file),
+                    "size": int(item.get("size") or 0),
+                    "dest_size": expected,
+                    "kind": kind,
+                    "verified": True,
+                }
+            )
+        files_verified = len(manifest)
+        verify_msg = f"{files_verified} / {len(files)} files verified"
         _update_card(
             card_id,
-            status="completed",
-            message="Copy verified — wiping & ejecting…",
+            status="verifying",
+            message=verify_msg,
             dest=str(dest),
-            speed_mbps=0,
-            eta_seconds=0,
-            bytes_done=total_bytes,
+            files_verified=files_verified,
+            files_total=len(files),
+            files_done=files_verified,
         )
+        _log_line(f"{card_id}: {verify_msg}", kind="ok")
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        try:
-            _update_card(card_id, status="wiping", message="Wiping transferred files on card…")
-            # Keep completed semantics if wipe/eject races the watcher.
-            eject.wipe_transferred_tasks(card_root, task_names, root_rels)
-        except Exception as wipe_exc:  # noqa: BLE001
-            _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
+        eject.assert_wipe_allowed(card_root, manifest)
+
+        prog["status"] = "complete"
+        progress.save_progress(card_root, prog)
+
+        _update_card(
+            card_id,
+            status="wiping",
+            message=f"{verify_msg} — wiping verified files on card…",
+            dest=str(dest),
+            files_verified=files_verified,
+            files_total=len(files),
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
+        eject.wipe_verified_sources(
+            card_root, [str(row["source"]) for row in manifest if row.get("source")]
+        )
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
@@ -1563,6 +1606,8 @@ def _copy_card_worker(
             speed_mbps=0,
             eta_seconds=0,
             bytes_done=total_bytes,
+            files_verified=files_verified,
+            files_total=len(files),
             reader_slot=port,
             reader_label=label,
         )

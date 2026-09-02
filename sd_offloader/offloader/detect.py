@@ -259,41 +259,15 @@ def _sidecar_paths_for_mp4(mp4: Path) -> list[Path]:
 
 
 def _gopro_dir_has_media(gopro: Path) -> bool:
-    """True when folder has ≥1 MP4 and a relevant JSON sidecar (or legacy task MP4s)."""
+    """True when any nested folder under xxxGOPRO has an MP4 (JSON checked later)."""
     try:
-        entries = list(gopro.iterdir())
+        for path in gopro.rglob("*"):
+            if not path.is_file() or path.name.startswith("._"):
+                continue
+            if path.suffix.upper() == ".MP4":
+                return True
     except OSError:
         return False
-
-    mp4s = [
-        e
-        for e in entries
-        if e.is_file() and e.suffix.upper() == ".MP4" and not e.name.startswith("._")
-    ]
-    jsons = [e for e in entries if e.is_file() and is_json_sidecar(e.name)]
-
-    # Primary layout: MP4 + matching .JSON / .segments.json
-    for mp4 in mp4s:
-        for side in _sidecar_paths_for_mp4(mp4):
-            if side.is_file():
-                return True
-    if mp4s and jsons:
-        return True
-
-    # Legacy pre-trimmed task folders under ###GOPRO
-    for entry in entries:
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        try:
-            children = list(entry.iterdir())
-        except OSError:
-            continue
-        has_mp4 = any(
-            c.is_file() and c.suffix.upper() == ".MP4" and not c.name.startswith("._")
-            for c in children
-        )
-        if has_mp4:
-            return True
     return False
 
 

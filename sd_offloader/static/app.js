@@ -486,6 +486,11 @@ function renderCards(cards) {
         : card.status === "interrupted"
           ? "interrupted — Retry"
           : card.status || "";
+    const total = Number(card.files_total || 0);
+    const verified = Number(card.files_verified || 0);
+    const fileLabel = ["verifying", "wiping", "ejecting", "completed"].includes(card.status)
+      ? `${verified || card.files_done || 0} / ${total} files verified`
+      : `${card.files_done || 0}/${total} files`;
     const div = document.createElement("div");
     div.className =
       "card" + (canRetry ? " card-error" : "") + (card.status === "removed" ? " card-removed" : "");
@@ -503,7 +508,7 @@ function renderCards(cards) {
         <span>${formatBytes(card.bytes_done || 0)} / ${formatBytes(card.bytes_total || 0)}</span>
         <span>${Number(card.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(card.eta_seconds)}</span>
-        <span>${card.files_done || 0}/${card.files_total || 0} files</span>
+        <span>${fileLabel}</span>
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${escapeHtml(card.message || "")}</div>
