@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voiceover Player</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <span class="mark"></span>
+          <div>
+            <h1>Voiceover Player</h1>
+            <p>Space plays video · R records voiceover with the picture</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button id="demoBtn" class="file-btn" type="button">Load demo clip</button>
+          <label class="file-btn">
+            Open video
+            <input id="file" type="file" accept="video/*" hidden />
+          </label>
+          <button id="exportBtn" class="file-btn" type="button">Export video</button>
+          <button id="folderBtn" class="file-btn" type="button">Open recordings folder</button>
+          <div id="recBadge" class="badge" hidden>
+            <span class="dot"></span>
+            REC
+          </div>
+        </div>
+      </header>
+
+      <main class="stage">
+        <section class="player-card">
+          <div id="drop" class="viewport">
+            <video id="video" playsinline muted></video>
+            <div id="empty" class="empty">
+              <strong>Open a video to begin</strong>
+              <span>Voiceover only — the clip’s own audio stays muted</span>
+            </div>
+            <div id="pauseHint" class="pause-hint" hidden>
+              Video paused · microphone still recording
+            </div>
+          </div>
+
+          <div class="meters">
+            <div class="meter-row">
+              <span class="meter-label">Played</span>
+              <div
+                id="playBar"
+                class="bar play-bar"
+                role="slider"
+                tabindex="0"
+                aria-label="Video position"
+                aria-valuemin="0"
+                aria-valuenow="0"
+                aria-valuemax="0"
+                title="Drag or click to scrub. Space plays from here. R still records from the last R stop."
+              >
+                <div id="playFill" class="fill play-fill"></div>
+                <div id="playHead" class="head play-head"></div>
+                <div id="resumeMark" class="resume-mark" title="Last R stop"></div>
+              </div>
+              <span id="timeLabel" class="time">0:00 / 0:00</span>
+            </div>
+            <div class="meter-row">
+              <span class="meter-label">Voice</span>
+              <div
+                id="coverBar"
+                class="bar cover-bar"
+                title="How long the microphone has been recording, including time while the picture is paused."
+              >
+                <div id="coverFill" class="fill cover-fill"></div>
+                <div id="liveFill" class="fill live-fill"></div>
+              </div>
+              <span id="coverLabel" class="time">0:00 voice</span>
+            </div>
+          </div>
+
+          <div class="status-row">
+            <p id="status">Load a video, then press Space or R.</p>
+            <p id="micClock" class="mic-clock" hidden>Mic 0:00</p>
+          </div>
+        </section>
+
+        <aside class="side">
+          <h2>Takes</h2>
+          <p class="side-note">
+            Each R → R pair is one take. Export builds one MP4 with your
+            voiceover; paused picture is freeze-framed so the audio can be longer.
+          </p>
+          <ol id="takes" class="takes">
+            <li class="muted">No takes yet</li>
+          </ol>
+          <p id="exportLink" class="side-note" hidden></p>
+          <dl class="keys">
+            <div><dt>Space</dt><dd>Play / pause video only</dd></div>
+            <div><dt>R</dt><dd>Start or stop video + microphone</dd></div>
+          </dl>
+        </aside>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

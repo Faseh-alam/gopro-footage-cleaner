@@ -1,0 +1,390 @@
+:root {
+  --bg: #0b0c10;
+  --card: #14161c;
+  --line: #2a2e38;
+  --text: #f3f1ea;
+  --muted: #9aa0ad;
+  --red: #e11d2e;
+  --red-dim: #7a121c;
+  --voice: #2ee6b0;
+  --voice-dim: #0d3d32;
+  --warn: #ffb020;
+  --radius: 18px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, #2a1014 0%, transparent 55%),
+    radial-gradient(900px 400px at 100% 0%, #10261f 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: Outfit, "Segoe UI", sans-serif;
+}
+
+.app {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 22px 40px;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.mark {
+  width: 14px;
+  height: 42px;
+  border-radius: 99px;
+  background: linear-gradient(180deg, var(--red), #7c1020);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: -0.03em;
+}
+
+.brand p,
+.side-note,
+.muted,
+.empty span {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.file-btn,
+.badge {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-weight: 600;
+  font-size: 0.86rem;
+  color: var(--text);
+}
+
+.file-btn {
+  background: #1c2028;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.file-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.export-link a {
+  color: var(--voice);
+}
+
+.badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #3a0d12;
+  border-color: var(--red);
+  color: #ffd6d9;
+  letter-spacing: 0.12em;
+}
+
+.badge .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 0 0 rgba(225, 29, 46, 0.7);
+  animation: pulse 1.2s infinite;
+}
+
+@keyframes pulse {
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+}
+
+.stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 18px;
+}
+
+.player-card,
+.side {
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  backdrop-filter: blur(10px);
+}
+
+.viewport {
+  position: relative;
+  background: #000;
+  border-radius: var(--radius) var(--radius) 0 0;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+}
+
+video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.empty,
+.pause-hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.empty {
+  background: linear-gradient(180deg, #0e1016, #151820);
+}
+
+.pause-hint {
+  align-content: end;
+  padding-bottom: 18px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.meters {
+  padding: 16px 18px 8px;
+  display: grid;
+  gap: 12px;
+}
+
+.meter-row {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) 118px;
+  gap: 10px;
+  align-items: center;
+}
+
+.meter-label,
+.time,
+.mic-clock,
+.keys dt {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.74rem;
+}
+
+.meter-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.time {
+  text-align: right;
+  color: #d8dbe3;
+}
+
+.bar {
+  position: relative;
+  height: 10px;
+  border-radius: 99px;
+  background: #2a2e38;
+  overflow: hidden;
+}
+
+.play-bar {
+  height: 14px;
+  overflow: visible;
+  background: #2f333d;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.play-bar::before {
+  content: "";
+  position: absolute;
+  inset: -12px 0;
+}
+
+.play-bar.is-locked {
+  cursor: not-allowed;
+}
+
+.play-bar:hover .play-head,
+.play-bar.is-seeking .play-head {
+  transform: translate(-50%, -50%) scale(1.15);
+}
+
+.fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+}
+
+.fill,
+.head,
+.resume-mark,
+.live-fill {
+  pointer-events: none;
+}
+
+.play-fill {
+  background: var(--red);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--red) 50%, transparent);
+  border-radius: 99px 0 0 99px;
+}
+
+.cover-fill {
+  background: var(--voice);
+}
+
+.head {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px var(--red);
+  transform: translate(-50%, -50%);
+  z-index: 2;
+}
+
+.live-fill {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--voice) 0 8px,
+    #7dffd0 8px 12px
+  );
+  opacity: 0.85;
+}
+
+.resume-mark {
+  position: absolute;
+  top: -5px;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 8px solid var(--voice);
+  left: 0%;
+  display: none;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 18px 16px;
+}
+
+.status-row p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.mic-clock {
+  color: var(--warn);
+}
+
+.side {
+  padding: 18px 18px 14px;
+}
+
+.side h2 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.takes {
+  list-style: none;
+  margin: 14px 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.takes li {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #1b1e26;
+  border: 1px solid var(--line);
+  font-size: 0.86rem;
+}
+
+.takes li span {
+  display: block;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.74rem;
+  margin-top: 4px;
+}
+
+.keys {
+  margin: 18px 0 0;
+  display: grid;
+  gap: 8px;
+}
+
+.keys div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.keys dt {
+  background: #1b1e26;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.keys dd {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+@media (max-width: 900px) {
+  .stage {
+    grid-template-columns: 1fr;
+  }
+}
