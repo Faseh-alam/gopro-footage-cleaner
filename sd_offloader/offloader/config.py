@@ -19,9 +19,10 @@ DEFAULT_CONFIG = {
     "ssd1": "",
     "ssd2": "",
     "last_batch": "",
-    "disk_batches": {},  # path_key → live batch name (resume after restart)
+    "disk_batches": {},  # path_key → active (receiving cards) batch name
     "disk_completed": {},  # path_key → last verified-and-deleted batch
-    "frozen_disks": {},  # path_key → batch frozen for AWS upload
+    "closed_batches": {},  # path_key → list of batches closed for offload, still on disk
+    "frozen_disks": {},  # path_key → closed batch currently uploading (does not block new cards)
     "mode": "ssd_and_aws",  # ssd_only | ssd_and_aws — ping-pong upload when a disk is copy-full
     "port": 8877,
     "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)

@@ -431,6 +431,87 @@ button.danger {
   color: var(--warn);
 }
 
+.disk-state {
+  margin-top: 0.85rem;
+}
+
+.disk-card-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.disk-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0d1117;
+  padding: 0.75rem 0.85rem;
+}
+
+.disk-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.disk-card-title {
+  font-weight: 650;
+  font-size: 0.95rem;
+}
+
+.disk-card-active {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin-top: 0.15rem;
+}
+
+.disk-batch-list {
+  list-style: none;
+  margin: 0.65rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.28rem;
+}
+
+.disk-batch {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.disk-batch-active {
+  color: var(--ok);
+}
+
+.disk-batch-uploading,
+.disk-batch-verifying {
+  color: var(--accent);
+}
+
+.disk-batch-waiting {
+  color: var(--muted);
+}
+
+.disk-batch-failed {
+  color: var(--danger);
+}
+
+.disk-batch-verified,
+.disk-batch-cleaned,
+.disk-batch-completed {
+  color: var(--ok);
+}
+
+.batch-complete-btn {
+  white-space: nowrap;
+}
+
+@media (max-width: 800px) {
+  .disk-card-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .capacity {
   margin-top: 0.85rem;
   padding: 0.75rem 0.9rem;

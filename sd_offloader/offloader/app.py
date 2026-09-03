@@ -103,6 +103,19 @@ def create_app() -> Flask:
     def session_stop():
         return jsonify(engine.stop_session())
 
+    @app.post("/api/batch/complete")
+    def batch_complete():
+        """Close the active batch for new offload only — does not delete or finish AWS."""
+        payload = request.get_json(silent=True) or {}
+        ssd = str(payload.get("ssd") or "").strip()
+        if not ssd:
+            return jsonify({"error": "ssd required (1, 2, or a path)"}), 400
+        try:
+            result = engine.close_active_batch_for_ui(ssd)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
     @app.post("/api/card/cancel")
     def card_cancel():
         payload = request.get_json(silent=True) or {}

@@ -397,25 +397,110 @@ async function mapReader(slot) {
   }
 }
 
-function renderDiskState(diskBatches, frozenDisks, session) {
-  if (!el.diskState) return;
-  const batches = diskBatches || {};
-  const frozen = frozenDisks || {};
-  const ssd1 = session?.ssd1 || "";
-  const ssd2 = session?.ssd2 || "";
-  const parts = [];
-  const describe = (label, path) => {
-    if (!path) return;
-    const key = Object.keys(batches).find((k) => k.toLowerCase() === path.toLowerCase()) || path.toLowerCase();
-    const batch = batches[key] || batches[path] || "";
-    const isFrozen = Boolean(frozen[key] || frozen[path]);
-    parts.push(
-      `${label}: ${batch || "no live batch"}${isFrozen ? " (uploading / frozen)" : ""}`,
-    );
+function batchStateLabel(item) {
+  if (!item) return "";
+  if (item.role === "active" || item.state === "active") return "Active · offloading";
+  const aws = item.aws || item.state || "waiting";
+  const map = {
+    waiting: "Closed · waiting for upload",
+    uploading: "Closed · uploading",
+    verifying: "Closed · verifying",
+    verified: "Closed · verified",
+    failed: "Closed · failed / waiting",
+    cleaned: "Completed · cleaned",
+    completed: "Completed",
   };
-  describe("SSD1", ssd1);
-  describe("SSD2", ssd2);
-  el.diskState.textContent = parts.length ? parts.join(" · ") : "";
+  return map[aws] || `Closed · ${aws}`;
+}
+
+function renderDiskState(diskBatches, frozenDisks, session, diskBatchStates) {
+  if (!el.diskState) return;
+  const states = diskBatchStates || {};
+  const ssd1 = session?.ssd1 || states.ssd1?.path || "";
+  const ssd2 = session?.ssd2 || states.ssd2?.path || "";
+  const cards = [];
+  const renderCard = (slot, label, path, row) => {
+    if (!path && !row) return;
+    const active = row?.active || "";
+    const batches = row?.batches || [];
+    const list = batches.length
+      ? batches
+          .map((item) => {
+            const kind = item.role === "active" ? "active" : item.aws || "waiting";
+            return `<li class="disk-batch disk-batch-${kind}"><strong>${item.name}</strong> — ${batchStateLabel(item)}</li>`;
+          })
+          .join("")
+      : `<li class="disk-batch">${active ? `${active} — Active · offloading` : "no live batch"}</li>`;
+    const canClose = Boolean(active);
+    cards.push(`
+      <div class="disk-card">
+        <div class="disk-card-head">
+          <div>
+            <div class="disk-card-title">${label}</div>
+            <div class="disk-card-active">Current batch: <strong>${active || "—"}</strong></div>
+          </div>
+          <button
+            type="button"
+            class="secondary batch-complete-btn"
+            data-complete-ssd="${slot}"
+            data-complete-batch="${active || ""}"
+            ${canClose ? "" : "disabled"}
+            title="Stop adding SD cards to this batch. AWS upload continues separately. Does not delete."
+          >Batch Completed</button>
+        </div>
+        <ul class="disk-batch-list">${list}</ul>
+      </div>
+    `);
+  };
+  renderCard("1", "SSD 1", ssd1, states.ssd1);
+  renderCard("2", "SSD 2", ssd2, states.ssd2);
+  if (!cards.length) {
+    const batches = diskBatches || {};
+    const frozen = frozenDisks || {};
+    const parts = [];
+    const describe = (label, path) => {
+      if (!path) return;
+      const key = Object.keys(batches).find((k) => k.toLowerCase() === path.toLowerCase()) || path.toLowerCase();
+      const batch = batches[key] || batches[path] || "";
+      const isFrozen = Boolean(frozen[key] || frozen[path]);
+      parts.push(`${label}: ${batch || "no live batch"}${isFrozen ? " (uploading)" : ""}`);
+    };
+    describe("SSD1", ssd1);
+    describe("SSD2", ssd2);
+    el.diskState.textContent = parts.join(" · ");
+    return;
+  }
+  el.diskState.innerHTML = `<div class="disk-card-grid">${cards.join("")}</div>`;
+}
+
+async function completeActiveBatch(slot) {
+  const btn = el.diskState?.querySelector(`[data-complete-ssd="${slot}"]`);
+  const batch = btn?.dataset?.completeBatch || "this batch";
+  const ok = window.confirm(
+    `Close ${batch} for NEW offloading on SSD ${slot}?\n\n` +
+      "This does NOT delete the folder and does NOT mean AWS upload is finished.\n" +
+      "The next batch will become active so you can keep copying SD cards.",
+  );
+  if (!ok) return;
+  try {
+    const data = await api("/api/batch/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssd: String(slot) }),
+    });
+    setStatus(
+      `${data.closed} closed for new cards — now offloading to ${data.active} (AWS can finish later)`,
+      "ok",
+    );
+    showNotice(
+      `${data.closed} closed — ${data.active} is now active. Old batch was not deleted.`,
+      "ok",
+    );
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+    showNotice(error.message || "Batch Completed failed", "error");
+  }
 }
 
 function consumeServerNotices(notices) {
@@ -826,7 +911,7 @@ async function pollStatus() {
     renderAwsJobs(data.aws_jobs || []);
     renderLog(data.log || []);
     renderCapacity(data.capacity, data.parallel);
-    renderDiskState(data.disk_batches, data.frozen_disks, session);
+    renderDiskState(data.disk_batches, data.frozen_disks, session, data.disk_batch_states);
     consumeServerNotices(data.notices);
   } catch {
     /* ignore transient */
@@ -1000,6 +1085,12 @@ el.uploadBatch.addEventListener("click", async () => {
 
 el.updateApp?.addEventListener("click", () => {
   runUpdate().catch((error) => setStatus(error.message, "error"));
+});
+
+el.diskState?.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-complete-ssd]");
+  if (!btn || btn.disabled) return;
+  void completeActiveBatch(btn.dataset.completeSsd);
 });
 
 el.testAws?.addEventListener("click", async () => {

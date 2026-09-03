@@ -16,7 +16,7 @@
             Detects GoPro cards by <strong>DCIM/xxxGOPRO + MP4 + JSON</strong> (any volume name) ·
             up to <strong>3 cards in parallel</strong> · copy to dual SSDs ·
             <strong>10 GB reserve</strong> · same batch number on both SSDs ·
-            <strong>SSD + AWS ping-pong</strong> when a disk is copy-full
+            <strong>Batch Completed</strong> closes a disk for new cards (AWS can finish later)
           </p>
         </div>
         <div class="header-meta">
@@ -86,7 +86,7 @@
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
-        <div id="disk-state" class="hint"></div>
+        <div id="disk-state" class="disk-state"></div>
         <div id="capacity-panel" class="capacity"></div>
       </section>
 
@@ -120,13 +120,14 @@
         <div>
           <h2>AWS uploads (batches)</h2>
           <p class="hint">
-            In <strong>SSD + AWS</strong> mode, when a disk cannot take the next card with the
-            10&nbsp;GB reserve, that disk’s batch is frozen and <strong>s5cmd</strong> syncs it
-            while the other disk keeps ingesting. After two matching size checks, that batch is
-            deleted on that disk only and the next cycle number opens on that disk
-            (both SSDs use batch01, then both use batch02 — they do not skip ahead of each other).
-            <strong>Upload this batch to AWS</strong> still works for batches that are not full
-            (night). Verify, then <strong>Delete local</strong> only when verified.
+            In <strong>SSD + AWS</strong> mode, a batch is closed for new cards when the disk
+            cannot take the next card (10&nbsp;GB reserve) or when you click
+            <strong>Batch Completed</strong>. Closing does <em>not</em> delete the folder and does
+            <em>not</em> mean AWS is done — older closed batches upload, verify, and clean up
+            independently while the new active batch keeps receiving cards.
+            Both SSDs still start at the same cycle number and only advance on their own disk.
+            <strong>Upload this batch to AWS</strong> still works for a selected folder (night).
+            Verify, then <strong>Delete local</strong> only when verified.
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>

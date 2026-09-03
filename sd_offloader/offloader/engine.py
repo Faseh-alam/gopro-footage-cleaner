@@ -23,6 +23,7 @@ _session: dict = {
     "started_at": None,
     "disk_batches": {},
     "disk_completed": {},
+    "closed_batches": {},
     "frozen_disks": {},
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
@@ -147,6 +148,8 @@ def restore_ui_state() -> None:
                 _session["disk_completed"] = dict(cfg.get("disk_completed") or {})
             if not _session.get("disk_batches"):
                 _session["disk_batches"] = dict(cfg.get("disk_batches") or {})
+            if not _session.get("closed_batches"):
+                _session["closed_batches"] = dict(cfg.get("closed_batches") or {})
             if not _session.get("frozen_disks"):
                 _session["frozen_disks"] = dict(cfg.get("frozen_disks") or {})
         if _session.get("active"):
@@ -182,8 +185,10 @@ def get_status() -> dict:
             "readers": readers.saved_readers(),
             "disk_batches": dict(_session.get("disk_batches") or {}),
             "disk_completed": dict(_session.get("disk_completed") or {}),
+            "closed_batches": dict(_session.get("closed_batches") or {}),
             "frozen_disks": dict(_session.get("frozen_disks") or {}),
         }
+    status["disk_batch_states"] = _disk_batch_states()
     _save_snapshot(force=False)
     return status
 
@@ -256,6 +261,7 @@ def start_session(
         prev_batches = dict(_session.get("disk_batches") or cfg.get("disk_batches") or {})
         prev_frozen = dict(_session.get("frozen_disks") or cfg.get("frozen_disks") or {})
         prev_completed = dict(_session.get("disk_completed") or cfg.get("disk_completed") or {})
+        prev_closed = dict(_session.get("closed_batches") or cfg.get("closed_batches") or {})
         new_keys = {space.path_key(p) for p in (ssd1_path, ssd2_path) if p}
         _session.update(
             {
@@ -268,6 +274,7 @@ def start_session(
                 "started_at": time.time(),
                 "disk_batches": {k: v for k, v in prev_batches.items() if k in new_keys},
                 "disk_completed": {k: v for k, v in prev_completed.items() if k in new_keys},
+                "closed_batches": {k: v for k, v in prev_closed.items() if k in new_keys},
                 "frozen_disks": {k: v for k, v in prev_frozen.items() if k in new_keys},
             }
         )
@@ -289,6 +296,7 @@ def start_session(
     _persist_disk_state()
     _ensure_watcher()
     _ensure_watchdog()
+    _pump_closed_uploads()
     _log_line(
         f"Session started: {batch} ({mode}) — hotplug armed "
         "(insert/remove SDs anytime; same batch number on both SSDs; 10 GB SSD reserve)"
@@ -461,6 +469,10 @@ def run_watchdog_once() -> None:
         notes.extend(aws_upload.watchdog_pass())
     except Exception as exc:  # noqa: BLE001
         notes.append(f"AWS pass: {exc}")
+    try:
+        _pump_closed_uploads()
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"closed-batch upload queue: {exc}")
     for line in notes:
         _log_line(f"Watchdog: {line}", kind="ok")
 
@@ -755,11 +767,12 @@ def _committed_bytes_by_ssd(*, exclude_card: str = "") -> dict[str, int]:
 
 
 def _persist_disk_state() -> None:
-    """Write live/completed/frozen batch maps so a restart can resume."""
+    """Write live/completed/closed/frozen batch maps so a restart can resume."""
     with _lock:
         payload = {
             "disk_batches": dict(_session.get("disk_batches") or {}),
             "disk_completed": dict(_session.get("disk_completed") or {}),
+            "closed_batches": dict(_session.get("closed_batches") or {}),
             "frozen_disks": dict(_session.get("frozen_disks") or {}),
         }
     save_config(payload)
@@ -791,8 +804,257 @@ def _ssd_key_from_batch_folder(path: str | Path, ssd1: str, ssd2: str) -> str:
     return space.path_key(resolved)
 
 
+def _resolve_ssd_arg(ssd: str) -> str:
+    """Map UI values ``1`` / ``2`` / a path onto the session SSD path."""
+    raw = (ssd or "").strip()
+    with _lock:
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+    lowered = raw.lower().replace(" ", "")
+    if lowered in {"1", "ssd1"}:
+        if not ssd1:
+            raise ValueError("SSD 1 is not set — Start auto offload first")
+        return ssd1
+    if lowered in {"2", "ssd2"}:
+        if not ssd2:
+            raise ValueError("SSD 2 is not set — Start auto offload first")
+        return ssd2
+    if not raw:
+        raise ValueError("SSD required")
+    path = str(Path(raw).expanduser().resolve())
+    known = {space.path_key(p): p for p in (ssd1, ssd2) if p}
+    key = space.path_key(path)
+    if known and key not in known:
+        raise ValueError("SSD does not match SSD 1 or SSD 2 for this session")
+    return known.get(key, path)
+
+
+def _closed_names(key: str) -> list[str]:
+    with _lock:
+        raw = (_session.get("closed_batches") or {}).get(key) or []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _folder_has_transfer_files(folder: Path) -> bool:
+    try:
+        if not folder.is_dir():
+            return False
+        return any(folder.iterdir())
+    except OSError:
+        return False
+
+
+def _aws_status_for_folder(ssd_path: str, batch_name: str) -> str:
+    """Map AWS jobs for this SSD folder: waiting / uploading / verifying / verified / failed."""
+    folder = str(space.batch_root(ssd_path, batch_name))
+    folder_l = folder.replace("\\", "/").rstrip("/").lower()
+    jobs = aws_upload.list_jobs()
+    matched: dict | None = None
+    for job in jobs:
+        if str(job.get("batch") or "").strip() != batch_name:
+            continue
+        sources = [str(s).replace("\\", "/").rstrip("/").lower() for s in (job.get("sources") or [])]
+        if folder_l in sources or any(folder_l in s or s in folder_l for s in sources):
+            matched = job
+            break
+    if not matched:
+        return "waiting"
+    status = str(matched.get("status") or "")
+    if status in {"running", "checking", "cancelling"}:
+        return "uploading"
+    if status == "completed":
+        return "verifying"
+    if status == "verified":
+        return "verified"
+    if status == "deleted_local":
+        return "cleaned"
+    if status in {"error", "mismatch", "interrupted", "cancelled"}:
+        return "failed"
+    return status or "waiting"
+
+
+def _ssd_has_running_upload(ssd_path: str) -> bool:
+    key = space.path_key(ssd_path)
+    for name in _closed_names(key):
+        if _aws_status_for_folder(ssd_path, name) == "uploading":
+            return True
+    return False
+
+
+def _start_closed_batch_upload(ssd_path: str, batch_name: str) -> dict | None:
+    with _lock:
+        mode = str(_session.get("mode") or "")
+        s3_uri = str(_session.get("s3_uri") or "")
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+    if mode != "ssd_and_aws" or not s3_uri:
+        return None
+    folder = space.batch_root(ssd_path, batch_name)
+    if not _folder_has_transfer_files(folder):
+        return None
+    key = space.path_key(ssd_path)
+    only1 = ssd_path if ssd1 and space.path_key(ssd1) == key else ""
+    only2 = ssd_path if ssd2 and space.path_key(ssd2) == key else ""
+    if not only1 and not only2:
+        only1 = ssd_path
+        only2 = ""
+    job = aws_upload.start_batch_upload(
+        s3_uri=s3_uri,
+        batch_name=batch_name,
+        ssd1=only1 or (ssd_path if not only2 else ""),
+        ssd2=only2,
+        card_id=None,
+        auto_delete=True,
+    )
+    with _lock:
+        frozen = dict(_session.get("frozen_disks") or {})
+        frozen[key] = batch_name
+        _session["frozen_disks"] = frozen
+    _persist_disk_state()
+    return job
+
+
+def _pump_closed_uploads() -> None:
+    """Start at most one AWS upload per SSD for the oldest closed batch that needs it."""
+    with _lock:
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+        mode = str(_session.get("mode") or "")
+    if mode != "ssd_and_aws":
+        return
+    for ssd_path in (ssd1, ssd2):
+        if not ssd_path:
+            continue
+        if _ssd_has_running_upload(ssd_path):
+            continue
+        key = space.path_key(ssd_path)
+        for name in _closed_names(key):
+            st = _aws_status_for_folder(ssd_path, name)
+            if st in {"uploading", "verifying", "verified", "cleaned", "failed"}:
+                continue
+            try:
+                job = _start_closed_batch_upload(ssd_path, name)
+            except Exception as exc:  # noqa: BLE001
+                _log_line(f"{ssd_path}: could not upload closed {name} — {exc}", kind="error")
+                continue
+            if job:
+                _log_line(f"Queued AWS for closed {name} on {ssd_path}", kind="ok")
+                break
+
+
+def _disk_batch_states() -> dict:
+    """UI payload: active vs closed batches and AWS lifecycle per SSD."""
+    with _lock:
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+        live = dict(_session.get("disk_batches") or {})
+    rows = {}
+    for label, path in (("ssd1", ssd1), ("ssd2", ssd2)):
+        if not path:
+            continue
+        key = space.path_key(path)
+        active = str(live.get(key) or "")
+        closed = _closed_names(key)
+        items = []
+        for name in closed:
+            aws = _aws_status_for_folder(path, name)
+            items.append(
+                {
+                    "name": name,
+                    "role": "closed",
+                    "aws": aws,
+                    "state": aws or "waiting",
+                }
+            )
+        if active and active not in closed:
+            items.append({"name": active, "role": "active", "aws": "", "state": "active"})
+        items.sort(key=lambda row: (batches.batch_number(row["name"]) or 0, row["name"].lower()))
+        rows[label] = {
+            "path": path,
+            "active": active,
+            "batches": items,
+        }
+    return rows
+
+
+def close_active_batch_for_ui(ssd: str) -> dict:
+    """UI entry: close the active batch on SSD 1 / SSD 2 / a path."""
+    return close_active_batch(_resolve_ssd_arg(ssd))
+
+
+def close_active_batch(ssd_path: str) -> dict:
+    """Close the active batch for new offload and open the next cycle number.
+
+    Does not upload-complete or delete the old folder. AWS can catch up later.
+    """
+    if not ssd_path:
+        raise ValueError("SSD path required")
+    path = str(Path(ssd_path).expanduser().resolve())
+    key = space.path_key(path)
+    with _lock:
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+        seed = str(_session.get("batch") or load_config().get("last_batch") or "batch01")
+        current = str((_session.get("disk_batches") or {}).get(key) or "")
+    known = {space.path_key(p) for p in (ssd1, ssd2) if p}
+    if known and key not in known:
+        raise ValueError("SSD does not match SSD 1 or SSD 2 for this session")
+    if not current:
+        current = _batch_for_ssd(path, seed=seed)
+    closed = _closed_names(key)
+    if current in closed:
+        nxt = batches.successor_batch_name(current, seed=seed)
+        with _lock:
+            disk_batches = dict(_session.get("disk_batches") or {})
+            disk_batches[key] = nxt
+            _session["disk_batches"] = disk_batches
+        space.batch_root(path, nxt).mkdir(parents=True, exist_ok=True)
+        _persist_disk_state()
+        return {
+            "ok": True,
+            "ssd": path,
+            "closed": current,
+            "active": nxt,
+            "closed_batches": closed,
+        }
+    folder = space.batch_root(path, current)
+    if not _folder_has_transfer_files(folder):
+        raise ValueError(
+            f"{current} has no footage yet — add SD cards first "
+            "(Batch Completed does not delete; it only stops new cards on this batch)"
+        )
+    closed.append(current)
+    nxt = batches.successor_batch_name(current, seed=seed)
+    with _lock:
+        disk_batches = dict(_session.get("disk_batches") or {})
+        closed_map = dict(_session.get("closed_batches") or {})
+        disk_batches[key] = nxt
+        closed_map[key] = closed
+        _session["disk_batches"] = disk_batches
+        _session["closed_batches"] = closed_map
+    space.batch_root(path, nxt).mkdir(parents=True, exist_ok=True)
+    _persist_disk_state()
+    _log_line(f"{path}: {current} closed for offload — {nxt} is now active", kind="ok")
+    push_notice(f"{current} closed — now offloading to {nxt}", kind="ok")
+    _pump_closed_uploads()
+    return {
+        "ok": True,
+        "ssd": path,
+        "closed": current,
+        "active": nxt,
+        "closed_batches": closed,
+    }
+
+
 def _restore_disk_batches_from_folders(ssd1: str, ssd2: str, *, seed: str) -> None:
-    """If a batch folder is still on a disk after restart, keep that cycle live."""
+    """Keep the active cycle; do not reopen a closed folder as the live batch."""
     for path in (ssd1, ssd2):
         if not path:
             continue
@@ -800,14 +1062,27 @@ def _restore_disk_batches_from_folders(ssd1: str, ssd2: str, *, seed: str) -> No
         with _lock:
             live = str((_session.get("disk_batches") or {}).get(key) or "")
             completed = str((_session.get("disk_completed") or {}).get(key) or "")
-        if live and space.batch_root(path, live).exists():
+        closed = set(_closed_names(key))
+        if live and live not in closed and space.batch_root(path, live).exists():
             continue
         folders = batches.used_batch_names(path, "")
-        if not folders:
-            continue
-        name = batches.resume_or_next_batch(
-            seed=seed, live="", completed=completed, folders=folders
-        )
+        open_folders = {n for n in folders if n not in closed}
+        if open_folders:
+            name = max(
+                open_folders,
+                key=lambda n: (batches.batch_number(n) or 0, n.lower()),
+            )
+        else:
+            name = batches.resume_or_next_batch(
+                seed=seed, live="", completed=completed, folders=set()
+            )
+            if closed:
+                last_closed = max(
+                    closed, key=lambda n: (batches.batch_number(n) or 0, n.lower())
+                )
+                cand = batches.successor_batch_name(last_closed, seed=seed)
+                if (batches.batch_number(cand) or 0) >= (batches.batch_number(name) or 0):
+                    name = cand
         with _lock:
             disk_batches = dict(_session.get("disk_batches") or {})
             disk_batches[key] = name
@@ -815,11 +1090,9 @@ def _restore_disk_batches_from_folders(ssd1: str, ssd2: str, *, seed: str) -> No
 
 
 def _is_frozen(ssd_path: str) -> bool:
-    if not ssd_path:
-        return False
-    with _lock:
-        frozen = _session.get("frozen_disks") or {}
-    return bool(frozen.get(space.path_key(ssd_path)))
+    """Uploading a closed batch must not block new cards on this SSD."""
+    del ssd_path
+    return False
 
 
 def _live_batches() -> set[str]:
@@ -840,16 +1113,24 @@ def _other_ssd(ssd_path: str, ssd1: str, ssd2: str) -> str:
 
 
 def _batch_for_ssd(ssd_path: str, *, seed: str) -> str:
-    """Same cycle number on both SSDs; this disk advances only after its own delete."""
+    """Same cycle number on both SSDs; closed folders are not reused as active."""
     key = space.path_key(ssd_path)
     with _lock:
         disk_batches = dict(_session.get("disk_batches") or {})
         completed = str((_session.get("disk_completed") or {}).get(key) or "")
         current = str(disk_batches.get(key) or "")
-    folders = batches.used_batch_names(ssd_path, "")
+    closed = set(_closed_names(key))
+    if current in closed:
+        current = ""
+    folders = {n for n in batches.used_batch_names(ssd_path, "") if n not in closed}
     name = batches.resume_or_next_batch(
         seed=seed, live=current, completed=completed, folders=folders
     )
+    if closed and not current:
+        last_closed = max(closed, key=lambda n: (batches.batch_number(n) or 0, n.lower()))
+        cand = batches.successor_batch_name(last_closed, seed=seed)
+        if (batches.batch_number(cand) or 0) > (batches.batch_number(name) or 0):
+            name = cand
     with _lock:
         disk_batches = dict(_session.get("disk_batches") or {})
         disk_batches[key] = name
@@ -862,58 +1143,23 @@ def _batch_for_ssd(ssd_path: str, *, seed: str) -> str:
 
 
 def _maybe_auto_upload_disk(ssd_path: str) -> None:
-    """SSD+AWS: freeze this disk's batch and s5cmd-sync it (copy-full)."""
+    """SSD+AWS: when this disk cannot take the next card, close the active batch for offload."""
     with _lock:
         mode = str(_session.get("mode") or "")
         s3_uri = str(_session.get("s3_uri") or "")
-        ssd1 = str(_session.get("ssd1") or "")
-        ssd2 = str(_session.get("ssd2") or "")
         if mode != "ssd_and_aws" or not s3_uri or not ssd_path:
             return
         key = space.path_key(ssd_path)
-        frozen = dict(_session.get("frozen_disks") or {})
-        if frozen.get(key):
-            return
         batch = str((_session.get("disk_batches") or {}).get(key) or "")
-    if not batch:
+    if not batch or batch in _closed_names(key):
         return
     folder = space.batch_root(ssd_path, batch)
-    try:
-        has_files = folder.is_dir() and any(folder.iterdir())
-    except OSError:
-        has_files = False
-    if not has_files:
+    if not _folder_has_transfer_files(folder):
         return
-    with _lock:
-        frozen = dict(_session.get("frozen_disks") or {})
-        frozen[key] = batch
-        _session["frozen_disks"] = frozen
-    _persist_disk_state()
-    key = space.path_key(ssd_path)
-    only1 = ssd_path if ssd1 and space.path_key(ssd1) == key else ""
-    only2 = ssd_path if ssd2 and space.path_key(ssd2) == key else ""
-    if not only1 and not only2:
-        only1 = ssd_path
-        only2 = ""
     try:
-        job = aws_upload.start_batch_upload(
-            s3_uri=s3_uri,
-            batch_name=batch,
-            ssd1=only1 or (ssd_path if not only2 else ""),
-            ssd2=only2,
-            card_id=None,
-            auto_delete=True,
-        )
-        _log_line(f"Auto AWS {batch} on {ssd_path} ({job.get('id')})", kind="ok")
-        push_notice(f"SSD copy-full — uploading {batch} with s5cmd", kind="ok")
-        _persist_disk_state()
+        close_active_batch(ssd_path)
     except Exception as exc:  # noqa: BLE001
-        with _lock:
-            frozen = dict(_session.get("frozen_disks") or {})
-            frozen.pop(key, None)
-            _session["frozen_disks"] = frozen
-        _persist_disk_state()
-        _log_line(f"Auto AWS failed for {batch}: {exc}", kind="error")
+        _log_line(f"Auto-close {batch} on {ssd_path} failed — {exc}", kind="error")
 
 
 def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
@@ -936,21 +1182,33 @@ def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
                 if name == batch_name
             }
         for key in list(keys):
-            for existing in list(disk_batches) + list(frozen) + list(completed):
+            for existing in list(disk_batches) + list(frozen) + list(completed) + list(
+                (_session.get("closed_batches") or {}).keys()
+            ):
                 if existing.lower() == key.lower() or space.path_key(existing) == key:
                     keys.add(existing)
+        closed_map = dict(_session.get("closed_batches") or {})
         for key in keys:
+            names = [n for n in (closed_map.get(key) or []) if str(n) != batch_name]
+            if names:
+                closed_map[key] = names
+            else:
+                closed_map.pop(key, None)
             if disk_batches.get(key) == batch_name:
                 disk_batches.pop(key, None)
             if frozen.get(key) == batch_name:
                 frozen.pop(key, None)
-            completed[key] = batch_name
+            prev = str(completed.get(key) or "")
+            if (batches.batch_number(batch_name) or 0) >= (batches.batch_number(prev) or 0):
+                completed[key] = batch_name
+        _session["closed_batches"] = closed_map
         _session["frozen_disks"] = frozen
         _session["disk_batches"] = disk_batches
         _session["disk_completed"] = completed
     _persist_disk_state()
     _log_line(f"Deleted verified {batch_name} — that disk is free for the next cycle", kind="ok")
     push_notice(f"{batch_name} verified on AWS and deleted locally", kind="ok")
+    _pump_closed_uploads()
 
 
 def _assign_ssd_and_batch(
@@ -967,17 +1225,19 @@ def _assign_ssd_and_batch(
         ssd_path = _ssd_holding_path(resume_dest, ssd1, ssd2)
         if ssd_path:
             batch = resume_dest.name if resume_dest.name else _batch_for_ssd(ssd_path, seed=seed)
-            with _lock:
-                disk_batches = dict(_session.get("disk_batches") or {})
-                disk_batches[space.path_key(ssd_path)] = batch
-                _session["disk_batches"] = disk_batches
+            key = space.path_key(ssd_path)
+            if batch not in _closed_names(key):
+                with _lock:
+                    disk_batches = dict(_session.get("disk_batches") or {})
+                    disk_batches[key] = batch
+                    _session["disk_batches"] = disk_batches
             dest = space.batch_root(ssd_path, batch)
             dest.mkdir(parents=True, exist_ok=True)
             return ssd_path, dest, batch
 
     reserved = _committed_bytes_by_ssd(exclude_card=exclude_card)
 
-    # Prefer SSD1 when it fits and is not uploading.
+    # Prefer SSD1 when the card fits (uploading a closed batch does not block).
     picked = ""
     if ssd1 and not _is_frozen(ssd1):
         try:
@@ -998,7 +1258,7 @@ def _assign_ssd_and_batch(
     if not picked:
         raise RuntimeError(
             "No SSD can take this card with 10 GB reserve "
-            "(wait for AWS verify/delete, or free space)"
+            "(free space, or wait for a closed batch to finish AWS cleanup)"
         )
     batch = _batch_for_ssd(picked, seed=seed)
     dest = space.batch_root(picked, batch)
