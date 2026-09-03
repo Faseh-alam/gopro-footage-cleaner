@@ -177,10 +177,11 @@ def create_app() -> Flask:
                     ssd2=ssd2,
                     card_id=None,
                     show_console=True,
+                    auto_delete=True,
                 )
                 engine.log_message(
                     f"AWS upload started for batch {batch} via "
-                    f"{job.get('uploader') or 'sync'} (survives restart; UI tracks log)"
+                    f"{job.get('uploader') or 'sync'} — after verify, that batch folder is deleted on the SSD"
                 )
             else:
                 job = engine.upload_batch_now(external_window=True)

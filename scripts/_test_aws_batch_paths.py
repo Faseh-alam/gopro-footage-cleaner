@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "sd_offloader"))
 
 from offloader import aws_upload as a  # noqa: E402
+
+
+class _Proc:
+    def __init__(self, stdout: str, returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
 
 
 def main() -> int:
@@ -37,6 +45,43 @@ def main() -> int:
     m = a._BATCH_IN_PATH_RE.search(r"E:\Batches\batch 1\GX01.MP4")
     assert m and m.group(1) == "batch 1", m.group(1) if m else None
     print("BATCH_IN_PATH OK")
+
+    zero = a._parse_s5cmd_du_output("0 bytes in 0 objects: s3://bucket/prefix/")
+    assert zero == (0, 0), zero
+    real = a._parse_s5cmd_du_output("251353320 bytes in 3 objects: s3://bucket/prefix/*")
+    assert real == (251353320, 3), real
+    print("parse s5cmd du OK")
+
+    dest = "s3://bucket/footage/batch01/"
+
+    def du_zero_then_wildcard(cmd, **_kwargs):
+        target = cmd[-1]
+        if cmd[:2] == ["s5cmd", "du"] and target.endswith("*"):
+            return _Proc("251353320 bytes in 3 objects: s3://bucket/footage/batch01/*")
+        if cmd[:2] == ["s5cmd", "du"]:
+            return _Proc("0 bytes in 0 objects: s3://bucket/footage/batch01/")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    with patch.object(a, "s5cmd_available", return_value=True), patch.object(
+        a, "aws_cli_available", return_value=False
+    ), patch.object(a.subprocess, "run", side_effect=du_zero_then_wildcard):
+        summary = a._s3_prefix_summary(dest)
+    assert summary == (251353320, 3), summary
+    print("s5cmd du zero-prefix falls back to wildcard OK")
+
+    def du_zero_then_aws(cmd, **_kwargs):
+        if cmd[:2] == ["s5cmd", "du"]:
+            return _Proc("0 bytes in 0 objects: s3://bucket/footage/batch01/")
+        if cmd[:3] == ["aws", "s3", "ls"]:
+            return _Proc("Total Size: 251353320\nTotal Objects: 3\n")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    with patch.object(a, "s5cmd_available", return_value=True), patch.object(
+        a, "aws_cli_available", return_value=True
+    ), patch.object(a.subprocess, "run", side_effect=du_zero_then_aws):
+        summary = a._s3_prefix_summary(dest)
+    assert summary == (251353320, 3), summary
+    print("s5cmd du zero falls back to aws ls summarize OK")
 
     print("ALL PATH CHECKS PASSED")
     return 0

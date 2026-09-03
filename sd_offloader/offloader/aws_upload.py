@@ -599,7 +599,12 @@ def verify_job_sizes(job_id: str) -> dict:
             job["verified"] = True
             job["message"] = (
                 f"Verified · local {result['local_bytes']} ≈ S3 {result['s3_bytes']} "
-                f"({result['s3_objects']} objects) — safe to delete local if you want"
+                f"({result['s3_objects']} objects)"
+                + (
+                    " — deleting that batch folder on the SSD"
+                    if job.get("auto_delete")
+                    else " — safe to delete local if you want"
+                )
             )
         else:
             job["verified"] = False
@@ -1206,47 +1211,55 @@ def _parse_sync_cmdline(cmd: str) -> tuple[str | None, str | None, str | None]:
     return src or None, dest or None, batch
 
 
-def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
-    """Return (total_bytes, total_objects) already on S3 under dest, or None."""
-    if not dest.startswith("s3://"):
+def _parse_s5cmd_du_output(text: str) -> tuple[int, int] | None:
+    """Parse ``s5cmd du`` stdout into (bytes, objects)."""
+    text = text or ""
+    if not _S5CMD_DU_RE.search(text):
         return None
-    # Prefer s5cmd du when available (faster); fall back to aws summarize.
-    if s5cmd_available():
-        try:
-            result = subprocess.run(
-                ["s5cmd", "du", dest],
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            text = (result.stdout or "") + "\n" + (result.stderr or "")
-            if result.returncode == 0:
-                match = _S5CMD_DU_RE.search(text)
-                if match:
-                    # s5cmd may print human units — also accept a raw "N bytes in M objects"
-                    raw = re.search(
-                        r"(\d+)\s+bytes\s+in\s+(\d+)\s+objects?",
-                        text,
-                        re.IGNORECASE,
-                    )
-                    if raw:
-                        return int(raw.group(1)), int(raw.group(2))
-                    # Human-readable: convert first number + optional unit if present on same line
-                    human = re.search(
-                        r"([\d.]+)\s*([KMGT]i?B)?\s+in\s+(\d+)\s+objects?",
-                        text,
-                        re.IGNORECASE,
-                    )
-                    if human:
-                        val = float(human.group(1))
-                        unit = (human.group(2) or "B").upper()
-                        objects = int(human.group(3))
-                        return _to_bytes(val, unit), objects
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    raw = re.search(
+        r"(\d+)\s+bytes\s+in\s+(\d+)\s+objects?",
+        text,
+        re.IGNORECASE,
+    )
+    if raw:
+        return int(raw.group(1)), int(raw.group(2))
+    human = re.search(
+        r"([\d.]+)\s*([KMGT]i?B)?\s+in\s+(\d+)\s+objects?",
+        text,
+        re.IGNORECASE,
+    )
+    if not human:
+        return None
+    val = float(human.group(1))
+    unit = (human.group(2) or "B").upper()
+    objects = int(human.group(3))
+    return _to_bytes(val, unit), objects
 
-    if not aws_cli_available():
+
+def _s5cmd_du_targets(dest: str) -> list[str]:
+    """Folder URI first; wildcard next — ``du s3://…/prefix/`` often reports 0."""
+    base = dest.strip()
+    if not base.endswith("/"):
+        base = base + "/"
+    return [base, base + "*"]
+
+
+def _run_s5cmd_du(dest: str) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            ["s5cmd", "du", dest],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0:
+        return None
+    return _parse_s5cmd_du_output((result.stdout or "") + "\n" + (result.stderr or ""))
+
+
+def _run_aws_prefix_summary(dest: str) -> tuple[int, int] | None:
     try:
         result = subprocess.run(
             ["aws", "s3", "ls", dest, "--recursive", "--summarize"],
@@ -1266,6 +1279,27 @@ def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
     size = int(size_m.group(1))
     objects = int(obj_m.group(1)) if obj_m else 0
     return size, objects
+
+
+def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
+    """Return (total_bytes, total_objects) already on S3 under dest, or None.
+
+    ``s5cmd du`` on a trailing-slash prefix often prints ``0 bytes in 0 objects``
+    even when the files are there. Do not treat that 0 as truth — try the
+    wildcard form, then ``aws s3 ls --summarize``.
+    """
+    if not dest.startswith("s3://"):
+        return None
+    if s5cmd_available():
+        for target in _s5cmd_du_targets(dest):
+            parsed = _run_s5cmd_du(target)
+            if parsed and parsed[0] > 0:
+                return parsed
+    if aws_cli_available():
+        parsed = _run_aws_prefix_summary(dest)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _compare_local_s3_sizes(sources: list[Path], dest: str) -> dict:

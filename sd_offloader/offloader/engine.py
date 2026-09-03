@@ -2123,6 +2123,10 @@ def upload_batch_now(*, external_window: bool = True) -> dict:
         ssd2=ssd2,
         card_id=None,
         show_console=external_window,
+        auto_delete=True,
     )
-    _log_line(f"AWS upload started for batch {batch} → {job.get('dest')} (live progress in UI)")
+    _log_line(
+        f"AWS upload started for batch {batch} → {job.get('dest')} "
+        "(after verify, that batch folder is deleted on the SSD)"
+    )
     return job
