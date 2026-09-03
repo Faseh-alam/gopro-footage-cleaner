@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from paths import STATIC, resolve_media, safe_stem, video_dir
+from ffmpeg_setup import ensure_ffmpeg
 
 
 def ffprobe_json(path: Path) -> dict:
@@ -184,8 +185,9 @@ def _export_take(source: Path, take: dict, dest: Path, fps: float, video_duratio
 
 
 def export_voiceover(video_name: str, sidecar: dict) -> Path:
+    ensure_ffmpeg()
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("ffmpeg/ffprobe is not on PATH.")
+        raise RuntimeError("ffmpeg/ffprobe is not available. Check the terminal for the download error.")
     source = find_source(video_name, sidecar)
     takes = _valid_takes(video_name, sidecar)
     fps = stream_fps(source)

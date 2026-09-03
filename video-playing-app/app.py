@@ -20,6 +20,7 @@ from paths import (
     sidecar_path,
     video_dir,
 )
+from ffmpeg_setup import ensure_ffmpeg
 
 MAX_AUDIO_BYTES = 80 * 1024 * 1024
 MAX_VIDEO_BYTES = 15 * 1024 * 1024 * 1024
@@ -256,6 +257,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     RECORDINGS.mkdir(parents=True, exist_ok=True)
     migrate_flat_recordings()
+    ensure_ffmpeg()
     host, port = "127.0.0.1", 8765
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Voiceover player at http://{host}:{port}")
