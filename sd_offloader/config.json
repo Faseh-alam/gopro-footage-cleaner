@@ -10,7 +10,7 @@
   "max_parallel_cards": 3,
   "card_readers": {
     "1": {
-      "usb_id": "LETTER:D",
+      "usb_id": "USBSTOR\\DISK&VEN_GENERIC&PROD_FLASH-DISK&REV_1.00\\WA201016R1.000&0",
       "letter": "D",
       "label": "Reader 1",
       "path": "D:\\"

@@ -15,7 +15,7 @@
           <p class="hint">
             Detects GoPro cards by <strong>DCIM/xxxGOPRO + MP4 + JSON</strong> (any volume name) ·
             up to <strong>3 cards in parallel</strong> · copy to dual SSDs ·
-            <strong>10 GB reserve</strong> · unique batch per disk ·
+            <strong>10 GB reserve</strong> · same batch number on both SSDs ·
             <strong>SSD + AWS ping-pong</strong> when a disk is copy-full
           </p>
         </div>
@@ -123,7 +123,8 @@
             In <strong>SSD + AWS</strong> mode, when a disk cannot take the next card with the
             10&nbsp;GB reserve, that disk’s batch is frozen and <strong>s5cmd</strong> syncs it
             while the other disk keeps ingesting. After two matching size checks, that batch is
-            deleted on that disk only and the next unique batch number opens.
+            deleted on that disk only and the next cycle number opens on that disk
+            (both SSDs use batch01, then both use batch02 — they do not skip ahead of each other).
             <strong>Upload this batch to AWS</strong> still works for batches that are not full
             (night). Verify, then <strong>Delete local</strong> only when verified.
           </p>

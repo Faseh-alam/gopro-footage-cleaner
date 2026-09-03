@@ -22,6 +22,7 @@ _session: dict = {
     "s3_uri": "",
     "started_at": None,
     "disk_batches": {},
+    "disk_completed": {},
     "frozen_disks": {},
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
@@ -103,45 +104,51 @@ def restore_ui_state() -> None:
     aws_upload.set_batch_deleted_hook(on_batch_deleted)
     aws_upload.restore_jobs_from_disk()
     try:
-        if not SNAPSHOT_FILE.exists():
-            return
-        try:
-            data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return
-        if not isinstance(data, dict):
-            return
+        if SNAPSHOT_FILE.exists():
+            try:
+                data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = None
+            if isinstance(data, dict):
+                with _lock:
+                    session = data.get("session")
+                    if isinstance(session, dict):
+                        _session.update(session)
+                        # Watcher must be re-armed after process restart.
+                        if _session.get("active"):
+                            _session["active"] = True
+                    cards = data.get("cards")
+                    if isinstance(cards, list):
+                        for row in cards:
+                            if not isinstance(row, dict):
+                                continue
+                            card_id = str(row.get("card_id") or "").upper()
+                            if not card_id:
+                                continue
+                            status = row.get("status") or ""
+                            if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
+                                # In-flight copy threads died with the old process.
+                                if status in {"copying", "verifying"}:
+                                    row = dict(row)
+                                    row["status"] = "interrupted"
+                                    row["message"] = (
+                                        "Server restarted mid-copy — re-insert card or Start session "
+                                        "to resume (completed files are skipped)"
+                                    )
+                                    row["speed_mbps"] = 0.0
+                            _cards[card_id] = dict(row)
+                    lines = data.get("log")
+                    if isinstance(lines, list):
+                        _log.clear()
+                        _log.extend(line for line in lines if isinstance(line, dict))
+        cfg = load_config()
         with _lock:
-            session = data.get("session")
-            if isinstance(session, dict):
-                _session.update(session)
-                # Watcher must be re-armed after process restart.
-                if _session.get("active"):
-                    _session["active"] = True
-            cards = data.get("cards")
-            if isinstance(cards, list):
-                for row in cards:
-                    if not isinstance(row, dict):
-                        continue
-                    card_id = str(row.get("card_id") or "").upper()
-                    if not card_id:
-                        continue
-                    status = row.get("status") or ""
-                    if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
-                        # In-flight copy threads died with the old process.
-                        if status in {"copying", "verifying"}:
-                            row = dict(row)
-                            row["status"] = "interrupted"
-                            row["message"] = (
-                                "Server restarted mid-copy — re-insert card or Start session "
-                                "to resume (completed files are skipped)"
-                            )
-                            row["speed_mbps"] = 0.0
-                    _cards[card_id] = dict(row)
-            lines = data.get("log")
-            if isinstance(lines, list):
-                _log.clear()
-                _log.extend(line for line in lines if isinstance(line, dict))
+            if not _session.get("disk_completed"):
+                _session["disk_completed"] = dict(cfg.get("disk_completed") or {})
+            if not _session.get("disk_batches"):
+                _session["disk_batches"] = dict(cfg.get("disk_batches") or {})
+            if not _session.get("frozen_disks"):
+                _session["frozen_disks"] = dict(cfg.get("frozen_disks") or {})
         if _session.get("active"):
             # Do NOT auto-resume the SD watcher on startup — scanning drives during
             # boot was freezing the web UI on hung card readers. User clicks Start.
@@ -174,6 +181,7 @@ def get_status() -> dict:
             "notices": list(_notices[-12:]),
             "readers": readers.saved_readers(),
             "disk_batches": dict(_session.get("disk_batches") or {}),
+            "disk_completed": dict(_session.get("disk_completed") or {}),
             "frozen_disks": dict(_session.get("frozen_disks") or {}),
         }
     _save_snapshot(force=False)
@@ -243,7 +251,12 @@ def start_session(
         if path and not Path(path).exists():
             raise ValueError(f"SSD path not found: {path}")
 
+    cfg = load_config()
     with _lock:
+        prev_batches = dict(_session.get("disk_batches") or cfg.get("disk_batches") or {})
+        prev_frozen = dict(_session.get("frozen_disks") or cfg.get("frozen_disks") or {})
+        prev_completed = dict(_session.get("disk_completed") or cfg.get("disk_completed") or {})
+        new_keys = {space.path_key(p) for p in (ssd1_path, ssd2_path) if p}
         _session.update(
             {
                 "active": True,
@@ -253,8 +266,9 @@ def start_session(
                 "ssd2": ssd2_path,
                 "s3_uri": s3_uri.strip(),
                 "started_at": time.time(),
-                "disk_batches": {},
-                "frozen_disks": {},
+                "disk_batches": {k: v for k, v in prev_batches.items() if k in new_keys},
+                "disk_completed": {k: v for k, v in prev_completed.items() if k in new_keys},
+                "frozen_disks": {k: v for k, v in prev_frozen.items() if k in new_keys},
             }
         )
         # Allow previously cancelled cards to be picked up again on Start.
@@ -262,6 +276,7 @@ def start_session(
             if card.get("status") == "cancelled":
                 _cards.pop(cid, None)
                 _cancel_requested.discard(cid)
+    _restore_disk_batches_from_folders(ssd1_path, ssd2_path, seed=batch)
     save_config(
         {
             "last_batch": batch,
@@ -271,11 +286,12 @@ def start_session(
             "s3_uri": s3_uri.strip(),
         }
     )
+    _persist_disk_state()
     _ensure_watcher()
     _ensure_watchdog()
     _log_line(
         f"Session started: {batch} ({mode}) — hotplug armed "
-        "(insert/remove SDs anytime; unique batch per disk; 10 GB SSD reserve)"
+        "(insert/remove SDs anytime; same batch number on both SSDs; 10 GB SSD reserve)"
     )
     # Immediately scan once
     _scan_for_cards()
@@ -738,6 +754,66 @@ def _committed_bytes_by_ssd(*, exclude_card: str = "") -> dict[str, int]:
     return committed
 
 
+def _persist_disk_state() -> None:
+    """Write live/completed/frozen batch maps so a restart can resume."""
+    with _lock:
+        payload = {
+            "disk_batches": dict(_session.get("disk_batches") or {}),
+            "disk_completed": dict(_session.get("disk_completed") or {}),
+            "frozen_disks": dict(_session.get("frozen_disks") or {}),
+        }
+    save_config(payload)
+    _save_snapshot(force=True)
+
+
+def _ssd_key_from_batch_folder(path: str | Path, ssd1: str, ssd2: str) -> str:
+    """Map ``E:\\Batches\\batch01`` back to the SSD path_key that owns it."""
+    resolved = Path(path).expanduser()
+    try:
+        resolved = resolved.resolve()
+    except OSError:
+        pass
+    for ssd in (ssd1, ssd2):
+        if not ssd:
+            continue
+        root = Path(ssd).expanduser()
+        try:
+            root = root.resolve()
+        except OSError:
+            pass
+        try:
+            resolved.relative_to(root)
+            return space.path_key(root)
+        except ValueError:
+            continue
+    if resolved.parent.name.lower() == "batches":
+        return space.path_key(resolved.parent.parent)
+    return space.path_key(resolved)
+
+
+def _restore_disk_batches_from_folders(ssd1: str, ssd2: str, *, seed: str) -> None:
+    """If a batch folder is still on a disk after restart, keep that cycle live."""
+    for path in (ssd1, ssd2):
+        if not path:
+            continue
+        key = space.path_key(path)
+        with _lock:
+            live = str((_session.get("disk_batches") or {}).get(key) or "")
+            completed = str((_session.get("disk_completed") or {}).get(key) or "")
+        if live and space.batch_root(path, live).exists():
+            continue
+        folders = batches.used_batch_names(path, "")
+        if not folders:
+            continue
+        name = batches.resume_or_next_batch(
+            seed=seed, live="", completed=completed, folders=folders
+        )
+        with _lock:
+            disk_batches = dict(_session.get("disk_batches") or {})
+            disk_batches[key] = name
+            _session["disk_batches"] = disk_batches
+
+
 def _is_frozen(ssd_path: str) -> bool:
     if not ssd_path:
         return False
@@ -764,34 +840,24 @@ def _other_ssd(ssd_path: str, ssd1: str, ssd2: str) -> str:
 
 
 def _batch_for_ssd(ssd_path: str, *, seed: str) -> str:
-    """Unique live batch on this SSD; never the same number as the other disk."""
+    """Same cycle number on both SSDs; this disk advances only after its own delete."""
     key = space.path_key(ssd_path)
     with _lock:
         disk_batches = dict(_session.get("disk_batches") or {})
-        ssd1 = str(_session.get("ssd1") or "")
-        ssd2 = str(_session.get("ssd2") or "")
+        completed = str((_session.get("disk_completed") or {}).get(key) or "")
         current = str(disk_batches.get(key) or "")
-    if current:
-        return current
-    live = _live_batches()
-    other = _other_ssd(ssd_path, ssd1, ssd2)
-    seed = (seed or "").strip()
-    name = ""
-    if seed and seed not in live:
-        other_has = bool(other and space.batch_root(other, seed).is_dir())
-        if not other_has:
-            name = seed
-    if not name:
-        extra = set(live)
-        if other:
-            extra |= batches.used_batch_names(other, "")
-        name = batches.next_batch_name(ssd1, ssd2, seed=seed, extra=extra)
+    folders = batches.used_batch_names(ssd_path, "")
+    name = batches.resume_or_next_batch(
+        seed=seed, live=current, completed=completed, folders=folders
+    )
     with _lock:
         disk_batches = dict(_session.get("disk_batches") or {})
         disk_batches[key] = name
         _session["disk_batches"] = disk_batches
     space.batch_root(ssd_path, name).mkdir(parents=True, exist_ok=True)
-    _log_line(f"Opened {name} on {ssd_path}")
+    if name != current:
+        _log_line(f"Opened {name} on {ssd_path}")
+        _persist_disk_state()
     return name
 
 
@@ -822,6 +888,7 @@ def _maybe_auto_upload_disk(ssd_path: str) -> None:
         frozen = dict(_session.get("frozen_disks") or {})
         frozen[key] = batch
         _session["frozen_disks"] = frozen
+    _persist_disk_state()
     key = space.path_key(ssd_path)
     only1 = ssd_path if ssd1 and space.path_key(ssd1) == key else ""
     only2 = ssd_path if ssd2 and space.path_key(ssd2) == key else ""
@@ -839,30 +906,50 @@ def _maybe_auto_upload_disk(ssd_path: str) -> None:
         )
         _log_line(f"Auto AWS {batch} on {ssd_path} ({job.get('id')})", kind="ok")
         push_notice(f"SSD copy-full — uploading {batch} with s5cmd", kind="ok")
+        _persist_disk_state()
     except Exception as exc:  # noqa: BLE001
         with _lock:
             frozen = dict(_session.get("frozen_disks") or {})
             frozen.pop(key, None)
             _session["frozen_disks"] = frozen
+        _persist_disk_state()
         _log_line(f"Auto AWS failed for {batch}: {exc}", kind="error")
 
 
 def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
-    """Unfreeze disk(s) after verified delete so the next unique batch can open."""
-    del ssd_paths  # job sources are batch folders; unfreeze by unique batch name
+    """Unfreeze only the SSD(s) whose batch folder was deleted after verify."""
+    with _lock:
+        ssd1 = str(_session.get("ssd1") or "")
+        ssd2 = str(_session.get("ssd2") or "")
+    keys: set[str] = set()
+    for raw in ssd_paths or []:
+        if raw:
+            keys.add(_ssd_key_from_batch_folder(raw, ssd1, ssd2))
     with _lock:
         frozen = dict(_session.get("frozen_disks") or {})
         disk_batches = dict(_session.get("disk_batches") or {})
-        for key, name in list(disk_batches.items()):
-            if name == batch_name:
+        completed = dict(_session.get("disk_completed") or {})
+        if not keys:
+            keys = {
+                key
+                for key, name in frozen.items()
+                if name == batch_name
+            }
+        for key in list(keys):
+            for existing in list(disk_batches) + list(frozen) + list(completed):
+                if existing.lower() == key.lower() or space.path_key(existing) == key:
+                    keys.add(existing)
+        for key in keys:
+            if disk_batches.get(key) == batch_name:
                 disk_batches.pop(key, None)
+            if frozen.get(key) == batch_name:
                 frozen.pop(key, None)
-        for key, name in list(frozen.items()):
-            if name == batch_name:
-                frozen.pop(key, None)
+            completed[key] = batch_name
         _session["frozen_disks"] = frozen
         _session["disk_batches"] = disk_batches
-    _log_line(f"Deleted verified {batch_name} — disk free for next batch", kind="ok")
+        _session["disk_completed"] = completed
+    _persist_disk_state()
+    _log_line(f"Deleted verified {batch_name} — that disk is free for the next cycle", kind="ok")
     push_notice(f"{batch_name} verified on AWS and deleted locally", kind="ok")
 
 
@@ -875,7 +962,7 @@ def _assign_ssd_and_batch(
     exclude_card: str,
     resume_dest: Path | None,
 ) -> tuple[str, Path, str]:
-    """Pick one SSD (10 GB reserve, skip frozen), unique batch, never split."""
+    """Pick one SSD (10 GB reserve, skip frozen); both disks share the cycle number."""
     if resume_dest:
         ssd_path = _ssd_holding_path(resume_dest, ssd1, ssd2)
         if ssd_path:

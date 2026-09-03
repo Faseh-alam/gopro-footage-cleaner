@@ -95,8 +95,66 @@ def used_batch_names(ssd1: str = "", ssd2: str = "") -> set[str]:
     return {str(row.get("name") or "") for row in list_batches(ssd1, ssd2) if row.get("name")}
 
 
+def successor_batch_name(name: str, *, seed: str = "") -> str:
+    """Increment this disk's batch only: ``batch01`` → ``batch02``, ``batch 6`` → ``batch 7``."""
+    source = (name or seed or "batch01").strip()
+    match = re.search(r"^(.*?)(\d+)$", source)
+    if not match:
+        source = (seed or "batch01").strip()
+        match = re.search(r"^(.*?)(\d+)$", source)
+    if not match:
+        return "batch02"
+    prefix, digits = match.group(1), match.group(2)
+    return f"{prefix}{int(digits) + 1:0{len(digits)}d}"
+
+
+def resume_or_next_batch(
+    *,
+    seed: str = "",
+    live: str = "",
+    completed: str = "",
+    folders: set[str] | None = None,
+) -> str:
+    """Pick this SSD's batch for the shared cycle.
+
+    Both disks start at ``seed`` (e.g. batch01). A disk only moves to the next
+    number after *its* current folder is gone (verified AWS delete). The other
+    disk's folders must not skip this disk ahead (no global counter).
+    """
+    live = (live or "").strip()
+    if live:
+        return live
+    seed = (seed or "batch01").strip()
+    completed = (completed or "").strip()
+    folders = {str(name).strip() for name in (folders or set()) if str(name).strip()}
+    completed_n = batch_number(completed) or 0
+    pending: list[str] = []
+    for name in folders:
+        number = batch_number(name)
+        if name == completed:
+            pending.append(name)
+            continue
+        if number is None:
+            pending.append(name)
+            continue
+        if number > completed_n:
+            pending.append(name)
+    if pending:
+        return min(
+            pending,
+            key=lambda n: (batch_number(n) if batch_number(n) is not None else 10**9, n.lower()),
+        )
+    if not completed:
+        return seed
+    return successor_batch_name(completed, seed=seed)
+
+
 def next_batch_name(ssd1: str, ssd2: str, *, seed: str = "", extra: set[str] | None = None) -> str:
-    """Next unique name like ``batch 28`` that is not on either SSD or in extra."""
+    """Next unique name like ``batch 28`` that is not on either SSD or in extra.
+
+    Kept for UI / unused-name checks. Live ingest uses ``resume_or_next_batch``
+    so both SSDs share the same cycle number.
+    """
     used = used_batch_names(ssd1, ssd2)
     if extra:
         used |= {str(x) for x in extra if x}
