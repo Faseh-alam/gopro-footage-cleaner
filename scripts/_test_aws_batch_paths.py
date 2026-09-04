@@ -83,6 +83,28 @@ def main() -> int:
     assert summary == (251353320, 3), summary
     print("s5cmd du zero falls back to aws ls summarize OK")
 
+    timeouts: list[object] = []
+
+    def capture_timeout(cmd, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        if cmd[:2] == ["s5cmd", "du"]:
+            return _Proc("100 bytes in 1 objects: s3://bucket/footage/batch01/")
+        if cmd[:2] == ["s5cmd", "ls"]:
+            return _Proc("2026-01-01 00:00:00 100 s3://bucket/footage/batch01/GX010001.MP4")
+        if cmd[:3] == ["aws", "s3", "ls"]:
+            return _Proc("Total Size: 100\nTotal Objects: 1\n")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    with patch.object(a, "s5cmd_available", return_value=True), patch.object(
+        a, "aws_cli_available", return_value=True
+    ), patch.object(a.subprocess, "run", side_effect=capture_timeout):
+        a._s3_prefix_summary(dest)
+        a.list_s3_object_sizes(dest)
+    assert timeouts, "expected listing commands"
+    assert all(t == a.AWS_VERIFY_TIMEOUT_SECONDS for t in timeouts), timeouts
+    assert a.AWS_VERIFY_TIMEOUT_SECONDS == 30 * 60
+    print("verify listing timeout is 1800s OK")
+
     print("ALL PATH CHECKS PASSED")
     return 0
 

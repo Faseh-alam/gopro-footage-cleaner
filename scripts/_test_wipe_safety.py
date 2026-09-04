@@ -17,7 +17,10 @@ sys.path.insert(0, str(REPO / "sd_offloader"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from unittest.mock import patch
+
 from offloader import eject, embed_meta, engine, inventory  # noqa: E402
+from offloader import pairing  # noqa: E402
 from offloader.transfer import copy_file  # noqa: E402
 
 FAILURES: list[str] = []
@@ -394,6 +397,28 @@ def test_duplicate_card_skips_copy_and_wipe() -> None:
         )
 
 
+def test_labeled_duplicate_does_not_hash() -> None:
+    print("\n[9b] labeled same-video skip never SHA-256 hashes")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        card1 = Path(tmp) / "card1"
+        card2 = Path(tmp) / "card2"
+        specs = [("GX010001.MP4", b"labeled-same-video-XXXX")]
+        gopro1 = _card_with_mp4s(card1, specs)
+        gopro2 = _card_with_mp4s(card2, specs)
+        _stamp_identity(gopro1 / "GX010001.MP4", "CAM-A")
+        _stamp_identity(gopro2 / "GX010001.MP4", "CAM-A")
+        files1 = inventory.list_transfer_files(card1)
+        _copy_files(files1, dest, "SD-1")
+        with patch.object(pairing, "file_digest") as digest:
+            digest.side_effect = AssertionError("SHA-256 must not run for labeled same-video skip")
+            files2 = inventory.list_transfer_files(card2)
+            _copy_files(files2, dest, "SD-2")
+            mp4 = next(f for f in files2 if f.get("kind") == "mp4")
+            check("duplicate skipped by identity", bool(mp4.get("already_in_batch")))
+            check("file_digest was not called", digest.call_count == 0, str(digest.call_count))
+
+
 def test_same_name_different_identity_suffix_copy() -> None:
     print("\n[10] same filename, different sidecar identity → suffix copy + wipe the new card")
     with tempfile.TemporaryDirectory() as tmp:
@@ -597,6 +622,7 @@ def main() -> int:
     test_non_mp4_does_not_block()
     test_no_rmtree_on_gopro_folder()
     test_duplicate_card_skips_copy_and_wipe()
+    test_labeled_duplicate_does_not_hash()
     test_same_name_different_identity_suffix_copy()
     test_numeric_suffix_chain_and_two_ssds()
     test_unclear_dest_hash_same_bytes_skips()

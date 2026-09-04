@@ -36,6 +36,8 @@ _log: list[dict] = []
 _notices: list[dict] = []
 _watchdog_started = False
 WATCHDOG_SECONDS = 30 * 60
+# cid -> (bytes_done, last_increase_at) for live copy threads
+_watchdog_copy_snap: dict[str, tuple[int, float]] = {}
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
 _last_snapshot_at = 0.0
 ACTIVE_COPY_STATUSES = {
@@ -430,7 +432,7 @@ def _watchdog_loop() -> None:
 
 
 def run_watchdog_once() -> None:
-    """Resume interrupted work; never kill a healthy copy or upload."""
+    """Resume interrupted work; never kill a healthy or still-progressing copy."""
     notes: list[str] = []
     with _lock:
         cards = [dict(c) for c in _cards.values()]
@@ -443,7 +445,23 @@ def run_watchdog_once() -> None:
         status = str(card.get("status") or "")
         thread = threads.get(cid)
         if thread is not None and thread.is_alive():
+            if status in {"copying", "verifying"}:
+                done = int(card.get("bytes_done") or 0)
+                prev = _watchdog_copy_snap.get(cid)
+                if prev is None or done > prev[0]:
+                    _watchdog_copy_snap[cid] = (done, now)
+                elif now - prev[1] >= WATCHDOG_SECONDS:
+                    stalled_min = int((now - prev[1]) / 60)
+                    _update_card(
+                        cid,
+                        message=(
+                            f"Watchdog: copy stalled at {done} bytes for "
+                            f"{stalled_min} min — still waiting, not killing"
+                        ),
+                    )
+                    notes.append(f"SD {cid} stalled (bytes unchanged, thread alive)")
             continue
+        _watchdog_copy_snap.pop(cid, None)
         stale_copy = (
             status in {"copying", "verifying"}
             and now - float(card.get("started_at") or 0) > 20

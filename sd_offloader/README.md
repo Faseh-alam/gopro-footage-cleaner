@@ -100,16 +100,16 @@ chmod +x run.sh
    - **SSD + AWS** — when each card finishes, CMD syncs the **whole flat batch folder** (`Batches/<batch>/` → `s3://…/<batch>/`) with **s5cmd** (plain sync first; `--numworkers 20` on failure). If an upload is already running, a follow-up resync is queued so files from later cards are not missed. UI shows progress and re-attaches after restarts.
 6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
 7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
-8. **Upload this batch to AWS (CMD)** — opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
+8. **Upload this batch to AWS (CMD)** — if both SSDs have that batch, use **Upload this SSD to AWS** on the disk card instead (one SSD per job). Opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares this SSD's files vs their S3 keys; only then is that SSD's batch folder deleted
 9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, transferred files wiped, ejected
 
 ### Office resume example (batch 3 dumped at home, no internet)
 
 1. On the server: pick SSDs → select **batch 3** from the list  
 2. Start SD → SSD if more cards still need dumping  
-3. Click **Upload this batch to AWS (CMD)** — watch progress on the page; **Restart** resumes missing files (skips what’s already on S3)  
+3. Click **Upload this SSD to AWS** on the disk that holds the batch (or the top Upload button if only one SSD has it) — watch progress on the page; **Restart** resumes missing files (skips what’s already on S3 at the same size). A different video with the same filename is stored as `GX010001-1.MP4`.
 
-If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** batch folder name. AWS still syncs everything into one `…/batch 6/` prefix.
+If SSD 1 fills up mid-batch, new cards spill to SSD 2 under the **same** batch folder name. Upload each SSD separately into `…/batch 6/`. Same names with different sizes become `-1` / `-2` on S3 — nothing overwrites Video A.
 
 ## Resume after crash / unplug
 
@@ -159,7 +159,7 @@ The app runs `aws s3 sync` into `s3://your-bucket/footage/batch 6/…`.
 
 ### Upload later (SSD-only mode)
 
-After cards are dumped, click **Upload batch to AWS now**. It syncs `Batches/batch 6` from both SSDs into the same S3 batch folder.
+After cards are dumped, click **Upload this SSD to AWS** for each disk that has the batch. Same filename + same size is skipped on S3; a different-sized file is renamed to `GX010001-1.MP4`. Local delete happens only after that SSD's keys verify.
 
 ## IAM tip
 
@@ -177,5 +177,6 @@ Override: `SD_OFFLOADER_PORT=8899`
 
 - Wipe/eject happens only after size verification  
 - Only transferred, size-verified MP4s / sidecars / task folders under `DCIM/…GOPRO` are deleted on the card  
-- After upload the UI compares local vs S3 sizes; **Delete local** is optional and only enabled when verified
+- After upload the UI compares **this job's files** vs their S3 keys (extra objects from the other SSD are OK); **Delete local** only runs after that verify succeeds. A 30-minute listing timeout does **not** delete.
+- Same filename on a second SSD never overwrites the first on S3 (`-1` / `-2`). Same size is treated as already present (rare same-size different-content collision is not hashed on S3).
 - Config: `s5cmd_numworkers` (default 20 — used only after plain sync fails), `aws_upload_retries` (default 5) in `config.json`

@@ -68,7 +68,13 @@ _S5CMD_DU_RE = re.compile(
     r"([\d.]+)\s*(?:bytes|[KMGT]i?B)\s+in\s+(\d+)\s+objects?",
     re.IGNORECASE,
 )
-_SIZE_TOLERANCE_BYTES = 1024 * 1024  # 1 MiB slack for listing quirks
+# Verification listing only — never applied to s5cmd/aws sync (the upload itself).
+AWS_VERIFY_TIMEOUT_SECONDS = 30 * 60
+# 0.01% of the local byte count, with a 1 MiB floor (small batches stay strict;
+# a ~3.2 TB batch is allowed ~320 MB of listing slack).
+SIZE_TOLERANCE_PERCENT = 0.0001
+SIZE_TOLERANCE_FLOOR_BYTES = 1024 * 1024
+_SIZE_TOLERANCE_BYTES = SIZE_TOLERANCE_FLOOR_BYTES  # back-compat alias
 
 
 def aws_cli_available() -> bool:
@@ -209,7 +215,43 @@ def list_local_batch_roots(ssd1: str, ssd2: str, batch_name: str) -> list[Path]:
     return roots
 
 
-def _dir_bytes(root: Path) -> int:
+def choose_upload_sources(ssd1: str, ssd2: str, batch_name: str) -> list[Path]:
+    """Return 0 or 1 local batch folder. Never merge two SSDs into one S3 job."""
+    roots = list_local_batch_roots(ssd1, ssd2, batch_name)
+    if len(roots) <= 1:
+        return roots
+    raise RuntimeError(
+        f"Both SSDs have {batch_name} ({roots[0]} and {roots[1]}). "
+        "Upload one SSD at a time so GX010001.MP4 on SSD-B cannot overwrite "
+        "SSD-A on S3. Use Upload on that SSD card, or Batch Completed "
+        "(already uploads each SSD separately)."
+    )
+
+
+def size_tolerance_bytes(expected_bytes: int) -> int:
+    """1 MiB floor, else 0.01% of expected (intentional for multi-TB listings)."""
+    expected = max(0, int(expected_bytes or 0))
+    return max(SIZE_TOLERANCE_FLOOR_BYTES, int(expected * SIZE_TOLERANCE_PERCENT))
+
+
+def sizes_within_tolerance(local_bytes: int, remote_bytes: int) -> bool:
+    local_bytes = int(local_bytes or 0)
+    remote_bytes = int(remote_bytes or 0)
+    return abs(remote_bytes - local_bytes) <= size_tolerance_bytes(local_bytes)
+
+
+def _count_files(root: Path) -> int:
+    n = 0
+    try:
+        for path in root.rglob("*"):
+            if path.is_file():
+                n += 1
+    except OSError:
+        pass
+    return n
+
+
+def _walk_dir_bytes(root: Path) -> int:
     total = 0
     try:
         for path in root.rglob("*"):
@@ -221,6 +263,191 @@ def _dir_bytes(root: Path) -> int:
     except OSError:
         pass
     return total
+
+
+def _dir_bytes(root: Path, *, recorded_sizes: list[int] | None = None) -> int:
+    """Sum file sizes. Prefer a complete recorded list; else walk the folder."""
+    if recorded_sizes is not None:
+        try:
+            recorded = [int(x) for x in recorded_sizes]
+        except (TypeError, ValueError):
+            recorded = None
+        else:
+            nfiles = _count_files(root)
+            if nfiles > 0 and nfiles == len(recorded):
+                return sum(recorded)
+    return _walk_dir_bytes(root)
+
+
+def _next_free_s3_name(stem: str, suffix: str, taken_lower: set[str]) -> str:
+    first = f"{stem}{suffix}"
+    if first.lower() not in taken_lower:
+        return first
+    n = 1
+    while True:
+        cand = f"{stem}-{n}{suffix}"
+        if cand.lower() not in taken_lower:
+            return cand
+        n += 1
+
+
+def _sidecar_local_stem(name: str) -> str:
+    lower = name.lower()
+    if lower.endswith(".segments.json"):
+        return name[: -len(".segments.json")]
+    return Path(name).stem
+
+
+def plan_s3_dest_names(
+    local_files: list[tuple[str, int]],
+    s3_files: dict[str, int],
+) -> dict[str, str]:
+    """Map local filenames → S3 object names. Never overwrite a different-sized key.
+
+    Same name + same size → keep the name (already on S3). Same name + different
+    size → ``stem-1``, ``stem-2``, … Sidecars follow the MP4 dest stem.
+    """
+    s3_lower = {str(k).lower(): (str(k), int(v)) for k, v in (s3_files or {}).items()}
+    taken = {str(k).lower() for k in (s3_files or {})}
+    mapping: dict[str, str] = {}
+    mp4s = [(n, s) for n, s in local_files if Path(n).suffix.upper() == ".MP4"]
+    others = [(n, s) for n, s in local_files if Path(n).suffix.upper() != ".MP4"]
+    stem_map: dict[str, str] = {}
+    for name, size in mp4s:
+        existing = s3_lower.get(name.lower())
+        if existing is None:
+            dest = name
+        elif int(existing[1]) == int(size):
+            dest = existing[0]
+        else:
+            dest = _next_free_s3_name(Path(name).stem, Path(name).suffix, taken)
+        mapping[name] = dest
+        stem_map[Path(name).stem] = Path(dest).stem
+        taken.add(dest.lower())
+        s3_lower[dest.lower()] = (dest, int(size))
+    for name, _size in others:
+        local_stem = _sidecar_local_stem(name)
+        dest_stem = stem_map.get(local_stem, local_stem)
+        suffix = ".segments.json" if name.lower().endswith(".segments.json") else Path(name).suffix
+        dest = f"{dest_stem}{suffix}"
+        if dest.lower() in taken:
+            existing = s3_lower.get(dest.lower())
+            local_sz = int(_size)
+            if existing and int(existing[1]) != local_sz:
+                dest = _next_free_s3_name(dest_stem, suffix, taken)
+        mapping[name] = dest
+        taken.add(dest.lower())
+    return mapping
+
+
+def _list_source_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    try:
+        for path in root.rglob("*"):
+            if path.is_file():
+                files.append(path)
+    except OSError:
+        pass
+    return files
+
+
+def _s3_object_basename(uri_or_key: str) -> str:
+    text = str(uri_or_key or "").replace("\\", "/").rstrip("/")
+    return Path(text).name
+
+
+def _parse_s3_ls_sizes(text: str) -> dict[str, int]:
+    """Parse ``s5cmd ls`` / ``aws s3 ls --recursive`` into {filename: size}."""
+    out: dict[str, int] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # s5cmd: DATE TIME SIZE s3://bucket/key
+        m = re.match(
+            r"^\S+\s+\S+\s+(\d+)\s+(s3://\S+|\S+)$",
+            line,
+        )
+        if not m:
+            continue
+        size = int(m.group(1))
+        name = _s3_object_basename(m.group(2))
+        if name:
+            out[name] = size
+    return out
+
+
+def list_s3_object_sizes(dest: str) -> dict[str, int] | None:
+    """List object basenames under an S3 prefix. None = listing failed/timed out."""
+    if not dest.startswith("s3://"):
+        return None
+    prefix = dest if dest.endswith("/") else dest + "/"
+    try:
+        if s5cmd_available():
+            result = subprocess.run(
+                ["s5cmd", "ls", prefix],
+                capture_output=True,
+                text=True,
+                timeout=AWS_VERIFY_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                parsed = _parse_s3_ls_sizes((result.stdout or "") + "\n" + (result.stderr or ""))
+                return parsed
+        if aws_cli_available():
+            result = subprocess.run(
+                ["aws", "s3", "ls", prefix, "--recursive"],
+                capture_output=True,
+                text=True,
+                timeout=AWS_VERIFY_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                return _parse_s3_ls_sizes((result.stdout or "") + "\n" + (result.stderr or ""))
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        return None
+    return None
+
+
+def _prepare_s3_upload_plan(
+    local_root: Path, dest: str
+) -> tuple[dict[str, str], list[tuple[Path, str]] | None]:
+    """Return (local_name→s3_name, optional per-file cp pairs).
+
+    Folder ``sync`` is used when every file keeps its local name. If a name is
+    already on S3 at a *different* size, we ``cp`` to ``stem-1`` / ``stem-2``.
+    """
+    files = _list_source_files(local_root)
+    local_rows = []
+    for path in files:
+        try:
+            local_rows.append((path.name, int(path.stat().st_size)))
+        except OSError:
+            continue
+    existing = list_s3_object_sizes(dest)
+    if existing is None:
+        raise RuntimeError(
+            "Could not list S3 objects (timeout or error). Refusing to upload "
+            "so existing keys are not overwritten. Retry when the listing works."
+        )
+    key_map = plan_s3_dest_names(local_rows, existing)
+    dest_norm = dest if dest.endswith("/") else dest + "/"
+    needs_remap = any(key_map.get(name, name) != name for name, _sz in local_rows)
+    if not needs_remap:
+        return key_map, None
+    pairs: list[tuple[Path, str]] = []
+    existing_lower = {k.lower(): int(v) for k, v in existing.items()}
+    by_name = {p.name: p for p in files}
+    for name, size in local_rows:
+        src = by_name.get(name)
+        if src is None:
+            continue
+        s3_name = key_map.get(name, name)
+        prior = existing_lower.get(s3_name.lower())
+        if prior is not None and int(prior) == int(size):
+            continue
+        pairs.append((src, f"{dest_norm}{s3_name}"))
+    return key_map, pairs
 
 
 def find_running_batch_job(batch_name: str, dest: str | None = None) -> dict | None:
@@ -265,12 +492,11 @@ def start_batch_upload(
         )
 
     prefix = batch_s3_prefix(s3_uri, batch_name)
-    roots = list_local_batch_roots(ssd1, ssd2, batch_name)
+    roots = choose_upload_sources(ssd1, ssd2, batch_name)
     if not roots:
         raise RuntimeError(f"No local batch folder found for {batch_name} on the selected SSDs")
 
-    # Flat layout: always sync the batch root(s). Legacy per-card folders
-    # (Batches/<batch>/C1234/) are still included because they live under root.
+    # Flat layout: one SSD batch folder → ``s3://…/<batch>/`` (no card subfolder).
     sources = roots
     dest = prefix
 
@@ -304,6 +530,7 @@ def start_batch_upload(
         _persist_jobs()
         return get_job(running["id"]) or running
 
+    key_map, file_pairs = _prepare_s3_upload_plan(sources[0], dest)
     job = _launch_upload_job(
         sources=sources,
         dest=dest,
@@ -311,6 +538,8 @@ def start_batch_upload(
         card_id=card_id,
         s3_uri=s3_uri,
         tool=tool,
+        key_map=key_map,
+        file_pairs=file_pairs,
     )
     if auto_delete:
         with _lock:
@@ -372,7 +601,7 @@ def cancel_job(job_id: str) -> dict:
 def _kill_upload_processes(job: dict) -> int:
     """Kill CMD/PowerShell/s5cmd/aws processes tied to this upload job."""
     needles: list[str] = []
-    for key in ("script", "log_path", "dest"):
+    for key in ("script", "log_path", "dest", "run_file"):
         value = str(job.get(key) or "").strip()
         if value:
             needles.append(value)
@@ -444,7 +673,7 @@ def _windows_pids_matching(needles: list[str]) -> set[int]:
         cmd_l = cmd.lower()
         # Only touch sync-related shells / uploaders.
         name = str(row.get("Name") or "").lower()
-        if name in {"aws.exe", "s5cmd.exe"} and "sync" not in cmd_l:
+        if name in {"aws.exe", "s5cmd.exe"} and "sync" not in cmd_l and " run " not in f" {cmd_l} ":
             continue
         if name in {"cmd.exe", "powershell.exe", "pwsh.exe"}:
             if "sync" not in cmd_l and not any(
@@ -550,6 +779,7 @@ def restart_job(job_id: str) -> dict:
             prev["cancel_requested"] = False
 
     # Replace this job id so the UI Restart button keeps a stable reference.
+    key_map, file_pairs = _prepare_s3_upload_plan(sources[0], dest)
     return _launch_upload_job(
         sources=sources,
         dest=dest,
@@ -559,6 +789,8 @@ def restart_job(job_id: str) -> dict:
         tool=tool,
         reuse_job_id=job_id,
         restart=True,
+        key_map=key_map,
+        file_pairs=file_pairs,
     )
 
 
@@ -577,15 +809,28 @@ def verify_job_sizes(job_id: str) -> dict:
     if not dest.startswith("s3://"):
         raise RuntimeError("No S3 destination on this job")
 
-    first = _compare_local_s3_sizes(sources, dest)
-    second = _compare_local_s3_sizes(sources, dest)
-    result = dict(second)
-    result["ok"] = bool(
-        first.get("ok")
-        and second.get("ok")
-        and int(first.get("s3_bytes") or 0) == int(second.get("s3_bytes") or 0)
-        and int(first.get("local_bytes") or 0) == int(second.get("local_bytes") or 0)
+    key_map = dict(snap.get("key_map") or {})
+    recorded = snap.get("recorded_sizes")
+    first = _compare_local_s3_sizes(
+        sources, dest, key_map=key_map, recorded_sizes=recorded
     )
+    listing_failed = first.get("error") in {"timeout", "listing_failed"}
+    second = first
+    if not listing_failed:
+        second = _compare_local_s3_sizes(
+            sources, dest, key_map=key_map, recorded_sizes=recorded
+        )
+        listing_failed = second.get("error") in {"timeout", "listing_failed"}
+    result = dict(second)
+    if listing_failed:
+        result["ok"] = False
+    else:
+        result["ok"] = bool(
+            first.get("ok")
+            and second.get("ok")
+            and int(first.get("s3_bytes") or 0) == int(second.get("s3_bytes") or 0)
+            and int(first.get("local_bytes") or 0) == int(second.get("local_bytes") or 0)
+        )
     with _lock:
         job = _jobs.get(job_id)
         if not job:
@@ -598,23 +843,35 @@ def verify_job_sizes(job_id: str) -> dict:
             job["status"] = "verified"
             job["verified"] = True
             job["message"] = (
-                f"Verified · local {result['local_bytes']} ≈ S3 {result['s3_bytes']} "
+                f"Verified · this SSD {result['local_bytes']} ≈ S3 keys {result['s3_bytes']} "
                 f"({result['s3_objects']} objects)"
                 + (
-                    " — deleting that batch folder on the SSD"
+                    " — deleting that batch folder on this SSD"
                     if job.get("auto_delete")
                     else " — safe to delete local if you want"
                 )
             )
         else:
             job["verified"] = False
-            if job.get("status") in {"completed", "verified", "mismatch"}:
-                job["status"] = "mismatch"
-            job["message"] = (
-                f"Size mismatch · local {result['local_bytes']} vs S3 {result['s3_bytes']} "
-                f"(Δ {result['delta']}) — click Retry to resume missing files"
-            )
-        _append_job_log(job, f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} ok={result['ok']}")
+            if listing_failed:
+                if job.get("status") == "verified":
+                    job["status"] = "completed"
+                job["message"] = (
+                    "S3 listing timed out or failed after 30 minutes — "
+                    "local files NOT deleted. Click Verify sizes to try again."
+                )
+            else:
+                if job.get("status") in {"completed", "verified", "mismatch"}:
+                    job["status"] = "mismatch"
+                job["message"] = (
+                    f"Size mismatch · this SSD {result['local_bytes']} vs its S3 keys "
+                    f"{result['s3_bytes']} (Δ {result['delta']}) — click Retry to resume"
+                )
+        _append_job_log(
+            job,
+            f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} "
+            f"ok={result['ok']} error={result.get('error')}",
+        )
     _persist_jobs()
     return get_job(job_id) or result
 
@@ -635,16 +892,31 @@ def delete_local_after_verify(job_id: str, *, confirmed: bool = False) -> dict:
     if not sources:
         raise RuntimeError("No local sources to delete")
 
-    # Re-check right before delete.
-    check = _compare_local_s3_sizes(sources, str(snap.get("dest") or ""))
+    # Re-check this job's mapped keys only — never the whole prefix (other SSD may be there).
+    check = _compare_local_s3_sizes(
+        sources,
+        str(snap.get("dest") or ""),
+        key_map=dict(snap.get("key_map") or {}),
+        recorded_sizes=snap.get("recorded_sizes"),
+    )
     if not check["ok"]:
+        listing_failed = check.get("error") in {"timeout", "listing_failed"}
         with _lock:
             job = _jobs.get(job_id)
             if job:
-                job["status"] = "mismatch"
                 job["verified"] = False
-                job["message"] = "Refusing delete — sizes no longer match. Restart upload."
+                if listing_failed:
+                    if job.get("status") == "verified":
+                        job["status"] = "completed"
+                    job["message"] = (
+                        "Refusing delete — S3 listing timed out or failed. Local files kept."
+                    )
+                else:
+                    job["status"] = "mismatch"
+                    job["message"] = "Refusing delete — sizes no longer match. Restart upload."
         _persist_jobs()
+        if listing_failed:
+            raise RuntimeError("S3 listing timed out — refusing to delete local files")
         raise RuntimeError("Sizes no longer match — refusing to delete local files")
 
     deleted: list[str] = []
@@ -697,8 +969,20 @@ def _launch_upload_job(
     tool: str,
     reuse_job_id: str | None = None,
     restart: bool = False,
+    key_map: dict[str, str] | None = None,
+    file_pairs: list[tuple[Path, str]] | None = None,
 ) -> dict:
-    total_bytes = sum(_dir_bytes(src) for src in sources)
+    recorded: list[int] = []
+    for src in sources:
+        for path in _list_source_files(src):
+            try:
+                recorded.append(int(path.stat().st_size))
+            except OSError:
+                pass
+    total_bytes = sum(
+        _dir_bytes(src, recorded_sizes=recorded if len(sources) == 1 else None)
+        for src in sources
+    )
     stamp = int(time.time())
     label = f"{batch_name}-{card_id or 'ALL'}-{stamp}"
     job_id = reuse_job_id or f"aws:{label}"
@@ -708,6 +992,16 @@ def _launch_upload_job(
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{safe}.log"
     script_path = LOG_DIR / f"{safe}{'.bat' if platform.system() == 'Windows' else '.sh'}"
+    run_file: Path | None = None
+    if file_pairs:
+        run_file = LOG_DIR / f"{safe}.s5cmd.txt"
+        run_file.write_text(
+            "\n".join(
+                f'cp "{src}" "{s3_uri_key}"' for src, s3_uri_key in file_pairs
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     workers = _numworkers()
     retries = _upload_retries()
@@ -737,6 +1031,7 @@ def _launch_upload_job(
         tool=tool,
         numworkers=workers,
         retries=retries,
+        run_file=run_file,
     )
     _launch_external_script(
         script_path,
@@ -782,6 +1077,9 @@ def _launch_upload_job(
             "verified": False,
             "progress_via_s3": True,
             "auto_delete": bool((prev or {}).get("auto_delete")),
+            "key_map": dict(key_map or {}),
+            "recorded_sizes": recorded,
+            "run_file": str(run_file) if run_file else None,
         }
     _persist_jobs()
     _ensure_monitor()
@@ -798,6 +1096,7 @@ def _write_external_script(
     tool: str = "aws",
     numworkers: int = 20,
     retries: int = 5,
+    run_file: Path | None = None,
 ) -> None:
     """Write a console script that syncs with auto-retry and tees output into log_path.
 
@@ -827,53 +1126,90 @@ def _write_external_script(
             "echo.",
         ]
         dest_norm = dest if dest.endswith("/") else dest + "/"
-        for idx, src in enumerate(sources):
-            src_arg = _sync_local_arg(src)
-            # Prefer quoted paths for cmd.exe (spaces in "batch 1").
-            src_q = f'"{src_arg}"'
-            dest_q = f'"{dest_norm}"'
-            log_q = f'"{log_path}"'
+        log_q = f'"{log_path}"'
+        if run_file is not None:
+            run_q = f'"{run_file}"'
             if tool == "s5cmd":
-                sync_default = f"s5cmd sync {src_q} {dest_q}"
-                sync_workers = f"s5cmd --numworkers {numworkers} sync {src_q} {dest_q}"
+                sync_default = f"s5cmd run {run_q}"
+                sync_workers = f"s5cmd --numworkers {numworkers} run {run_q}"
             else:
-                sync_default = f"aws s3 sync {src_q} {dest_q}"
+                sync_default = f"s5cmd run {run_q}" if s5cmd_available() else f"aws s3 sync {_sync_local_arg(sources[0])} {dest_norm}"
                 sync_workers = sync_default
-            lines.append(f"echo Syncing {src_q} → {dest_q}")
-            lines.append(f"echo Syncing {src_q} → {dest_q}>> {log_q}")
+            lines.append(f"echo Uploading remapped keys from {run_q}")
+            lines.append(f"echo Uploading remapped keys from {run_q}>> {log_q}")
             lines.append(f"set MAX_TRIES={retries}")
             lines.append("set TRY=1")
-            lines.append(f":retry_loop_{idx}")
+            lines.append(":retry_loop_0")
             lines.append("echo --- attempt !TRY! of %MAX_TRIES% ---")
             lines.append(f"echo --- attempt !TRY! of %MAX_TRIES% --->> {log_q}")
             lines.append("if !TRY! equ 1 (")
-            lines.append(
-                "  echo Using default s5cmd sync" if tool == "s5cmd" else "  echo Using aws s3 sync"
-            )
-            # Run in this CMD window so progress is visible; UI also tracks via S3 size.
             lines.append(f"  {sync_default}")
             lines.append(") else (")
-            if tool == "s5cmd":
-                lines.append(f"  echo Using s5cmd --numworkers {numworkers} sync")
-            else:
-                lines.append("  echo Retrying aws s3 sync")
             lines.append(f"  {sync_workers}")
             lines.append(")")
             lines.append("set SYNC_ERR=%ERRORLEVEL%")
             lines.append(f"echo Sync exit !SYNC_ERR!>> {log_q}")
-            lines.append(f"if %SYNC_ERR% equ 0 goto sync_ok_{idx}")
+            lines.append("if %SYNC_ERR% equ 0 goto sync_ok_0")
             lines.append("echo Retrying after connection/upload error (exit %SYNC_ERR%)...")
             lines.append(f"echo Retrying after connection/upload error (exit %SYNC_ERR%)>> {log_q}")
             lines.append("timeout /t 15 /nobreak >nul")
             lines.append("set /a TRY+=1")
-            lines.append(f"if !TRY! leq %MAX_TRIES% goto retry_loop_{idx}")
+            lines.append("if !TRY! leq %MAX_TRIES% goto retry_loop_0")
             lines.append(f"echo {EXIT_MARKER}%SYNC_ERR%>> {log_q}")
             lines.append("echo.")
             lines.append("echo ERROR: sync failed after retries. Click Retry in the UI.")
             lines.append("pause")
             lines.append("exit /b %SYNC_ERR%")
-            lines.append(f":sync_ok_{idx}")
+            lines.append(":sync_ok_0")
             lines.append("echo.")
+        else:
+            for idx, src in enumerate(sources):
+                src_arg = _sync_local_arg(src)
+                # Prefer quoted paths for cmd.exe (spaces in "batch 1").
+                src_q = f'"{src_arg}"'
+                dest_q = f'"{dest_norm}"'
+                log_q = f'"{log_path}"'
+                if tool == "s5cmd":
+                    sync_default = f"s5cmd sync {src_q} {dest_q}"
+                    sync_workers = f"s5cmd --numworkers {numworkers} sync {src_q} {dest_q}"
+                else:
+                    sync_default = f"aws s3 sync {src_q} {dest_q}"
+                    sync_workers = sync_default
+                lines.append(f"echo Syncing {src_q} → {dest_q}")
+                lines.append(f"echo Syncing {src_q} → {dest_q}>> {log_q}")
+                lines.append(f"set MAX_TRIES={retries}")
+                lines.append("set TRY=1")
+                lines.append(f":retry_loop_{idx}")
+                lines.append("echo --- attempt !TRY! of %MAX_TRIES% ---")
+                lines.append(f"echo --- attempt !TRY! of %MAX_TRIES% --->> {log_q}")
+                lines.append("if !TRY! equ 1 (")
+                lines.append(
+                    "  echo Using default s5cmd sync" if tool == "s5cmd" else "  echo Using aws s3 sync"
+                )
+                # Run in this CMD window so progress is visible; UI also tracks via S3 size.
+                lines.append(f"  {sync_default}")
+                lines.append(") else (")
+                if tool == "s5cmd":
+                    lines.append(f"  echo Using s5cmd --numworkers {numworkers} sync")
+                else:
+                    lines.append("  echo Retrying aws s3 sync")
+                lines.append(f"  {sync_workers}")
+                lines.append(")")
+                lines.append("set SYNC_ERR=%ERRORLEVEL%")
+                lines.append(f"echo Sync exit !SYNC_ERR!>> {log_q}")
+                lines.append(f"if %SYNC_ERR% equ 0 goto sync_ok_{idx}")
+                lines.append("echo Retrying after connection/upload error (exit %SYNC_ERR%)...")
+                lines.append(f"echo Retrying after connection/upload error (exit %SYNC_ERR%)>> {log_q}")
+                lines.append("timeout /t 15 /nobreak >nul")
+                lines.append("set /a TRY+=1")
+                lines.append(f"if !TRY! leq %MAX_TRIES% goto retry_loop_{idx}")
+                lines.append(f"echo {EXIT_MARKER}%SYNC_ERR%>> {log_q}")
+                lines.append("echo.")
+                lines.append("echo ERROR: sync failed after retries. Click Retry in the UI.")
+                lines.append("pause")
+                lines.append("exit /b %SYNC_ERR%")
+                lines.append(f":sync_ok_{idx}")
+                lines.append("echo.")
         lines.append(f'echo {EXIT_MARKER}0>> "{log_path}"')
         lines.append("echo ============================================")
         lines.append("echo   Upload finished OK — UI will verify sizes next")
@@ -898,29 +1234,17 @@ def _write_external_script(
             "echo",
         ]
         dest_norm = dest if dest.endswith("/") else dest + "/"
-        for src in sources:
-            src_arg = _sync_local_arg(src)
-            if tool == "s5cmd":
-                sync_default = f's5cmd sync "{src_arg}" "{dest_norm}"'
-                sync_workers = (
-                    f's5cmd --numworkers {numworkers} sync "{src_arg}" "{dest_norm}"'
-                )
-            else:
-                sync_default = f'aws s3 sync "{src_arg}" "{dest_norm}"'
-                sync_workers = sync_default
-            lines.append(f'echo "Syncing {src} → {dest_norm}"')
-            lines.append(f"MAX_TRIES={retries}")
+        if run_file is not None:
+            sync_default = f's5cmd run "{run_file}"'
+            sync_workers = f's5cmd --numworkers {numworkers} run "{run_file}"'
+            lines.append(f'echo "Uploading remapped keys from {run_file}"')
+            lines.append("MAX_TRIES={retries}".format(retries=retries))
             lines.append("TRY=1")
             lines.append("while true; do")
             lines.append('  echo "--- attempt $TRY of $MAX_TRIES ---"')
             lines.append('  if [[ "$TRY" -eq 1 ]]; then')
-            lines.append(f'    echo "Using default sync"')
             lines.append(f'    set +e; {sync_default} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
             lines.append("  else")
-            if tool == "s5cmd":
-                lines.append(f'    echo "Using s5cmd --numworkers {numworkers}"')
-            else:
-                lines.append('    echo "Retrying aws s3 sync"')
             lines.append(f'    set +e; {sync_workers} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
             lines.append("  fi")
             lines.append('  if [[ "$ec" -eq 0 ]]; then break; fi')
@@ -935,6 +1259,44 @@ def _write_external_script(
             lines.append("  fi")
             lines.append("done")
             lines.append("echo")
+        else:
+            for src in sources:
+                src_arg = _sync_local_arg(src)
+                if tool == "s5cmd":
+                    sync_default = f's5cmd sync "{src_arg}" "{dest_norm}"'
+                    sync_workers = (
+                        f's5cmd --numworkers {numworkers} sync "{src_arg}" "{dest_norm}"'
+                    )
+                else:
+                    sync_default = f'aws s3 sync "{src_arg}" "{dest_norm}"'
+                    sync_workers = sync_default
+                lines.append(f'echo "Syncing {src} → {dest_norm}"')
+                lines.append(f"MAX_TRIES={retries}")
+                lines.append("TRY=1")
+                lines.append("while true; do")
+                lines.append('  echo "--- attempt $TRY of $MAX_TRIES ---"')
+                lines.append('  if [[ "$TRY" -eq 1 ]]; then')
+                lines.append(f'    echo "Using default sync"')
+                lines.append(f'    set +e; {sync_default} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
+                lines.append("  else")
+                if tool == "s5cmd":
+                    lines.append(f'    echo "Using s5cmd --numworkers {numworkers}"')
+                else:
+                    lines.append('    echo "Retrying aws s3 sync"')
+                lines.append(f'    set +e; {sync_workers} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
+                lines.append("  fi")
+                lines.append('  if [[ "$ec" -eq 0 ]]; then break; fi')
+                lines.append('  echo "Retrying after error (exit $ec)..."')
+                lines.append("  sleep 15")
+                lines.append("  TRY=$((TRY+1))")
+                lines.append('  if [[ "$TRY" -gt "$MAX_TRIES" ]]; then')
+                lines.append(f'    echo "{EXIT_MARKER}${{ec}}" >> "{log_path}"')
+                lines.append('    echo "ERROR: sync failed after retries"')
+                lines.append("    read -r")
+                lines.append('    exit "$ec"')
+                lines.append("  fi")
+                lines.append("done")
+                lines.append("echo")
         lines.append(f'echo "{EXIT_MARKER}0" >> "{log_path}"')
         lines.extend(
             [
@@ -1250,7 +1612,7 @@ def _run_s5cmd_du(dest: str) -> tuple[int, int] | None:
             ["s5cmd", "du", dest],
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=AWS_VERIFY_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1265,7 +1627,7 @@ def _run_aws_prefix_summary(dest: str) -> tuple[int, int] | None:
             ["aws", "s3", "ls", dest, "--recursive", "--summarize"],
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=AWS_VERIFY_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1302,27 +1664,81 @@ def _s3_prefix_summary(dest: str) -> tuple[int, int] | None:
     return None
 
 
-def _compare_local_s3_sizes(sources: list[Path], dest: str) -> dict:
-    local_bytes = sum(_dir_bytes(src) for src in sources if src.exists())
-    summary = _s3_prefix_summary(dest)
-    if summary is None:
+def _s3_bytes_for_names(dest: str, dest_names: set[str]) -> tuple[int, int] | None:
+    """Sum S3 sizes for this job's object names. Extra prefix objects are ignored."""
+    listed = list_s3_object_sizes(dest)
+    if listed is None:
+        return None
+    want = {str(n).lower() for n in dest_names}
+    total = 0
+    count = 0
+    for name, size in listed.items():
+        if str(name).lower() in want:
+            total += int(size)
+            count += 1
+    return total, count
+
+
+def _compare_local_s3_sizes(
+    sources: list[Path],
+    dest: str,
+    *,
+    key_map: dict[str, str] | None = None,
+    recorded_sizes: list[int] | None = None,
+) -> dict:
+    """Compare this job's local files to their mapped S3 keys (not the whole prefix)."""
+    rec = recorded_sizes if len(sources) == 1 else None
+    local_bytes = sum(
+        _dir_bytes(src, recorded_sizes=rec) for src in sources if src.exists()
+    )
+    listed = list_s3_object_sizes(dest)
+    if listed is None:
         return {
             "ok": False,
             "local_bytes": local_bytes,
             "s3_bytes": None,
             "s3_objects": None,
             "delta": None,
-            "error": "Could not read S3 size (aws/s5cmd)",
+            "error": "timeout",
         }
-    s3_bytes, s3_objects = summary
-    delta = abs(int(s3_bytes) - int(local_bytes))
-    ok = delta <= _SIZE_TOLERANCE_BYTES
+    s3_lower = {str(k).lower(): int(v) for k, v in listed.items()}
+    mapping = dict(key_map or {})
+    files: list[Path] = []
+    for src in sources:
+        if src.exists():
+            files.extend(_list_source_files(src))
+    job_s3_bytes = 0
+    job_s3_objects = 0
+    missing = 0
+    mismatched = 0
+    for path in files:
+        try:
+            size = int(path.stat().st_size)
+        except OSError:
+            continue
+        dest_name = mapping.get(path.name, path.name)
+        remote = s3_lower.get(dest_name.lower())
+        if remote is None:
+            missing += 1
+            continue
+        job_s3_objects += 1
+        job_s3_bytes += int(remote)
+        if int(remote) != int(size):
+            mismatched += 1
+    delta = abs(int(job_s3_bytes) - int(local_bytes))
+    ok = (
+        missing == 0
+        and mismatched == 0
+        and job_s3_objects == len(files)
+        and sizes_within_tolerance(local_bytes, job_s3_bytes)
+    )
     return {
         "ok": ok,
         "local_bytes": local_bytes,
-        "s3_bytes": s3_bytes,
-        "s3_objects": s3_objects,
+        "s3_bytes": job_s3_bytes,
+        "s3_objects": job_s3_objects,
         "delta": delta,
+        "error": None if ok else "mismatch",
     }
 
 
@@ -1762,11 +2178,12 @@ def _poll_s3_progress_for_jobs() -> None:
                     float(job.get("last_s3_bytes") or 0),
                     float(job.get("last_s3_poll_at") or job.get("started_at") or now),
                     str(job.get("_need_total") or ""),
+                    dict(job.get("key_map") or {}),
                 )
             )
             job.pop("_need_total", None)
 
-    for job_id, dest, bytes_total, sources, prev_bytes, prev_at, need_total in targets:
+    for job_id, dest, bytes_total, sources, prev_bytes, prev_at, need_total, key_map in targets:
         if bytes_total <= 0:
             root = need_total or (sources[0] if sources else "")
             if root:
@@ -1774,7 +2191,11 @@ def _poll_s3_progress_for_jobs() -> None:
                 with _lock:
                     if job_id in _jobs and bytes_total:
                         _jobs[job_id]["bytes_total"] = bytes_total
-        summary = _s3_prefix_summary(dest)
+        dest_names = {str(v) for v in key_map.values()} if key_map else set()
+        if dest_names:
+            summary = _s3_bytes_for_names(dest, dest_names)
+        else:
+            summary = _s3_prefix_summary(dest)
         if summary is None:
             with _lock:
                 job = _jobs.get(job_id)

@@ -432,6 +432,7 @@ function renderDiskState(diskBatches, frozenDisks, session, diskBatchStates) {
           .join("")
       : `<li class="disk-batch">${active ? `${active} — Active · offloading` : "no live batch"}</li>`;
     const canClose = Boolean(active);
+    const canUpload = Boolean(path);
     cards.push(`
       <div class="disk-card">
         <div class="disk-card-head">
@@ -439,14 +440,23 @@ function renderDiskState(diskBatches, frozenDisks, session, diskBatchStates) {
             <div class="disk-card-title">${label}</div>
             <div class="disk-card-active">Current batch: <strong>${active || "—"}</strong></div>
           </div>
-          <button
-            type="button"
-            class="secondary batch-complete-btn"
-            data-complete-ssd="${slot}"
-            data-complete-batch="${active || ""}"
-            ${canClose ? "" : "disabled"}
-            title="Stop adding SD cards to this batch. AWS upload continues separately. Does not delete."
-          >Batch Completed</button>
+          <div class="disk-card-actions">
+            <button
+              type="button"
+              class="secondary batch-complete-btn"
+              data-complete-ssd="${slot}"
+              data-complete-batch="${active || ""}"
+              ${canClose ? "" : "disabled"}
+              title="Stop adding SD cards to this batch. AWS upload continues separately. Does not delete."
+            >Batch Completed</button>
+            <button
+              type="button"
+              class="secondary ssd-upload-btn"
+              data-upload-ssd="${slot}"
+              ${canUpload ? "" : "disabled"}
+              title="Upload the selected batch from this SSD only. Never merges both SSDs into one S3 job. Same names with different sizes become GX010001-1.MP4 on S3."
+            >Upload this SSD to AWS</button>
+          </div>
         </div>
         <ul class="disk-batch-list">${list}</ul>
       </div>
@@ -473,6 +483,45 @@ function renderDiskState(diskBatches, frozenDisks, session, diskBatchStates) {
   el.diskState.innerHTML = `<div class="disk-card-grid">${cards.join("")}</div>`;
 }
 
+async function uploadSsdToAws(slot) {
+  const payload = sessionPayload();
+  if (!payload.batch) {
+    setStatus("Select the batch that is already on the SSDs", "error");
+    return;
+  }
+  if (!payload.s3_uri) {
+    setStatus("Paste S3 URI first", "error");
+    return;
+  }
+  const ssd1 = slot === "1" ? payload.ssd1 : "";
+  const ssd2 = slot === "2" ? payload.ssd2 : "";
+  if (!ssd1 && !ssd2) {
+    setStatus(`Pick SSD ${slot} first`, "error");
+    return;
+  }
+  setStatus(`Opening AWS Command Prompt for "${payload.batch}" on SSD ${slot}…`);
+  try {
+    const data = await api("/api/aws/upload-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch: payload.batch,
+        s3_uri: payload.s3_uri,
+        ssd1,
+        ssd2,
+      }),
+    });
+    setStatus(
+      data.job?.message ||
+        `AWS upload started for ${payload.batch} on SSD ${slot}`,
+      "ok",
+    );
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+    showNotice(error.message || "SSD upload failed", "error");
+  }
+}
 async function completeActiveBatch(slot) {
   const btn = el.diskState?.querySelector(`[data-complete-ssd="${slot}"]`);
   const batch = btn?.dataset?.completeBatch || "this batch";
@@ -634,7 +683,7 @@ function renderAwsJobs(jobs) {
   el.awsJobs.innerHTML = "";
   if (!jobs.length) {
     el.awsJobs.innerHTML =
-      '<div class="hint">No AWS uploads yet — use “Upload this batch to AWS (CMD)” or SSD+AWS mode</div>';
+      '<div class="hint">No AWS uploads yet — use “Upload this SSD to AWS” on a disk card, or SSD+AWS mode</div>';
     return;
   }
   for (const job of jobs.slice(0, 12)) {
@@ -1088,6 +1137,11 @@ el.updateApp?.addEventListener("click", () => {
 });
 
 el.diskState?.addEventListener("click", (ev) => {
+  const uploadBtn = ev.target.closest("[data-upload-ssd]");
+  if (uploadBtn && !uploadBtn.disabled) {
+    void uploadSsdToAws(uploadBtn.dataset.uploadSsd);
+    return;
+  }
   const btn = ev.target.closest("[data-complete-ssd]");
   if (!btn || btn.disabled) return;
   void completeActiveBatch(btn.dataset.completeSsd);

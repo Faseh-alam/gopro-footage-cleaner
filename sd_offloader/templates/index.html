@@ -82,7 +82,7 @@
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
           <button id="start-session" type="button" class="primary">Start auto offload (SD → SSD → AWS)</button>
           <button id="stop-session" type="button" class="secondary">Stop hotplug watching</button>
-          <button id="upload-batch" type="button" class="primary" title="Opens CMD with s5cmd (or aws) sync — after a successful size verify, only this batch folder is deleted on the SSD">Upload this batch to AWS (CMD)</button>
+          <button id="upload-batch" type="button" class="primary" title="Uploads the selected batch from one SSD at a time. If both SSDs have this batch, use Upload this SSD on the disk card so GX010001.MP4 on SSD-B cannot overwrite SSD-A. After a successful size verify, only that SSD's batch folder is deleted.">Upload this batch to AWS (CMD)</button>
           <button id="test-aws" type="button" class="secondary" title="Uploads an empty test file using aws configure credentials">Test AWS connection</button>
         </div>
         <p id="session-status" class="status"></p>
@@ -126,9 +126,10 @@
             <em>not</em> mean AWS is done — older closed batches upload, verify, and clean up
             independently while the new active batch keeps receiving cards.
             Both SSDs still start at the same cycle number and only advance on their own disk.
-            After <strong>Upload this batch to AWS</strong> or <strong>Batch Completed</strong>,
-            a successful size verify <strong>deletes only that batch folder</strong> on the SSD
-            (other batches stay).
+            After <strong>Upload this SSD to AWS</strong> or <strong>Batch Completed</strong>,
+            a successful size verify <strong>deletes only that SSD's batch folder</strong>
+            (the other SSD and other batches stay). Same filename on two SSDs becomes
+            <code>GX010001-1.MP4</code> on S3 instead of overwriting.
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>

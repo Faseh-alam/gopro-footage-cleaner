@@ -165,8 +165,8 @@ def create_app() -> Flask:
                     {
                         "last_batch": batch,
                         "s3_uri": s3_uri,
-                        "ssd1": ssd1,
-                        "ssd2": ssd2,
+                        **({"ssd1": ssd1} if ssd1 else {}),
+                        **({"ssd2": ssd2} if ssd2 else {}),
                     }
                 )
                 engine.bind_batch_context(batch=batch, ssd1=ssd1, ssd2=ssd2, s3_uri=s3_uri)

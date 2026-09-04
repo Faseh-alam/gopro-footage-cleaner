@@ -4,6 +4,19 @@ This document describes how the SD Offloader worked **before**, what it does **n
 
 ---
 
+## v1.9.11 — multi-TB / dual-SSD S3 safety
+
+- Verify listings (`s5cmd du`, `aws s3 ls --recursive --summarize`, object `ls`) wait up to **30 minutes**. The `s5cmd sync` / `cp` upload itself is never killed by that timer.
+- Size check slack is **max(1 MiB, 0.01% of this job's local bytes)** so a ~3.2 TB batch is allowed ~320 MB of listing noise. Exact match still PASSes; outside the slack FAILs.
+- Local byte totals prefer a complete recorded size list when it matches the file count; otherwise the folder is walked.
+- Copy watchdog still runs every 30 minutes. A live copy whose `bytes_done` is increasing is left alone. A live copy whose byte count has not moved for 30 minutes is marked stalled in the UI — **the thread is not killed**.
+- Never merge two SSDs into one S3 job. Use **Upload this SSD to AWS** (or Batch Completed, which already uploads per disk). If both disks have the selected batch, the combined Upload button refuses.
+- After SSD-A has uploaded `batch01/GX010001.MP4`, SSD-B's different `GX010001.MP4` is copied to `batch01/GX010001-1.MP4` (sidecar follows). Same name + same size is treated as already on S3 (no download/hash of TB objects). If S3 listing fails or times out, upload is refused rather than blindly syncing over existing keys.
+- Verify compares **this job's mapped keys**, not the whole prefix, so extra objects from the other SSD do not fail the check.
+- Auto-delete runs only after a successful verify of that job's `sources` folder. Timeout or mismatch keeps local files. SD cards are never wiped by AWS verify.
+
+---
+
 ## Summary
 
 | Topic | Previous | Current |

@@ -455,6 +455,13 @@ button.danger {
   align-items: flex-start;
 }
 
+.disk-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
 .disk-card-title {
   font-weight: 650;
   font-size: 0.95rem;
