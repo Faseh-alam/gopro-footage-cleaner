@@ -1,0 +1,839 @@
+# SD Offloader — Process Flowchart
+
+**Application:** SD Card Offloader (`sd_offloader`)
+**Version:** 1.9.15 (`sd_offloader/offloader/__init__.py`)
+**Branch:** `redesign-testing`
+**Interface:** Flask + waitress web UI on `http://127.0.0.1:8877`
+**Purpose of this document:** a complete, code-accurate map of the offloader's runtime behaviour — every stage, decision branch, retry path and safety gate — for review by the team lead before it goes to the project manager.
+
+> This document was produced by reading the shipped source. No application code was modified.
+>
+> **Scope note for the reviewer:** it describes the working tree at version **1.9.15**. The last commit on `redesign-testing` is 1.9.14; the 1.9.15 changes to `engine.py` and `aws_upload.py` are still uncommitted. Section 19 lists exactly what those changes are, so they can be confirmed before this goes further.
+
+---
+
+## 1. Where the offloader sits in the pipeline
+
+The offloader is the middle stage: it moves labelled-but-untrimmed footage off SD cards onto two SSDs, embeds the label metadata inside each SSD copy, and optionally pushes each completed batch to S3.
+
+```mermaid
+flowchart LR
+    A["GoPro Cleaner<br/>operator labels footage<br/>writes GX010001.segments.json<br/>and embeds JSON into the MP4"]
+    B["SD card - untrimmed<br/>DCIM/100GOPRO/<br/>GX010001.MP4 + sidecar JSON"]
+    C["SD OFFLOADER v1.9.15<br/>Flask + waitress<br/>127.0.0.1:8877"]
+    D["SSD 1 and / or SSD 2<br/>Batches/batch01/ - flat, no card folder<br/>segments JSON embedded into the SSD copy"]
+    E["AWS S3<br/>s3://bucket/prefix/batch01/"]
+    F["AWS host<br/>scripts/aws_trim_batch.py<br/>cuts work segments into task folders"]
+    G["SSD batch folder deleted<br/>next batch number opened"]
+
+    A --> B --> C --> D --> E --> F
+    D -.->|"only after this job's S3 sizes verify twice"| G
+
+    classDef nProc fill:#f1f5f9,stroke:#475569,color:#0f172a
+    classDef nApp fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nCloud fill:#e0e7ff,stroke:#4f46e5,color:#312e81
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,B,D nProc
+    class C nApp
+    class E,F nCloud
+    class G nSafe
+```
+
+**Key design points of the current version**
+
+| Aspect | Behaviour |
+|---|---|
+| SSD layout | Flat — `Batches/batch01/GX010001.MP4`. No card-ID subfolder, no task subfolders. |
+| Label storage | `.segments.json` sidecar **plus** the same JSON embedded inside the SSD copy of the MP4 as an ignorable MP4 `skip` box tagged `WCSG`. |
+| Card originals | Never modified. Embedding happens only on the SSD copy. |
+| Card detection | Structure-based: any volume with `DCIM/` + a 3-digit `GOPRO` folder containing an MP4. A `C1234` volume label is **not** required. |
+| Trimming | Does not happen here. Raw MP4s are shipped whole; trimming happens later on AWS. |
+| Concurrency | Up to `max_parallel_cards` (default 3, clamped 1–8) SD→SSD copies at once; further cards queue. |
+| Card splitting | A single card is never split across two SSDs. |
+
+---
+
+## 2. Application startup
+
+```mermaid
+flowchart TD
+    S(["run.bat / run.sh"]) --> A["offloader.app main()"]
+    A --> B["ensure_dirs() and load_config()<br/>port = SD_OFFLOADER_PORT or config.port or 8877<br/>host = SD_OFFLOADER_HOST or 127.0.0.1"]
+    B --> C["create_app() - register all API routes"]
+    C --> T1["thread offloader-restore:<br/>sleep 2 s, then restore_ui_state()"]
+    C --> T2["thread offloader-browser:<br/>poll /api/ping up to 60 times at 0.5 s,<br/>then open the browser"]
+    C --> D{"is waitress installed?"}
+    D -->|yes| E["serve with threads=16, channel_timeout=30"]
+    D -->|no| F["Flask dev server<br/>threaded=True, no reloader"]
+    E --> G{"port bind succeeds?"}
+    F --> G
+    G -->|"OSError"| H["ERROR: another program holds the port<br/>abort startup"]
+    G -->|yes| I(["Server listening - UI reachable"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nThread fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    class S,I nStart
+    class A,B,C,E,F nProc
+    class D,G nDec
+    class H nStop
+    class T1,T2 nThread
+```
+
+The startup path deliberately does **no** disk, WMI or AWS work before the port is bound. `/api/ping` and `/api/health` are cheap by design; the expensive tool/PATH scan lives behind `/api/health/full`.
+
+---
+
+## 3. Crash and restart recovery — `restore_ui_state()`
+
+This runs 2 seconds after boot and decides what survived a restart. External AWS uploads run in their own console window, so they usually *do* survive.
+
+```mermaid
+flowchart TD
+    A(["restore_ui_state()"]) --> B["register the batch-deleted hook<br/>aws_upload to engine.on_batch_deleted"]
+    B --> C["restore_jobs_from_disk()<br/>read state/aws_jobs.json, newest 40"]
+    C --> C1{"stored status is<br/>running / interrupted / checking?"}
+    C1 -->|no| C7["keep the stored status"]
+    C1 -->|yes| C2{"log file still being written<br/>OR stored PID still alive?"}
+    C2 -->|yes| C3["status = running<br/>re-attached to the live console upload"]
+    C2 -->|no| C4{"log contains the<br/>OFFLOADER_EXIT marker?"}
+    C4 -->|"exit 0"| C5["status = completed<br/>spawn background _auto_verify_job"]
+    C4 -->|"exit non-zero"| C6["status = error<br/>operator clicks Retry"]
+    C4 -->|"no marker"| C8["status = checking<br/>settle it via a process scan"]
+
+    C3 --> D
+    C5 --> D
+    C6 --> D
+    C7 --> D
+    C8 --> D
+
+    D["_discover_orphan_logs()<br/>adopt any log file with no job row,<br/>modified within the last 6 h"]
+    D --> E["_persist_jobs() and _ensure_monitor()<br/>start the 1 s aws-log-monitor thread"]
+    E --> F["background thread aws-discover:<br/>_discover_live_aws_processes()<br/>_finalize_checking_jobs()"]
+    F --> G["read state/ui_snapshot.json<br/>session + card rows + log"]
+    G --> H{"card status was<br/>copying or verifying?"}
+    H -->|yes| I["status = interrupted<br/>its copy thread died with the old process"]
+    H -->|no| J["restore the row unchanged"]
+    I --> K
+    J --> K
+    K["restore disk_batches, disk_completed,<br/>closed_batches and frozen_disks from config"]
+    K --> L["FORCE session.active = false<br/>the SD watcher is NOT auto-resumed;<br/>scanning drives at boot froze the UI on hung readers"]
+    L --> M["_ensure_watchdog() - 30 min recovery loop"]
+    M --> N(["Operator must click Start to re-arm hotplug"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nWarn fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    class A,N nStart
+    class B,C,C3,C5,C7,D,E,F,G,I,J,K,M nProc
+    class C1,C2,C4,H nDec
+    class C6,C8,L nWarn
+```
+
+---
+
+## 4. Starting a session — the validation gate
+
+`POST /api/session/start` refuses anything under-specified before a single byte moves.
+
+```mermaid
+flowchart TD
+    A(["Operator clicks<br/>Start auto offload - SD to SSD to AWS"]) --> B{"batch name provided?"}
+    B -->|no| X1["400 - Batch name is required"]
+    B -->|yes| C{"mode is ssd_only<br/>or ssd_and_aws?"}
+    C -->|no| X2["400 - invalid mode"]
+    C -->|yes| D{"at least one SSD selected?"}
+    D -->|no| X3["400 - Pick at least one SSD"]
+    D -->|yes| E{"mode is ssd_and_aws<br/>with an empty S3 URI?"}
+    E -->|yes| X4["400 - S3 URI required for SSD + AWS mode"]
+    E -->|no| F{"every selected SSD path exists?"}
+    F -->|no| X5["400 - SSD path not found"]
+    F -->|yes| G["session.active = true<br/>store batch, mode, ssd1, ssd2, s3_uri<br/>prune disk state maps to these two SSDs<br/>clear previously cancelled card rows"]
+    G --> H["_restore_disk_batches_from_folders()<br/>reuse the newest OPEN batch folder per disk;<br/>a closed batch is never reopened as active"]
+    H --> I["save_config() and _persist_disk_state()"]
+    I --> J["_ensure_watcher() - 1 s hotplug loop<br/>_ensure_watchdog() - 30 min loop<br/>_pump_closed_uploads() - resume pending AWS work"]
+    J --> K(["Immediate _scan_for_cards() - hotplug armed"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    class A,K nStart
+    class G,H,I,J nProc
+    class B,C,D,E,F nDec
+    class X1,X2,X3,X4,X5 nStop
+```
+
+Other operator actions around this stage: **Refresh drives & batches**, **Test AWS connection** (uploads then deletes a tiny probe object), card-reader slot mapping, and the one-click **Update** button (section 16).
+
+---
+
+## 5. Hotplug watcher and card detection
+
+```mermaid
+flowchart TD
+    A(["sd-watcher thread"]) --> B{"session.active?"}
+    B -->|no| B1["sleep 2 s"]
+    B1 --> B
+    B -->|yes| C["_scan_for_cards()"]
+    C --> C1["sleep 1 s"]
+    C1 --> B
+
+    C --> D["find_card_volumes()<br/>excluding the configured SSD paths"]
+    D --> D1["enumerate drives<br/>Windows GetLogicalDrives, mac /Volumes, linux /media<br/>each probe capped at 1.5 s so a hung reader cannot block"]
+    D1 --> D2{"drive type is<br/>removable or fixed?"}
+    D2 -->|no| D3["ignored"]
+    D2 -->|yes| D4{"is there a DCIM folder with a<br/>3-digit GOPRO subfolder containing<br/>at least one MP4 anywhere below it?"}
+    D4 -->|no| D3
+    D4 -->|yes| E["it is a GoPro card<br/>card_id = SD- plus the last 8 of the volume serial<br/>the volume label is irrelevant"]
+    E --> F["_reconcile_hotplug() - handle removals, section 6"]
+    F --> G["per-card gating decisions, section 7"]
+    G --> H["_pump_waiting_queue()<br/>promote queued cards into free slots"]
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    class A nStart
+    class C,C1,D,D1,E,F,G,H nProc
+    class B,D2,D4 nDec
+    class B1,D3 nIdle
+```
+
+---
+
+## 6. Card removal handling — `_reconcile_hotplug()`
+
+A card that disappears is classified by **what it was doing**, so an unplug mid-copy never looks like a success.
+
+```mermaid
+flowchart TD
+    A(["known card is no longer present<br/>and its mount path is gone"]) --> B["drop any queued entry for it"]
+    B --> C{"what was its status?"}
+    C -->|"waiting"| D["status = removed<br/>re-insert anytime to auto-start"]
+    C -->|"queued / copying / verifying<br/>cancelling / scanning"| E["mark cancel-requested<br/>status = interrupted<br/>SD removed during transfer:<br/>re-insert the SAME card and click Retry.<br/>Files already on the SSD are kept."]
+    C -->|"wiping / ejecting<br/>uploading / completed"| F["status = removed<br/>SSD copy already verified, AWS work continues,<br/>the slot is free for the next card"]
+    C -->|"error / interrupted / cancelled"| G["status is KEPT, not cleared to removed<br/>message becomes: SD not seen - re-insert the same<br/>card and click Retry; it will NOT auto-start<br/>and SSD files are kept<br/>(changed in 1.9.15 - see section 19)"]
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nWarn fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A nStart
+    class B nProc
+    class C nDec
+    class E nWarn
+    class D,F,G nSafe
+```
+
+---
+
+## 7. Per-card gating — should this card start now?
+
+This is the busiest decision cluster in the app. It prevents duplicate work, respects operator intent, and detects media swapped in behind the same tracking id.
+
+```mermaid
+flowchart TD
+    A(["card present in this scan"]) --> B{"same tracking id but a DIFFERENT<br/>volume serial than the stored row?"}
+    B -->|"yes - old row finished, failed or waiting"| B1["new physical media detected<br/>clear the old row, dequeue it, auto-start"]
+    B -->|no| C{"stored status = removed?"}
+    C -->|yes| C1["drop the stale row and continue"]
+    C -->|no| D{"status is error / interrupted /<br/>cancelled / cancelling?"}
+    D -->|yes| D1["SKIP - wait for the operator to click Retry.<br/>A failed or cancelled card is NEVER auto-restarted."]
+    D -->|no| E{"status is active AND its copy thread<br/>is alive AND the mount is unchanged?"}
+    E -->|yes| E1["SKIP - already being handled"]
+    E -->|no| F{"status is completed / wiping /<br/>ejecting / uploading?"}
+    F -->|yes| G{"any transferable files<br/>left on the card?"}
+    G -->|no| G1["mark completed - a wiped card stays DONE,<br/>hotplug stays armed for the next SD"]
+    G -->|"yes, and status = completed"| G2["new files appeared on a finished card<br/>re-offload it"]
+    G -->|"yes, still mid-finish"| G3["SKIP until it settles"]
+    F -->|no| H{"status is active BUT<br/>its thread is dead?"}
+    H -->|"was cancelling"| H1["status = cancelled - SKIP"]
+    H -->|"was waiting"| H2["leave it queued - SKIP"]
+    H -->|"was queued less than 8 s ago"| H4["SKIP - the thread has not started yet,<br/>this is not a crash<br/>(added in 1.9.15 - see section 19)"]
+    H -->|"any other active status"| H3["status = interrupted<br/>copy worker stopped - click Retry"]
+    H -->|"not an active status - fresh card"| I
+
+    B1 --> I
+    C1 --> I
+    G2 --> I
+
+    I{"does the card progress file say<br/>complete for THIS batch?"}
+    I -->|no| K["_start_card_job() - section 8"]
+    I -->|yes| J{"does the SSD destination actually hold<br/>those files at the recorded sizes?"}
+    J -->|yes| J1["status = completed<br/>Already on SSD - the SD card is NOT wiped"]
+    J -->|no| J2["the progress file was wrong<br/>clear it and re-copy from scratch"]
+    J2 --> K
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nSkip fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    classDef nWarn fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A nStart
+    class B1,C1,G2,J2,K nProc
+    class B,C,D,E,F,G,H,I,J nDec
+    class D1,E1,G3,H2,H4 nSkip
+    class H1,H3 nWarn
+    class G1,J1 nSafe
+```
+
+---
+
+## 8. Card admission — inventory, metadata gate, SSD and batch assignment
+
+```mermaid
+flowchart TD
+    A(["_start_card_job()"]) --> B["inventory.list_transfer_files()<br/>recursive walk of DCIM and its 3-digit GOPRO folders<br/>collect every MP4 plus its sidecar<br/>preferred order: .segments.json, then .JSON, then .json<br/>skip dot-underscore files, .trash,<br/>System Volume Information and the recycle bin<br/>each absolute source path is a unique transfer identity"]
+    B --> C{"any MP4 found?"}
+    C -->|no| X1["status = error<br/>No MP4s + JSON under DCIM GOPRO folders<br/>click Retry after fixing"]
+    C -->|yes| D{"does EVERY MP4 have a sidecar JSON?"}
+    D -->|no| X2["STOP - status = error<br/>MP4 missing JSON sidecar<br/>click Retry after labeling in GoPro Cleaner<br/>NOTHING is copied and the card is NOT touched"]
+    D -->|yes| E["readers.match_reader()<br/>resolve Reader 1 / 2 / 3 from the PNP id or drive letter"]
+    E --> F{"is there a resume destination<br/>in the card's progress file?"}
+    F -->|yes| F1["reuse the SSD that already holds that folder<br/>and keep the same batch name"]
+    F -->|no| G["_committed_bytes_by_ssd()<br/>subtract bytes already promised to<br/>waiting, queued and in-flight cards"]
+    G --> H{"does the WHOLE card fit on SSD 1<br/>while leaving the 10 GB reserve free?"}
+    H -->|yes| H1["pick SSD 1"]
+    H -->|no| H2["_maybe_auto_upload_disk on SSD 1<br/>close its active batch so AWS can drain it"]
+    H2 --> I{"does the whole card fit on SSD 2<br/>while leaving the 10 GB reserve free?"}
+    I -->|yes| I1["pick SSD 2"]
+    I -->|no| I2["_maybe_auto_upload_disk on SSD 2"]
+    I2 --> X3["status = error<br/>No SSD can take this card with the 10 GB reserve<br/>free space, or wait for AWS cleanup, then Retry"]
+
+    H1 --> J
+    I1 --> J
+    F1 --> J
+    J["_batch_for_ssd()<br/>both disks share the same cycle number<br/>a CLOSED batch is never reused as active<br/>create the Batches folder for this batch"]
+    J --> K["write .gopro_offload_progress.json on the card<br/>status = in_progress, plus dest and bytes_total"]
+    K --> L{"are active copies already at<br/>max_parallel_cards? default 3, clamp 1 to 8"}
+    L -->|yes| L1["status = waiting<br/>queued for a free slot"]
+    L -->|no| M(["_launch_copy_thread() - section 10"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    class A,M nStart
+    class B,E,F1,G,H1,H2,I1,I2,J,K nProc
+    class C,D,F,H,I,L nDec
+    class X1,X2,X3 nStop
+    class L1 nIdle
+```
+
+> **Gate worth flagging to the PM:** a single unlabelled MP4 (no sidecar) fails the **entire card**. Nothing is copied and nothing is wiped until the operator labels it in GoPro Cleaner. This is intentional — it guarantees no footage reaches the SSD without labels.
+
+---
+
+## 9. Destination naming — filename collisions across cards
+
+GoPro restarts numbering on every card, so `GX010001.MP4` arrives many times. Names are resolved **before** copying, under a per-destination-folder lock, so two parallel cards cannot claim the same name.
+
+```mermaid
+flowchart TD
+    A(["_resolve_dest_names() - holds the batch folder lock"]) --> B["pass 1 handles MP4s, pass 2 handles sidecars,<br/>so a sidecar can follow its MP4's final name"]
+    B --> C{"does the progress file already record<br/>a destination name for this file?"}
+    C -->|yes| C1["reuse the recorded name<br/>so resume stays consistent"]
+    C -->|no| D["pairing.find_existing_dest_name()<br/>inspect GX010001.MP4, GX010001-1.MP4 and so on"]
+    D --> E{"same size AND same identity?<br/>compare the embedded WCSG payload or dest sidecar:<br/>source, size_bytes, device_id, device_type,<br/>card_badge, camera_serial, recorded_at"}
+    E -->|"identical video"| E1["already_in_batch = true<br/>reuse the existing name<br/>DO NOT copy, DO NOT wipe it from the card"]
+    E -->|"identity unreadable, sizes match"| F{"SHA-256 of both files equal?<br/>hashing is a last resort only"}
+    F -->|yes| E1
+    F -->|no| G
+    E -->|"different video"| G["_claim_flat_name()<br/>GX010001.MP4 taken, so use GX010001-1.MP4,<br/>then -2, and so on<br/>always a flat filename, never a subfolder"]
+    G --> H["the sidecar follows the chosen stem:<br/>GX010001-1.segments.json"]
+    C1 --> I(["names fixed for this card"])
+    E1 --> I
+    H --> I
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,I nStart
+    class B,C1,D,G,H nProc
+    class C,E,F nDec
+    class E1 nSafe
+```
+
+Nothing already in the batch folder is ever overwritten.
+
+---
+
+## 10. The copy worker — per file
+
+One thread per card (`copy-CARDID`). Cancellation is checked at every step, including inside the write loop.
+
+```mermaid
+flowchart TD
+    A(["_copy_card_worker() - status = copying"]) --> B["for each file in the manifest"]
+    B --> C{"cancel requested?"}
+    C -->|yes| Z1["raise CopyCancelled"]
+    C -->|no| D{"already_in_batch and the<br/>destination file exists?"}
+    D -->|yes| D1["do not copy<br/>still ensure the sidecar and embed on the dest MP4<br/>count it as already in this batch"]
+    D1 --> B
+    D -->|no| E{"progress file says done AND the dest<br/>exists at the recorded size?"}
+    E -->|yes| E1["skip the copy, re-assert metadata"]
+    E1 --> B
+    E -->|no| F{"is the source file still on the card?"}
+    F -->|no| Z2["raise - Source missing on card"]
+    F -->|yes| G["transfer.copy_file()<br/>write to a .partial temp file<br/>16 MB buffer, or 1 MB reads while reporting progress<br/>UI updated at least every 1 MB"]
+    G --> H{"partial size equals source size?"}
+    H -->|no| Z3["delete the partial, raise - Copy size mismatch"]
+    H -->|yes| I["_finalize_partial()<br/>rename to the final name<br/>up to 12 retries on Windows sharing or permission locks<br/>such as antivirus or Explorer holding the file"]
+    I --> J{"does the dest exist at the exact expected size?"}
+    J -->|no| Z4["raise - Copy did not land on SSD"]
+    J -->|yes| K{"is this an MP4?"}
+    K -->|"no - sidecar JSON"| P
+    K -->|yes| L["_preserve_dest_metadata()"]
+    L --> L1["_ensure_dest_sidecar()<br/>copy the JSON next to the dest MP4 if absent"]
+    L1 --> L2{"does the dest MP4 already carry<br/>an embedded WCSG payload?"}
+    L2 -->|yes| P
+    L2 -->|no| L3["validate_sidecar_for_mp4()<br/>check the sidecar source field matches the MP4 name,<br/>the sidecar stem matches, and size_bytes matches"]
+    L3 --> L4{"any validation errors?"}
+    L4 -->|yes| L5["LOG the mismatch<br/>the sidecar is still copied, embedding is SKIPPED"]
+    L4 -->|no| L6["warn about any missing field:<br/>complete, segments, device_id, device_type,<br/>camera_serial, recorded_at, IMU sensor list"]
+    L6 --> L7["embed_meta.embed_segments_json()<br/>append an MP4 skip box tagged WCSG<br/>no re-encode; video, audio and the gpmd IMU track untouched<br/>THE CARD ORIGINAL IS NEVER MODIFIED"]
+    L7 --> M{"does the dest MP4 now have<br/>a sidecar beside it?"}
+    L5 --> M
+    M -->|no| Z5["raise - JSON sidecar missing for dest MP4"]
+    M -->|yes| P
+    P["progress.mark_file_done()<br/>record size, the dest_size after embedding, and dest_rel"]
+    P --> Q{"more files?"}
+    Q -->|yes| B
+    Q -->|no| R{"was nothing written at all, even though<br/>files existed and were not all skipped?"}
+    R -->|yes| Z6["raise - No files were written under the destination"]
+    R -->|no| S(["proceed to verify - section 11"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,S nStart
+    class B,G,I,L,L1,L3,L6,L7,P,D1,E1 nProc
+    class C,D,E,F,H,J,K,L2,L4,M,Q,R nDec
+    class Z1,Z2,Z3,Z4,Z5,Z6 nStop
+    class L5 nSafe
+```
+
+---
+
+## 11. Verify, wipe, eject — the destructive stage
+
+Deletion on the SD card happens **only** through this gate, and only for files this card actually copied and verified.
+
+```mermaid
+flowchart TD
+    A(["status = verifying"]) --> B["build the manifest, one row per file"]
+    B --> C{"does the dest file exist at the expected size?<br/>expected = dest_size after embedding"}
+    C -->|no| X1["raise - Verify failed: missing or wrong size"]
+    C -->|yes| D{"is this an MP4 whose card had a sidecar,<br/>but the dest sidecar is missing?"}
+    D -->|yes| D1["try _ensure_dest_sidecar() once more"]
+    D1 --> D2{"present now?"}
+    D2 -->|no| X2["raise - Verify failed: JSON sidecar missing"]
+    D2 -->|yes| E
+    D -->|no| E["mark the row verified<br/>wipe = this card copied it AND it was not already_in_batch"]
+    E --> F{"any rows flagged for wipe?"}
+    F -->|no| F1["progress = complete<br/>LOG: nothing new copied, the SD card is NOT wiped"]
+    F -->|yes| G["eject.assert_wipe_allowed() - THREE checks"]
+    G --> G1{"is the manifest empty?"}
+    G1 -->|yes| X3["WipeBlocked - empty transfer manifest"]
+    G1 -->|no| G2{"is any row flagged for wipe still unverified?"}
+    G2 -->|yes| X4["WipeBlocked - files not verified on the SSD"]
+    G2 -->|no| G3{"is any MP4 on the card absent from<br/>the accounted source list?"}
+    G3 -->|yes| X5["WipeBlocked - MP4s were not copied or verified<br/>the SD card was NOT wiped"]
+    G3 -->|no| H["progress = complete, status = wiping"]
+    H --> I["wipe_verified_sources()<br/>unlink ONLY the listed source paths<br/>each path re-checked to be under the card root<br/>shutil.rmtree is NEVER used<br/>then delete the progress file"]
+    I --> J
+    F1 --> J
+    J{"is any MP4 still left on the card?"}
+    J -->|no| K["status = ejecting<br/>Windows Shell eject verb, diskutil eject, or umount<br/>a failure here is logged as a warning only"]
+    J -->|yes| L["do NOT eject<br/>LOG: MP4s remain on the card"]
+    K --> M
+    L --> M
+    M["status = completed - the message depends on the outcome:<br/>all new files copied and card ejected, or<br/>0 new files, all already in this batch, not wiped, or<br/>files left on SD, not wiped, or<br/>Offloading of Reader X complete, insert a new card in port X"]
+    M --> N(["thread exits, _pump_waiting_queue() promotes the next card"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nDanger fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,N nStart
+    class B,E,D1,H,K,L,M nProc
+    class C,D,D2,F,G1,G2,G3,J nDec
+    class X1,X2,X3,X4,X5 nStop
+    class G,I nDanger
+    class F1 nSafe
+```
+
+### Failure exits from the card worker
+
+```mermaid
+flowchart LR
+    A["exception inside the worker"] --> B{"CopyCancelled?"}
+    B -->|yes| C["status = cancelled<br/>files already on the SSD are KEPT<br/>the card was NOT wiped<br/>re-insert and Retry to resume"]
+    B -->|no| D["status = error<br/>message plus click Retry to resume<br/>files already on the SSD are skipped on retry"]
+    C --> E["finally: remove the thread,<br/>then _pump_waiting_queue()"]
+    D --> E
+
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nWarn fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,E nProc
+    class B nDec
+    class D nWarn
+    class C nSafe
+```
+
+---
+
+## 12. Closing a batch and dispatching it to AWS
+
+A batch closes either **manually** (the *Batch Completed* button on a disk card) or **automatically** when that SSD can no longer accept the next card.
+
+```mermaid
+flowchart TD
+    A1(["Operator clicks Batch Completed on a disk"]) --> B
+    A2(["SSD cannot fit the next card<br/>_maybe_auto_upload_disk()"]) --> B
+    B["close_active_batch(ssd)"] --> C{"does the SSD belong to this session?"}
+    C -->|no| X1["error - SSD does not match SSD 1 or SSD 2"]
+    C -->|yes| D{"does the active batch folder<br/>contain any footage?"}
+    D -->|no| X2["error - this batch has no footage yet<br/>Batch Completed does not delete anything;<br/>it only stops new cards going into this batch"]
+    D -->|yes| E["append the batch to closed_batches for this disk<br/>open the successor, batch01 becomes batch02<br/>create the new folder and persist state"]
+    E --> F["_pump_closed_uploads()"]
+    F --> G{"mode is ssd_and_aws<br/>with an S3 URI set?"}
+    G -->|no| G1["SSD-only mode<br/>the batch just sits on the disk, nothing uploads"]
+    G -->|yes| H{"does this SSD already have<br/>an upload running?"}
+    H -->|yes| H1["wait - at most ONE upload per SSD"]
+    H -->|no| I["take the oldest closed batch whose AWS state is not<br/>uploading, verifying, verified, cleaned or failed"]
+    I --> J["_start_closed_batch_upload()<br/>scoped to THIS disk only, auto_delete = true"]
+    J --> K(["start_batch_upload() - section 13"])
+
+    NOTE["Note: the disk is recorded in frozen_disks for the UI,<br/>but an in-progress upload does NOT block new cards -<br/>_is_frozen() always returns false by design"]
+    J -.-> NOTE
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    classDef nNote fill:#fffbeb,stroke:#f59e0b,color:#78350f
+    class A1,A2,K nStart
+    class B,E,F,I,J nProc
+    class C,D,G,H nDec
+    class X1,X2 nStop
+    class G1,H1 nIdle
+    class NOTE nNote
+```
+
+---
+
+## 13. AWS upload — planning and launch
+
+```mermaid
+flowchart TD
+    A(["start_batch_upload()"]) --> B{"is s5cmd or the AWS CLI on PATH?"}
+    B -->|neither| X1["error - install s5cmd (preferred) or AWS CLI v2,<br/>then run aws configure"]
+    B -->|yes| C["tool = s5cmd if present, otherwise aws<br/>dest = batch_s3_prefix()<br/>it does not double-nest if the URI already ends in the batch name"]
+    C --> D{"how many SSDs hold this batch folder?"}
+    D -->|"both"| X2["REFUSED - two SSDs are never merged into one S3 job.<br/>Use Upload this SSD to AWS on each disk in turn, so<br/>GX010001.MP4 from SSD-B cannot overwrite SSD-A's."]
+    D -->|none| X3["error - no local batch folder found on the selected SSDs"]
+    D -->|one| E{"is an upload already running<br/>for this batch and destination?"}
+    E -->|yes| E1["COALESCE - do not open a second console<br/>set pending_resync on the live job<br/>a follow-up sync runs when it finishes, so files<br/>added mid-upload still reach S3"]
+    E -->|no| F["_prepare_s3_upload_plan()"]
+    F --> G["list_s3_object_sizes()<br/>s5cmd ls on the prefix, then the wildcard form,<br/>then aws s3 ls --recursive<br/>each listing capped at 30 minutes"]
+    G --> H{"listing outcome?"}
+    H -->|"credentials or access error, or timeout"| X4["REFUSED TO UPLOAD<br/>S3 objects could not be listed, so existing keys<br/>will not be blindly overwritten.<br/>Run Test AWS connection, then retry."]
+    H -->|"empty prefix"| I["treated as empty, not an error -<br/>a first upload must not be blocked"]
+    H -->|ok| I
+    I --> J["plan_s3_dest_names()<br/>same name and same size means keep it, already on S3<br/>same name but a DIFFERENT size becomes stem-1, stem-2, ...<br/>sidecars follow their MP4's destination stem"]
+    J --> K{"does any file need a remapped key?"}
+    K -->|no| L["plain folder sync<br/>s5cmd sync SRC to DEST, or aws s3 sync"]
+    K -->|yes| M["write an s5cmd run-file of explicit cp lines<br/>skipping files already on S3 at the same size"]
+    L --> N
+    M --> N
+    N["_launch_upload_job()<br/>record every file size for later verification<br/>write a .bat or .sh plus a tee'd log under state/aws_logs/<br/>auto_delete defaults to TRUE for a new job since 1.9.15"]
+    N --> O["launch a DETACHED external console window<br/>restarting the offloader does NOT stop the upload;<br/>closing that window DOES stop it"]
+    O --> P["retry ladder inside the script:<br/>attempt 1 is a plain s5cmd sync with default workers<br/>later attempts use s5cmd --numworkers 20<br/>up to 5 attempts, 15 s apart<br/>then write the OFFLOADER_EXIT marker with the exit code"]
+    P --> Q(["job status = running, monitored - section 14"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class A,Q nStart
+    class C,F,G,I,J,L,M,N,O,P nProc
+    class B,D,E,H,K nDec
+    class X1,X3 nStop
+    class X2,X4,E1 nSafe
+```
+
+---
+
+## 14. AWS monitoring, verification, and local deletion
+
+```mermaid
+flowchart TD
+    A(["aws-log-monitor thread, 1 s tick"]) --> B["_poll_all_jobs()<br/>tail the log for speed, Completed X of Y,<br/>files remaining and per-file upload lines"]
+    A --> C["_poll_s3_progress_for_jobs() - at most every 12 s<br/>sum S3 bytes for THIS job's mapped keys only,<br/>so the other SSD's objects never inflate progress"]
+    A --> D["Windows only: re-scan for live aws and s5cmd processes<br/>a changed PID becomes checking, not finished"]
+    B --> E{"OFFLOADER_EXIT marker seen in the log?"}
+    E -->|no| A
+    E -->|"cancelled"| F["status = cancelled<br/>S3 may hold a partial upload - Retry resumes it"]
+    E -->|"non-zero exit"| G["status = error<br/>click Retry, which is resume-safe"]
+    E -->|"exit 0"| H["status = completed"]
+    H --> H1{"was pending_resync set?<br/>more cards landed while this upload ran"}
+    H1 -->|yes| H2["set followup_resync = true<br/>start a NEW follow-up sync job, auto_delete = true<br/>THIS job is NOT verified and NOT deleted, and the<br/>watchdog skips it, so the folder can never be removed<br/>while files are still being synced"]
+    H1 -->|no| H3["spawn _auto_verify_job()"]
+    H2 --> HB(["the follow-up job re-enters the flow at section 13"])
+    H3 --> I
+
+    I["verify_job_sizes()"] --> J["_compare_local_s3_sizes() runs TWICE and both must agree<br/>local bytes come from the recorded size list when the<br/>file count matches, otherwise the folder is walked<br/>only this job's mapped keys are compared"]
+    J --> K{"result?"}
+    K -->|"listing timed out or failed"| K1["status returns to completed<br/>LOCAL FILES ARE NOT DELETED<br/>click Verify sizes to try again"]
+    K -->|"missing, extra, or size mismatch<br/>beyond tolerance"| K2["status = mismatch<br/>click Retry to resume the upload"]
+    K -->|"both passes agree, within<br/>1 MiB or 0.01% of local bytes"| L["status = verified"]
+    L --> M{"is auto-delete enabled for this job?<br/>opt-out since 1.9.15: true unless explicitly false,<br/>and followup_resync must not be set"}
+    M -->|no| M1["idle - the operator may click Delete local"]
+    M -->|yes| N["delete_local_after_verify with confirmed = true<br/>called INLINE from verify_job_sizes since 1.9.15,<br/>so every verify path deletes consistently"]
+    M1 -->|"operator clicks Delete local"| N
+    N --> O{"is the job verified?"}
+    O -->|no| X1["refuse - Verify sizes first"]
+    O -->|yes| P["RE-COMPARE the sizes one more time,<br/>immediately before deleting"]
+    P --> Q{"do they still match?"}
+    Q -->|"listing failed"| X2["refuse the delete - local files are kept"]
+    Q -->|"mismatch"| X3["refuse the delete - status = mismatch,<br/>restart the upload"]
+    Q -->|yes| R["delete ONLY that SSD's batch folder<br/>SD cards are never touched by AWS verification"]
+    R --> S["status = deleted_local, then the on_batch_deleted hook"]
+    S --> T["clear the batch from closed_batches, disk_batches and frozen_disks<br/>record it in disk_completed<br/>open the next batch folder on that disk<br/>notify the UI, then _pump_closed_uploads()"]
+    T --> U(["the disk is free for the next cycle"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nDanger fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    class A,U,HB nStart
+    class B,C,D,H,H2,H3,I,J,L,S,T,P nProc
+    class E,H1,K,M,O,Q nDec
+    class F,G,K2 nStop
+    class K1,X1,X2,X3 nSafe
+    class N,R nDanger
+    class M1 nIdle
+```
+
+**Manual AWS controls:** *Upload this batch to AWS (CMD)*, *Upload this SSD to AWS* (per disk), *Cancel* (kills the console plus the uploader process tree), *Retry / Restart*, *Verify sizes*, and *Delete local* (confirmed in the UI).
+
+---
+
+## 15. Watchdog — automatic recovery every 30 minutes
+
+```mermaid
+flowchart TD
+    A(["offloader-watchdog thread<br/>runs once at startup, then every 30 min"]) --> P1["Phase 1 - card jobs"]
+    P1 --> C{"is the copy thread alive with<br/>status copying or verifying?"}
+    C -->|yes| D{"has bytes_done increased<br/>since the last pass?"}
+    D -->|yes| D1["healthy - update the snapshot, leave it alone"]
+    D -->|no| D2["mark copy stalled for N minutes in the UI<br/>THE THREAD IS NOT KILLED<br/>a slow card is not a failed card"]
+    C -->|no| E{"status = interrupted, OR a copying or verifying<br/>row whose thread died more than 20 s ago?"}
+    E -->|no| E1["nothing to do"]
+    E -->|yes| F{"is the card still mounted?"}
+    F -->|no| F1["wait for the operator to re-insert it"]
+    F -->|yes| G["retry_card_job() - resume, skipping files<br/>already verified on the SSD"]
+
+    D1 --> P2
+    D2 --> P2
+    E1 --> P2
+    F1 --> P2
+    G --> P2
+
+    P2["Phase 2 - aws_upload.watchdog_pass()"] --> I{"AWS job status?"}
+    I -->|"followup_resync is set"| I0["SKIP entirely - its follow-up job owns<br/>verification and deletion (1.9.15)"]
+    I -->|"running / checking / cancelling"| I1["leave it alone"]
+    I -->|"error / mismatch / interrupted"| I2["restart_job() - resume-safe"]
+    I -->|"completed but not verified"| I3["_auto_verify_job()"]
+    I -->|"verified with auto_delete"| I4["delete_local_after_verify()"]
+    I -->|"deleted_local, hook not yet fired"| I5["fire on_batch_deleted() to free the disk"]
+    I0 --> J
+    I1 --> J
+    I2 --> J
+    I3 --> J
+    I4 --> J
+    I5 --> J
+    J["Phase 3 - _pump_closed_uploads()<br/>start any closed batch still waiting for AWS"] --> K(["log every action, then sleep 30 min"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    classDef nSafe fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef nPhase fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    class A,K nStart
+    class G,I2,I3,I4,I5 nProc
+    class C,D,E,F,I nDec
+    class E1,F1,I1,I0 nIdle
+    class D1,D2 nSafe
+    class P1,P2,J nPhase
+```
+
+---
+
+## 16. One-click self-update
+
+```mermaid
+flowchart TD
+    A(["Operator clicks Update"]) --> B["check_for_updates()<br/>git fetch origin for the current branch"]
+    B --> C{"is git available and is this a git checkout?"}
+    C -->|no| X1["report git unavailable, or not a git checkout"]
+    C -->|yes| D{"is HEAD detached?"}
+    D -->|yes| X2["refuse - this checkout is not on a branch,<br/>ask the developer to select the right branch"]
+    D -->|no| E{"is origin ahead of local?"}
+    E -->|no| E1["already up to date, nothing to do"]
+    E -->|yes| F["back up sd_offloader/config.json in memory"]
+    F --> G["git reset --hard to the origin branch<br/>local uncommitted edits are discarded"]
+    G --> H["restore config.json so machine-local settings survive"]
+    H --> I["relaunch run.bat or run.sh in a new console<br/>with browser-open suppressed, then exit this process"]
+    I --> J(["the open tab reconnects to the new build"])
+
+    classDef nStart fill:#0f766e,stroke:#0f766e,color:#ffffff
+    classDef nProc fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef nDec fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef nStop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef nIdle fill:#e2e8f0,stroke:#94a3b8,color:#334155
+    class A,J nStart
+    class B,F,G,H,I nProc
+    class C,D,E nDec
+    class X1,X2 nStop
+    class E1 nIdle
+```
+
+> Note for review: `git reset --hard` discards local uncommitted changes on the operator machine — only `sd_offloader/config.json` is preserved. That is intended for operator PCs, but worth confirming with the team lead as accepted policy.
+
+---
+
+## 17. Reference tables
+
+### 17.1 Card job states
+
+| State | Meaning | Auto-advances? |
+|---|---|---|
+| `scanning` | Being evaluated by the watcher | yes |
+| `waiting` | Queued; all parallel slots busy | yes, when a slot frees |
+| `queued` | Thread created, about to copy | yes |
+| `copying` | SD→SSD transfer in progress | yes |
+| `verifying` | Size and sidecar check of every file | yes |
+| `wiping` | Deleting verified source files on the card | yes |
+| `ejecting` | Ejecting the volume | yes |
+| `completed` | Done; the message states whether the card was wiped and ejected | terminal |
+| `interrupted` | Worker died, or the card was pulled mid-transfer | **no — needs Retry** |
+| `error` | Validation or transfer failure | **no — needs Retry** |
+| `cancelled` | Operator cancelled; SSD files kept, card not wiped | **no — needs Retry** |
+| `cancelling` | Cancel requested, stopping after the current chunk | yes |
+| `removed` | Card unplugged; the slot is ready for the next card | terminal |
+
+### 17.2 AWS job states
+
+| State | Meaning |
+|---|---|
+| `running` | External console sync in progress |
+| `checking` | PID or log ambiguous after a restart; being confirmed |
+| `completed` | Sync exited 0; size verification pending |
+| `verified` | Local bytes match this job's S3 keys, on two consecutive passes |
+| `deleted_local` | SSD batch folder removed after verification |
+| `mismatch` | Sizes disagree — Retry to resume |
+| `error` | Sync failed after all retries |
+| `interrupted` | No live upload found after a restart |
+| `cancelling` / `cancelled` | Operator stopped it; partial S3 objects may remain |
+
+### 17.3 Safety gates — every point where the app refuses to proceed
+
+| # | Gate | Consequence |
+|---|---|---|
+| 1 | Any MP4 on the card lacks a JSON sidecar | Whole card rejected; nothing copied, nothing wiped |
+| 2 | Card does not fit an SSD with the 10 GB reserve | Card rejected; a batch may be auto-closed for AWS |
+| 3 | Copy size mismatch, or destination file missing | File-level error; card not wiped |
+| 4 | Destination MP4 ends up without a sidecar | Hard error at both copy and verify time |
+| 5 | Sidecar does not describe its MP4 | Sidecar still copied; embedding skipped and logged |
+| 6 | Empty transfer manifest | Wipe blocked |
+| 7 | Any file flagged for wipe is unverified | Wipe blocked |
+| 8 | Any MP4 on the card is unaccounted for | Wipe blocked |
+| 9 | MP4s still remain on the card | Card not ejected |
+| 10 | Both SSDs hold the same batch | Combined upload refused; per-disk upload required |
+| 11 | S3 listing fails, times out, or credentials are bad | Upload refused — existing keys are never overwritten |
+| 12 | Same object name on S3 with a different size | Uploaded as `stem-1`, `stem-2`, … — never overwritten |
+| 13 | Size verification fails or times out | Local files kept; deletion refused |
+| 14 | Delete requested without `confirmed=true` | Rejected |
+| 15 | Sizes drift between verification and deletion | Deletion refused at the last moment |
+| 16 | A follow-up resync is pending for the batch | Verification and deletion deferred to the follow-up job; the folder is never deleted mid-sync |
+| 17 | Copy stalled for 30+ minutes | Flagged in the UI; the thread is **not** killed |
+| 18 | Detached HEAD on update | Update refused |
+
+### 17.4 Tunables (`sd_offloader/config.json`)
+
+| Key | Default | Range | Effect |
+|---|---|---|---|
+| `port` | 8877 | — | UI port (`SD_OFFLOADER_PORT` overrides) |
+| `mode` | `ssd_and_aws` | `ssd_only` / `ssd_and_aws` | Whether closed batches upload to S3 |
+| `max_parallel_cards` | 3 | 1–8 | Simultaneous SD→SSD copies |
+| `s5cmd_numworkers` | 20 | 1–256 | s5cmd parallelism on retry attempts |
+| `aws_upload_retries` | 5 | 1–20 | Retry attempts inside the console script |
+| `ssd1` / `ssd2` | — | — | Destination disks |
+| `s3_uri` | — | — | Base S3 prefix |
+| `card_readers` | `{}` | slots 1–3 | Reader slot mapping for operator messages |
+
+Hard-coded constants: 10 GiB SSD reserve, 30-minute watchdog interval, 30-minute S3 listing timeout, 1.5-second drive probe timeout, 16 MB copy buffer, and a size tolerance of `max(1 MiB, 0.01%)`.
+
+### 17.5 Persisted state files
+
+| Path | Contents |
+|---|---|
+| `<SD card>/.gopro_offload_progress.json` | Per-card resume record: batch, destination, per-file status, sizes, renamed destinations |
+| `sd_offloader/config.json` | Operator settings and per-disk batch cycle state |
+| `sd_offloader/state/ui_snapshot.json` | Live session, card rows and log, so reopening the UI still shows in-flight work |
+| `sd_offloader/state/aws_jobs.json` | AWS job list (newest 40) used for restart re-attachment |
+| `sd_offloader/state/aws_logs/*.log` | Tee'd upload output, also used to detect completion |
+| `sd_offloader/state/aws_logs/*.bat` and `*.sh` | The generated console upload scripts |
+| `sd_offloader/state/<batch>__<card>.json` | Local mirror of each card's progress file |
+
+---
+
+## 18. Modes at a glance
+
+| | `ssd_only` | `ssd_and_aws` |
+|---|---|---|
+| SD → SSD copy | yes | yes |
+| Embed labels into the SSD copy | yes | yes |
+| Verify, wipe, eject the card | yes | yes |
+| Batch Completed closes the batch | yes | yes |
+| Closed batch uploads to S3 | **no** — it stays on the disk | yes, one upload per SSD at a time |
+| SSD folder deleted after verification | no | yes, auto-delete is on by default |
+| Disk frees itself for the next cycle | manual | automatic |
+
+---
+
+## 19. What changed in 1.9.15 (uncommitted at the time of writing)
+
+The last commit on `redesign-testing` is **1.9.14**. The working tree is **1.9.15**, with edits to `engine.py` and `aws_upload.py`. These five changes are already reflected in the diagrams above and are the items most worth confirming during review.
+
+| # | Area | Change | Why it matters |
+|---|---|---|---|
+| 1 | `_reconcile_hotplug` (section 6) | A card in `error` / `interrupted` / `cancelled` that vanishes now **keeps its status** instead of being reset to `removed`; only its message changes. | A flaky USB reader that dropped for a single watcher tick used to clear the row, so the next tick auto-started the same card, the worker died, and the log spammed once a second. |
+| 2 | `_scan_for_cards` (section 7) | A `queued` card whose thread is not yet alive is given an **8-second grace period** before being called `interrupted`. | `queued` is set just before the thread starts, so the watcher could mistake normal startup for a crash. |
+| 3 | `_launch_upload_job` (section 13) | `auto_delete` became **opt-out**: a new job defaults to `true`, and `_auto_delete_enabled()` treats anything other than an explicit `false` as enabled. | Verified batches now reliably free their SSD instead of waiting for someone to press *Delete local*. Reviewers should confirm this default is intended. |
+| 4 | `verify_job_sizes` (section 14) | Auto-delete is now performed **inline at the end of verification** rather than only in `_auto_verify_job`. | Every route into verification — automatic, watchdog, or the manual *Verify sizes* button — now behaves identically. |
+| 5 | New `followup_resync` flag (sections 14 and 15) | When a sync finishes but more cards arrived mid-upload, the original job is flagged and is **not** verified or deleted; the follow-up sync job owns that. The watchdog skips flagged jobs. | Closes a window in which a batch folder could be deleted while a follow-up sync was still uploading files from it. |
+
+**Point to raise with the team lead:** change 3 makes local deletion the default for every new upload job. Deletion is still protected by the double size comparison and the immediate pre-delete re-check (gates 13–15), so it should be safe, but it is a policy shift worth an explicit sign-off before the project manager sees it.

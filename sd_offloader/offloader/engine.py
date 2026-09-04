@@ -602,6 +602,11 @@ def _scan_for_cards() -> None:
                     continue
                 if existing.get("status") == "waiting":
                     continue
+                # queued is set before the copy thread is alive — do not treat as a crash.
+                if existing.get("status") == "queued":
+                    started = float(existing.get("started_at") or 0)
+                    if time.time() - started < 8:
+                        continue
                 existing["status"] = "interrupted"
                 existing["message"] = (
                     "Copy worker stopped — click Retry to resume "
@@ -702,12 +707,14 @@ def _reconcile_hotplug(present: dict[str, dict]) -> None:
                 )
                 _log_line(f"{cid}: removed after finish — waiting for next card", kind="ok")
             elif status in MANUAL_RETRY_STATUSES:
-                card["status"] = "removed"
+                # Keep interrupted/error/cancelled. Flaky USB readers drop for one
+                # watcher tick; clearing to "removed" made the next tick auto-start
+                # the same card, the worker died, and the log spammed every second.
                 card["message"] = (
-                    "Card removed — plug a new SD to auto-start, "
-                    "or re-insert and Retry if this was a failed job"
+                    "SD not seen — re-insert the same card and click Retry "
+                    "(will not auto-start; files already on the SSD are kept)"
                 )
-                _log_line(f"{cid}: removed while {status}", kind="ok")
+                card["speed_mbps"] = 0.0
     _save_snapshot(force=False)
 
 

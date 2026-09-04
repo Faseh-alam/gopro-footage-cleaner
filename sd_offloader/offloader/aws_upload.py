@@ -618,6 +618,7 @@ def start_batch_upload(
         tool=tool,
         key_map=key_map,
         file_pairs=file_pairs,
+        auto_delete=auto_delete,
     )
     if auto_delete:
         with _lock:
@@ -872,6 +873,13 @@ def restart_job(job_id: str) -> dict:
     )
 
 
+def _auto_delete_enabled(job: dict | None) -> bool:
+    """Delete local after verify unless the job explicitly set auto_delete False."""
+    if not job:
+        return False
+    return job.get("auto_delete") is not False
+
+
 def verify_job_sizes(job_id: str) -> dict:
     """Compare local folder bytes vs S3 prefix; mark verified or mismatch."""
     with _lock:
@@ -925,7 +933,7 @@ def verify_job_sizes(job_id: str) -> dict:
                 f"({result['s3_objects']} objects)"
                 + (
                     " — deleting that batch folder on this SSD"
-                    if job.get("auto_delete")
+                    if _auto_delete_enabled(job)
                     else " — safe to delete local if you want"
                 )
             )
@@ -950,7 +958,17 @@ def verify_job_sizes(job_id: str) -> dict:
             f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} "
             f"ok={result['ok']} error={result.get('error')}",
         )
+        want_delete = bool(result["ok"] and _auto_delete_enabled(job) and not job.get("followup_resync"))
     _persist_jobs()
+    if want_delete:
+        try:
+            delete_local_after_verify(job_id, confirmed=True)
+        except Exception as exc:  # noqa: BLE001
+            with _lock:
+                live = _jobs.get(job_id)
+                if live:
+                    live["message"] = f"Verified but delete refused: {exc}"
+            _persist_jobs()
     return get_job(job_id) or result
 
 
@@ -1049,6 +1067,7 @@ def _launch_upload_job(
     restart: bool = False,
     key_map: dict[str, str] | None = None,
     file_pairs: list[tuple[Path, str]] | None = None,
+    auto_delete: bool | None = None,
 ) -> dict:
     recorded: list[int] = []
     for src in sources:
@@ -1154,7 +1173,13 @@ def _launch_upload_job(
             "transferred": 0,
             "verified": False,
             "progress_via_s3": True,
-            "auto_delete": bool((prev or {}).get("auto_delete")),
+            "auto_delete": (
+                True
+                if auto_delete is None and not prev
+                else bool(auto_delete)
+                if auto_delete is not None
+                else prev.get("auto_delete") is not False
+            ),
             "key_map": dict(key_map or {}),
             "recorded_sizes": recorded,
             "run_file": str(run_file) if run_file else None,
@@ -1827,6 +1852,10 @@ def set_batch_deleted_hook(fn) -> None:
 
 def _auto_verify_job(job_id: str) -> None:
     """Background size check after a successful sync exit; optional auto-delete."""
+    with _lock:
+        job = dict(_jobs.get(job_id) or {})
+    if job.get("followup_resync"):
+        return
     try:
         verify_job_sizes(job_id)
     except Exception:  # noqa: BLE001
@@ -1837,19 +1866,6 @@ def _auto_verify_job(job_id: str) -> None:
                     (job.get("message") or "Uploaded")
                     + " — click Verify sizes to confirm before deleting local"
                 )
-        _persist_jobs()
-        return
-    with _lock:
-        job = dict(_jobs.get(job_id) or {})
-    if not job.get("verified") or not job.get("auto_delete"):
-        return
-    try:
-        delete_local_after_verify(job_id, confirmed=True)
-    except Exception as exc:  # noqa: BLE001
-        with _lock:
-            live = _jobs.get(job_id)
-            if live:
-                live["message"] = f"Verified but delete refused: {exc}"
         _persist_jobs()
 
 
@@ -1863,6 +1879,8 @@ def watchdog_pass() -> list[str]:
         if not jid:
             continue
         if status in {"running", "checking", "cancelling"}:
+            continue
+        if job.get("followup_resync"):
             continue
         if status in {"error", "mismatch", "interrupted"}:
             try:
@@ -1878,7 +1896,7 @@ def watchdog_pass() -> list[str]:
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"AWS {jid} verify failed: {exc}")
             continue
-        if status == "verified" and job.get("auto_delete"):
+        if status == "verified" and _auto_delete_enabled(job):
             try:
                 delete_local_after_verify(jid, confirmed=True)
                 notes.append(f"deleted verified AWS {jid}")
@@ -1926,6 +1944,7 @@ def _run_pending_resync(
             ssd1=ssd1,
             ssd2=ssd2,
             card_id=card_id,
+            auto_delete=True,
         )
         with _lock:
             # Keep a breadcrumb on the new job.
@@ -2389,18 +2408,26 @@ def _ingest_log_progress(job_id: str) -> bool:
                         "card_id": job.get("pending_resync_card_id"),
                     }
                     job["pending_resync"] = False
-                    threading.Thread(
-                        target=_auto_verify_job,
-                        args=(job_id,),
-                        daemon=True,
-                        name=f"aws-verify-{job_id[-12:]}",
-                    ).start()
                     if need_resync and resync_args["s3_uri"] and resync_args["batch_name"]:
+                        # Do not verify/delete this folder until the follow-up sync
+                        # finishes (new job has auto_delete=True).
+                        job["followup_resync"] = True
+                        job["message"] = (
+                            f"Uploaded to {job.get('dest') or 'S3'} — "
+                            "starting follow-up sync for files added mid-upload"
+                        )
                         threading.Thread(
                             target=_run_pending_resync,
                             kwargs=resync_args,
                             daemon=True,
                             name=f"aws-resync-{job_id[-12:]}",
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=_auto_verify_job,
+                            args=(job_id,),
+                            daemon=True,
+                            name=f"aws-verify-{job_id[-12:]}",
                         ).start()
                 else:
                     job["status"] = "error"

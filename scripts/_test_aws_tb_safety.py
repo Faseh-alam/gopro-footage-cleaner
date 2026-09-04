@@ -238,6 +238,72 @@ def test_watchdog_stall_vs_progress() -> None:
         engine._watchdog_copy_snap.clear()
 
 
+def test_interrupt_hotplug_and_watchdog_resume() -> None:
+    print("\n[9] USB flicker does not auto-start; watchdog resumes interrupted")
+    with tempfile.TemporaryDirectory() as tmp:
+        engine._cards.clear()
+        engine._copy_threads.clear()
+        engine._waiting_queue.clear()
+        engine._cancel_requested.clear()
+        engine._cards["SD-1"] = {
+            "card_id": "SD-1",
+            "status": "interrupted",
+            "mount": tmp,
+            "message": "waiting for Retry",
+        }
+        engine._reconcile_hotplug({})
+        check(
+            "flicker keeps interrupted (not removed)",
+            engine._cards["SD-1"]["status"] == "interrupted",
+            str(engine._cards["SD-1"].get("status")),
+        )
+        with patch.object(engine, "retry_card_job") as retry, patch.object(
+            engine.aws_upload, "watchdog_pass", return_value=[]
+        ), patch.object(engine, "_pump_closed_uploads"):
+            engine.run_watchdog_once()
+            check("watchdog retries interrupted card when mount exists", retry.call_count == 1)
+        engine._cards.clear()
+
+
+def test_missing_auto_delete_still_deletes() -> None:
+    print("\n[10] verified jobs delete even if auto_delete key was missing")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "batch01"
+        src.mkdir()
+        body = b"keep-me"
+        (src / "GX010001.MP4").write_bytes(body)
+        job_id = "aws:missing-flag"
+        job = {
+            "id": job_id,
+            "status": "completed",
+            "verified": False,
+            "sources": [str(src)],
+            "dest": "s3://bucket/footage/batch01/",
+            "batch": "batch01",
+            "key_map": {"GX010001.MP4": "GX010001.MP4"},
+            "log": [],
+        }
+        with patch.object(a, "_persist_jobs"), patch.object(
+            a, "list_s3_object_sizes", return_value={"GX010001.MP4": len(body)}
+        ), patch.object(a, "_on_batch_deleted", None):
+            a._jobs[job_id] = dict(job)
+            a._auto_verify_job(job_id)
+            check("missing auto_delete still deleted folder", not src.exists())
+            check("job marked deleted_local", a._jobs[job_id].get("status") == "deleted_local")
+
+        src.mkdir()
+        (src / "GX010001.MP4").write_bytes(body)
+        job["auto_delete"] = False
+        with patch.object(a, "_persist_jobs"), patch.object(
+            a, "list_s3_object_sizes", return_value={"GX010001.MP4": len(body)}
+        ), patch.object(a, "_on_batch_deleted", None):
+            a._jobs[job_id] = dict(job)
+            a._auto_verify_job(job_id)
+            check("explicit auto_delete False keeps folder", src.exists())
+            check("still verified", a._jobs[job_id].get("verified") is True)
+        a._jobs.pop(job_id, None)
+
+
 def test_s3_list_empty_prefix_is_not_error() -> None:
     print("\n[9] empty S3 prefix is allowed; access denied is not")
 
@@ -278,6 +344,8 @@ def main() -> int:
     test_compare_ignores_other_ssd_objects()
     test_verify_timeout_and_mismatch_do_not_delete()
     test_watchdog_stall_vs_progress()
+    test_interrupt_hotplug_and_watchdog_resume()
+    test_missing_auto_delete_still_deletes()
     test_s3_list_empty_prefix_is_not_error()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
