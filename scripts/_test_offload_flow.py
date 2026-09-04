@@ -92,18 +92,25 @@ def simulate_worker(card_root: Path, dest: Path, card_id: str) -> tuple[list[dic
         if progress.is_file_done(prog, item["rel"], int(item["size"]), dest_file):
             item["dest_size"] = dest_file.stat().st_size
             item["copied"] = True
+            if inventory._item_is_mp4(item):
+                item["dest_size"] = engine._preserve_dest_metadata(
+                    card_id, item["rel"], src, dest_file, item.get("embed_json") or ""
+                )
             continue
         if item.get("already_in_batch") and dest_file.is_file():
             item["dest_size"] = dest_file.stat().st_size
             item["copied"] = False
+            if inventory._item_is_mp4(item):
+                item["dest_size"] = engine._preserve_dest_metadata(
+                    card_id, item["rel"], src, dest_file, item.get("embed_json") or ""
+                )
             continue
         copy_file(src, dest_file)
         dest_size = int(item["size"])
-        if item.get("embed_json"):
-            payload = json.loads(Path(item["embed_json"]).read_text(encoding="utf-8"))
-            if not pairing.validate_sidecar_for_mp4(src, Path(item["embed_json"]), payload):
-                embed_meta.embed_segments_json(dest_file, payload)
-                dest_size = dest_file.stat().st_size
+        if inventory._item_is_mp4(item):
+            dest_size = engine._preserve_dest_metadata(
+                card_id, item["rel"], src, dest_file, item.get("embed_json") or ""
+            )
         item["dest_size"] = dest_size
         item["copied"] = True
         progress.mark_file_done(card_root, prog, item["rel"], int(item["size"]),
@@ -179,7 +186,7 @@ def main() -> int:
           nested_mp4.get("dest_rel") == "GX101.MP4"
           and (batch_dest / "GX101.MP4").is_file(),
           str(nested_mp4.get("dest_rel")))
-    check("nested sidecar is flattened", (batch_dest / "GX101.json").is_file())
+    check("nested sidecar is flattened", (batch_dest / "GX101.segments.json").is_file())
     check("legacy clip is flattened", (batch_dest / "GX019999.MP4").is_file())
     check("no 100GOPRO subfolder on SSD", not (batch_dest / "100GOPRO").exists())
     check("no task subfolder on SSD", not (batch_dest / "pipe-welding").exists())
@@ -204,7 +211,7 @@ def main() -> int:
     check("duplicate was not copied", mp4_dup.get("copied") is False)
     check("no extra dest file for duplicate card",
           before_dup_dest == {p.name for p in batch_dest.iterdir()}
-          and not (batch_dest / "GX010001__CDUP.MP4").exists())
+          and not (batch_dest / "GX010001-1.MP4").exists())
     check("duplicate card still has its MP4", (gopro_dup / "GX010001.MP4").is_file())
     check("duplicate card still has its sidecar",
           (gopro_dup / "GX010001.segments.json").is_file())
@@ -213,36 +220,52 @@ def main() -> int:
     files_b, prog_b = simulate_worker(card_b, batch_dest, "C5678")
     mp4_b = next(f for f in files_b if f["rel"] == "GX010001.MP4")
     side_b = next(f for f in files_b if f["rel"].endswith(".segments.json"))
-    check("MP4 renamed with card suffix", mp4_b["dest_rel"] == "GX010001__C5678.MP4",
+    check("MP4 renamed with -1", mp4_b["dest_rel"] == "GX010001-1.MP4",
           str(mp4_b["dest_rel"]))
     check("sidecar follows renamed stem",
-          side_b["dest_rel"] == "GX010001__C5678.segments.json", str(side_b["dest_rel"]))
+          side_b["dest_rel"] == "GX010001-1.segments.json", str(side_b["dest_rel"]))
     check("both files exist in batch folder",
-          (batch_dest / "GX010001__C5678.MP4").is_file()
-          and (batch_dest / "GX010001__C5678.segments.json").is_file())
+          (batch_dest / "GX010001-1.MP4").is_file()
+          and (batch_dest / "GX010001-1.segments.json").is_file())
     check("card A copy untouched",
           embed_meta.read_embedded_segments(batch_dest / "GX010001.MP4") == full_sidecar)
+    check(
+        "-1 JSON keeps original labels",
+        json.loads((batch_dest / "GX010001-1.segments.json").read_text(encoding="utf-8")).get("card_badge") == "C5678",
+    )
+    check(
+        "-1 MP4 still has embedded labels",
+        (embed_meta.read_embedded_segments(batch_dest / "GX010001-1.MP4") or {}).get("card_badge") == "C5678",
+    )
+    check(
+        "every labeled dest MP4 has its own JSON",
+        all(
+            inventory.sidecar_for_mp4(p) is not None
+            for p in batch_dest.iterdir()
+            if p.is_file() and p.suffix.upper() == ".MP4" and p.name in {"GX010001.MP4", "GX010001-1.MP4", "GX101.MP4"}
+        ),
+    )
 
     print("\n[4] resume + duplicate prevention")
     loaded_b = progress.load_progress(card_b)
     entry = (loaded_b.get("files") or {}).get("GX010001.MP4") or {}
-    check("progress remembers dest_rel", entry.get("dest_rel") == "GX010001__C5678.MP4")
+    check("progress remembers dest_rel", entry.get("dest_rel") == "GX010001-1.MP4")
     check("renamed embedded file counts as done",
           progress.is_file_done(loaded_b, "GX010001.MP4", int(mp4_b["size"]),
-                                batch_dest / "GX010001__C5678.MP4"))
+                                batch_dest / "GX010001-1.MP4"))
     check("dest_looks_complete via dest_rel", progress.dest_looks_complete(loaded_b, batch_dest))
     check("re-run reuses same names (no dupes)",
-          not any("__C5678__" in p.name for p in batch_dest.iterdir()))
+          not any(p.name.startswith("GX010001-1-") for p in batch_dest.iterdir()))
     progress.clear_progress(card_a)
     simulate_worker(card_a, batch_dest, "C1234")
     names = {p.name for p in batch_dest.iterdir()}
     check(
         "re-offload same card reuses labeled dest (no duplicate)",
         (batch_dest / "GX010001.MP4").is_file()
-        and not (batch_dest / "GX010001__C1234.MP4").exists()
+        and not (batch_dest / "GX010001-2.MP4").exists()
         and (batch_dest / "GX101.MP4").is_file()
-        and not any(n.startswith("GX101__C1234") for n in names),
-        str(sorted(n for n in names if "__C1234" in n and n.upper().endswith(".MP4"))),
+        and not any(n.startswith("GX101-") for n in names),
+        str(sorted(n for n in names if n.upper().endswith(".MP4"))),
     )
 
     print("\n[5] metadata pairing checks")
@@ -284,7 +307,7 @@ def main() -> int:
               sorted(p.name for p in (out_root / "C0712").iterdir()) == ["pipe-welding"]
               if (out_root / "C0712").is_dir() else False)
         check("incomplete video skipped by default",
-              "GX010001__C5678.MP4" in result.stdout
+              "GX010001-1.MP4" in result.stdout
               and not (out_root / "C5678" / "cable-pulling").exists())
         clip_meta = embed_meta.read_embedded_segments(clip) if clip.is_file() else None
         check("clip carries its own embedded identity",
@@ -306,7 +329,7 @@ def main() -> int:
             capture_output=True, text=True, timeout=300,
         )
         check("--include-incomplete cuts cable-pulling clip",
-              (out_root / "C5678" / "cable-pulling" / "GX010001__C5678.MP4").is_file(),
+              (out_root / "C5678" / "cable-pulling" / "GX010001-1.MP4").is_file(),
               (result2.stdout + result2.stderr)[-200:])
         shutil.rmtree(out_root, ignore_errors=True)
     else:

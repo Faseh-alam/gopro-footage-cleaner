@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 from . import embed_meta
+
+_HASH_CHUNK = 1024 * 1024
 
 
 def load_sidecar(path: str | Path) -> dict | None:
@@ -83,6 +86,63 @@ def payloads_equivalent(a: dict, b: dict) -> bool:
     return True
 
 
+def dest_identity_unclear(dest_mp4: Path) -> bool:
+    """True when the SSD copy has no embed/sidecar we can compare."""
+    dest_mp4 = Path(dest_mp4)
+    if not dest_mp4.is_file():
+        return True
+    if embed_meta.read_embedded_segments(dest_mp4):
+        return False
+    from . import inventory as _inventory
+
+    dest_side = _inventory.sidecar_for_mp4(dest_mp4)
+    return load_sidecar(dest_side) is None if dest_side else True
+
+
+def file_digest(path: Path) -> str | None:
+    """SHA-256 of a file. Used only when metadata cannot decide identity."""
+    path = Path(path)
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(_HASH_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def files_same_bytes(left: Path, right: Path) -> bool:
+    """Size first, then hash. Never hashes when sizes differ."""
+    left, right = Path(left), Path(right)
+    try:
+        if int(left.stat().st_size) != int(right.stat().st_size):
+            return False
+    except OSError:
+        return False
+    a = file_digest(left)
+    b = file_digest(right)
+    return bool(a and b and a == b)
+
+
+def is_name_variant(original_stem: str, other_stem: str) -> bool:
+    """``GX010001``, ``GX010001-1``, and legacy ``GX010001__C1234`` are variants."""
+    original_stem = str(original_stem or "")
+    other_stem = str(other_stem or "")
+    if not original_stem or not other_stem:
+        return False
+    if other_stem == original_stem:
+        return True
+    if other_stem.startswith(f"{original_stem}-") and other_stem[len(original_stem) + 1 :].isdigit():
+        return True
+    if other_stem.startswith(f"{original_stem}__"):
+        return True
+    return False
+
+
 def batch_file_is_same_video(
     dest_mp4: Path,
     *,
@@ -120,34 +180,49 @@ def find_existing_dest_name(
     *,
     card_mp4_size: int,
     sidecar: dict | None,
+    card_mp4: Path | str | None = None,
 ) -> str | None:
-    """Reuse a batch MP4 only when sidecar/embed identity matches — never size-only."""
-    if not sidecar:
-        return None
+    """Reuse a batch MP4 only when it is the same video — never overwrite.
+
+    Fast path: sidecar/embed identity. Hash only when identity is unclear
+    (missing metadata) and sizes already match.
+    """
     dest = Path(dest)
     mp4_name = Path(str(mp4_name)).name
     stem = Path(mp4_name).stem
     suffix = Path(mp4_name).suffix.lower()
+    card_path = Path(card_mp4) if card_mp4 else None
     candidates: list[Path] = []
-    exact = dest / mp4_name
-    if exact.is_file():
-        candidates.append(exact)
     try:
         for path in dest.iterdir():
             if not path.is_file():
                 continue
             if path.suffix.lower() != suffix:
                 continue
-            if path.name == mp4_name:
-                continue
-            pstem = path.stem
-            if pstem == stem or pstem.startswith(f"{stem}__"):
+            if is_name_variant(stem, path.stem):
                 candidates.append(path)
     except OSError:
         pass
-    for path in candidates:
-        if batch_file_is_same_video(
-            path, card_mp4_size=card_mp4_size, sidecar=sidecar
-        ):
-            return path.name
+    exact = dest / mp4_name
+    if exact.is_file() and exact not in candidates:
+        candidates.insert(0, exact)
+
+    if sidecar:
+        for path in candidates:
+            if batch_file_is_same_video(
+                path, card_mp4_size=card_mp4_size, sidecar=sidecar
+            ):
+                return path.name
+        if card_path and card_path.is_file():
+            for path in candidates:
+                if not dest_identity_unclear(path):
+                    continue
+                if files_same_bytes(path, card_path):
+                    return path.name
+        return None
+
+    if card_path and card_path.is_file():
+        for path in candidates:
+            if files_same_bytes(path, card_path):
+                return path.name
     return None

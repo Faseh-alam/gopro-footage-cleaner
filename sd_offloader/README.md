@@ -21,17 +21,22 @@ Onto SSD — all cards flat into the batch folder (no per-card subfolder):
 ```text
 <SSD>/Batches/batch 6/GX010001.MP4          ← segments JSON also EMBEDDED inside
 <SSD>/Batches/batch 6/GX010001.segments.json
-<SSD>/Batches/batch 6/GX010001__C5678.MP4   ← same filename from another card → auto-suffixed
-<SSD>/Batches/batch 6/GX010001__C5678.segments.json
+<SSD>/Batches/batch 6/GX010001-1.MP4        ← same filename, different video → -1, -2, …
+<SSD>/Batches/batch 6/GX010001-1.segments.json
 ```
 
 GoPro numbering repeats across cards (every card has a `GX010001.MP4`), so
-when a name is already taken in the batch, the incoming pair is renamed with
-the card id — nothing is ever overwritten.
+when a name is already taken by a *different* video, the incoming pair is
+renamed `GX010001-1.MP4`, then `-2`, and so on — nothing is ever overwritten.
+If the batch already holds the **same** video (JSON + size + embed), that
+file is skipped. A full-file hash is used only when metadata is missing.
 
-While copying, each MP4's segments JSON is **embedded into the SSD copy of the
-MP4 itself** (an ignorable `skip` box appended at the end — video, audio and
-GPMF/IMU tracks are untouched, players and GoPro tools are unaffected). So
+While copying, each MP4's segments JSON is **copied beside that dest MP4**
+(same stem: `GX010001-1.MP4` + `GX010001-1.segments.json`) and **embedded into
+the SSD copy of the MP4 itself** (an ignorable `skip` box appended at the end —
+video, audio and GPMF/IMU tracks are untouched). Card originals are never
+modified. If a dest MP4 is skipped as already in the batch but has no JSON or
+embed yet, the sidecar is still written and the payload is still embedded.
 even if a sidecar file gets separated from its video on S3, the tasks +
 timestamps + camera serial / device id travel inside the MP4. If a sidecar is
 missing key fields (complete flag, device id, camera serial, recorded-at, IMU

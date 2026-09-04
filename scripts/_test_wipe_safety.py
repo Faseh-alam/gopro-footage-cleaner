@@ -7,6 +7,7 @@ that was not copied and verified.
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -16,7 +17,7 @@ sys.path.insert(0, str(REPO / "sd_offloader"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from offloader import eject, engine, inventory  # noqa: E402
+from offloader import eject, embed_meta, engine, inventory  # noqa: E402
 from offloader.transfer import copy_file  # noqa: E402
 
 FAILURES: list[str] = []
@@ -65,10 +66,26 @@ def _copy_files(files: list[dict], dest: Path, card_id: str) -> None:
         if item.get("already_in_batch") and dest_file.is_file():
             item["copied"] = False
             item["dest_size"] = dest_file.stat().st_size
+            if inventory._item_is_mp4(item):
+                engine._ensure_dest_sidecar(dest_file, item.get("embed_json"))
             continue
         copy_file(Path(item["source"]), dest_file)
         item["copied"] = True
         item["dest_size"] = dest_file.stat().st_size
+        if inventory._item_is_mp4(item):
+            engine._ensure_dest_sidecar(dest_file, item.get("embed_json"))
+    transferred = {
+        engine._flat_name(item.get("dest_rel") or item["rel"])
+        for item in files
+        if inventory._item_is_mp4(item)
+    }
+    missing = [
+        name
+        for name in sorted(transferred)
+        if inventory.sidecar_for_mp4(dest / name) is None
+    ]
+    if missing:
+        raise RuntimeError(f"dest MP4s missing JSON sidecar: {missing}")
 
 
 def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None) -> list[dict]:
@@ -83,7 +100,7 @@ def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None
             except OSError:
                 ok = False
         copied = bool(item.get("copied", True))
-        already = bool(item.get("already_in_batch")) and not copied
+        already = bool(item.get("already_in_batch"))
         rows.append(
             {
                 "source": item["source"],
@@ -94,7 +111,7 @@ def _manifest_for(files: list[dict], dest: Path, *, verified: bool | None = None
                 "dest_size": int(item.get("dest_size") or item["size"]),
                 "kind": item.get("kind") or "mp4",
                 "verified": bool(ok),
-                "wipe": copied,
+                "wipe": copied and not already,
                 "already_in_batch": already,
             }
         )
@@ -365,7 +382,7 @@ def test_duplicate_card_skips_copy_and_wipe() -> None:
             dest_mp4s_before == dest_mp4s_after,
             str(dest_mp4s_after),
         )
-        check("no suffix copy for the duplicate card", not any("__SD-2" in n for n in dest_mp4s_after))
+        check("no -1 copy for the duplicate card", not any("-1." in n for n in dest_mp4s_after))
         manifest2 = _manifest_for(files2, dest)
         wipe_sources = [r["source"] for r in manifest2 if r.get("wipe")]
         check("wipe list is empty", wipe_sources == [])
@@ -395,17 +412,17 @@ def test_same_name_different_identity_suffix_copy() -> None:
         mp4_b = next(f for f in files2 if f.get("kind") == "mp4")
         check("second video is not treated as already in batch", not mp4_b.get("already_in_batch"))
         check(
-            "second video saved with card suffix",
-            mp4_b.get("dest_rel") == "GX010001__SD-B.MP4",
+            "second video saved as -1",
+            mp4_b.get("dest_rel") == "GX010001-1.MP4",
             str(mp4_b.get("dest_rel")),
         )
         check(
             "both dest MP4s exist",
-            (dest / "GX010001.MP4").is_file() and (dest / "GX010001__SD-B.MP4").is_file(),
+            (dest / "GX010001.MP4").is_file() and (dest / "GX010001-1.MP4").is_file(),
         )
         check(
             "dest bodies differ",
-            (dest / "GX010001.MP4").read_bytes() != (dest / "GX010001__SD-B.MP4").read_bytes(),
+            (dest / "GX010001.MP4").read_bytes() != (dest / "GX010001-1.MP4").read_bytes(),
         )
         manifest2 = _manifest_for(files2, dest)
         try:
@@ -420,6 +437,156 @@ def test_same_name_different_identity_suffix_copy() -> None:
         check("second card wiped after suffix copy", inventory.list_card_mp4_paths(card2) == [])
 
 
+def test_numeric_suffix_chain_and_two_ssds() -> None:
+    print("\n[11] collisions use -1/-2; existing -1 kept; two SSDs stay independent")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest_a = Path(tmp) / "ssdA" / "batch01"
+        dest_b = Path(tmp) / "ssdB" / "batch01"
+        card1 = Path(tmp) / "card1"
+        card2 = Path(tmp) / "card2"
+        card3 = Path(tmp) / "card3"
+        gopro1 = _card_with_mp4s(card1, [("GX010001.MP4", b"video-from-card-AAAA")])
+        gopro2 = _card_with_mp4s(card2, [("GX010001.MP4", b"video-from-card-BBBB")])
+        gopro3 = _card_with_mp4s(card3, [("GX010001.MP4", b"video-from-card-CCCC")])
+        _stamp_identity(gopro1 / "GX010001.MP4", "CAM-A")
+        _stamp_identity(gopro2 / "GX010001.MP4", "CAM-B")
+        _stamp_identity(gopro3 / "GX010001.MP4", "CAM-C")
+
+        files1 = inventory.list_transfer_files(card1)
+        _copy_files(files1, dest_a, "SD-A")
+        files2 = inventory.list_transfer_files(card2)
+        _copy_files(files2, dest_a, "SD-B")
+        body_minus_1 = (dest_a / "GX010001-1.MP4").read_bytes()
+        files3 = inventory.list_transfer_files(card3)
+        _copy_files(files3, dest_a, "SD-C")
+        mp4_c = next(f for f in files3 if f.get("kind") == "mp4")
+        check("third different video is GX010001-2.MP4", mp4_c.get("dest_rel") == "GX010001-2.MP4",
+              str(mp4_c.get("dest_rel")))
+        check(
+            "all three dest names exist on SSD A",
+            (dest_a / "GX010001.MP4").is_file()
+            and (dest_a / "GX010001-1.MP4").is_file()
+            and (dest_a / "GX010001-2.MP4").is_file(),
+        )
+        check("existing -1 was not overwritten", (dest_a / "GX010001-1.MP4").read_bytes() == body_minus_1)
+
+        files1b = inventory.list_transfer_files(card1)
+        _copy_files(files1b, dest_b, "SD-A")
+        mp4_b = next(f for f in files1b if f.get("kind") == "mp4")
+        check("SSD B still uses the original name", mp4_b.get("dest_rel") == "GX010001.MP4")
+        check("SSD B has no -1", not (dest_b / "GX010001-1.MP4").exists())
+        check(
+            "two SSD batch folders are independent",
+            (dest_b / "GX010001.MP4").is_file() and not (dest_b / "GX010001-2.MP4").exists(),
+        )
+
+
+def test_unclear_dest_hash_same_bytes_skips() -> None:
+    print("\n[12] dest has no sidecar/embed — same bytes → hash skip, no copy")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        dest.mkdir()
+        body = b"ftypmdat-same-bytes-payload-XXXX"
+        (dest / "GX010001.MP4").write_bytes(body)
+        card = Path(tmp) / "card"
+        _card_with_mp4s(card, [("GX010001.MP4", body)])
+        files = inventory.list_transfer_files(card)
+        _copy_files(files, dest, "SD-H")
+        mp4 = next(f for f in files if f.get("kind") == "mp4")
+        check("hash match marked already_in_batch", bool(mp4.get("already_in_batch")))
+        check("reuses original dest name", mp4.get("dest_rel") == "GX010001.MP4", str(mp4.get("dest_rel")))
+        check("was not copied again", mp4.get("copied") is False)
+        check("no -1 created", not (dest / "GX010001-1.MP4").exists())
+
+
+def test_unclear_dest_hash_different_bytes_renames() -> None:
+    print("\n[13] dest has no sidecar/embed — different bytes, same size → -1")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        dest.mkdir()
+        body_a = b"AAAA" * 40
+        body_b = b"BBBB" * 40
+        (dest / "GX010001.MP4").write_bytes(body_a)
+        card = Path(tmp) / "card"
+        _card_with_mp4s(card, [("GX010001.MP4", body_b)])
+        files = inventory.list_transfer_files(card)
+        _copy_files(files, dest, "SD-H")
+        mp4 = next(f for f in files if f.get("kind") == "mp4")
+        check("not treated as the same video", not mp4.get("already_in_batch"))
+        check("saved as -1", mp4.get("dest_rel") == "GX010001-1.MP4", str(mp4.get("dest_rel")))
+        check("original dest body unchanged", (dest / "GX010001.MP4").read_bytes() == body_a)
+        check("new dest has card bytes", (dest / "GX010001-1.MP4").read_bytes() == body_b)
+
+
+def test_legacy_cardid_name_still_matched() -> None:
+    print("\n[14] legacy GX010001__C5678.MP4 still counts as the same video")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        dest.mkdir()
+        body = b"legacy-same-video-bytes-YYYY"
+        dest_mp4 = dest / "GX010001__C5678.MP4"
+        dest_mp4.write_bytes(body)
+        (dest / "GX010001__C5678.json").write_text(
+            json.dumps(
+                {
+                    "source": "GX010001.MP4",
+                    "size_bytes": len(body),
+                    "complete": True,
+                    "device_id": "CAM-A",
+                    "card_badge": "CAM-A",
+                    "media_meta": {
+                        "camera_serial": "CAM-A",
+                        "recorded_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    "segments": [{"kind": "work", "task": "x", "start": 0, "end": 1}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        card = Path(tmp) / "card"
+        gopro = _card_with_mp4s(card, [("GX010001.MP4", body)])
+        _stamp_identity(gopro / "GX010001.MP4", "CAM-A")
+        files = inventory.list_transfer_files(card)
+        _copy_files(files, dest, "SD-L")
+        mp4 = next(f for f in files if f.get("kind") == "mp4")
+        check("reuses legacy dest name", mp4.get("dest_rel") == "GX010001__C5678.MP4",
+              str(mp4.get("dest_rel")))
+        check("skipped copy", bool(mp4.get("already_in_batch")) and mp4.get("copied") is False)
+        check("did not also write GX010001.MP4", not (dest / "GX010001.MP4").exists())
+
+
+def test_skip_backfills_json_and_embed() -> None:
+    print("\n[15] dest MP4 with no JSON/embed — skip copy, still attach sidecar + embed")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "batch"
+        dest.mkdir()
+        ftyp = struct.pack(">I", 20) + b"ftypisom" + struct.pack(">I", 512) + b"isom"
+        mdat = struct.pack(">I", 8 + 100) + b"mdat" + b"\x00" * 100
+        body = ftyp + mdat
+        dest_mp4 = dest / "GX010001.MP4"
+        dest_mp4.write_bytes(body)
+        card = Path(tmp) / "card"
+        gopro = _card_with_mp4s(card, [("GX010001.MP4", body)])
+        _stamp_identity(gopro / "GX010001.MP4", "CAM-A")
+        files = inventory.list_transfer_files(card)
+        mp4 = next(f for f in files if f.get("kind") == "mp4")
+        engine._preserve_dest_metadata(
+            "SD-H", mp4["rel"], Path(mp4["source"]), dest_mp4, mp4.get("embed_json") or ""
+        )
+        side = inventory.sidecar_for_mp4(dest_mp4)
+        check("JSON written beside dest MP4", bool(side and side.is_file()), str(side))
+        embedded = embed_meta.read_embedded_segments(dest_mp4)
+        check(
+            "metadata embedded into dest MP4",
+            bool(embedded) and embedded.get("device_id") == "CAM-A",
+            str(embedded),
+        )
+        check(
+            "sidecar JSON still has camera identity",
+            bool(side) and json.loads(side.read_text(encoding="utf-8")).get("device_id") == "CAM-A",
+        )
+
+
 def main() -> int:
     test_six_copied_wipe_allowed()
     test_four_of_six_wipe_blocked()
@@ -431,6 +598,11 @@ def main() -> int:
     test_no_rmtree_on_gopro_folder()
     test_duplicate_card_skips_copy_and_wipe()
     test_same_name_different_identity_suffix_copy()
+    test_numeric_suffix_chain_and_two_ssds()
+    test_unclear_dest_hash_same_bytes_skips()
+    test_unclear_dest_hash_different_bytes_renames()
+    test_legacy_cardid_name_still_matched()
+    test_skip_backfills_json_and_embed()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
 

@@ -93,13 +93,15 @@ C1234/
 ### Filename collisions (same GoPro name on two cards)
 
 GoPro numbering repeats across cards (`GX010001.MP4` on almost every card).  
-If that name already exists in the batch, the incoming pair is renamed:
+If that name already exists in the batch **and it is a different video**, the incoming pair is renamed:
 
 ```text
-GX010001__C5678.MP4
-GX010001__C5678.segments.json
+GX010001-1.MP4
+GX010001-1.segments.json
 ```
 
+Same video (sidecar/embed identity) is skipped — not overwritten, not wiped.
+A content hash is used only when the SSD copy has no sidecar/embed to compare.
 Nothing is overwritten. The rename is stored in the card progress file so resume still works.
 
 ### Legacy cards

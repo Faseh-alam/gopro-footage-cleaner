@@ -1617,28 +1617,29 @@ def _sidecar_stem(rel: str) -> str:
     return Path(name).stem
 
 
+def _name_taken(claimed: set[str], dest: Path, cand: str) -> bool:
+    if cand.lower() in claimed:
+        return True
+    return (dest / cand).is_file() or (dest / f"{cand}.partial").is_file()
+
+
 def _claim_flat_name(
     claimed: set[str], dest: Path, base: str, suffix: str, card_id: str, rel: str
 ) -> str:
-    """Pick a unique filename in the batch folder (suffix on clash, never a subfolder)."""
-    cid = str(card_id or "").strip().upper()
-    parent = Path(str(rel or "").replace("\\", "/")).parent.name
-    candidates = [f"{base}{suffix}"]
-    if cid:
-        candidates.append(f"{base}__{cid}{suffix}")
-    if parent and parent not in {".", ""}:
-        candidates.append(f"{base}__{parent}{suffix}")
-    for cand in candidates:
-        if cand.lower() in claimed:
-            continue
-        if (dest / cand).is_file() or (dest / f"{cand}.partial").is_file():
-            continue
-        claimed.add(cand.lower())
-        return cand
-    n = 2
+    """Pick a unique filename: original, then ``base-1``, ``base-2``, … Never a subfolder.
+
+    ``card_id`` / ``rel`` are unused (kept so call sites stay stable). Legacy
+    ``stem__CARDID`` files already on disk still count as taken names.
+    """
+    del card_id, rel
+    first = f"{base}{suffix}"
+    if not _name_taken(claimed, dest, first):
+        claimed.add(first.lower())
+        return first
+    n = 1
     while True:
-        cand = f"{base}__{cid or 'DUP'}_{n}{suffix}"
-        if cand.lower() not in claimed and not (dest / cand).is_file():
+        cand = f"{base}-{n}{suffix}"
+        if not _name_taken(claimed, dest, cand):
             claimed.add(cand.lower())
             return cand
         n += 1
@@ -1658,9 +1659,10 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
     Every file is ``Batches/<batch>/<filename>`` — never ``100GOPRO/`` or a
     task subfolder. GoPro numbering repeats across cards, so when another card
     already parked a *different* video under the same name, the incoming pair
-    is renamed to ``<stem>__<CARDID><ext>``. When the batch already holds the
-    same video (sidecar/embed identity), the existing name is reused and the
-    card file is not copied or wiped.
+    is renamed to ``<stem>-1<ext>``, ``<stem>-2<ext>``, … When the batch
+    already holds the same video (sidecar/embed, or a hash only if metadata
+    is missing), the existing name is reused and the card file is not copied
+    or wiped.
     """
     entries = prog.get("files") or {}
     stem_map: dict[str, str] = {}  # pair key -> dest stem
@@ -1685,10 +1687,8 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
             final_base = _flat_name(stem_map.get(pair, base)) or base
             if recorded:
                 item["dest_rel"] = recorded
-            elif suffix.lower() == ".segments.json":
-                item["dest_rel"] = f"{final_base}.segments.json"
             else:
-                item["dest_rel"] = f"{final_base}{suffix}"
+                item["dest_rel"] = _dest_sidecar_name(dest, final_base)
             if pair in already_pairs:
                 item["already_in_batch"] = True
             claimed.add(str(item["dest_rel"]).lower())
@@ -1705,7 +1705,11 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
             pairing.load_sidecar(item["embed_json"]) if item.get("embed_json") else None
         )
         existing = pairing.find_existing_dest_name(
-            dest, name, card_mp4_size=card_size, sidecar=sidecar_payload
+            dest,
+            name,
+            card_mp4_size=card_size,
+            sidecar=sidecar_payload,
+            card_mp4=item.get("source"),
         )
         flat_existing = _flat_name(existing) if existing else ""
         if existing and flat_existing.lower() not in claimed:
@@ -1741,6 +1745,94 @@ _META_CHECKS = (
 def _missing_metadata(payload: dict) -> list[str]:
     """Names of expected sidecar fields that are absent/empty (for log warnings)."""
     return [name for name, present in _META_CHECKS if not present(payload)]
+
+
+def _dest_sidecar_name(dest: Path, stem: str) -> str:
+    """Sidecar filename that belongs to this dest MP4 stem.
+
+    Reuse an existing ``.segments.json`` / ``.json`` next to the MP4; otherwise
+    use the canonical ``{stem}.segments.json`` so every dest video has its own
+    JSON through SSD and S3.
+    """
+    for ext in (".MP4", ".mp4"):
+        mp4 = dest / f"{stem}{ext}"
+        if mp4.is_file():
+            found = inventory.sidecar_for_mp4(mp4)
+            if found:
+                return found.name
+    return f"{stem}.segments.json"
+
+
+def _ensure_dest_sidecar(dest_mp4: Path, card_sidecar: str | Path | None) -> Path | None:
+    """Copy the card JSON beside the dest MP4 when that pair is missing."""
+    dest_mp4 = Path(dest_mp4)
+    existing = inventory.sidecar_for_mp4(dest_mp4)
+    if existing:
+        return existing
+    if not card_sidecar:
+        return None
+    src = Path(card_sidecar)
+    if not src.is_file():
+        return None
+    dest_side = dest_mp4.with_name(f"{dest_mp4.stem}.segments.json")
+    copy_file(src, dest_side)
+    return dest_side if dest_side.is_file() else None
+
+
+def _preserve_dest_metadata(
+    card_id: str,
+    rel: str,
+    src: Path,
+    dest_mp4: Path,
+    sidecar_path: str,
+) -> int:
+    """Keep JSON beside the dest MP4 and embed it when the MP4 has no payload.
+
+    Card original is never modified. Existing dest sidecar/embed is left as-is.
+    """
+    dest_mp4 = Path(dest_mp4)
+    src = Path(src)
+    _ensure_dest_sidecar(dest_mp4, sidecar_path or None)
+    try:
+        dest_size = dest_mp4.stat().st_size
+    except OSError:
+        return 0
+    if not sidecar_path:
+        return dest_size
+    if embed_meta.read_embedded_segments(dest_mp4):
+        return dest_size
+    if _is_cancel_requested(card_id):
+        raise CopyCancelled(f"{card_id}: cancelled by operator")
+    try:
+        payload = pairing.load_sidecar(sidecar_path)
+        if not payload:
+            return dest_size
+        mismatches = pairing.validate_sidecar_for_mp4(src, Path(sidecar_path), payload)
+        if mismatches:
+            _log_line(
+                f"{card_id}: {rel} metadata mismatch — "
+                f"{'; '.join(mismatches)} (sidecar copied; embed skipped)",
+                kind="error",
+            )
+            return dest_size
+        missing = _missing_metadata(payload)
+        if missing:
+            _log_line(
+                f"{card_id}: {rel} sidecar is missing "
+                f"{', '.join(missing)} — re-check in GoPro Cleaner",
+                kind="error",
+            )
+        embed_meta.embed_segments_json(dest_mp4, payload)
+        dest_size = dest_mp4.stat().st_size
+        _log_line(f"{card_id}: embedded segments into {dest_mp4.name}")
+    except CopyCancelled:
+        raise
+    except Exception as embed_exc:  # noqa: BLE001
+        _log_line(
+            f"{card_id}: could not embed segments into {rel} — {embed_exc}",
+            kind="error",
+        )
+    return dest_size
 
 
 def _copy_card_worker(
@@ -1846,6 +1938,14 @@ def _copy_card_worker(
                 except OSError:
                     item["dest_size"] = size
                 item["copied"] = False
+                if inventory._item_is_mp4(item):
+                    item["dest_size"] = _preserve_dest_metadata(
+                        card_id, rel, src, dest_file, item.get("embed_json") or ""
+                    )
+                    if item.get("embed_json") and inventory.sidecar_for_mp4(dest_file) is None:
+                        raise RuntimeError(
+                            f"JSON sidecar missing for dest MP4 {dest_file.name}"
+                        )
                 done_bytes += size
                 files_done += 1
                 files_already += 1
@@ -1861,6 +1961,10 @@ def _copy_card_worker(
                 except OSError:
                     item["dest_size"] = size
                 item["copied"] = True
+                if inventory._item_is_mp4(item):
+                    item["dest_size"] = _preserve_dest_metadata(
+                        card_id, rel, src, dest_file, item.get("embed_json") or ""
+                    )
                 done_bytes += size
                 files_done += 1
                 saw_disk_write = True
@@ -1894,44 +1998,15 @@ def _copy_card_worker(
                 )
             saw_disk_write = True
 
-            # Embed the GoPro Cleaner segments JSON inside the SSD copy so the
-            # MP4 itself carries task names + timestamps (sidecar still copied
-            # alongside). Card original is never modified.
+            # JSON beside the dest MP4 + embed inside it. Card original is never modified.
             dest_size = size
-            sidecar_path = item.get("embed_json") or ""
-            if sidecar_path:
-                if _is_cancel_requested(card_id):
-                    raise CopyCancelled(f"{card_id}: cancelled by operator")
-                try:
-                    payload = json.loads(
-                        Path(sidecar_path).read_text(encoding="utf-8")
-                    )
-                    mismatches = pairing.validate_sidecar_for_mp4(
-                        src, Path(sidecar_path), payload
-                    )
-                    if mismatches:
-                        _log_line(
-                            f"{card_id}: {rel} metadata mismatch — "
-                            f"{'; '.join(mismatches)} (sidecar copied; embed skipped)",
-                            kind="error",
-                        )
-                    else:
-                        missing = _missing_metadata(payload)
-                        if missing:
-                            _log_line(
-                                f"{card_id}: {rel} sidecar is missing "
-                                f"{', '.join(missing)} — re-check in GoPro Cleaner",
-                                kind="error",
-                            )
-                        embed_meta.embed_segments_json(dest_file, payload)
-                        dest_size = dest_file.stat().st_size
-                        _log_line(f"{card_id}: embedded segments into {dest_rel}")
-                except CopyCancelled:
-                    raise
-                except Exception as embed_exc:  # noqa: BLE001
-                    _log_line(
-                        f"{card_id}: could not embed segments into {rel} — {embed_exc}",
-                        kind="error",
+            if inventory._item_is_mp4(item):
+                dest_size = _preserve_dest_metadata(
+                    card_id, rel, src, dest_file, item.get("embed_json") or ""
+                )
+                if item.get("embed_json") and inventory.sidecar_for_mp4(dest_file) is None:
+                    raise RuntimeError(
+                        f"JSON sidecar missing for dest MP4 {dest_file.name}"
                     )
             item["dest_size"] = dest_size
             item["copied"] = True
@@ -1972,12 +2047,15 @@ def _copy_card_worker(
                 verified = dest_file.is_file() and dest_file.stat().st_size == expected
             except OSError:
                 verified = False
-            if kind == "mp4" and verified and inventory.sidecar_for_mp4(dest_file) is None:
-                raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_file.name}")
+            if kind == "mp4" and dest_file.is_file() and item.get("embed_json"):
+                if inventory.sidecar_for_mp4(dest_file) is None:
+                    _ensure_dest_sidecar(dest_file, item.get("embed_json"))
+                if inventory.sidecar_for_mp4(dest_file) is None:
+                    raise RuntimeError(f"Verify failed: JSON sidecar missing for {dest_file.name}")
             if not verified:
                 raise RuntimeError(f"Verify failed: {item['rel']} missing or wrong size under {dest}")
             copied = bool(item.get("copied"))
-            already = bool(item.get("already_in_batch")) and not copied
+            already = bool(item.get("already_in_batch"))
             manifest.append(
                 {
                     "source": str(item.get("source") or ""),
@@ -1988,7 +2066,7 @@ def _copy_card_worker(
                     "dest_size": expected,
                     "kind": kind,
                     "verified": True,
-                    "wipe": copied,
+                    "wipe": copied and not already,
                     "already_in_batch": already,
                 }
             )
