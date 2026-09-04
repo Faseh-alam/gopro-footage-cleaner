@@ -135,7 +135,7 @@ async function performUpdate() {
   setUpdateState("pulling");
   setStatus("Checking GitHub for updates…");
   try {
-    const res = await api("/api/update", { method: "POST", timeoutMs: 180000 });
+    const res = await api("/api/update", { method: "POST", timeoutMs: 90000 });
     if (!res.restarting) {
       setUpdateState("idle");
       setStatus(`Already up to date (${res.branch} @ ${res.after})`, "ok");
@@ -152,8 +152,8 @@ async function performUpdate() {
     } catch {
       /* ignore */
     }
-    await sleep(4000);
-    const deadline = Date.now() + 180000;
+    await sleep(2000);
+    const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
       try {
         await api("/api/ping", { timeoutMs: 3000 });
@@ -181,7 +181,7 @@ async function performUpdate() {
 async function checkForUpdates() {
   if (!el.updateApp) return;
   try {
-    const check = await api("/api/update/check", { timeoutMs: 30000 });
+    const check = await api("/api/update/check", { timeoutMs: 20000 });
     if (check.branch) {
       el.updateApp.title = check.behind
         ? `New code on ${check.branch}: ${check.local} → ${check.remote}`

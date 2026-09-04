@@ -31,6 +31,7 @@ _copy_threads: dict[str, threading.Thread] = {}
 _batch_dest_locks: dict[str, threading.Lock] = {}
 _cancel_requested: set[str] = set()
 _waiting_queue: list[dict] = []  # queued starts when at max parallel
+_retry_hold: set[str] = set()  # interrupted cards — watcher must not auto-start
 _watcher_started = False
 _log: list[dict] = []
 _notices: list[dict] = []
@@ -58,6 +59,43 @@ HOTPLUG_CLEAR_STATUSES = {"removed", "completed"}
 
 class CopyCancelled(Exception):
     """Raised when the operator cancels an SD→SSD card job."""
+
+
+def _copy_thread_alive(card_id: str) -> bool:
+    thread = _copy_threads.get(str(card_id or "").upper())
+    return bool(thread and thread.is_alive())
+
+
+def _revive_live_copy(card_id: str) -> bool:
+    """If the worker is still writing, keep COPYING in the UI (USB list can flicker)."""
+    cid = str(card_id or "").upper()
+    with _lock:
+        thread = _copy_threads.get(cid)
+        if not (thread and thread.is_alive()):
+            return False
+        card = _cards.get(cid)
+        if card and card.get("status") == "cancelling":
+            return False
+        _retry_hold.discard(cid)
+        if card and card.get("status") in MANUAL_RETRY_STATUSES:
+            card["status"] = "copying"
+            card["message"] = "Copying (slow USB — worker still running)"
+        return True
+
+
+def _mark_waiting_for_retry(card_id: str, *, message: str, log: bool = True) -> None:
+    """Freeze this card until the operator clicks Retry. Log at most once."""
+    cid = str(card_id or "").upper()
+    if _revive_live_copy(cid):
+        return
+    first = cid not in _retry_hold
+    _retry_hold.add(cid)
+    if cid in _cards:
+        _cards[cid]["status"] = "interrupted"
+        _cards[cid]["message"] = message
+        _cards[cid]["speed_mbps"] = 0.0
+    if log and first:
+        _log_line(f"{cid}: interrupted — waiting for Retry", kind="error")
 
 
 def _log_line(message: str, *, kind: str = "info") -> None:
@@ -140,6 +178,8 @@ def restore_ui_state() -> None:
                                     )
                                     row["speed_mbps"] = 0.0
                             _cards[card_id] = dict(row)
+                            if str(_cards[card_id].get("status") or "") in MANUAL_RETRY_STATUSES:
+                                _retry_hold.add(card_id)
                     lines = data.get("log")
                     if isinstance(lines, list):
                         _log.clear()
@@ -369,9 +409,11 @@ def retry_card_job(card_id: str) -> dict:
         ssd2 = str(_session.get("ssd2") or load_config().get("ssd2") or "")
         s3_uri = str(_session.get("s3_uri") or load_config().get("s3_uri") or "")
         _cancel_requested.discard(cid)
+        _retry_hold.discard(cid)
         card["status"] = "queued"
         card["message"] = "Retry queued…"
         card["error"] = ""
+        card["started_at"] = time.time()
     if not batch:
         raise RuntimeError("No batch selected — Start SD → SSD first")
     if not mount or not Path(mount).exists():
@@ -468,6 +510,9 @@ def run_watchdog_once() -> None:
         )
         if status != "interrupted" and not stale_copy:
             continue
+        if status == "interrupted":
+            # Operator must click Retry. Auto-resume here restarted the 1s log loop.
+            continue
         mount = str(card.get("mount") or "")
         if not mount or not Path(mount).exists():
             continue
@@ -543,6 +588,8 @@ def _scan_for_cards() -> None:
             existing = _cards.get(card_id)
             thread = _copy_threads.get(card_id)
             thread_alive = bool(thread and thread.is_alive())
+            if thread_alive:
+                _revive_live_copy(card_id)
 
             # New physical media under the same tracking id → clear old job and auto-start.
             if existing and serial:
@@ -563,6 +610,7 @@ def _scan_for_cards() -> None:
                             if str(j.get("card_id") or "").upper() != card_id
                         ]
                         _cancel_requested.discard(card_id)
+                        _retry_hold.discard(card_id)
                         _cards.pop(card_id, None)
                         existing = None
                         thread_alive = False
@@ -571,6 +619,29 @@ def _scan_for_cards() -> None:
             if existing and existing.get("status") == "removed":
                 _cards.pop(card_id, None)
                 existing = None
+
+            if card_id in _retry_hold:
+                if thread_alive or _revive_live_copy(card_id):
+                    continue
+                if existing:
+                    existing["status"] = "interrupted"
+                    existing["mount"] = str(card_root)
+                    if serial:
+                        existing["volume_serial"] = serial
+                    continue
+                _cards[card_id] = {
+                    "card_id": card_id,
+                    "mount": str(card_root),
+                    "volume_serial": serial,
+                    "status": "interrupted",
+                    "message": (
+                        "Copy worker stopped — click Retry to resume "
+                        "(completed files on SSD are skipped)"
+                    ),
+                    "speed_mbps": 0.0,
+                    "started_at": time.time(),
+                }
+                continue
 
             # Operator cancelled / failed — do not auto-restart until Retry
             # (unless serial change already cleared the row above).
@@ -607,12 +678,13 @@ def _scan_for_cards() -> None:
                     started = float(existing.get("started_at") or 0)
                     if time.time() - started < 8:
                         continue
-                existing["status"] = "interrupted"
-                existing["message"] = (
-                    "Copy worker stopped — click Retry to resume "
-                    "(completed files on SSD are skipped)"
+                _mark_waiting_for_retry(
+                    card_id,
+                    message=(
+                        "Copy worker stopped — click Retry to resume "
+                        "(completed files on SSD are skipped)"
+                    ),
                 )
-                _log_line(f"{card_id}: interrupted — waiting for Retry", kind="error")
                 continue
 
         prog = progress.load_progress(card_root)
@@ -664,6 +736,11 @@ def _reconcile_hotplug(present: dict[str, dict]) -> None:
             if status == "removed":
                 continue
             if cid in present:
+                _revive_live_copy(cid)
+                continue
+            if _revive_live_copy(cid):
+                # Drive letter dropped from the volume list, but the copy thread
+                # is still writing. Slow USB looks like "removed" in the UI.
                 continue
             mount = str(card.get("mount") or "")
             mount_alive = False
@@ -689,15 +766,15 @@ def _reconcile_hotplug(present: dict[str, dict]) -> None:
                 card["speed_mbps"] = 0.0
                 _log_line(f"{cid}: removed while waiting", kind="ok")
             elif status in {"queued", "copying", "verifying", "cancelling", "scanning"}:
-                # Mid SD→SSD transfer only — ask for Retry; do not auto-restart.
-                _cancel_requested.add(cid)
-                card["status"] = "interrupted"
-                card["message"] = (
-                    "SD removed during transfer — re-insert the same card and click Retry "
-                    "(SSD files already copied are kept; no duplicate upload)"
+                # Mid SD→SSD transfer — Retry only if the worker is actually dead.
+                # Do not cancel a live thread: USB list flicker would stop a slow copy.
+                _mark_waiting_for_retry(
+                    cid,
+                    message=(
+                        "SD removed during transfer — re-insert the same card and click Retry "
+                        "(SSD files already copied are kept; no duplicate upload)"
+                    ),
                 )
-                card["speed_mbps"] = 0.0
-                _log_line(f"{cid}: hotplug remove during {status}", kind="error")
             elif status in {"wiping", "ejecting", "uploading", "completed"}:
                 # SSD copy already verified — keep AWS/session going; slot ready for next SD.
                 card["status"] = "removed"
@@ -707,9 +784,7 @@ def _reconcile_hotplug(present: dict[str, dict]) -> None:
                 )
                 _log_line(f"{cid}: removed after finish — waiting for next card", kind="ok")
             elif status in MANUAL_RETRY_STATUSES:
-                # Keep interrupted/error/cancelled. Flaky USB readers drop for one
-                # watcher tick; clearing to "removed" made the next tick auto-start
-                # the same card, the worker died, and the log spammed every second.
+                _retry_hold.add(cid)
                 card["message"] = (
                     "SD not seen — re-insert the same card and click Retry "
                     "(will not auto-start; files already on the SSD are kept)"
@@ -1911,6 +1986,7 @@ def _copy_card_worker(
 
     def _publish(current_file_bytes: int = 0, *, message: str | None = None, force: bool = False) -> None:
         nonlocal last_ui, last_live, last_speed_at
+        _revive_live_copy(card_id)
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
         now = time.time()

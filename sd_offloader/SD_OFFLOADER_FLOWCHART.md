@@ -824,9 +824,9 @@ Hard-coded constants: 10 GiB SSD reserve, 30-minute watchdog interval, 30-minute
 
 ---
 
-## 19. What changed in 1.9.15 (uncommitted at the time of writing)
+## 19. What changed in 1.9.15
 
-The last commit on `redesign-testing` is **1.9.14**. The working tree is **1.9.15**, with edits to `engine.py` and `aws_upload.py`. These five changes are already reflected in the diagrams above and are the items most worth confirming during review.
+Version 1.9.15 landed on `redesign-testing` as commits `7186c28` (*fix/sd-card-log*) and `5546c9c` (*fix/interrupt-loop*), on top of 1.9.14 (`ce42959`). All of it is reflected in the diagrams above; these are the items most worth confirming during review.
 
 | # | Area | Change | Why it matters |
 |---|---|---|---|
@@ -835,5 +835,8 @@ The last commit on `redesign-testing` is **1.9.14**. The working tree is **1.9.1
 | 3 | `_launch_upload_job` (section 13) | `auto_delete` became **opt-out**: a new job defaults to `true`, and `_auto_delete_enabled()` treats anything other than an explicit `false` as enabled. | Verified batches now reliably free their SSD instead of waiting for someone to press *Delete local*. Reviewers should confirm this default is intended. |
 | 4 | `verify_job_sizes` (section 14) | Auto-delete is now performed **inline at the end of verification** rather than only in `_auto_verify_job`. | Every route into verification — automatic, watchdog, or the manual *Verify sizes* button — now behaves identically. |
 | 5 | New `followup_resync` flag (sections 14 and 15) | When a sync finishes but more cards arrived mid-upload, the original job is flagged and is **not** verified or deleted; the follow-up sync job owns that. The watchdog skips flagged jobs. | Closes a window in which a batch folder could be deleted while a follow-up sync was still uploading files from it. |
+| 6 | `_update_card` | Card `bytes_done` is now **monotonic** while a card is `queued`, `copying` or `verifying` — it can never decrease. | USB size glitches made the per-card progress bar jump backwards. |
+| 7 | `_poll_s3_progress_for_jobs` (section 14) | Upload `bytes_done` is likewise monotonic, taking `max(previous, listed)`. | An incomplete S3 listing made the upload bar fall back, e.g. 12 GB to 15 GB then back to 12 GB. |
+| 8 | `readers.py` and the UI | The reader dropdown no longer performs per-drive PowerShell PNP lookups, and `card_reader_status()` no longer scans for cards. | Those blocking calls hung the page so Reader 1/2/3 never painted. Reader matching inside the copy flow (`match_reader`) is unchanged, so nothing in sections 8–11 is affected. |
 
 **Point to raise with the team lead:** change 3 makes local deletion the default for every new upload job. Deletion is still protected by the double size comparison and the immediate pre-delete re-check (gates 13–15), so it should be safe, but it is a policy shift worth an explicit sign-off before the project manager sees it.

@@ -245,12 +245,14 @@ def test_interrupt_hotplug_and_watchdog_resume() -> None:
         engine._copy_threads.clear()
         engine._waiting_queue.clear()
         engine._cancel_requested.clear()
+        engine._retry_hold.clear()
         engine._cards["SD-1"] = {
             "card_id": "SD-1",
             "status": "interrupted",
             "mount": tmp,
             "message": "waiting for Retry",
         }
+        engine._retry_hold.add("SD-1")
         engine._reconcile_hotplug({})
         check(
             "flicker keeps interrupted (not removed)",
@@ -261,8 +263,47 @@ def test_interrupt_hotplug_and_watchdog_resume() -> None:
             engine.aws_upload, "watchdog_pass", return_value=[]
         ), patch.object(engine, "_pump_closed_uploads"):
             engine.run_watchdog_once()
-            check("watchdog retries interrupted card when mount exists", retry.call_count == 1)
+            check("watchdog does not auto-retry interrupted cards", retry.call_count == 0)
         engine._cards.clear()
+        engine._retry_hold.clear()
+
+
+def test_live_copy_not_interrupted_on_usb_flicker() -> None:
+    print("\n[11] live slow copy stays COPYING when Windows misses the drive for a tick")
+
+    class Alive:
+        def is_alive(self) -> bool:
+            return True
+
+    engine._cards.clear()
+    engine._copy_threads.clear()
+    engine._retry_hold.clear()
+    engine._cancel_requested.clear()
+    engine._cards["SD-1"] = {
+        "card_id": "SD-1",
+        "status": "copying",
+        "mount": "X:\\",
+        "message": "Copying GX01.MP4",
+        "bytes_done": 20_000_000_000,
+    }
+    engine._copy_threads["SD-1"] = Alive()
+    engine._reconcile_hotplug({})
+    check(
+        "status stays copying",
+        engine._cards["SD-1"]["status"] == "copying",
+        str(engine._cards["SD-1"].get("status")),
+    )
+    check("not on retry hold", "SD-1" not in engine._retry_hold)
+    check("worker not cancelled", "SD-1" not in engine._cancel_requested)
+    engine._mark_waiting_for_retry("SD-1", message="should ignore")
+    check(
+        "mark retry ignored while thread alive",
+        engine._cards["SD-1"]["status"] == "copying",
+        str(engine._cards["SD-1"].get("status")),
+    )
+    engine._cards.clear()
+    engine._copy_threads.clear()
+    engine._retry_hold.clear()
 
 
 def test_missing_auto_delete_still_deletes() -> None:
@@ -345,6 +386,7 @@ def main() -> int:
     test_verify_timeout_and_mismatch_do_not_delete()
     test_watchdog_stall_vs_progress()
     test_interrupt_hotplug_and_watchdog_resume()
+    test_live_copy_not_interrupted_on_usb_flicker()
     test_missing_auto_delete_still_deletes()
     test_s3_list_empty_prefix_is_not_error()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
