@@ -1162,6 +1162,53 @@ def _maybe_auto_upload_disk(ssd_path: str) -> None:
         _log_line(f"Auto-close {batch} on {ssd_path} failed — {exc}", kind="error")
 
 
+def _ssd_path_for_key(key: str, ssd1: str, ssd2: str, ssd_paths: list[str]) -> str:
+    """Map a path_key back to the session SSD path (or the deleted folder's disk)."""
+    for path in (ssd1, ssd2):
+        if path and space.path_key(path) == key:
+            return path
+    for raw in ssd_paths or []:
+        if not raw:
+            continue
+        if _ssd_key_from_batch_folder(raw, ssd1, ssd2) != key:
+            continue
+        folder = Path(raw)
+        try:
+            folder = folder.expanduser().resolve()
+        except OSError:
+            pass
+        if folder.parent.name.lower() == "batches":
+            return str(folder.parent.parent)
+        if folder.name.lower() == "batches":
+            return str(folder.parent)
+        return str(folder)
+    return ""
+
+
+def _ensure_next_active_batch(ssd_path: str, *, deleted: str) -> str | None:
+    """After AWS delete, keep a newer live batch or open the successor folder."""
+    if not ssd_path:
+        return None
+    key = space.path_key(ssd_path)
+    with _lock:
+        seed = str(_session.get("batch") or load_config().get("last_batch") or "batch01")
+        live = str((_session.get("disk_batches") or {}).get(key) or "")
+    if live and live != deleted:
+        try:
+            space.batch_root(ssd_path, live).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return live
+    if Path(ssd_path).exists():
+        return _batch_for_ssd(ssd_path, seed=seed)
+    nxt = batches.successor_batch_name(deleted, seed=seed)
+    with _lock:
+        disk_batches = dict(_session.get("disk_batches") or {})
+        disk_batches[key] = nxt
+        _session["disk_batches"] = disk_batches
+    return nxt
+
+
 def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
     """Unfreeze only the SSD(s) whose batch folder was deleted after verify."""
     with _lock:
@@ -1205,9 +1252,26 @@ def on_batch_deleted(ssd_paths: list[str], batch_name: str) -> None:
         _session["frozen_disks"] = frozen
         _session["disk_batches"] = disk_batches
         _session["disk_completed"] = completed
+        affected_keys = set(keys)
     _persist_disk_state()
-    _log_line(f"Deleted verified {batch_name} — that disk is free for the next cycle", kind="ok")
-    push_notice(f"{batch_name} verified on AWS and deleted locally", kind="ok")
+    opened: list[str] = []
+    for key in affected_keys:
+        path = _ssd_path_for_key(key, ssd1, ssd2, ssd_paths or [])
+        try:
+            nxt = _ensure_next_active_batch(path, deleted=batch_name)
+        except Exception as exc:  # noqa: BLE001
+            _log_line(f"{path or key}: could not open next batch after {batch_name} — {exc}", kind="error")
+            continue
+        if nxt:
+            opened.append(nxt)
+    _persist_disk_state()
+    nxt_note = f" — {opened[0]} is active for new offload" if len(opened) == 1 else ""
+    _log_line(f"Deleted verified {batch_name} — that disk is free for the next cycle{nxt_note}", kind="ok")
+    push_notice(
+        f"{batch_name} verified on AWS and deleted locally"
+        + (f" — now offloading to {opened[0]}" if len(opened) == 1 else ""),
+        kind="ok",
+    )
     _pump_closed_uploads()
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -550,6 +551,60 @@ def test_ui_resolver_and_empty_close() -> None:
         check("UI slot 2 cannot close empty SSD2", ssd2_empty is False)
 
 
+def test_delete_opens_next_batch_folder() -> None:
+    print("\n[next batch] AWS delete creates the next folder when none is live")
+    with tempfile.TemporaryDirectory() as tmp:
+        ssd1 = Path(tmp) / "ssd1"
+        ssd2 = Path(tmp) / "ssd2"
+        ssd1.mkdir()
+        ssd2.mkdir()
+        k1, k2 = space.path_key(ssd1), space.path_key(ssd2)
+        _put_clip(ssd1, "batch01")
+        _put_clip(ssd2, "batch01")
+        _reset_session(
+            ssd1=str(ssd1),
+            ssd2=str(ssd2),
+            disk_batches={k1: "batch01", k2: "batch01"},
+            batch="batch01",
+        )
+        root1 = space.batch_root(ssd1, "batch01")
+        if root1.exists():
+            shutil.rmtree(root1)
+        with _silence_engine():
+            engine.on_batch_deleted([str(root1)], "batch01")
+        with engine._lock:
+            live = dict(engine._session.get("disk_batches") or {})
+        check("deleted live batch01 → active batch02", live.get(k1) == "batch02", str(live))
+        check("batch02 folder created on that SSD", space.batch_root(ssd1, "batch02").is_dir())
+        check("SSD2 still on batch01", live.get(k2) == "batch01", str(live))
+        check("SSD2 batch02 not created", not space.batch_root(ssd2, "batch02").exists())
+
+        _reset_session(
+            ssd1=str(ssd1),
+            ssd2=str(ssd2),
+            disk_batches={k1: "batch01", k2: "batch02"},
+            closed_batches={k2: ["batch01"]},
+            batch="batch01",
+        )
+        space.batch_root(ssd2, "batch02").mkdir(parents=True, exist_ok=True)
+        _put_clip(ssd2, "batch01")
+        closed_root = space.batch_root(ssd2, "batch01")
+        with _silence_engine():
+            if closed_root.exists():
+                shutil.rmtree(closed_root)
+            engine.on_batch_deleted([str(closed_root)], "batch01")
+        with engine._lock:
+            live = dict(engine._session.get("disk_batches") or {})
+        check(
+            "Batch Completed already opened batch02 → stay on batch02",
+            live.get(k2) == "batch02",
+            str(live),
+        )
+        check("does not skip to batch03", live.get(k2) != "batch03", str(live))
+        check("batch02 folder still there", space.batch_root(ssd2, "batch02").is_dir())
+        check("SSD1 unchanged at batch01", live.get(k1) == "batch01", str(live))
+
+
 def main() -> None:
     test_next_batch_name()
     test_successor_and_resume()
@@ -563,6 +618,7 @@ def main() -> None:
     test_restart_does_not_reset_cycle()
     test_manual_batch_completed_workflow()
     test_ui_resolver_and_empty_close()
+    test_delete_opens_next_batch_folder()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")
