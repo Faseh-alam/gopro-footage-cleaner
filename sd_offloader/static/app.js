@@ -24,12 +24,14 @@ const el = {
   capacityPanel: document.getElementById("capacity-panel"),
   readerMap: document.getElementById("reader-map"),
   diskState: document.getElementById("disk-state"),
+  uploadMeter: document.getElementById("upload-meter"),
 };
 
 let updateState = "idle";
 const UPDATE_POPUP_KEY = "sdOffloaderUpdatePopup";
 let noticeSeq = 0;
 const seenNoticeKeys = new Set();
+const uploadRate = { t: 0, bytes: 0, mbps: 0 };
 
 function setUpdateState(state) {
   updateState = state;
@@ -680,6 +682,45 @@ function renderCards(cards) {
   });
 }
 
+function renderUploadMeter(jobs) {
+  if (!el.uploadMeter) return;
+  const running = (jobs || []).filter((job) =>
+    ["running", "checking", "cancelling"].includes(job.status),
+  );
+  const sent = running.reduce((sum, job) => sum + Number(job.bytes_done || 0), 0);
+  const total = running.reduce((sum, job) => sum + Number(job.bytes_total || 0), 0);
+  const reported = running.reduce((sum, job) => sum + Number(job.speed_mbps || 0), 0);
+  const now = Date.now();
+  if (sent !== uploadRate.bytes && uploadRate.t) {
+    const dt = Math.max(0.4, (now - uploadRate.t) / 1000);
+    const instant = Math.max(0, (sent - uploadRate.bytes) / (1024 * 1024) / dt);
+    if (instant <= 2048) {
+      uploadRate.mbps = uploadRate.mbps * 0.5 + instant * 0.5;
+    }
+    uploadRate.t = now;
+    uploadRate.bytes = sent;
+  } else if (!uploadRate.t) {
+    uploadRate.t = now;
+    uploadRate.bytes = sent;
+  }
+  if (!running.length) {
+    uploadRate.mbps = 0;
+    uploadRate.t = 0;
+    uploadRate.bytes = 0;
+    el.uploadMeter.className = "upload-meter idle";
+    el.uploadMeter.textContent = "No live AWS upload · 0.0 MB/s";
+    return;
+  }
+  const mbps = Math.max(uploadRate.mbps, reported);
+  const bits = mbps * 8;
+  const batches = running.map((job) => job.batch || "?").join(", ");
+  el.uploadMeter.className = "upload-meter live";
+  el.uploadMeter.textContent =
+    `LIVE UPLOAD  ${mbps.toFixed(1)} MB/s  (${bits.toFixed(0)} Mb/s)` +
+    `  ·  sent ${formatBytes(sent)}${total ? ` / ${formatBytes(total)}` : ""}` +
+    `  ·  ${running.length} job${running.length === 1 ? "" : "s"} (${batches})`;
+}
+
 function renderAwsJobs(jobs) {
   el.awsJobs.innerHTML = "";
   if (!jobs.length) {
@@ -959,6 +1000,7 @@ async function pollStatus() {
     }
     renderCards(data.cards || []);
     renderAwsJobs(data.aws_jobs || []);
+    renderUploadMeter(data.aws_jobs || []);
     renderLog(data.log || []);
     renderCapacity(data.capacity, data.parallel);
     renderDiskState(data.disk_batches, data.frozen_disks, session, data.disk_batch_states);

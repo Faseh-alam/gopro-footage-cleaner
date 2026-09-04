@@ -108,42 +108,42 @@ def restore_ui_state() -> None:
     aws_upload.restore_jobs_from_disk()
     try:
         if SNAPSHOT_FILE.exists():
-            try:
-                data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+        try:
+            data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
                 data = None
             if isinstance(data, dict):
-                with _lock:
-                    session = data.get("session")
-                    if isinstance(session, dict):
-                        _session.update(session)
-                        # Watcher must be re-armed after process restart.
-                        if _session.get("active"):
-                            _session["active"] = True
-                    cards = data.get("cards")
-                    if isinstance(cards, list):
-                        for row in cards:
-                            if not isinstance(row, dict):
-                                continue
-                            card_id = str(row.get("card_id") or "").upper()
-                            if not card_id:
-                                continue
-                            status = row.get("status") or ""
-                            if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
-                                # In-flight copy threads died with the old process.
-                                if status in {"copying", "verifying"}:
-                                    row = dict(row)
-                                    row["status"] = "interrupted"
-                                    row["message"] = (
-                                        "Server restarted mid-copy — re-insert card or Start session "
-                                        "to resume (completed files are skipped)"
-                                    )
-                                    row["speed_mbps"] = 0.0
-                            _cards[card_id] = dict(row)
-                    lines = data.get("log")
-                    if isinstance(lines, list):
-                        _log.clear()
-                        _log.extend(line for line in lines if isinstance(line, dict))
+        with _lock:
+            session = data.get("session")
+            if isinstance(session, dict):
+                _session.update(session)
+                # Watcher must be re-armed after process restart.
+                if _session.get("active"):
+                    _session["active"] = True
+            cards = data.get("cards")
+            if isinstance(cards, list):
+                for row in cards:
+                    if not isinstance(row, dict):
+                        continue
+                    card_id = str(row.get("card_id") or "").upper()
+                    if not card_id:
+                        continue
+                    status = row.get("status") or ""
+                    if status in {"copying", "verifying", "wiping", "ejecting", "uploading", "queued", "scanning"}:
+                        # In-flight copy threads died with the old process.
+                        if status in {"copying", "verifying"}:
+                            row = dict(row)
+                            row["status"] = "interrupted"
+                            row["message"] = (
+                                "Server restarted mid-copy — re-insert card or Start session "
+                                "to resume (completed files are skipped)"
+                            )
+                            row["speed_mbps"] = 0.0
+                    _cards[card_id] = dict(row)
+            lines = data.get("log")
+            if isinstance(lines, list):
+                _log.clear()
+                _log.extend(line for line in lines if isinstance(line, dict))
         cfg = load_config()
         with _lock:
             if not _session.get("disk_completed"):
@@ -863,7 +863,7 @@ def _closed_names(key: str) -> list[str]:
 def _folder_has_transfer_files(folder: Path) -> bool:
     try:
         if not folder.is_dir():
-            return False
+        return False
         return any(folder.iterdir())
     except OSError:
         return False
@@ -1155,7 +1155,7 @@ def _batch_for_ssd(ssd_path: str, *, seed: str) -> str:
         _session["disk_batches"] = disk_batches
     space.batch_root(ssd_path, name).mkdir(parents=True, exist_ok=True)
     if name != current:
-        _log_line(f"Opened {name} on {ssd_path}")
+    _log_line(f"Opened {name} on {ssd_path}")
         _persist_disk_state()
     return name
 
@@ -1193,7 +1193,7 @@ def _ssd_path_for_key(key: str, ssd1: str, ssd2: str, ssd_paths: list[str]) -> s
         folder = Path(raw)
         try:
             folder = folder.expanduser().resolve()
-        except OSError:
+    except OSError:
             pass
         if folder.parent.name.lower() == "batches":
             return str(folder.parent.parent)
@@ -1220,7 +1220,7 @@ def _ensure_next_active_batch(ssd_path: str, *, deleted: str) -> str | None:
     if Path(ssd_path).exists():
         return _batch_for_ssd(ssd_path, seed=seed)
     nxt = batches.successor_batch_name(deleted, seed=seed)
-    with _lock:
+        with _lock:
         disk_batches = dict(_session.get("disk_batches") or {})
         disk_batches[key] = nxt
         _session["disk_batches"] = disk_batches
@@ -1309,10 +1309,10 @@ def _assign_ssd_and_batch(
             batch = resume_dest.name if resume_dest.name else _batch_for_ssd(ssd_path, seed=seed)
             key = space.path_key(ssd_path)
             if batch not in _closed_names(key):
-                with _lock:
-                    disk_batches = dict(_session.get("disk_batches") or {})
+            with _lock:
+                disk_batches = dict(_session.get("disk_batches") or {})
                     disk_batches[key] = batch
-                    _session["disk_batches"] = disk_batches
+                _session["disk_batches"] = disk_batches
             dest = space.batch_root(ssd_path, batch)
             dest.mkdir(parents=True, exist_ok=True)
             return ssd_path, dest, batch
@@ -2119,21 +2119,21 @@ def _copy_card_worker(
         ]
         if wipe_sources:
             eject.assert_wipe_allowed(card_root, manifest)
-            prog["status"] = "complete"
-            progress.save_progress(card_root, prog)
-            _update_card(
-                card_id,
+        prog["status"] = "complete"
+        progress.save_progress(card_root, prog)
+        _update_card(
+            card_id,
                 status="wiping",
                 message=f"{verify_msg} — wiping verified files on card…",
-                dest=str(dest),
+            dest=str(dest),
                 files_verified=files_verified,
                 files_total=len(files),
                 files_already_in_batch=files_already,
                 files_copied=files_copied,
-                speed_mbps=0,
-                eta_seconds=0,
-                bytes_done=total_bytes,
-            )
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
             eject.wipe_verified_sources(card_root, wipe_sources)
         else:
             prog["status"] = "complete"
@@ -2148,11 +2148,11 @@ def _copy_card_worker(
 
         leftover_mp4s = inventory.list_card_mp4_paths(card_root)
         if not leftover_mp4s:
-            try:
-                _update_card(card_id, status="ejecting", message="Ejecting card…")
-                eject.eject_volume(card_root)
-            except Exception as eject_exc:  # noqa: BLE001
-                _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
+        try:
+            _update_card(card_id, status="ejecting", message="Ejecting card…")
+            eject.eject_volume(card_root)
+        except Exception as eject_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
         else:
             _log_line(
                 f"{card_id}: {len(leftover_mp4s)} MP4(s) remain on the card — not ejecting",
@@ -2177,9 +2177,9 @@ def _copy_card_worker(
                 f"{leftover_n} file(s) left on SD (not wiped)"
             )
         elif port:
-            done_msg = (
-                f"Offloading of {label} has completed, insert a new card in port {port}"
-            )
+        done_msg = (
+            f"Offloading of {label} has completed, insert a new card in port {port}"
+        )
         else:
             done_msg = "Ready — card ejected"
         _update_card(

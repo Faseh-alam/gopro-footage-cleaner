@@ -61,6 +61,27 @@ header {
   font-weight: 700;
 }
 
+.upload-meter {
+  margin: 0 0 1rem;
+  padding: 0.7rem 1rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  font-weight: 650;
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+}
+
+.upload-meter.idle {
+  color: var(--muted);
+  background: #0d1117;
+}
+
+.upload-meter.live {
+  color: #d8ffe8;
+  background: #113322;
+  border-color: #2f6f4a;
+}
+
 button:disabled {
   opacity: 0.6;
   cursor: wait;

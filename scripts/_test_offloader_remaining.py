@@ -128,7 +128,7 @@ def test_unfreeze_by_batch_name() -> None:
         frozen_disks={"e:\\ssd1": "batch 9"},
     )
     with _silence_engine():
-        engine.on_batch_deleted([r"E:\ssd1\Batches\batch 9"], "batch 9")
+    engine.on_batch_deleted([r"E:\ssd1\Batches\batch 9"], "batch 9")
     with engine._lock:
         frozen = dict(engine._session.get("frozen_disks") or {})
         live = dict(engine._session.get("disk_batches") or {})
@@ -182,14 +182,14 @@ def test_freeze_skip() -> None:
 
         with patch.object(space, "volume_free_bytes", side_effect=fake_free):
             with _silence_engine():
-                picked, dest, batch = engine._assign_ssd_and_batch(
-                    needed=40 * 1024**3,
-                    ssd1=str(ssd1),
-                    ssd2=str(ssd2),
-                    seed="batch 11",
-                    exclude_card="",
-                    resume_dest=None,
-                )
+            picked, dest, batch = engine._assign_ssd_and_batch(
+                needed=40 * 1024**3,
+                ssd1=str(ssd1),
+                ssd2=str(ssd2),
+                seed="batch 11",
+                exclude_card="",
+                resume_dest=None,
+            )
         check("frozen SSD1 → SSD2", space.path_key(picked) == space.path_key(ssd2), picked)
         check("SSD2 shares the same cycle", batch == "batch 11", batch)
 
