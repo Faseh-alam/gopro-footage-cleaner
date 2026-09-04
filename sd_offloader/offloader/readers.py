@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .config import load_config, save_config
-from .detect import find_card_volumes, list_volumes
+from .detect import list_volumes
 
 _usb_cache: dict[str, str] = {}
 
@@ -126,6 +126,13 @@ def map_slot(slot: int | str, path: str) -> dict:
 
 
 def list_mappable_volumes() -> list[dict]:
+    """Drive list for the Map dropdown — no PowerShell PNP (that blocked the UI)."""
+    mapped = saved_readers()
+    by_letter = {
+        str(row.get("letter") or "").upper(): slot
+        for slot, row in mapped.items()
+        if row.get("letter")
+    }
     rows = []
     for vol in list_volumes():
         path = str(vol.get("path") or "")
@@ -133,21 +140,26 @@ def list_mappable_volumes() -> list[dict]:
             continue
         if vol.get("drive_type") == "fixed" and not vol.get("is_card_candidate"):
             continue
-        ident = match_reader(path)
+        letter = volume_letter(path)
+        slot = by_letter.get(letter, "")
+        label = ""
+        if slot:
+            label = str((mapped.get(slot) or {}).get("label") or f"Reader {slot}")
         rows.append(
             {
                 **{k: vol.get(k) for k in ("path", "label", "is_card_candidate", "card_id")},
-                "reader_slot": ident.get("slot") or "",
-                "reader_label": ident.get("label") or "",
-                "usb_id": ident.get("usb_id") or "",
+                "reader_slot": slot,
+                "reader_label": label,
+                "usb_id": "",
             }
         )
     return rows
 
 
 def card_reader_status() -> dict:
+    # Do not scan cards here. find_card_volumes / per-drive PNP hung the page
+    # so Reader 1/2/3 never painted.
     return {
         "mapped": saved_readers(),
         "volumes": list_mappable_volumes(),
-        "cards": find_card_volumes(),
     }

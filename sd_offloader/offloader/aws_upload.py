@@ -2312,7 +2312,10 @@ def _poll_s3_progress_for_jobs() -> None:
             if bytes_total and not job.get("bytes_total"):
                 job["bytes_total"] = bytes_total
             total = int(job.get("bytes_total") or bytes_total or 0)
-            job["bytes_done"] = min(total, s3_bytes) if total else s3_bytes
+            listed = min(total, s3_bytes) if total else s3_bytes
+            prev_done = int(job.get("bytes_done") or 0)
+            # Incomplete S3 listings must not drop the bar (12 GB → 15 GB → 12 GB).
+            job["bytes_done"] = max(prev_done, listed)
             job["files_done"] = max(int(job.get("files_done") or 0), s3_objects)
             job["last_s3_bytes"] = s3_bytes
             job["last_s3_poll_at"] = now

@@ -1608,7 +1608,17 @@ def _update_card(card_id: str, **kwargs) -> None:
     with _lock:
         if card_id not in _cards:
             _cards[card_id] = {"card_id": card_id}
-        _cards[card_id].update(kwargs)
+        prev = _cards[card_id]
+        # Live copy progress must not jump backwards (USB size glitches).
+        new_status = str(kwargs.get("status") or prev.get("status") or "")
+        if "bytes_done" in kwargs and new_status in {"copying", "verifying", "queued"}:
+            try:
+                kwargs["bytes_done"] = max(
+                    int(prev.get("bytes_done") or 0), int(kwargs["bytes_done"] or 0)
+                )
+            except (TypeError, ValueError):
+                pass
+        prev.update(kwargs)
     _save_snapshot(force=False)
 
 

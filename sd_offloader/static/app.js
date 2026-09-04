@@ -32,6 +32,9 @@ const UPDATE_POPUP_KEY = "sdOffloaderUpdatePopup";
 let noticeSeq = 0;
 const seenNoticeKeys = new Set();
 const uploadRate = { t: 0, bytes: 0, mbps: 0 };
+const lastShownBytes = {};
+let lastReaderVolumes = [];
+let lastMappedReaders = {};
 
 function setUpdateState(state) {
   updateState = state;
@@ -227,6 +230,28 @@ function formatBytes(bytes) {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
+function formatGb(bytes) {
+  return `${(Number(bytes || 0) / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function formatCopied(done, total) {
+  const left = formatBytes(done || 0);
+  const right = formatBytes(total || 0);
+  return `${left} / ${right} (${formatGb(done || 0)})`;
+}
+
+function steadyBytes(id, bytes, active) {
+  const n = Math.max(0, Number(bytes) || 0);
+  if (!id) return n;
+  if (!active) {
+    delete lastShownBytes[id];
+    return n;
+  }
+  const next = Math.max(lastShownBytes[id] || 0, n);
+  lastShownBytes[id] = next;
+  return next;
+}
+
 function formatEta(seconds) {
   if (!Number.isFinite(seconds) || seconds == null) return "—";
   const s = Math.max(0, Math.ceil(seconds));
@@ -335,9 +360,11 @@ async function refreshReaders() {
   if (!el.readerMap) return;
   try {
     const data = await api("/api/readers", { timeoutMs: 20000 });
+    if (Array.isArray(data.volumes)) lastReaderVolumes = data.volumes;
+    if (data.mapped) lastMappedReaders = data.mapped;
     renderReaders(data);
   } catch {
-    /* mapping is optional */
+    renderReaders({ mapped: lastMappedReaders, volumes: lastReaderVolumes });
   }
 }
 
@@ -345,7 +372,11 @@ function renderReaders(data) {
   const box = el.readerMap;
   if (!box) return;
   const mapped = (data && data.mapped) || {};
-  const volumes = (data && data.volumes) || [];
+  const volumes = (data && data.volumes) || lastReaderVolumes || [];
+  const prev = {};
+  box.querySelectorAll("select[data-reader-slot]").forEach((sel) => {
+    prev[sel.getAttribute("data-reader-slot")] = sel.value;
+  });
   box.innerHTML = [1, 2, 3]
     .map((slot) => {
       const row = mapped[String(slot)] || {};
@@ -372,6 +403,10 @@ function renderReaders(data) {
       </div>`;
     })
     .join("");
+  box.querySelectorAll("select[data-reader-slot]").forEach((sel) => {
+    const keep = prev[sel.getAttribute("data-reader-slot")] || "";
+    if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  });
   box.querySelectorAll(".reader-map-btn").forEach((btn) => {
     btn.addEventListener("click", () => mapReader(btn.getAttribute("data-reader-slot")));
   });
@@ -604,7 +639,9 @@ function renderCards(cards) {
   }${failed ? ` · ${failed} need Retry` : ""}`;
 
   for (const card of cards) {
-    const pct = card.bytes_total ? Math.min(100, (card.bytes_done / card.bytes_total) * 100) : 0;
+    const liveCopy = ["copying", "verifying", "queued", "waiting"].includes(card.status);
+    const shownDone = steadyBytes(card.card_id, card.bytes_done || 0, liveCopy);
+    const pct = card.bytes_total ? Math.min(100, (shownDone / card.bytes_total) * 100) : 0;
     const canCancel = [
       "queued",
       "waiting",
@@ -646,7 +683,7 @@ function renderCards(cards) {
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="meta">
-        <span>${formatBytes(card.bytes_done || 0)} / ${formatBytes(card.bytes_total || 0)}</span>
+        <span>${formatCopied(shownDone, card.bytes_total || 0)}</span>
         <span>${Number(card.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(card.eta_seconds)}</span>
         <span>${fileLabel}</span>
@@ -687,7 +724,10 @@ function renderUploadMeter(jobs) {
   const running = (jobs || []).filter((job) =>
     ["running", "checking", "cancelling"].includes(job.status),
   );
-  const sent = running.reduce((sum, job) => sum + Number(job.bytes_done || 0), 0);
+  const sent = running.reduce(
+    (sum, job) => sum + steadyBytes(`aws:${job.id}`, job.bytes_done || 0, true),
+    0,
+  );
   const total = running.reduce((sum, job) => sum + Number(job.bytes_total || 0), 0);
   const reported = running.reduce((sum, job) => sum + Number(job.speed_mbps || 0), 0);
   const now = Date.now();
@@ -708,7 +748,10 @@ function renderUploadMeter(jobs) {
     uploadRate.t = 0;
     uploadRate.bytes = 0;
     el.uploadMeter.className = "upload-meter idle";
-    el.uploadMeter.textContent = "No live AWS upload · 0.0 MB/s";
+    el.uploadMeter.textContent = "No live AWS upload · 0.0 MB/s (0.0 GB)";
+    Object.keys(lastShownBytes).forEach((key) => {
+      if (key.startsWith("aws:")) delete lastShownBytes[key];
+    });
     return;
   }
   const mbps = Math.max(uploadRate.mbps, reported);
@@ -717,7 +760,7 @@ function renderUploadMeter(jobs) {
   el.uploadMeter.className = "upload-meter live";
   el.uploadMeter.textContent =
     `LIVE UPLOAD  ${mbps.toFixed(1)} MB/s  (${bits.toFixed(0)} Mb/s)` +
-    `  ·  sent ${formatBytes(sent)}${total ? ` / ${formatBytes(total)}` : ""}` +
+    `  ·  sent ${formatCopied(sent, total)}` +
     `  ·  ${running.length} job${running.length === 1 ? "" : "s"} (${batches})`;
 }
 
@@ -729,7 +772,9 @@ function renderAwsJobs(jobs) {
     return;
   }
   for (const job of jobs.slice(0, 12)) {
-    const pct = job.bytes_total ? Math.min(100, (job.bytes_done / job.bytes_total) * 100) : 0;
+    const liveAws = ["running", "checking", "cancelling"].includes(job.status);
+    const shownDone = steadyBytes(`aws:${job.id}`, job.bytes_done || 0, liveAws);
+    const pct = job.bytes_total ? Math.min(100, (shownDone / job.bytes_total) * 100) : 0;
     const statusLabel =
       job.status === "running"
         ? job.console
@@ -780,7 +825,7 @@ function renderAwsJobs(jobs) {
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
       <div class="meta">
-        <span>${formatBytes(job.bytes_done || 0)} / ${formatBytes(job.bytes_total || 0)}</span>
+        <span>${formatCopied(shownDone, job.bytes_total || 0)}</span>
         <span>${Number(job.speed_mbps || 0).toFixed(1)} MB/s</span>
         <span>ETA ${formatEta(job.eta_seconds)}</span>
         <span>${
@@ -1001,6 +1046,12 @@ async function pollStatus() {
     renderCards(data.cards || []);
     renderAwsJobs(data.aws_jobs || []);
     renderUploadMeter(data.aws_jobs || []);
+    if (data.readers && typeof data.readers === "object") {
+      lastMappedReaders = { ...lastMappedReaders, ...data.readers };
+      if (el.readerMap && !el.readerMap.querySelector(".reader-row")) {
+        renderReaders({ mapped: lastMappedReaders, volumes: lastReaderVolumes });
+      }
+    }
     renderLog(data.log || []);
     renderCapacity(data.capacity, data.parallel);
     renderDiskState(data.disk_batches, data.frozen_disks, session, data.disk_batch_states);
@@ -1064,6 +1115,8 @@ async function bootstrap() {
   }
 
   setStatus("Loading drives…");
+  renderReaders({ mapped: config.card_readers || lastMappedReaders, volumes: [] });
+  refreshReaders().catch(() => {});
   try {
     await refreshVolumes();
     if (config.ssd1) el.ssd1.value = config.ssd1;
