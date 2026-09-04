@@ -238,6 +238,36 @@ def test_watchdog_stall_vs_progress() -> None:
         engine._watchdog_copy_snap.clear()
 
 
+def test_s3_list_empty_prefix_is_not_error() -> None:
+    print("\n[9] empty S3 prefix is allowed; access denied is not")
+
+    class _Proc:
+        def __init__(self, text: str, returncode: int = 1):
+            self.stdout = ""
+            self.stderr = text
+            self.returncode = returncode
+
+    dest = "s3://bucket/footage/Batch-29/"
+
+    def empty_ls(cmd, **_kwargs):
+        return _Proc('ERROR "s3://bucket/footage/Batch-29/": no object found')
+
+    with patch.object(a, "s5cmd_available", return_value=True), patch.object(
+        a, "aws_cli_available", return_value=False
+    ), patch.object(a.subprocess, "run", side_effect=empty_ls):
+        listed = a.list_s3_object_sizes(dest)
+    check("s5cmd no object found → empty dict", listed == {}, str(listed))
+
+    def denied_ls(cmd, **_kwargs):
+        return _Proc("AccessDenied: not allowed to list", 1)
+
+    with patch.object(a, "s5cmd_available", return_value=True), patch.object(
+        a, "aws_cli_available", return_value=False
+    ), patch.object(a.subprocess, "run", side_effect=denied_ls):
+        listed = a.list_s3_object_sizes(dest)
+    check("access denied → refuse listing", listed is None)
+
+
 def main() -> int:
     test_timeout_constant()
     test_size_slack()
@@ -248,6 +278,7 @@ def main() -> int:
     test_compare_ignores_other_ssd_objects()
     test_verify_timeout_and_mismatch_do_not_delete()
     test_watchdog_stall_vs_progress()
+    test_s3_list_empty_prefix_is_not_error()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
 

@@ -396,35 +396,90 @@ def _parse_s3_ls_sizes(text: str) -> dict[str, int]:
     return out
 
 
+_EMPTY_S3_LS_RE = re.compile(
+    r"no object found|no objects found|0 objects|Not Found|The specified key does not exist",
+    re.IGNORECASE,
+)
+_FATAL_S3_LS_RE = re.compile(
+    r"AccessDenied|InvalidAccessKey|SignatureDoesNotMatch|ExpiredToken|"
+    r"NoSuchBucket|Forbidden|Unable to locate credentials|could not get credentials|"
+    r"AccessDeniedException|AllAccessDisabled",
+    re.IGNORECASE,
+)
+
+
+_LAST_S3_LIST_ERROR = ""
+
+
+def _s3_ls_output(result: subprocess.CompletedProcess[str]) -> str:
+    return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+
+
+def _run_s3_ls(cmd: list[str]) -> tuple[str, str]:
+    """Return ('ok'|'empty'|'timeout'|'error', text)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=AWS_VERIFY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout", "S3 listing timed out after 30 minutes"
+    except OSError as exc:
+        return "error", str(exc)
+    text = _s3_ls_output(result)
+    if result.returncode == 0:
+        return "ok", text
+    if _FATAL_S3_LS_RE.search(text):
+        return "error", text or f"exit {result.returncode}"
+    if _EMPTY_S3_LS_RE.search(text) or not text:
+        return "empty", text
+    return "error", text or f"exit {result.returncode}"
+
+
 def list_s3_object_sizes(dest: str) -> dict[str, int] | None:
-    """List object basenames under an S3 prefix. None = listing failed/timed out."""
+    """List object basenames under an S3 prefix. None = listing failed/timed out.
+
+    An empty prefix (nothing uploaded yet) is ``{}``, not an error — otherwise
+    the first upload of a batch is blocked when s5cmd prints ``no object found``.
+    """
+    global _LAST_S3_LIST_ERROR
+    _LAST_S3_LIST_ERROR = ""
     if not dest.startswith("s3://"):
+        _LAST_S3_LIST_ERROR = "destination is not an s3:// URI"
         return None
     prefix = dest if dest.endswith("/") else dest + "/"
-    try:
-        if s5cmd_available():
-            result = subprocess.run(
-                ["s5cmd", "ls", prefix],
-                capture_output=True,
-                text=True,
-                timeout=AWS_VERIFY_TIMEOUT_SECONDS,
-            )
-            if result.returncode == 0:
-                parsed = _parse_s3_ls_sizes((result.stdout or "") + "\n" + (result.stderr or ""))
-                return parsed
-        if aws_cli_available():
-            result = subprocess.run(
-                ["aws", "s3", "ls", prefix, "--recursive"],
-                capture_output=True,
-                text=True,
-                timeout=AWS_VERIFY_TIMEOUT_SECONDS,
-            )
-            if result.returncode == 0:
-                return _parse_s3_ls_sizes((result.stdout or "") + "\n" + (result.stderr or ""))
-    except subprocess.TimeoutExpired:
-        return None
-    except OSError:
-        return None
+    empty_ok = False
+    last_error = ""
+    if s5cmd_available():
+        for target in (prefix, prefix + "*"):
+            status, text = _run_s3_ls(["s5cmd", "ls", target])
+            if status == "timeout":
+                _LAST_S3_LIST_ERROR = text
+                return None
+            if status == "ok":
+                return _parse_s3_ls_sizes(text)
+            if status == "empty":
+                empty_ok = True
+            else:
+                last_error = text
+    if aws_cli_available():
+        status, text = _run_s3_ls(["aws", "s3", "ls", prefix, "--recursive"])
+        if status == "timeout":
+            _LAST_S3_LIST_ERROR = text
+            return None
+        if status == "ok":
+            return _parse_s3_ls_sizes(text)
+        if status == "empty":
+            empty_ok = True
+        else:
+            last_error = text or last_error
+    if empty_ok:
+        return {}
+    _LAST_S3_LIST_ERROR = last_error or "s5cmd/aws listing failed"
     return None
 
 
@@ -445,9 +500,13 @@ def _prepare_s3_upload_plan(
             continue
     existing = list_s3_object_sizes(dest)
     if existing is None:
+        detail = (_LAST_S3_LIST_ERROR or "").strip()
+        extra = f" Details: {detail[:300]}" if detail else ""
         raise RuntimeError(
-            "Could not list S3 objects (timeout or error). Refusing to upload "
-            "so existing keys are not overwritten. Retry when the listing works."
+            "Could not list S3 objects (timeout, login error, or s5cmd/aws failed). "
+            "Refusing to upload so existing keys are not overwritten. "
+            "Click Test AWS connection, then retry."
+            + extra
         )
     key_map = plan_s3_dest_names(local_rows, existing)
     dest_norm = dest if dest.endswith("/") else dest + "/"
