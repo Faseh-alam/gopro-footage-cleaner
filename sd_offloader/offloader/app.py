@@ -151,12 +151,11 @@ def create_app() -> Flask:
         ssd1 = str(payload.get("ssd1") or "").strip()
         ssd2 = str(payload.get("ssd2") or "").strip()
         try:
-            if batch or s3_uri or ssd1 or ssd2:
+            if batch or s3_uri or ssd1 or ssd2 or str(payload.get("ssd_slot") or "").strip():
                 cfg = load_config()
                 batch = batch or str(cfg.get("last_batch") or "")
                 s3_uri = s3_uri or str(cfg.get("s3_uri") or "")
-                ssd1 = ssd1 or str(cfg.get("ssd1") or "")
-                ssd2 = ssd2 or str(cfg.get("ssd2") or "")
+                ssd1, ssd2 = aws_upload.resolve_upload_ssds(payload, cfg)
                 if not batch:
                     return jsonify({"error": "Select a batch first"}), 400
                 if not s3_uri:

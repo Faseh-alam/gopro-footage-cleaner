@@ -509,6 +509,7 @@ async function uploadSsdToAws(slot) {
         s3_uri: payload.s3_uri,
         ssd1,
         ssd2,
+        ssd_slot: String(slot),
       }),
     });
     setStatus(

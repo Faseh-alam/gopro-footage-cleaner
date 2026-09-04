@@ -222,10 +222,29 @@ def choose_upload_sources(ssd1: str, ssd2: str, batch_name: str) -> list[Path]:
         return roots
     raise RuntimeError(
         f"Both SSDs have {batch_name} ({roots[0]} and {roots[1]}). "
-        "Upload one SSD at a time so GX010001.MP4 on SSD-B cannot overwrite "
-        "SSD-A on S3. Use Upload on that SSD card, or Batch Completed "
-        "(already uploads each SSD separately)."
+        "Do not use the top Upload this batch button. On the SSD card below, "
+        "click Upload this SSD to AWS — one disk, then the other after it finishes."
     )
+
+
+def resolve_upload_ssds(payload: dict, cfg: dict) -> tuple[str, str]:
+    """Pick SSD paths for one upload. A single-SSD request must not fill in the other disk."""
+    payload = payload or {}
+    cfg = cfg or {}
+    slot = str(payload.get("ssd_slot") or "").strip()
+    p1 = str(payload.get("ssd1") or "").strip()
+    p2 = str(payload.get("ssd2") or "").strip()
+    c1 = str(cfg.get("ssd1") or "").strip()
+    c2 = str(cfg.get("ssd2") or "").strip()
+    if slot in {"1", "ssd1"}:
+        return (p1 or c1, "")
+    if slot in {"2", "ssd2"}:
+        return ("", p2 or c2)
+    if p1 and not p2:
+        return (p1, "")
+    if p2 and not p1:
+        return ("", p2)
+    return (p1 or c1, p2 or c2)
 
 
 def size_tolerance_bytes(expected_bytes: int) -> int:

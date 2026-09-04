@@ -80,8 +80,19 @@ def test_choose_upload_sources() -> None:
             a.choose_upload_sources(str(ssd1), str(ssd2), "batch01")
         except RuntimeError as exc:
             raised = True
-            check("error mentions one SSD at a time", "one SSD at a time" in str(exc), str(exc))
+            check("error tells operator to use Upload this SSD", "Upload this SSD" in str(exc), str(exc))
         check("two SSDs raise", raised)
+
+
+def test_resolve_upload_ssds_one_slot() -> None:
+    print("\n[4b] Upload this SSD does not fill in the other disk from config")
+    cfg = {"ssd1": r"I:\\", "ssd2": r"F:\\"}
+    one, two = a.resolve_upload_ssds({"ssd_slot": "1", "ssd1": r"I:\\", "ssd2": ""}, cfg)
+    check("slot 1 keeps only SSD1", one == r"I:\\" and two == "", f"{one!r} {two!r}")
+    one, two = a.resolve_upload_ssds({"ssd_slot": "2", "ssd1": "", "ssd2": r"F:\\"}, cfg)
+    check("slot 2 keeps only SSD2", one == "" and two == r"F:\\", f"{one!r} {two!r}")
+    one, two = a.resolve_upload_ssds({"ssd1": r"I:\\", "ssd2": ""}, cfg)
+    check("one path in body does not pull SSD2 from config", two == "", two)
 
 
 def test_plan_s3_dest_names() -> None:
@@ -232,6 +243,7 @@ def main() -> int:
     test_size_slack()
     test_dir_bytes_manifest()
     test_choose_upload_sources()
+    test_resolve_upload_ssds_one_slot()
     test_plan_s3_dest_names()
     test_compare_ignores_other_ssd_objects()
     test_verify_timeout_and_mismatch_do_not_delete()
