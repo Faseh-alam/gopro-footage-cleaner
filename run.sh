@@ -9,7 +9,9 @@ cd "$ROOT"
 
 VENV_PY="${ROOT}/.venv/bin/python"
 PORT="${GOPRO_CLEANER_PORT:-8765}"
-APP_URL="http://127.0.0.1:${PORT}/review"
+START_PATH="${GOPRO_START_PATH:-/review}"
+APP_NAME="${GOPRO_APP_NAME:-GoPro Footage Cleaner}"
+APP_URL="http://127.0.0.1:${PORT}${START_PATH}"
 WEB_DIR="${ROOT}/gopro_cleaner/web"
 FRONTEND_DIR="${ROOT}/gopro_cleaner/frontend"
 
@@ -19,8 +21,10 @@ if [[ ! -x "${VENV_PY}" ]]; then
 fi
 
 echo "Installing Python dependencies..."
+# Prefer binary wheels so students never compile cryptography / OpenSSL.
 "${VENV_PY}" -m pip install -q --upgrade pip
-"${VENV_PY}" -m pip install -q -r requirements.txt
+"${VENV_PY}" -m pip install -q --only-binary=:all: -r requirements.txt \
+  || "${VENV_PY}" -m pip install -q -r requirements.txt
 
 export PYTHONPATH="${ROOT}"
 export GOPRO_LITE_MODE=1
@@ -99,7 +103,7 @@ fi
 
 echo ""
 echo "========================================================"
-echo " GoPro Footage Cleaner is running!"
+echo " ${APP_NAME} is running!"
 echo " App:  ${APP_URL}"
 echo " API:  http://127.0.0.1:${PORT}/api/health"
 echo " Press Ctrl+C to stop."

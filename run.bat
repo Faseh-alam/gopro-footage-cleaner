@@ -11,7 +11,10 @@ if defined GOPRO_CLEANER_PORT set "PORT=%GOPRO_CLEANER_PORT%"
 set "VENV_PY=%CD%\.venv\Scripts\python.exe"
 set "WEB_DIR=%CD%\gopro_cleaner\web"
 set "FRONTEND_DIR=%CD%\gopro_cleaner\frontend"
-set "APP_URL=http://127.0.0.1:%PORT%/review"
+
+if not defined GOPRO_START_PATH set "GOPRO_START_PATH=/review"
+if not defined GOPRO_APP_NAME set "GOPRO_APP_NAME=GoPro Footage Cleaner"
+set "APP_URL=http://127.0.0.1:%PORT%%GOPRO_START_PATH%"
 
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (
@@ -34,7 +37,10 @@ if not exist "%VENV_PY%" (
 
 echo Installing Python dependencies...
 "%VENV_PY%" -m pip install --upgrade pip >nul 2>&1
-"%VENV_PY%" -m pip install -r requirements.txt
+"%VENV_PY%" -m pip install --only-binary=:all: -r requirements.txt
+if errorlevel 1 (
+  "%VENV_PY%" -m pip install -r requirements.txt
+)
 if errorlevel 1 (
   echo.
   echo Failed to install dependencies. Check your internet connection and try again.

@@ -42,6 +42,10 @@ Optional:
 
 ## Installation
 
+### Voiceover narrators (students)
+
+See **[VOICEOVER.md](VOICEOVER.md)** — double-click **`start-voiceover.bat`** (Windows) or run **`./start-voiceover.sh`** (Mac). Opens Voiceover Station only.
+
 ### Windows (recommended)
 
 1. Clone or download this repository.

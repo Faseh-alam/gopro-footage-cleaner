@@ -10,6 +10,7 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 from .eager_routes import create_eager_blueprint
+from .voiceover_routes import create_voiceover_blueprint
 from .core.probe import MediaInfo, is_video_file, looks_like_gopro, probe_media
 from .core.queue import trim_queue
 from .core.sheet_import import parse_sheet, preview_to_dict, queue_import
@@ -36,6 +37,7 @@ def create_app() -> Flask:
     CORS(app)
 
     app.register_blueprint(create_eager_blueprint())
+    app.register_blueprint(create_voiceover_blueprint())
     app.register_blueprint(create_cards_blueprint())
     app.register_blueprint(create_auth_blueprint())
 

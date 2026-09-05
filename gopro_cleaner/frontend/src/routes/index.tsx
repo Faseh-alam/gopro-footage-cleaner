@@ -257,6 +257,12 @@ function Index() {
           >
             Review station <ArrowUpRight className="size-3.5" />
           </Link>
+          <Link
+            to="/voiceover"
+            className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72] transition-opacity hover:opacity-75"
+          >
+            Voiceover <ArrowUpRight className="size-3.5" />
+          </Link>
         </div>
       </header>
 

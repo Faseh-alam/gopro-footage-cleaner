@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as MetadataRouteImport } from './routes/metadata'
 import { Route as ReviewRouteImport } from './routes/review'
+import { Route as VoiceoverRouteImport } from './routes/voiceover'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -34,18 +35,25 @@ const ReviewRoute = ReviewRouteImport.update({
   path: '/review',
   getParentRoute: () => rootRouteImport,
 } as any)
+const VoiceoverRoute = VoiceoverRouteImport.update({
+  id: '/voiceover',
+  path: '/voiceover',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/metadata': typeof MetadataRoute
   '/review': typeof ReviewRoute
+  '/voiceover': typeof VoiceoverRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/metadata': typeof MetadataRoute
   '/review': typeof ReviewRoute
+  '/voiceover': typeof VoiceoverRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -53,13 +61,14 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/metadata': typeof MetadataRoute
   '/review': typeof ReviewRoute
+  '/voiceover': typeof VoiceoverRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/login' | '/metadata' | '/review'
+  fullPaths: '/' | '/login' | '/metadata' | '/review' | '/voiceover'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/login' | '/metadata' | '/review'
-  id: '__root__' | '/' | '/login' | '/metadata' | '/review'
+  to: '/' | '/login' | '/metadata' | '/review' | '/voiceover'
+  id: '__root__' | '/' | '/login' | '/metadata' | '/review' | '/voiceover'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -67,6 +76,7 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   MetadataRoute: typeof MetadataRoute
   ReviewRoute: typeof ReviewRoute
+  VoiceoverRoute: typeof VoiceoverRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -99,6 +109,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/voiceover': {
+      id: '/voiceover'
+      path: '/voiceover'
+      fullPath: '/voiceover'
+      preLoaderRoute: typeof VoiceoverRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -107,6 +124,7 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   MetadataRoute: MetadataRoute,
   ReviewRoute: ReviewRoute,
+  VoiceoverRoute: VoiceoverRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

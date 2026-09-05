@@ -366,6 +366,12 @@ function ReviewPage() {
 
             <nav className="flex items-center gap-3 border-l border-border pl-3 font-mono text-[11px] uppercase tracking-[0.14em] text-[#b96d72]">
               <Link
+                to="/voiceover"
+                className="inline-flex items-center gap-1 transition-opacity hover:opacity-75"
+              >
+                Voiceover <ArrowUpRight className="size-3" />
+              </Link>
+              <Link
                 to="/metadata"
                 className="inline-flex items-center gap-1 transition-opacity hover:opacity-75"
               >

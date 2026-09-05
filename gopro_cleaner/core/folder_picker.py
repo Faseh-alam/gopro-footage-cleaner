@@ -24,11 +24,15 @@ def _pick_folder_mac(initial: Path | None) -> Path | None:
     if initial is not None:
         location = str(initial.resolve()).replace("\\", "\\\\").replace('"', '\\"')
         script = (
-            f'POSIX path of (choose folder with prompt "Select footage folder" '
+            f'POSIX path of (choose folder with prompt '
+            f'"Select the folder that contains the clips to rewrite" '
             f'default location (POSIX file "{location}"))'
         )
     else:
-        script = 'POSIX path of (choose folder with prompt "Select footage folder")'
+        script = (
+            'POSIX path of (choose folder with prompt '
+            '"Select the folder that contains the clips to rewrite")'
+        )
 
     result = subprocess.run(
         ["osascript", "-e", script],
