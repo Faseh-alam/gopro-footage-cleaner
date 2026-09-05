@@ -37,6 +37,7 @@ type Clip = {
   size_bytes: number;
   has_gpmf: boolean;
   done: boolean;
+  pending?: boolean;
 };
 
 type ClassRow = {
@@ -252,6 +253,20 @@ function VoiceoverPage() {
     setScript("");
   }, [clips.length]);
 
+  const releasePlayer = useCallback(async () => {
+    const v = videoRef.current;
+    if (!v) return;
+    try {
+      v.pause();
+    } catch {
+      /* ignore */
+    }
+    // Drop the HTTP stream so Windows/USB unlocks the MP4 for mux replace.
+    v.removeAttribute("src");
+    v.load();
+    await new Promise((r) => window.setTimeout(r, 400));
+  }, []);
+
   const stopRecording = useCallback(
     async (opts: { discard?: boolean } = {}) => {
       const recorder = mediaRecorderRef.current;
@@ -282,7 +297,8 @@ function VoiceoverPage() {
       }
 
       setSaving(true);
-      setStatus(`Muxing narration into ${current.name} (GPMF preserved)…`);
+      setStatus(`Attaching narration into ${current.name} (GPMF preserved)…`);
+      await releasePlayer();
       try {
         const form = new FormData();
         form.append("path", current.path);
@@ -291,32 +307,103 @@ function VoiceoverPage() {
         const micLabel = mics.find((m) => m.deviceId === micId)?.label || micId || "default";
         form.append("mic", micLabel);
         form.append("audio", blob, "take.webm");
-        const result = await api<{
+        const response = await fetch(apiUrl("/api/voiceover/save-take"), {
+          method: "POST",
+          body: form,
+        });
+        const result = (await response.json().catch(() => ({}))) as {
           ok?: boolean;
+          pending?: boolean;
           message?: string;
           path?: string;
-          has_gpmf?: boolean;
           error?: string;
-        }>("/api/voiceover/save-take", { method: "POST", body: form });
-        const savedPath = result.path || current.path;
-        setStatus(`Rewrote original clip · play from 0:00 · ${savedPath}`);
-        toast.success(`Saved into original file: ${savedPath}`);
-        await scanRoot(root, { keepClass: activeClass, keepPath: current.path });
-        const v = videoRef.current;
-        if (v) {
-          v.muted = false;
-          v.currentTime = 0;
-          setScrub(0);
+        };
+        if (response.ok && result.ok !== false) {
+          const savedPath = result.path || current.path;
+          setStatus(`Rewrote original clip · play from 0:00 · ${savedPath}`);
+          toast.success("Voiceover attached — play from the start to review");
+          await scanRoot(root, { keepClass: activeClass, keepPath: current.path });
+          const v = videoRef.current;
+          if (v) {
+            v.muted = false;
+            v.currentTime = 0;
+            setScrub(0);
+          }
+        } else if (result.pending || response.status === 409) {
+          setStatus(
+            result.message ||
+              "Take kept on USB — click Attach voiceover (player released the file)",
+          );
+          toast.message("Take saved — click Attach voiceover to finish");
+          await scanRoot(root, { keepClass: activeClass, keepPath: current.path });
+        } else {
+          throw new Error(result.error || result.message || `Save failed (${response.status})`);
         }
       } catch (error: any) {
         toast.error(error.message || "Mux failed — original left untouched");
         setStatus(error.message || "Mux failed");
+        setBust((b) => b + 1);
       } finally {
         setSaving(false);
       }
     },
-    [activeClass, current, micId, mics, narrator, releaseMic, root, scanRoot],
+    [
+      activeClass,
+      current,
+      micId,
+      mics,
+      narrator,
+      releaseMic,
+      releasePlayer,
+      root,
+      scanRoot,
+    ],
   );
+
+  const attachPending = useCallback(async () => {
+    if (!current) return;
+    setSaving(true);
+    setStatus(`Attaching pending take into ${current.name}…`);
+    await releasePlayer();
+    try {
+      const result = await api<{ path?: string; message?: string }>(
+        "/api/voiceover/attach-pending",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            path: current.path,
+            root,
+            narrator,
+            mic: mics.find((m) => m.deviceId === micId)?.label || micId || "",
+          }),
+        },
+      );
+      toast.success("Voiceover attached — play from the start to review");
+      setStatus(result.message || `Attached · ${result.path || current.path}`);
+      await scanRoot(root, { keepClass: activeClass, keepPath: current.path });
+      const v = videoRef.current;
+      if (v) {
+        v.muted = false;
+        v.currentTime = 0;
+        setScrub(0);
+      }
+    } catch (error: any) {
+      toast.error(error.message || "Attach failed — try again in a moment");
+      setStatus(error.message || "Attach failed");
+      setBust((b) => b + 1);
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    activeClass,
+    current,
+    micId,
+    mics,
+    narrator,
+    releasePlayer,
+    root,
+    scanRoot,
+  ]);
 
   const startRecording = useCallback(async () => {
     if (!current) {
@@ -566,7 +653,7 @@ function VoiceoverPage() {
               >
                 <span className="truncate text-sm">{clip.name}</span>
                 <span className="font-mono text-[10px] uppercase tracking-wider">
-                  {clip.done ? "done" : "todo"}
+                  {clip.done ? "done" : clip.pending ? "pending" : "todo"}
                   {clip.has_gpmf ? " · gpmf" : ""}
                 </span>
               </button>
@@ -606,7 +693,7 @@ function VoiceoverPage() {
             )}
             {saving && (
               <div className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm">
-                Muxing narration into MP4…
+                Attaching narration into MP4…
               </div>
             )}
           </div>
@@ -625,7 +712,14 @@ function VoiceoverPage() {
               {recording ? <Square className="size-3.5" /> : <Mic className="size-3.5" />}
               {recording ? "Stop (R)" : "Record (R)"}
             </Button>
-            <Button size="sm" variant="ghost" onClick={seekStart} disabled={!current || recording}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void attachPending()}
+              disabled={!current || saving || recording || !current.pending}
+            >
+              Attach voiceover
+            </Button>            <Button size="sm" variant="ghost" onClick={seekStart} disabled={!current || recording}>
               Start (S)
             </Button>
             <Button size="sm" variant="ghost" onClick={nextClip} disabled={!clips.length || recording}>
@@ -643,9 +737,9 @@ function VoiceoverPage() {
             </p>
           )}
           <p className="text-xs text-muted-foreground">
-            When you stop recording, your voice replaces the audio on the same file you are
-            playing — same path, no copy elsewhere. Clip audio is muted until a take is saved.
-            R starts at 0:00; Space pauses video only; Esc discards.
+            When you stop recording, your voice is written into the same file you are playing.
+            On slow USBs the app releases the player first; if attach fails, your take is kept and
+            you can press Attach voiceover (then play from 0:00 to check). Esc discards a live take.
           </p>
         </section>
 

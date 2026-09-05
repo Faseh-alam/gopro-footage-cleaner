@@ -92,14 +92,34 @@ def create_voiceover_blueprint() -> Blueprint:
             if not raw:
                 return jsonify({"error": "empty audio upload"}), 400
             temp_audio = voiceover_store.save_uploaded_audio(raw, suffix=suffix)
-            result = voiceover_store.mux_voiceover_inplace(
-                source,
-                temp_audio,
-                root=Path(root) if root else source.parent,
-                narrator=narrator,
-                mic=mic,
-            )
-            return jsonify(result)
+            # Always keep a pending sidecar first so a USB lock can't lose the take.
+            pending = voiceover_store.save_pending_take(source, temp_audio)
+            try:
+                result = voiceover_store.mux_voiceover_inplace(
+                    source,
+                    temp_audio,
+                    root=Path(root) if root else source.parent,
+                    narrator=narrator,
+                    mic=mic,
+                )
+                return jsonify(result)
+            except Exception as mux_exc:  # noqa: BLE001
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "pending": True,
+                            "pending_path": str(pending),
+                            "path": str(source),
+                            "error": str(mux_exc),
+                            "message": (
+                                "Take saved next to the clip, but attaching failed "
+                                f"(often USB file-in-use). Click Attach voiceover. ({mux_exc})"
+                            ),
+                        }
+                    ),
+                    409,
+                )
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 404
         except Exception as exc:  # noqa: BLE001
@@ -110,6 +130,30 @@ def create_voiceover_blueprint() -> Blueprint:
                     temp_audio.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    @vo.post("/api/voiceover/attach-pending")
+    def voiceover_attach_pending():
+        """Mux a saved pending take into the original clip (retry / later attach)."""
+        payload = request.get_json(silent=True) or {}
+        video_path = str(payload.get("path") or request.form.get("path") or "").strip()
+        root = str(payload.get("root") or request.form.get("root") or "").strip()
+        narrator = str(payload.get("narrator") or request.form.get("narrator") or "").strip()
+        mic = str(payload.get("mic") or request.form.get("mic") or "").strip()
+        if not video_path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            source = Path(video_path).expanduser().resolve(strict=True)
+            result = voiceover_store.attach_pending_take(
+                source,
+                root=Path(root) if root else source.parent,
+                narrator=narrator,
+                mic=mic,
+            )
+            return jsonify(result)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
 
     @vo.get("/api/voiceover/probe")
     def voiceover_probe():

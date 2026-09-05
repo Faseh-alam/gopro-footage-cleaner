@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -31,6 +32,7 @@ class VoiceoverClip:
     size_bytes: int
     has_gpmf: bool
     done: bool
+    pending: bool = False
 
 
 def _now_iso() -> str:
@@ -94,6 +96,10 @@ def _is_junk(path: Path) -> bool:
         return True
     if ".partial" in lower:
         return True
+    if "__pre_voiceover__" in lower or "__new_voiceover__" in lower:
+        return True
+    if lower.endswith(".voiceover-pending.webm"):
+        return True
     if lower == PROGRESS_NAME:
         return True
     return False
@@ -133,6 +139,7 @@ def scan_voiceover_tree(root: Path) -> dict:
             size_bytes=video.stat().st_size,
             has_gpmf=bool(media and media.has_gpmf),
             done=key in done_map,
+            pending=has_pending_take(video),
         )
         classes.setdefault(class_name, []).append(clip)
 
@@ -167,6 +174,7 @@ def scan_voiceover_tree(root: Path) -> dict:
                         "size_bytes": c.size_bytes,
                         "has_gpmf": c.has_gpmf,
                         "done": c.done,
+                        "pending": c.pending,
                     }
                     for c in clips
                 ],
@@ -267,6 +275,78 @@ def _assert_narration_usable(audio_path: Path) -> None:
         )
 
 
+def pending_audio_path(video: Path) -> Path:
+    """Sidecar for a recorded take waiting to be muxed into ``video``."""
+    video = video.expanduser().resolve()
+    return video.with_name(f"{video.stem}.voiceover-pending.webm")
+
+
+def save_pending_take(video: Path, audio_path: Path) -> Path:
+    """Keep the take next to the clip so Attach / retry can finish later."""
+    video = video.expanduser().resolve(strict=True)
+    audio_path = audio_path.expanduser().resolve(strict=True)
+    dest = pending_audio_path(video)
+    if dest.exists():
+        dest.unlink()
+    shutil.copy2(audio_path, dest)
+    return dest
+
+
+def has_pending_take(video: Path) -> bool:
+    try:
+        p = pending_audio_path(video)
+    except OSError:
+        return False
+    return p.is_file() and p.stat().st_size > 512
+
+
+def _replace_file_with_retries(source: Path, new_file: Path, *, attempts: int = 12) -> None:
+    """Replace ``source`` with ``new_file`` (may be on another volume). Retries locks."""
+    import time
+
+    ext = source.suffix or ".MP4"
+    backup = source.with_name(f"{source.stem}.__pre_voiceover__{ext}")
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            if backup.exists():
+                backup.unlink()
+            # Prefer rename when same volume; else copy then swap.
+            try:
+                if source.resolve().anchor == new_file.resolve().anchor:
+                    os.replace(source, backup)
+                    os.replace(new_file, source)
+                else:
+                    os.replace(source, backup)
+                    shutil.copy2(new_file, source)
+                    new_file.unlink(missing_ok=True)
+            except OSError:
+                # Source locked or cross-device oddity — copy over via temp name on target.
+                staged = source.with_name(f"{source.stem}.__new_voiceover__{ext}")
+                if staged.exists():
+                    staged.unlink()
+                shutil.copy2(new_file, staged)
+                if source.exists():
+                    os.replace(source, backup)
+                os.replace(staged, source)
+                new_file.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            return
+        except OSError as exc:
+            last_err = exc
+            # Roll back if we moved source aside but failed to place the new file.
+            if not source.exists() and backup.exists():
+                try:
+                    os.replace(backup, source)
+                except OSError:
+                    pass
+            time.sleep(0.35 * (attempt + 1))
+    raise RuntimeError(
+        f"Could not replace clip (file in use / locked). "
+        f"Close other players and click Attach voiceover. Detail: {last_err}"
+    )
+
+
 def mux_voiceover_inplace(
     source: Path,
     audio_path: Path,
@@ -275,7 +355,11 @@ def mux_voiceover_inplace(
     narrator: str = "",
     mic: str = "",
 ) -> dict:
-    """Replace audio on ``source`` in place; preserve video + GPMF. Fail closed."""
+    """Replace audio on ``source`` in place; preserve video + GPMF. Fail closed.
+
+    FFmpeg writes to a **local temp file** first (avoids USB lock / slow partial
+    writes), then copies the result back onto the original path with retries.
+    """
     source = source.expanduser().resolve(strict=True)
     audio_path = audio_path.expanduser().resolve(strict=True)
     if not is_video_file(source):
@@ -288,67 +372,76 @@ def mux_voiceover_inplace(
     _assert_narration_usable(audio_path)
 
     ext = source.suffix or ".MP4"
-    partial = source.with_name(f"{source.stem}.partial{ext}")
-    if partial.exists():
-        partial.unlink()
-
-    command = _build_mux_command(media, audio_path, partial)
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        if partial.exists():
-            partial.unlink(missing_ok=True)
-        err = (result.stderr or result.stdout or "ffmpeg mux failed").strip()
-        raise RuntimeError(err)
-
+    work = Path(tempfile.mkdtemp(prefix="vo-mux-"))
+    partial = work / f"out{ext}"
     try:
-        out_media = probe_media(partial)
-    except Exception as exc:  # noqa: BLE001
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(f"Could not probe muxed output: {exc}") from exc
-
-    if had_gpmf and not out_media.has_gpmf:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Muxed file is missing GPMF / IMU — original left untouched"
+        command = _build_mux_command(media, audio_path, partial)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "ffmpeg mux failed").strip()
+            raise RuntimeError(err)
 
-    # Atomic-ish replace on same volume.
-    backup = source.with_name(f"{source.stem}.__pre_voiceover__{ext}")
-    try:
-        if backup.exists():
-            backup.unlink()
-        os.replace(source, backup)
-        os.replace(partial, source)
-        backup.unlink(missing_ok=True)
-    except OSError:
-        # Roll back if replace failed mid-way.
-        if not source.exists() and backup.exists():
-            os.replace(backup, source)
-        partial.unlink(missing_ok=True)
-        raise
-
-    if root is not None:
         try:
-            mark_done(root, source, narrator=narrator, mic=mic)
-        except OSError:
-            pass
+            out_media = probe_media(partial)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Could not probe muxed output: {exc}") from exc
 
-    final = probe_media(source)
-    return {
-        "ok": True,
-        "path": str(source),
-        "has_gpmf": final.has_gpmf,
-        "duration": final.duration,
-        "size_bytes": final.size_bytes,
-        "message": f"Rewrote original clip: {source}"
-        + (" · GPMF preserved" if final.has_gpmf else ""),
-    }
+        if had_gpmf and not out_media.has_gpmf:
+            raise RuntimeError(
+                "Muxed file is missing GPMF / IMU — original left untouched"
+            )
+
+        _replace_file_with_retries(source, partial)
+
+        # Clear pending sidecar if attach succeeded.
+        pending = pending_audio_path(source)
+        pending.unlink(missing_ok=True)
+
+        if root is not None:
+            try:
+                mark_done(root, source, narrator=narrator, mic=mic)
+            except OSError:
+                pass
+
+        final = probe_media(source)
+        return {
+            "ok": True,
+            "path": str(source),
+            "has_gpmf": final.has_gpmf,
+            "duration": final.duration,
+            "size_bytes": final.size_bytes,
+            "message": f"Rewrote original clip: {source}"
+            + (" · GPMF preserved" if final.has_gpmf else ""),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def attach_pending_take(
+    source: Path,
+    *,
+    root: Path | None = None,
+    narrator: str = "",
+    mic: str = "",
+) -> dict:
+    """Mux a previously saved ``.voiceover-pending.webm`` into the clip."""
+    source = source.expanduser().resolve(strict=True)
+    pending = pending_audio_path(source)
+    if not pending.is_file():
+        raise FileNotFoundError(f"No pending take for {source.name}")
+    return mux_voiceover_inplace(
+        source,
+        pending,
+        root=root,
+        narrator=narrator,
+        mic=mic,
+    )
 
 
 def save_uploaded_audio(upload_bytes: bytes, suffix: str = ".webm") -> Path:
