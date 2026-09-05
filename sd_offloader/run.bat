@@ -50,6 +50,20 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT% ^| findstr LISTENING'
   taskkill /PID %%a /F >nul 2>&1
 )
 
+echo Checking engine.py before start...
+"%VENV_PY%" -m py_compile offloader\engine.py offloader\app.py offloader\aws_upload.py
+if errorlevel 1 (
+  echo.
+  echo engine.py is broken ^(IndentationError^). Do not keep this copy.
+  echo In the gopro-footage-cleaner git folder run:
+  echo   git fetch origin
+  echo   git checkout redesign-testing
+  echo   git reset --hard origin/redesign-testing
+  echo Then double-click run.bat again.
+  pause
+  exit /b 1
+)
+
 echo.
 echo Starting server in THIS window...
 echo When you see "Ready — opening browser", the UI should open.
