@@ -630,8 +630,109 @@ def start_batch_upload(
     return job
 
 
+def _norm_s3_dest(dest: str) -> str:
+    return str(dest or "").strip().rstrip("/").lower()
+
+
+def _job_is_operator_cancelled(job: dict) -> bool:
+    status = str(job.get("status") or "")
+    return bool(job.get("cancel_requested")) or status in {"cancelled", "cancelling"}
+
+
+def _job_matches_upload(
+    job: dict,
+    *,
+    pid=None,
+    dest: str = "",
+    batch: str = "",
+    run_file: str = "",
+) -> bool:
+    if pid is not None:
+        try:
+            pid_i = int(pid)
+        except (TypeError, ValueError):
+            pid_i = None
+        if pid_i is not None:
+            for key in ("aws_pid", "cancelled_pid"):
+                try:
+                    if int(job.get(key) or 0) == pid_i:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+    dest_n = _norm_s3_dest(dest)
+    if dest_n:
+        for key in ("dest", "cancelled_dest"):
+            if dest_n == _norm_s3_dest(str(job.get(key) or "")):
+                return True
+    batch_n = str(batch or "").strip().lower()
+    if batch_n:
+        for key in ("batch", "cancelled_batch"):
+            if batch_n == str(job.get(key) or "").strip().lower():
+                return True
+    run_n = str(run_file or "").replace("/", "\\").strip().lower()
+    if run_n:
+        job_run = str(job.get("run_file") or "").replace("/", "\\").strip().lower()
+        if job_run and (run_n == job_run or Path(run_n).name == Path(job_run).name):
+            return True
+    return False
+
+
+def _cancelled_blocks_reattach_locked(
+    *,
+    pid=None,
+    dest: str = "",
+    batch: str = "",
+    run_file: str = "",
+) -> bool:
+    return any(
+        _job_is_operator_cancelled(j)
+        and _job_matches_upload(j, pid=pid, dest=dest, batch=batch, run_file=run_file)
+        for j in _jobs.values()
+    )
+
+
+def _apply_cancelled_state(job: dict, *, message: str | None = None) -> None:
+    """Mark a job cancelled immediately so the live meter drops."""
+    if job.get("aws_pid") and not job.get("cancelled_pid"):
+        job["cancelled_pid"] = job.get("aws_pid")
+    if job.get("dest") and not job.get("cancelled_dest"):
+        job["cancelled_dest"] = job.get("dest")
+    if job.get("batch") and not job.get("cancelled_batch"):
+        job["cancelled_batch"] = job.get("batch")
+    job["cancel_requested"] = True
+    job["pending_resync"] = False
+    job["status"] = "cancelled"
+    job["speed_mbps"] = 0.0
+    job["eta_seconds"] = None
+    job["aws_pid"] = None
+    job["message"] = message or (
+        "Cancelled — S3 may have a partial upload; click Retry to resume missing files"
+    )
+
+
+def _still_want_process_kill(job_id: str) -> bool:
+    """Do not kill processes after the operator has Restarted this job."""
+    with _lock:
+        live = _jobs.get(job_id)
+        if not live:
+            return True
+        if str(live.get("status") or "") == "running" and not live.get("cancel_requested"):
+            return False
+        return _job_is_operator_cancelled(live)
+
+
+def _has_other_live_uploads(except_id: str) -> bool:
+    with _lock:
+        return any(
+            jid != except_id
+            and str(j.get("status") or "") in {"running", "checking"}
+            and not j.get("cancel_requested")
+            for jid, j in _jobs.items()
+        )
+
+
 def cancel_job(job_id: str) -> dict:
-    """Stop a running AWS upload (kill CMD / s5cmd / aws process tree)."""
+    """Stop a running AWS upload. UI is cancelled immediately; process kill is background."""
     with _lock:
         job = _jobs.get(job_id)
         if not job:
@@ -639,33 +740,14 @@ def cancel_job(job_id: str) -> dict:
         status = str(job.get("status") or "")
         if status == "cancelled":
             return dict(job)
-        if status not in {"running", "checking"}:
+        if status not in {"running", "checking", "cancelling"}:
             raise RuntimeError(f"Job is not running ({status}) — nothing to cancel")
         snap = dict(job)
-        job["cancel_requested"] = True
-        job["pending_resync"] = False
-        job["status"] = "cancelling"
-        job["message"] = "Cancel requested — stopping upload processes…"
-        _append_job_log(job, "Cancel requested by operator")
-    _persist_jobs()
-
-    killed = _kill_upload_processes(snap)
-    with _lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise RuntimeError("Upload job not found")
-        job["cancel_requested"] = True
-        job["pending_resync"] = False
-        job["status"] = "cancelled"
-        job["speed_mbps"] = 0.0
-        job["eta_seconds"] = None
-        job["aws_pid"] = None
-        job["message"] = (
-            "Cancelled — S3 may have a partial upload; click Retry to resume missing files"
-            + (f" · stopped {killed} process(es)" if killed else "")
+        _apply_cancelled_state(
+            job,
+            message="Cancelled — stopping leftover upload processes if any remain",
         )
-        _append_job_log(job, f"Cancelled (killed={killed})")
-        # Marker so log monitor does not treat a half-written exit as a hard error.
+        _append_job_log(job, "Cancelled by operator")
         log_path = Path(str(job.get("log_path") or ""))
         if log_path.is_file():
             try:
@@ -674,45 +756,135 @@ def cancel_job(job_id: str) -> dict:
             except OSError:
                 pass
     _persist_jobs()
+
+    threading.Thread(
+        target=_kill_upload_processes,
+        args=(snap,),
+        daemon=True,
+        name=f"aws-cancel-kill-{(job_id or '')[-8:]}",
+    ).start()
     return get_job(job_id) or {"id": job_id, "status": "cancelled"}
 
 
 def _kill_upload_processes(job: dict) -> int:
-    """Kill CMD/PowerShell/s5cmd/aws processes tied to this upload job."""
+    """Kill CMD / s5cmd / aws processes tied to this upload job.
+
+    Fast path: stored PID + CMD window title + s5cmd.exe. Slow WMI scan is last.
+    """
+    job_id = str(job.get("id") or "")
+    if job_id and not _still_want_process_kill(job_id):
+        return 0
+
+    killed = 0
+    stored = job.get("aws_pid") or job.get("cancelled_pid")
+    if stored:
+        try:
+            if _kill_pid_tree(int(stored)):
+                killed += 1
+        except (TypeError, ValueError):
+            pass
+
+    batch = str(job.get("batch") or job.get("cancelled_batch") or "").strip()
+    if platform.system() == "Windows" and batch:
+        for title in (f"AWS — {batch}", f"AWS - {batch}"):
+            if _taskkill_window_title(title):
+                killed += 1
+                break
+
     needles: list[str] = []
-    for key in ("script", "log_path", "dest", "run_file"):
+    for key in ("script", "log_path", "dest", "run_file", "cancelled_dest"):
         value = str(job.get(key) or "").strip()
         if value:
             needles.append(value)
             needles.append(value.replace("/", "\\"))
             needles.append(value.replace("\\", "/"))
-    # Unique basename of the .bat/.sh also helps match the CMD window title path.
     script = str(job.get("script") or "")
     if script:
         needles.append(Path(script).name)
-    dest = str(job.get("dest") or "").strip()
+    dest = str(job.get("dest") or job.get("cancelled_dest") or "").strip()
     if dest:
         needles.append(dest.rstrip("/"))
     needles = [n for n in dict.fromkeys(needles) if len(n) >= 8]
 
     pids: set[int] = set()
-    stored = job.get("aws_pid")
-    if stored:
-        try:
-            pids.add(int(stored))
-        except (TypeError, ValueError):
-            pass
-
     if platform.system() == "Windows":
         pids.update(_windows_pids_matching(needles))
     else:
         pids.update(_posix_pids_matching(needles))
-
-    killed = 0
+    if stored:
+        try:
+            pids.discard(int(stored))
+        except (TypeError, ValueError):
+            pass
     for pid in sorted(pids):
+        if job_id and not _still_want_process_kill(job_id):
+            break
         if _kill_pid_tree(pid):
             killed += 1
+
+    if (
+        platform.system() == "Windows"
+        and job_id
+        and _still_want_process_kill(job_id)
+        and not _has_other_live_uploads(job_id)
+    ):
+        if _taskkill_image("s5cmd.exe"):
+            killed += 1
+
+    if job_id and _still_want_process_kill(job_id):
+        with _lock:
+            live = _jobs.get(job_id)
+            if live and _job_is_operator_cancelled(live):
+                extra = f" · stopped {killed} process(es)" if killed else ""
+                live["speed_mbps"] = 0.0
+                live["status"] = "cancelled"
+                live["message"] = (
+                    "Cancelled — S3 may have a partial upload; click Retry to resume missing files"
+                    + extra
+                )
+                _append_job_log(live, f"Cancel kill finished (killed={killed})")
+        _persist_jobs()
     return killed
+
+
+def _taskkill_window_title(title: str) -> bool:
+    title = str(title or "").strip()
+    if not title or platform.system() != "Windows":
+        return False
+    return _taskkill_filter(f"WINDOWTITLE eq {title}*")
+
+
+def _taskkill_image(image: str) -> bool:
+    image = str(image or "").strip()
+    if not image or platform.system() != "Windows":
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", image],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    out = f"{result.stdout or ''}{result.stderr or ''}".upper()
+    return "SUCCESS" in out
+
+
+def _taskkill_filter(filter_expr: str) -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/FI", filter_expr],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    out = f"{result.stdout or ''}{result.stderr or ''}".upper()
+    return "SUCCESS" in out
 
 
 def _windows_pids_matching(needles: list[str]) -> set[int]:
@@ -724,13 +896,13 @@ def _windows_pids_matching(needles: list[str]) -> set[int]:
                 "powershell.exe",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process | "
-                "Where-Object { $_.Name -match '^(aws|s5cmd|cmd|powershell|pwsh)\\.exe$' } | "
+                "Get-CimInstance Win32_Process -Filter "
+                "\"Name='s5cmd.exe' OR Name='aws.exe' OR Name='cmd.exe'\" | "
                 "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
             ],
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=8,
         )
     except (OSError, subprocess.TimeoutExpired):
         return set()
@@ -750,15 +922,13 @@ def _windows_pids_matching(needles: list[str]) -> set[int]:
         if not cmd:
             continue
         cmd_l = cmd.lower()
-        # Only touch sync-related shells / uploaders.
         name = str(row.get("Name") or "").lower()
         if name in {"aws.exe", "s5cmd.exe"} and "sync" not in cmd_l and " run " not in f" {cmd_l} ":
             continue
-        if name in {"cmd.exe", "powershell.exe", "pwsh.exe"}:
-            if "sync" not in cmd_l and not any(
-                Path(n).name.lower() in cmd_l for n in needles if n.endswith((".bat", ".sh", ".log"))
+        if name == "cmd.exe":
+            if "sync" not in cmd_l and "s5cmd" not in cmd_l and not any(
+                Path(n).name.lower() in cmd_l for n in needles if n.endswith((".bat", ".sh", ".log", ".txt"))
             ):
-                # Still match if dest / script path appears.
                 if not any(n in cmd_l for n in needles_l):
                     continue
         if any(n in cmd_l for n in needles_l):
@@ -810,7 +980,7 @@ def _kill_pid_tree(pid: int) -> bool:
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=8,
             )
             return result.returncode == 0
         os.kill(pid, 15)
@@ -856,6 +1026,9 @@ def restart_job(job_id: str) -> dict:
         prev = _jobs.get(job_id)
         if prev:
             prev["cancel_requested"] = False
+            prev["cancelled_pid"] = None
+            prev["cancelled_dest"] = None
+            prev["cancelled_batch"] = None
 
     # Replace this job id so the UI Restart button keeps a stable reference.
     key_map, file_pairs = _prepare_s3_upload_plan(sources[0], dest)
@@ -1454,6 +1627,7 @@ def restore_jobs_from_disk() -> None:
     """Reload jobs and keep monitoring any CMD uploads that are still running."""
     ensure_dirs()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    need_kill: list[dict] = []
     if JOBS_FILE.exists():
         try:
             rows = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
@@ -1480,8 +1654,17 @@ def restore_jobs_from_disk() -> None:
                     still_log = _log_still_active(log_path)
                     pid = job.get("aws_pid")
                     pid_live = bool(pid) and pid_live_map.get(int(pid), False)
+                    status_before = str(job.get("status") or "")
 
-                    if job.get("status") in {"running", "interrupted", "checking"}:
+                    if _job_is_operator_cancelled(job) or status_before == "cancelling":
+                        _apply_cancelled_state(
+                            job,
+                            message="Cancelled — leftover upload processes will be stopped",
+                        )
+                        job["speed_mbps"] = 0.0
+                        if status_before in {"cancelling", "running", "checking"}:
+                            need_kill.append(dict(job))
+                    elif job.get("status") in {"running", "interrupted", "checking"}:
                         if still_log or pid_live:
                             job["status"] = "running"
                             job["message"] = (
@@ -1518,6 +1701,13 @@ def restore_jobs_from_disk() -> None:
     _discover_orphan_logs()
     _persist_jobs()
     _ensure_monitor()
+    for snap in need_kill:
+        threading.Thread(
+            target=_kill_upload_processes,
+            args=(snap,),
+            daemon=True,
+            name=f"aws-cancel-restore-{(snap.get('id') or '')[-8:]}",
+        ).start()
 
     def _later_discover() -> None:
         try:
@@ -1529,6 +1719,27 @@ def restore_jobs_from_disk() -> None:
 
     # PowerShell WMI process scan can hang — never do it on the request/startup path.
     threading.Thread(target=_later_discover, daemon=True, name="aws-discover").start()
+
+
+def _finalize_stuck_cancels() -> None:
+    """If a job is left on cancelling, treat it as cancelled so the meter goes idle."""
+    snaps: list[dict] = []
+    with _lock:
+        for job in _jobs.values():
+            if str(job.get("status") or "") != "cancelling":
+                continue
+            _apply_cancelled_state(job)
+            snaps.append(dict(job))
+    if not snaps:
+        return
+    _persist_jobs()
+    for snap in snaps:
+        threading.Thread(
+            target=_kill_upload_processes,
+            args=(snap,),
+            daemon=True,
+            name=f"aws-cancel-stuck-{(snap.get('id') or '')[-8:]}",
+        ).start()
 
 
 def _finalize_checking_jobs() -> None:
@@ -1674,6 +1885,17 @@ def _parse_sync_cmdline(cmd: str) -> tuple[str | None, str | None, str | None]:
         if parts:
             batch = parts[-1]
     return src or None, dest or None, batch
+
+
+def _parse_s5cmd_run_file(cmd: str) -> str | None:
+    text = cmd or ""
+    match = re.search(r"\brun\s+\"([^\"]+)\"", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"\brun\s+(\S+\.s5cmd\.txt|\S+\.txt)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip('"')
+    return None
 
 
 def _parse_s5cmd_du_output(text: str) -> tuple[int, int] | None:
@@ -1878,7 +2100,15 @@ def watchdog_pass() -> list[str]:
         status = str(job.get("status") or "")
         if not jid:
             continue
-        if status in {"running", "checking", "cancelling"}:
+        if status == "cancelling" or (status != "cancelled" and job.get("cancel_requested")):
+            with _lock:
+                live = _jobs.get(jid)
+                if live:
+                    _apply_cancelled_state(live)
+            _persist_jobs()
+            notes.append(f"finalized cancelled AWS {jid}")
+            continue
+        if status in {"running", "checking"}:
             continue
         if job.get("followup_resync"):
             continue
@@ -1994,49 +2224,31 @@ def _discover_live_aws_processes() -> None:
         pid = row.get("ProcessId")
         name = str(row.get("Name") or "").lower()
         cmd_l = cmd.lower()
-        if "sync" not in cmd_l:
+        is_run = " run " in f" {cmd_l} "
+        if "sync" not in cmd_l and not is_run:
             continue
-        if "aws" in name and "s3" not in cmd_l:
+        if "aws" in name and "s3" not in cmd_l and not is_run:
             continue
-        if "s5cmd" in name and "sync" not in cmd_l:
+        if "s5cmd" in name and "sync" not in cmd_l and not is_run:
             continue
         src, dest, batch = _parse_sync_cmdline(cmd)
+        run_file = _parse_s5cmd_run_file(cmd) or ""
         # Never walk multi-TB trees here — that blocked server startup for minutes.
         bytes_total = 0
 
         with _lock:
-            # Prefer an existing job for same batch / dest / pid (revive interrupted).
-            # Never revive an operator-cancelled job.
+            if _cancelled_blocks_reattach_locked(pid=pid, dest=dest or "", batch=batch or "", run_file=run_file):
+                continue
             existing_id = None
             for jid, j in _jobs.items():
-                if j.get("status") in {"cancelled", "cancelling"} or j.get("cancel_requested"):
-                    if j.get("aws_pid") == pid or (dest and j.get("dest") == dest):
-                        # Same upload was cancelled — do not re-attach.
-                        existing_id = None
-                        break
+                if _job_is_operator_cancelled(j):
                     continue
                 if j.get("status") not in {"running", "interrupted", "checking"}:
                     continue
-                if j.get("aws_pid") == pid:
+                if _job_matches_upload(j, pid=pid, dest=dest or "", batch=batch or "", run_file=run_file):
                     existing_id = jid
                     break
-                if dest and j.get("dest") == dest:
-                    existing_id = jid
-                    break
-                if batch and j.get("batch") == batch:
-                    existing_id = jid
-                    break
-            # Skip creating a tracker if this dest/batch was just cancelled.
-            cancelled_match = any(
-                (j.get("status") in {"cancelled", "cancelling"} or j.get("cancel_requested"))
-                and (
-                    (dest and j.get("dest") == dest)
-                    or (batch and j.get("batch") == batch)
-                    or j.get("aws_pid") == pid
-                )
-                for j in _jobs.values()
-            )
-            if cancelled_match and not existing_id:
+            if not existing_id and not dest and not batch and not run_file:
                 continue
             uploader = "s5cmd" if "s5cmd" in name or "s5cmd" in cmd_l else "aws"
             if existing_id:
@@ -2070,6 +2282,8 @@ def _discover_live_aws_processes() -> None:
 
             job_id = f"aws:proc:{pid}"
             if job_id in _jobs:
+                if _job_is_operator_cancelled(_jobs[job_id]):
+                    continue
                 job = _jobs[job_id]
                 job["status"] = "running"
                 job["aws_pid"] = pid
@@ -2160,6 +2374,10 @@ def _monitor_loop() -> None:
         except Exception:  # noqa: BLE001
             pass
         try:
+            _finalize_stuck_cancels()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             _poll_s3_progress_for_jobs()
         except Exception:  # noqa: BLE001
             pass
@@ -2234,7 +2452,7 @@ def _poll_s3_progress_for_jobs() -> None:
     with _lock:
         targets = []
         for jid, job in _jobs.items():
-            if job.get("status") != "running":
+            if job.get("status") != "running" or job.get("cancel_requested"):
                 continue
             dest = str(job.get("dest") or "")
             # Enrich from stored cmdline if needed.
@@ -2305,7 +2523,7 @@ def _poll_s3_progress_for_jobs() -> None:
         speed = (delta / (1024 * 1024)) / elapsed if delta > 0 else 0.0
         with _lock:
             job = _jobs.get(job_id)
-            if not job or job.get("status") != "running":
+            if not job or job.get("status") != "running" or job.get("cancel_requested"):
                 continue
             if job.get("using_completed_meter"):
                 continue
@@ -2322,9 +2540,9 @@ def _poll_s3_progress_for_jobs() -> None:
             job["progress_via_s3"] = True
             if speed > 0:
                 job["speed_mbps"] = speed
-            elif job["bytes_done"] > 0:
-                since = max(0.1, now - float(job.get("started_at") or now))
-                job["speed_mbps"] = (job["bytes_done"] / (1024 * 1024)) / since
+            else:
+                prev_speed = float(job.get("speed_mbps") or 0)
+                job["speed_mbps"] = prev_speed * 0.4 if prev_speed > 0.08 else 0.0
             remaining = max(0, total - int(job["bytes_done"]))
             mib_s = float(job.get("speed_mbps") or 0)
             if mib_s > 0 and remaining > 0:
@@ -2342,7 +2560,7 @@ def _poll_s3_progress_for_jobs() -> None:
 def _ingest_log_progress(job_id: str) -> bool:
     with _lock:
         job = _jobs.get(job_id)
-        if not job or job.get("status") != "running":
+        if not job or job.get("status") != "running" or job.get("cancel_requested"):
             return False
         log_path = Path(str(job.get("log_path") or ""))
         offset = int(job.get("log_offset") or 0)

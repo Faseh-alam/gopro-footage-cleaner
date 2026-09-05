@@ -967,7 +967,7 @@ def _aws_status_for_folder(ssd_path: str, batch_name: str) -> str:
     if not matched:
         return "waiting"
     status = str(matched.get("status") or "")
-    if status in {"running", "checking", "cancelling"}:
+    if status in {"running", "checking"}:
         return "uploading"
     if status == "completed":
         return "verifying"
@@ -975,7 +975,7 @@ def _aws_status_for_folder(ssd_path: str, batch_name: str) -> str:
         return "verified"
     if status == "deleted_local":
         return "cleaned"
-    if status in {"error", "mismatch", "interrupted", "cancelled"}:
+    if status in {"error", "mismatch", "interrupted", "cancelled", "cancelling"}:
         return "failed"
     return status or "waiting"
 

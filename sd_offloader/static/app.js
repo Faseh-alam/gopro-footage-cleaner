@@ -33,6 +33,7 @@ let noticeSeq = 0;
 const seenNoticeKeys = new Set();
 const uploadRate = { t: 0, bytes: 0, mbps: 0 };
 const lastShownBytes = {};
+const cancelledAwsIds = new Set();
 let lastReaderVolumes = [];
 let lastMappedReaders = {};
 
@@ -719,11 +720,16 @@ function renderCards(cards) {
   });
 }
 
+function isLiveAwsJob(job) {
+  if (!job) return false;
+  if (cancelledAwsIds.has(job.id) || job.cancel_requested) return false;
+  if (job.status === "cancelling" || job.status === "cancelled") return false;
+  return job.status === "running" || job.status === "checking";
+}
+
 function renderUploadMeter(jobs) {
   if (!el.uploadMeter) return;
-  const running = (jobs || []).filter((job) =>
-    ["running", "checking", "cancelling"].includes(job.status),
-  );
+  const running = (jobs || []).filter(isLiveAwsJob);
   const sent = running.reduce(
     (sum, job) => sum + steadyBytes(`aws:${job.id}`, job.bytes_done || 0, true),
     0,
@@ -731,6 +737,7 @@ function renderUploadMeter(jobs) {
   const total = running.reduce((sum, job) => sum + Number(job.bytes_total || 0), 0);
   const reported = running.reduce((sum, job) => sum + Number(job.speed_mbps || 0), 0);
   const now = Date.now();
+  let moved = false;
   if (sent !== uploadRate.bytes && uploadRate.t) {
     const dt = Math.max(0.4, (now - uploadRate.t) / 1000);
     const instant = Math.max(0, (sent - uploadRate.bytes) / (1024 * 1024) / dt);
@@ -739,9 +746,14 @@ function renderUploadMeter(jobs) {
     }
     uploadRate.t = now;
     uploadRate.bytes = sent;
+    moved = instant > 0.05;
   } else if (!uploadRate.t) {
     uploadRate.t = now;
     uploadRate.bytes = sent;
+  } else {
+    uploadRate.mbps *= 0.4;
+    if (uploadRate.mbps < 0.08) uploadRate.mbps = 0;
+    uploadRate.t = now;
   }
   if (!running.length) {
     uploadRate.mbps = 0;
@@ -754,7 +766,7 @@ function renderUploadMeter(jobs) {
     });
     return;
   }
-  const mbps = Math.max(uploadRate.mbps, reported);
+  const mbps = moved ? Math.max(uploadRate.mbps, reported) : uploadRate.mbps;
   const bits = mbps * 8;
   const batches = running.map((job) => job.batch || "?").join(", ");
   el.uploadMeter.className = "upload-meter live";
@@ -772,7 +784,7 @@ function renderAwsJobs(jobs) {
     return;
   }
   for (const job of jobs.slice(0, 12)) {
-    const liveAws = ["running", "checking", "cancelling"].includes(job.status);
+    const liveAws = isLiveAwsJob(job);
     const shownDone = steadyBytes(`aws:${job.id}`, job.bytes_done || 0, liveAws);
     const pct = job.bytes_total ? Math.min(100, (shownDone / job.bytes_total) * 100) : 0;
     const statusLabel =
@@ -790,7 +802,7 @@ function renderAwsJobs(jobs) {
                 ? "cancelling…"
                 : job.status || "";
     const recent = (job.log || []).slice(-4);
-    const canCancel = ["running", "checking", "cancelling"].includes(job.status);
+    const canCancel = isLiveAwsJob(job) || job.status === "cancelling";
     const canRestart = [
       "error",
       "interrupted",
@@ -940,13 +952,21 @@ async function cancelAwsJob(jobId) {
   ) {
     return;
   }
+  cancelledAwsIds.add(jobId);
+  renderUploadMeter(
+    (window.__lastAwsJobs || []).map((job) =>
+      job.id === jobId
+        ? { ...job, status: "cancelled", cancel_requested: true, speed_mbps: 0 }
+        : job,
+    ),
+  );
   try {
     setStatus("Cancelling AWS upload…");
     const data = await api("/api/aws/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId }),
-      timeoutMs: 45000,
+      timeoutMs: 15000,
     });
     setStatus(data.job?.message || "Upload cancelled", "ok");
     await pollStatus();
@@ -958,6 +978,7 @@ async function cancelAwsJob(jobId) {
 async function restartAwsJob(jobId) {
   if (!jobId) return;
   try {
+    cancelledAwsIds.delete(jobId);
     setStatus(`Retrying AWS upload…`);
     const data = await api("/api/aws/restart", {
       method: "POST",
@@ -1044,6 +1065,12 @@ async function pollStatus() {
       );
     }
     renderCards(data.cards || []);
+    window.__lastAwsJobs = data.aws_jobs || [];
+    (data.aws_jobs || []).forEach((job) => {
+      if (job.status === "running" && !job.cancel_requested) {
+        cancelledAwsIds.delete(job.id);
+      }
+    });
     renderAwsJobs(data.aws_jobs || []);
     renderUploadMeter(data.aws_jobs || []);
     if (data.readers && typeof data.readers === "object") {

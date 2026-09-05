@@ -375,6 +375,56 @@ def test_s3_list_empty_prefix_is_not_error() -> None:
     check("access denied → refuse listing", listed is None)
 
 
+def test_cancel_job_is_immediate_and_blocks_reattach() -> None:
+    print("\n[12] AWS cancel drops live state immediately")
+    job_id = "aws:cancel-now"
+    dest = "s3://bucket/worldcontext-data/raw/batches/Batch-25/"
+    a._jobs[job_id] = {
+        "id": job_id,
+        "status": "running",
+        "batch": "Batch-25",
+        "dest": dest,
+        "speed_mbps": 82.5,
+        "bytes_done": 5_000_000_000,
+        "aws_pid": 4242,
+        "log": [],
+        "cancel_requested": False,
+    }
+    with patch.object(a, "_persist_jobs"), patch.object(a.threading, "Thread") as th:
+        out = a.cancel_job(job_id)
+        check("status is cancelled now", out.get("status") == "cancelled", str(out.get("status")))
+        check("speed is 0", out.get("speed_mbps") == 0, str(out.get("speed_mbps")))
+        check("cancel_requested set", bool(out.get("cancel_requested")))
+        check("pid cleared", out.get("aws_pid") is None)
+        check("remembered pid", out.get("cancelled_pid") == 4242)
+        check("kill dispatched", th.called)
+        check(
+            "same dest cannot re-attach",
+            a._cancelled_blocks_reattach_locked(pid=4242, dest=dest, batch="Batch-25"),
+        )
+        check(
+            "trailing-slash dest still matches",
+            a._cancelled_blocks_reattach_locked(dest=dest.rstrip("/"), batch="Batch-25"),
+        )
+        again = a.cancel_job(job_id)
+        check("second cancel allowed", again.get("status") == "cancelled")
+
+        a._jobs[job_id]["status"] = "cancelling"
+        a._jobs[job_id]["speed_mbps"] = 40
+        a._finalize_stuck_cancels()
+        check(
+            "stuck cancelling becomes cancelled",
+            a._jobs[job_id]["status"] == "cancelled",
+            str(a._jobs[job_id].get("status")),
+        )
+        check("stuck speed zeroed", a._jobs[job_id].get("speed_mbps") == 0)
+
+        with patch.object(a, "restart_job") as restart:
+            notes = a.watchdog_pass()
+            check("watchdog does not resume cancelled", restart.call_count == 0, str(notes))
+    a._jobs.pop(job_id, None)
+
+
 def main() -> int:
     test_timeout_constant()
     test_size_slack()
@@ -389,6 +439,7 @@ def main() -> int:
     test_live_copy_not_interrupted_on_usb_flicker()
     test_missing_auto_delete_still_deletes()
     test_s3_list_empty_prefix_is_not_error()
+    test_cancel_job_is_immediate_and_blocks_reattach()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
 
