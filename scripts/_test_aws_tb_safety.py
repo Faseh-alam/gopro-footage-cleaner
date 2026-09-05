@@ -263,7 +263,14 @@ def test_interrupt_hotplug_and_watchdog_resume() -> None:
             engine.aws_upload, "watchdog_pass", return_value=[]
         ), patch.object(engine, "_pump_closed_uploads"):
             engine.run_watchdog_once()
-            check("watchdog does not auto-retry interrupted cards", retry.call_count == 0)
+            check("watchdog auto-retries interrupted card when it is present", retry.call_count == 1)
+        engine._cards["SD-1"]["mount"] = str(Path(tmp) / "missing")
+        engine._cards["SD-1"]["status"] = "interrupted"
+        with patch.object(engine, "retry_card_job") as retry, patch.object(
+            engine.aws_upload, "watchdog_pass", return_value=[]
+        ), patch.object(engine, "_pump_closed_uploads"):
+            engine.run_watchdog_once()
+            check("watchdog does not retry when the card is unplugged", retry.call_count == 0)
         engine._cards.clear()
         engine._retry_hold.clear()
 
@@ -340,8 +347,8 @@ def test_missing_auto_delete_still_deletes() -> None:
         ), patch.object(a, "_on_batch_deleted", None):
             a._jobs[job_id] = dict(job)
             a._auto_verify_job(job_id)
-            check("explicit auto_delete False keeps folder", src.exists())
-            check("still verified", a._jobs[job_id].get("verified") is True)
+            check("explicit auto_delete False still deleted folder", not src.exists())
+            check("job marked deleted_local", a._jobs[job_id].get("status") == "deleted_local")
         a._jobs.pop(job_id, None)
 
 
@@ -421,8 +428,68 @@ def test_cancel_job_is_immediate_and_blocks_reattach() -> None:
 
         with patch.object(a, "restart_job") as restart:
             notes = a.watchdog_pass()
-            check("watchdog does not resume cancelled", restart.call_count == 0, str(notes))
+            check("watchdog does not resume cancelled with no local folder", restart.call_count == 0, str(notes))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "Batch-25"
+            src.mkdir()
+            a._jobs[job_id]["sources"] = [str(src)]
+            a._jobs[job_id]["status"] = "cancelled"
+            a._jobs[job_id]["cancel_requested"] = True
+            with patch.object(a, "restart_job") as restart:
+                notes = a.watchdog_pass()
+                check(
+                    "watchdog resumes cancelled when batch folder exists",
+                    restart.call_count == 1,
+                    str(notes),
+                )
     a._jobs.pop(job_id, None)
+
+
+def test_watchdog_deletes_leftover_verified_folder() -> None:
+    print("\n[13] leftover verified SSD folder is deleted even if auto_delete was False")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "Batch-29"
+        src.mkdir()
+        body = b"abc"
+        (src / "GX010001.MP4").write_bytes(body)
+        job_id = "aws:leftover-verified"
+        a._jobs[job_id] = {
+            "id": job_id,
+            "status": "verified",
+            "verified": True,
+            "auto_delete": False,
+            "sources": [str(src)],
+            "dest": "s3://bucket/footage/Batch-29/",
+            "batch": "Batch-29",
+            "key_map": {"GX010001.MP4": "GX010001.MP4"},
+            "log": [],
+        }
+        with patch.object(a, "_persist_jobs"), patch.object(
+            a, "list_s3_object_sizes", return_value={"GX010001.MP4": len(body)}
+        ), patch.object(a, "_on_batch_deleted", None):
+            notes = a.watchdog_pass()
+            check("watchdog deleted leftover verified folder", not src.exists(), str(notes))
+            check("job marked deleted_local", a._jobs[job_id].get("status") == "deleted_local")
+        a._jobs.pop(job_id, None)
+
+
+def test_watchdog_sd_every_minute_aws_every_30() -> None:
+    print("\n[14] SD watchdog every tick; AWS resume only every 30 minutes")
+    engine._cards.clear()
+    engine._copy_threads.clear()
+    engine._last_aws_watchdog_at = 0.0
+    with patch.object(engine.aws_upload, "watchdog_pass", return_value=["aws"]) as aws, patch.object(
+        engine, "_pump_closed_uploads"
+    ):
+        engine.run_watchdog_once()
+        check("first tick runs AWS", aws.call_count == 1)
+        engine.run_watchdog_once()
+        check("next tick skips AWS (under 30 min)", aws.call_count == 1)
+        engine._last_aws_watchdog_at = time.time() - engine.AWS_WATCHDOG_SECONDS - 1
+        engine.run_watchdog_once()
+        check("after 30 min runs AWS again", aws.call_count == 2)
+    engine._last_aws_watchdog_at = 0.0
 
 
 def main() -> int:
@@ -440,6 +507,8 @@ def main() -> int:
     test_missing_auto_delete_still_deletes()
     test_s3_list_empty_prefix_is_not_error()
     test_cancel_job_is_immediate_and_blocks_reattach()
+    test_watchdog_deletes_leftover_verified_folder()
+    test_watchdog_sd_every_minute_aws_every_30()
     print(f"\n{'ALL PASS' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     return 0 if not FAILURES else 1
 

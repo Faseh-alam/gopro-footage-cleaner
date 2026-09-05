@@ -37,8 +37,11 @@ _log: list[dict] = []
 _notices: list[dict] = []
 _watchdog_started = False
 WATCHDOG_SECONDS = 30 * 60
+WATCHDOG_LOOP_SECONDS = 60
+AWS_WATCHDOG_SECONDS = 30 * 60
 # cid -> (bytes_done, last_increase_at) for live copy threads
 _watchdog_copy_snap: dict[str, tuple[int, float]] = {}
+_last_aws_watchdog_at = 0.0
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
 _last_snapshot_at = 0.0
 ACTIVE_COPY_STATUSES = {
@@ -51,7 +54,7 @@ ACTIVE_COPY_STATUSES = {
     "uploading",
     "cancelling",
 }
-# Operator must click Retry — do not auto-loop these.
+# Watchdog retries these when the same SD is plugged in again.
 MANUAL_RETRY_STATUSES = {"error", "interrupted", "cancelled"}
 # Finished / unplugged — next insert may auto-start (same tracking id OK).
 HOTPLUG_CLEAR_STATUSES = {"removed", "completed"}
@@ -466,7 +469,7 @@ def _watchdog_loop() -> None:
     except Exception as exc:  # noqa: BLE001
         _log_line(f"Watchdog startup: {exc}", kind="error")
     while True:
-        time.sleep(WATCHDOG_SECONDS)
+        time.sleep(WATCHDOG_LOOP_SECONDS)
         try:
             run_watchdog_once()
         except Exception as exc:  # noqa: BLE001
@@ -508,30 +511,39 @@ def run_watchdog_once() -> None:
             status in {"copying", "verifying"}
             and now - float(card.get("started_at") or 0) > 20
         )
-        if status != "interrupted" and not stale_copy:
-            continue
-        if status == "interrupted":
-            # Operator must click Retry. Auto-resume here restarted the 1s log loop.
-            continue
         mount = str(card.get("mount") or "")
-        if not mount or not Path(mount).exists():
-            continue
-        try:
-            if stale_copy:
+        card_present = bool(mount and Path(mount).exists())
+        if stale_copy:
+            if not card_present:
+                continue
+            try:
                 _update_card(
                     cid,
                     status="interrupted",
                     message="Watchdog: copy thread died — resuming",
                     speed_mbps=0.0,
                 )
+                retry_card_job(cid)
+                notes.append(f"resumed SD {cid}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"SD {cid}: {exc}")
+            continue
+        if status not in MANUAL_RETRY_STATUSES:
+            continue
+        if not card_present:
+            continue
+        try:
             retry_card_job(cid)
-            notes.append(f"resumed SD {cid}")
+            notes.append(f"resumed SD {cid} ({status})")
         except Exception as exc:  # noqa: BLE001
             notes.append(f"SD {cid}: {exc}")
-    try:
-        notes.extend(aws_upload.watchdog_pass())
-    except Exception as exc:  # noqa: BLE001
-        notes.append(f"AWS pass: {exc}")
+    global _last_aws_watchdog_at
+    if _last_aws_watchdog_at <= 0 or now - _last_aws_watchdog_at >= AWS_WATCHDOG_SECONDS:
+        _last_aws_watchdog_at = now
+        try:
+            notes.extend(aws_upload.watchdog_pass())
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"AWS pass: {exc}")
     try:
         _pump_closed_uploads()
     except Exception as exc:  # noqa: BLE001

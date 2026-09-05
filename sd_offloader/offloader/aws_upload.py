@@ -1105,9 +1105,9 @@ def verify_job_sizes(job_id: str) -> dict:
                 f"Verified · this SSD {result['local_bytes']} ≈ S3 keys {result['s3_bytes']} "
                 f"({result['s3_objects']} objects)"
                 + (
-                    " — deleting that batch folder on this SSD"
-                    if _auto_delete_enabled(job)
-                    else " — safe to delete local if you want"
+                    " — waiting for follow-up sync before delete"
+                    if job.get("followup_resync")
+                    else " — deleting that batch folder on this SSD"
                 )
             )
         else:
@@ -1131,7 +1131,7 @@ def verify_job_sizes(job_id: str) -> dict:
             f"VERIFY local={result['local_bytes']} s3={result['s3_bytes']} "
             f"ok={result['ok']} error={result.get('error')}",
         )
-        want_delete = bool(result["ok"] and _auto_delete_enabled(job) and not job.get("followup_resync"))
+        want_delete = bool(result["ok"] and not job.get("followup_resync"))
     _persist_jobs()
     if want_delete:
         try:
@@ -2091,6 +2091,47 @@ def _auto_verify_job(job_id: str) -> None:
         _persist_jobs()
 
 
+def _job_sources_available(job: dict | None) -> bool:
+    """True when this AWS job's local batch folder is still on the SSD."""
+    if not job:
+        return False
+    sources = [Path(p) for p in (job.get("sources") or []) if p]
+    return bool(sources) and all(p.is_dir() for p in sources)
+
+
+def _log_mtime_age(log_path: Path) -> float | None:
+    if not log_path or not log_path.is_file():
+        return None
+    try:
+        return max(0.0, time.time() - log_path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _aws_job_looks_dead(job: dict) -> bool:
+    """True when a running/checking upload has no live process and a quiet log."""
+    log_path = Path(str(job.get("log_path") or ""))
+    if log_path.is_file() and _log_has_exit(log_path):
+        return True
+    pid = job.get("aws_pid")
+    if pid is not None:
+        try:
+            if _pid_alive(int(pid)):
+                return False
+        except (TypeError, ValueError):
+            pass
+        age = _log_mtime_age(log_path)
+        if age is not None and age <= 180:
+            return False
+        return True
+    if str(job.get("status") or "") == "checking":
+        age = _log_mtime_age(log_path)
+        if age is not None and age <= 180:
+            return False
+        return True
+    return False
+
+
 def watchdog_pass() -> list[str]:
     """Resume failed/interrupted uploads; verify completed; never stop a healthy job."""
     notes: list[str] = []
@@ -2108,11 +2149,27 @@ def watchdog_pass() -> list[str]:
             _persist_jobs()
             notes.append(f"finalized cancelled AWS {jid}")
             continue
-        if status in {"running", "checking"}:
-            continue
         if job.get("followup_resync"):
             continue
-        if status in {"error", "mismatch", "interrupted"}:
+        if status in {"running", "checking"}:
+            if not _aws_job_looks_dead(job):
+                continue
+            with _lock:
+                live = _jobs.get(jid)
+                if live and live.get("status") in {"running", "checking"}:
+                    live["status"] = "interrupted"
+                    live["speed_mbps"] = 0.0
+                    live["message"] = (
+                        "Upload process stopped — watchdog will resume if the batch is still on disk"
+                    )
+            _persist_jobs()
+            notes.append(f"marked dead AWS {jid} interrupted")
+            status = "interrupted"
+            job = get_job(jid) or job
+        if status in {"error", "mismatch", "interrupted", "cancelled"}:
+            if not _job_sources_available(job):
+                notes.append(f"AWS {jid} left {status} — local batch not on disk")
+                continue
             try:
                 restart_job(jid)
                 notes.append(f"resumed AWS {jid} ({status})")
@@ -2126,7 +2183,7 @@ def watchdog_pass() -> list[str]:
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"AWS {jid} verify failed: {exc}")
             continue
-        if status == "verified" and _auto_delete_enabled(job):
+        if status == "verified":
             try:
                 delete_local_after_verify(jid, confirmed=True)
                 notes.append(f"deleted verified AWS {jid}")
