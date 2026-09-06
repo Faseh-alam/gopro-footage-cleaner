@@ -640,20 +640,35 @@ def _start_card_job(
     volume_serial: str = "",
 ) -> None:
     files = inventory.list_transfer_files(card_root)
+    skipped = inventory.unlabeled_root_mp4s(card_root)
     total = inventory.total_bytes(files)
+    if skipped:
+        _log_line(
+            f"{card_id}: skipping {len(skipped)} unlabeled MP4(s) "
+            f"(no JSON sidecar; left on card): {', '.join(skipped)}",
+            kind="error",
+        )
     if not files:
         with _lock:
             existing = _cards.get(card_id)
             if existing and existing.get("status") == "completed":
                 return
-        _log_line(f"{card_id}: no MP4s under DCIM/…GOPRO", kind="error")
+        if skipped:
+            message = (
+                f"Skipped unlabeled MP4s ({', '.join(skipped)}) — "
+                "nothing labeled left to copy. Label them and click Retry"
+            )
+        else:
+            message = "No MP4s + JSON under DCIM/xxxGOPRO — click Retry after fixing"
+        _log_line(f"{card_id}: {message}", kind="error")
         with _lock:
             _cards[card_id] = {
                 "card_id": card_id,
                 "mount": str(card_root),
                 "volume_serial": volume_serial,
                 "status": "error",
-                "message": "No MP4s + JSON under DCIM/xxxGOPRO — click Retry after fixing",
+                "message": message,
+                "skipped_unlabeled": skipped,
                 "bytes_done": 0,
                 "bytes_total": 0,
                 "speed_mbps": 0,
@@ -714,6 +729,7 @@ def _start_card_job(
         "ssd_path": ssd_path,
         "total": total,
         "volume_serial": volume_serial,
+        "skipped_unlabeled": skipped,
     }
 
     if _active_copy_count() >= _max_parallel_cards():
@@ -740,6 +756,7 @@ def _start_card_job(
                 "eta_seconds": None,
                 "files_total": len(files),
                 "files_done": 0,
+                "skipped_unlabeled": skipped,
                 "started_at": time.time(),
             }
         _log_line(
@@ -765,6 +782,7 @@ def _launch_copy_thread(
     ssd_path: str,
     total: int,
     volume_serial: str = "",
+    skipped_unlabeled: list[str] | None = None,
 ) -> None:
     with _lock:
         _cards[card_id] = {
@@ -781,6 +799,7 @@ def _launch_copy_thread(
             "eta_seconds": None,
             "files_total": len(files),
             "files_done": 0,
+            "skipped_unlabeled": list(skipped_unlabeled or []),
             "started_at": time.time(),
         }
 
@@ -794,6 +813,16 @@ def _launch_copy_thread(
     with _lock:
         _copy_threads[card_id] = thread
     thread.start()
+
+
+def _skip_note(card_id: str) -> str:
+    with _lock:
+        skipped = list((_cards.get(card_id) or {}).get("skipped_unlabeled") or [])
+    if not skipped:
+        return ""
+    shown = ", ".join(skipped[:3])
+    extra = f" +{len(skipped) - 3} more" if len(skipped) > 3 else ""
+    return f" · left unlabeled on card: {shown}{extra}"
 
 
 def _update_card(card_id: str, **kwargs) -> None:
@@ -1162,9 +1191,12 @@ def _copy_card_worker(
                     card_id,
                     status="completed",
                     message=(
-                        f"Ready — batch AWS upload already running; resync queued ({job.get('id')})"
-                        if coalesced
-                        else f"Ready — batch AWS upload live in UI ({job.get('id')})"
+                        (
+                            f"Ready — batch AWS upload already running; resync queued ({job.get('id')})"
+                            if coalesced
+                            else f"Ready — batch AWS upload live in UI ({job.get('id')})"
+                        )
+                        + _skip_note(card_id)
                     ),
                     speed_mbps=0,
                     eta_seconds=0,
@@ -1181,7 +1213,7 @@ def _copy_card_worker(
             _update_card(
                 card_id,
                 status="completed",
-                message="Ready — card ejected (SSD only)",
+                message="Ready — card ejected (SSD only)" + _skip_note(card_id),
                 speed_mbps=0,
                 eta_seconds=0,
                 bytes_done=total_bytes,

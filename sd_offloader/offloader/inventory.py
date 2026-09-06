@@ -106,8 +106,10 @@ def list_transfer_files(card_root: Path) -> list[dict]:
             }
             if is_mp4:
                 sidecar = _embed_sidecar_for(item)
-                if sidecar is not None:
-                    row["embed_json"] = str(sidecar.resolve())
+                if sidecar is None:
+                    # Leave unlabeled clips on the card; copy the rest.
+                    continue
+                row["embed_json"] = str(sidecar.resolve())
             files.append(row)
 
         # 2) Legacy pre-trimmed task folders.
@@ -147,6 +149,24 @@ def list_transfer_files(card_root: Path) -> list[dict]:
                 )
 
     return files
+
+
+def unlabeled_root_mp4s(card_root: Path) -> list[str]:
+    """Root-level MP4s that have no JSON sidecar (skipped, not fatal)."""
+    names: list[str] = []
+    for gopro in find_gopro_dirs(card_root):
+        try:
+            entries = list(gopro.iterdir())
+        except OSError:
+            continue
+        for item in entries:
+            if not item.is_file() or item.name.startswith("._"):
+                continue
+            if item.suffix.upper() != ".MP4":
+                continue
+            if _embed_sidecar_for(item) is None:
+                names.append(item.name)
+    return sorted(set(names))
 
 
 def total_bytes(files: list[dict]) -> int:

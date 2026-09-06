@@ -354,6 +354,36 @@ button.danger {
   border-color: rgba(248, 81, 73, 0.45);
 }
 
+.card-warn {
+  border-color: rgba(210, 153, 34, 0.5);
+}
+
+.unlabeled-box {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  background: rgba(210, 153, 34, 0.12);
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  color: var(--warn);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.unlabeled-box strong {
+  display: block;
+  margin-bottom: 0.15rem;
+}
+
+.unlabeled-box span {
+  display: block;
+}
+
+.unlabeled-files {
+  margin-top: 0.25rem;
+  color: var(--text);
+  word-break: break-word;
+}
+
 .phase.waiting {
   color: var(--warn);
 }

@@ -211,6 +211,7 @@ function renderCards(cards) {
       "cancelling",
     ].includes(card.status);
     const canRetry = ["error", "interrupted", "cancelled"].includes(card.status);
+    const skipped = Array.isArray(card.skipped_unlabeled) ? card.skipped_unlabeled : [];
     const phaseLabel =
       card.status === "removed"
         ? "removed — insert next"
@@ -219,7 +220,17 @@ function renderCards(cards) {
           : card.status || "";
     const div = document.createElement("div");
     div.className =
-      "card" + (canRetry ? " card-error" : "") + (card.status === "removed" ? " card-removed" : "");
+      "card" +
+      (canRetry ? " card-error" : "") +
+      (card.status === "removed" ? " card-removed" : "") +
+      (skipped.length && !canRetry ? " card-warn" : "");
+    const unlabeledBox = skipped.length
+      ? `<div class="unlabeled-box">
+          <strong>Unlabeled — left on card</strong>
+          <span>No .json sidecar. Label in GoPro Cleaner, then Retry.</span>
+          <span class="unlabeled-files">${escapeHtml(skipped.join(", "))}</span>
+        </div>`
+      : "";
     div.innerHTML = `
       <div class="card-top">
         <span class="card-id">${card.card_id || "?"}</span>
@@ -234,6 +245,7 @@ function renderCards(cards) {
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${escapeHtml(card.message || "")}</div>
+      ${unlabeledBox}
       ${card.dest ? `<div class="hint">SSD dest: ${escapeHtml(card.dest)}</div>` : ""}
       <div class="job-actions">
         ${

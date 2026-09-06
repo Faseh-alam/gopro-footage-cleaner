@@ -145,8 +145,10 @@ def main() -> int:
     files_a = inventory.list_transfer_files(card_a)
     rels = sorted(f["rel"] for f in files_a)
     check("finds root MP4s + sidecar + legacy", rels == [
-        "GX010001.MP4", "GX010001.segments.json", "GX010002.MP4", "pipe-welding/GX019999.MP4",
+        "GX010001.MP4", "GX010001.segments.json", "pipe-welding/GX019999.MP4",
     ], str(rels))
+    check("unlabeled root MP4 is skipped",
+          inventory.unlabeled_root_mp4s(card_a) == ["GX010002.MP4"])
     check("root-level MP4s make card candidate", detect._looks_like_sd_card(card_a, "NO NAME"))
 
     print("\n[2] card A → flat batch folder (no card subfolder)")
@@ -270,10 +272,10 @@ def main() -> int:
     task_names = sorted({f["task"] for f in files_a if f.get("task")})
     root_rels = sorted(f["rel"] for f in files_a if not f.get("task"))
     eject.wipe_transferred_tasks(card_a, task_names, root_rels)
-    check("root MP4s + sidecar removed",
+    check("labeled root pair removed",
           not (gopro_a / "GX010001.MP4").exists()
-          and not (gopro_a / "GX010001.segments.json").exists()
-          and not (gopro_a / "GX010002.MP4").exists())
+          and not (gopro_a / "GX010001.segments.json").exists())
+    check("unlabeled MP4 left on card", (gopro_a / "GX010002.MP4").exists())
     check("legacy task folder removed", not (gopro_a / "pipe-welding").exists())
     check("junk untouched (THM/LRV stay)", (gopro_a / "GX010001.THM").exists())
     check("progress file cleared", progress.load_progress(card_a) is None)
