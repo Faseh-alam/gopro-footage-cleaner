@@ -1064,7 +1064,7 @@ def _launch_run_job(
     header = (
         f"AWS S3 direct upload  {batch_name} / {card_id}\n"
         f"Tool: s5cmd run (no SD staging — full cards OK)\n"
-        f"Command: s5cmd --numworkers {workers} --concurrency {concurrency} run\n"
+        f"Command: s5cmd --numworkers {workers} run\n"
         f"Run file: {run_path}\n"
         f"Destination: {dest}\n"
         f"Files: {file_count} · ~{total_bytes} bytes\n"
@@ -1089,7 +1089,7 @@ def _launch_run_job(
 
     message = (
         f"CMD s5cmd run → {dest} "
-        f"(--numworkers {workers} --concurrency {concurrency} · {file_count} files · no SD copy)"
+        f"(--numworkers {workers} · {file_count} files · no SD copy)"
     )
     with _lock:
         _jobs[job_id] = {
@@ -1143,10 +1143,10 @@ def _write_external_run_script(
     """CMD/shell wrapper for ``s5cmd run`` with retries (survives Flask restart)."""
     run_q = str(run_path)
     log_q = str(log_path)
-    # Global flags (s5cmd): --numworkers / --concurrency before the subcommand.
-    run_cmd = (
-        f's5cmd --numworkers {numworkers} --concurrency {concurrency} run "{run_q}"'
-    )
+    # Older s5cmd builds support ``sync --concurrency N`` but reject global
+    # ``--concurrency`` (and have no concurrency flag on ``run``).
+    run_cmd = f's5cmd --numworkers {numworkers} run "{run_q}"'
+
     if platform.system() == "Windows":
         lines = [
             "@echo off",
