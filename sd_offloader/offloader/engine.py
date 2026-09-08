@@ -1177,12 +1177,18 @@ def _upload_card_worker(
     dest_prefix: str,
     prog: dict,
 ) -> None:
-    """Upload paired MP4+JSON from the SD card straight to S3, then wipe + eject."""
+    """Stage paired files, open CMD ``s5cmd sync``, verify, wipe pairs, eject."""
+    import shutil
+
     total_bytes = inventory.total_bytes(files)
+    _resolve_s3_dest_names(files, prog, card_id)
+    wipe_names = sorted({Path(item["source"]).name for item in files})
+    stage_dir: Path | None = None
+
     _update_card(
         card_id,
         status="uploading",
-        message=f"Uploading → {dest_prefix}",
+        message="Preparing sync stage (hardlinks)…",
         dest=dest_prefix,
         bytes_done=0,
         bytes_total=total_bytes,
@@ -1191,126 +1197,89 @@ def _upload_card_worker(
         speed_mbps=0.0,
         eta_seconds=None,
     )
-    started = time.time()
-    done_bytes = 0
-    files_done = 0
-    wipe_names: list[str] = []
-    _resolve_s3_dest_names(files, prog, card_id)
-    # Small JSON sidecars first so the S3 “folder” appears quickly and auth is proven
-    # before multi‑GB MP4s (UI used to sit at 0% for a long time on the first video).
-    files = sorted(
-        files,
-        key=lambda f: (0 if _is_sidecar_rel(str(f.get("dest_rel") or f.get("rel") or "")) else 1, str(f.get("rel") or "")),
-    )
-    last_ui = 0.0
-    last_live = 0
-    last_speed_at = started
-    uploaded_any = False
-    tool = aws_upload.preferred_uploader() or "s5cmd"
-    _log_line(
-        f"{card_id}: SD→AWS via {tool} → {dest_prefix} "
-        f"({len(files)} files, JSON first). No separate CMD window — watch this card card."
-    )
-
-    def _publish(*, message: str | None = None, force: bool = False) -> None:
-        nonlocal last_ui, last_live, last_speed_at
-        if _is_cancel_requested(card_id):
-            raise CopyCancelled(f"{card_id}: cancelled by operator")
-        now = time.time()
-        live = done_bytes
-        if not force and message is None and now - last_ui < 0.2:
-            return
-        last_ui = now
-        elapsed = max(0.1, now - started)
-        window = max(0.1, now - last_speed_at)
-        delta = max(0, live - last_live)
-        if delta > 0 and window >= 0.2:
-            speed = (delta / (1024 * 1024)) / window
-            last_live = live
-            last_speed_at = now
-        else:
-            speed = (live / (1024 * 1024)) / elapsed if live > 0 else 0.0
-        remaining = max(0, total_bytes - live)
-        eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
-        payload = {
-            "status": "uploading",
-            "dest": dest_prefix,
-            "bytes_done": live,
-            "bytes_total": total_bytes,
-            "files_done": files_done,
-            "files_total": len(files),
-            "speed_mbps": round(speed, 2),
-            "eta_seconds": eta,
-        }
-        if message is not None:
-            payload["message"] = message
-        _update_card(card_id, **payload)
 
     try:
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
+        # Skip files already verified on S3 from the stage set.
+        pending: list[dict] = []
+        already = 0
         for item in files:
-            if _is_cancel_requested(card_id):
-                raise CopyCancelled(f"{card_id}: cancelled by operator")
             rel = item["rel"]
-            src = Path(item["source"])
             size = int(item["size"])
             dest_rel = item.get("dest_rel") or rel
             s3_key = f"{dest_prefix.rstrip('/')}/{dest_rel}"
-            wipe_names.append(src.name)
-
-            if dest_rel != rel and not (prog.get("files") or {}).get(rel):
-                _log_line(
-                    f"{card_id}: {rel} already in batch on S3 — uploading as {dest_rel}"
-                )
-
             if _is_s3_upload_done(prog, rel, size, s3_key):
+                already += 1
                 item["dest_size"] = size
-                done_bytes += size
-                files_done += 1
-                uploaded_any = True
-                _publish(message=f"Skipped (already on S3): {dest_rel}", force=True)
-                continue
-
-            if not src.is_file():
-                raise RuntimeError(f"Source missing on card: {src}")
-
-            _publish(
-                message=f"Uploading {dest_rel} ({size / (1024 * 1024):.0f} MB) via {tool}…",
-                force=True,
-            )
-            try:
-                def _on_progress(_elapsed: float, msg: str) -> None:
-                    _publish(message=msg, force=True)
-
-                aws_upload.upload_local_file(
-                    src,
-                    s3_key,
-                    cancel_check=lambda: _is_cancel_requested(card_id),
-                    progress_callback=_on_progress,
+                progress.mark_file_done(
+                    card_root, prog, rel, size, dest_size=size, dest_rel=dest_rel
                 )
-            except RuntimeError as upload_exc:
-                if "cancel" in str(upload_exc).lower():
-                    raise CopyCancelled(f"{card_id}: cancelled by operator") from upload_exc
-                raise
-            if not aws_upload.verify_s3_object(s3_key, size, tolerance=0):
-                raise RuntimeError(f"S3 verify failed after upload: {dest_rel}")
+            else:
+                pending.append(item)
 
-            item["dest_size"] = size
-            progress.mark_file_done(
-                card_root, prog, rel, size, dest_size=size, dest_rel=dest_rel
+        if not pending and already:
+            _log_line(f"{card_id}: all {already} file(s) already on S3 — wipe & eject", kind="ok")
+        elif not pending:
+            raise RuntimeError(f"No files to upload to {dest_prefix}")
+        else:
+            _update_card(
+                card_id,
+                status="uploading",
+                message=f"Staging {len(pending)} file(s) for s5cmd sync…",
+                files_done=already,
             )
-            done_bytes += size
-            files_done += 1
-            uploaded_any = True
-            _publish(message=f"Uploaded {dest_rel}", force=True)
+            stage_dir = aws_upload.prepare_direct_sync_stage(card_root, batch, pending)
+            _log_line(
+                f"{card_id}: staged {len(pending)} file(s) at {stage_dir} — opening CMD "
+                f"s5cmd --numworkers {_safe_workers()} sync --concurrency {_safe_concurrency()}"
+            )
 
-        if _is_cancel_requested(card_id):
-            raise CopyCancelled(f"{card_id}: cancelled by operator")
+            job = aws_upload.start_direct_card_sync(
+                stage_batch_dir=stage_dir,
+                s3_uri=s3_uri,
+                batch_name=batch,
+                card_id=card_id,
+            )
+            job_id = str(job.get("id") or "")
+            if not job_id:
+                raise RuntimeError("Failed to start CMD sync job")
 
-        if not uploaded_any and files:
-            raise RuntimeError(f"No files were uploaded to {dest_prefix}")
+            def _on_job(j: dict) -> None:
+                if _is_cancel_requested(card_id):
+                    raise CopyCancelled(f"{card_id}: cancelled by operator")
+                _update_card(
+                    card_id,
+                    status="uploading",
+                    message=j.get("message") or f"CMD sync → {j.get('dest') or dest_prefix}",
+                    dest=str(j.get("dest") or dest_prefix),
+                    bytes_done=int(j.get("bytes_done") or 0),
+                    bytes_total=int(j.get("bytes_total") or total_bytes),
+                    files_done=int(j.get("files_done") or already),
+                    files_total=len(files),
+                    speed_mbps=float(j.get("speed_mbps") or 0),
+                    eta_seconds=j.get("eta_seconds"),
+                    aws_job_id=job_id,
+                )
+
+            try:
+                finished = aws_upload.wait_for_job(
+                    job_id,
+                    cancel_check=lambda: _is_cancel_requested(card_id),
+                    on_progress=_on_job,
+                )
+            except RuntimeError as wait_exc:
+                if "cancel" in str(wait_exc).lower():
+                    raise CopyCancelled(f"{card_id}: cancelled by operator") from wait_exc
+                raise
+
+            status = str(finished.get("status") or "")
+            if status not in {"completed", "verified"}:
+                raise RuntimeError(
+                    finished.get("message")
+                    or f"CMD sync ended with status {status} — check the CMD window / Retry"
+                )
 
         _update_card(
             card_id,
@@ -1326,27 +1295,33 @@ def _upload_card_worker(
             expected = int(item.get("dest_size") or item["size"])
             if not aws_upload.verify_s3_object(s3_key, expected, tolerance=0):
                 raise RuntimeError(f"Verify failed: {dest_rel} missing/wrong size on S3")
+            progress.mark_file_done(
+                card_root,
+                prog,
+                item["rel"],
+                int(item["size"]),
+                dest_size=expected,
+                dest_rel=dest_rel,
+            )
 
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
-        _update_card(
-            card_id,
-            status="completed",
-            message="Upload verified — wiping pairs & ejecting…",
-            dest=dest_prefix,
-            speed_mbps=0,
-            eta_seconds=0,
-            bytes_done=total_bytes,
-        )
+        if stage_dir and stage_dir.exists():
+            try:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                parent = stage_dir.parent
+                if parent.name == ".wc_aws_stage" and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError:
+                pass
 
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
         try:
             _update_card(card_id, status="wiping", message="Wiping uploaded MP4+JSON pairs on card…")
-            # Unique basenames only — orphan MP4s (no JSON) were never listed.
-            eject.wipe_transferred_tasks(card_root, [], sorted(set(wipe_names)))
+            eject.wipe_transferred_tasks(card_root, [], wipe_names)
         except Exception as wipe_exc:  # noqa: BLE001
             _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
 
@@ -1362,11 +1337,12 @@ def _upload_card_worker(
         _update_card(
             card_id,
             status="completed",
-            message=f"Ready — uploaded to {dest_prefix} · card ejected",
+            message=f"Ready — CMD sync to {dest_prefix} · card ejected",
             dest=dest_prefix,
             speed_mbps=0,
             eta_seconds=0,
             bytes_done=total_bytes,
+            files_done=len(files),
         )
         _log_line(f"{card_id}: complete → {dest_prefix}", kind="ok")
     except CopyCancelled as exc:
@@ -1375,8 +1351,8 @@ def _upload_card_worker(
             card_id,
             status="cancelled",
             message=(
-                "Cancelled / card removed — files already on S3 are kept; card was not wiped. "
-                "Re-insert and click Retry to resume (session stays armed)."
+                "Cancelled — CMD may still be running until you close it; card was not wiped. "
+                "Re-insert and click Retry to resume."
             ),
             dest=dest_prefix,
             speed_mbps=0.0,
@@ -1388,7 +1364,7 @@ def _upload_card_worker(
         _update_card(
             card_id,
             status="error",
-            message=f"{exc} — click Retry to resume (files already on S3 are skipped)",
+            message=f"{exc} — click Retry (CMD sync resumes missing files)",
             dest=dest_prefix,
         )
         _log_line(f"{card_id}: error — {exc}", kind="error")
@@ -1396,6 +1372,20 @@ def _upload_card_worker(
         with _lock:
             _copy_threads.pop(card_id, None)
         _pump_waiting_queue()
+
+
+def _safe_workers() -> int:
+    try:
+        return int(load_config().get("s5cmd_numworkers") or 20)
+    except (TypeError, ValueError):
+        return 20
+
+
+def _safe_concurrency() -> int:
+    try:
+        return int(load_config().get("s5cmd_concurrency") or 10)
+    except (TypeError, ValueError):
+        return 10
 
 
 _META_CHECKS = (

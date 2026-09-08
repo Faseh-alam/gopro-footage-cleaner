@@ -100,6 +100,14 @@ def _numworkers() -> int:
     return max(1, min(n, 256))
 
 
+def _concurrency() -> int:
+    try:
+        n = int(load_config().get("s5cmd_concurrency") or 10)
+    except (TypeError, ValueError):
+        n = 10
+    return max(1, min(n, 64))
+
+
 def _upload_retries() -> int:
     try:
         n = int(load_config().get("aws_upload_retries") or 5)
@@ -425,13 +433,21 @@ def verify_s3_object(s3_uri: str, expected_size: int, *, tolerance: int = 0) -> 
     return abs(int(size) - int(expected_size)) <= max(0, int(tolerance))
 
 
-def _sync_local_arg(path: Path) -> str:
-    """Local folder for aws/s5cmd sync — trailing slash syncs folder *contents*."""
+def _sync_local_arg(path: Path, *, trailing_slash: bool = True) -> str:
+    """Local folder for aws/s5cmd sync.
+
+    With ``trailing_slash=True`` (default), syncs folder *contents* into dest.
+    With ``trailing_slash=False``, s5cmd keeps the folder name under dest
+    (operator style: ``sync F:\\Batches\\batch-29 s3://…/batches/``).
+    """
     text = str(path)
     # Forward slashes are accepted by aws CLI and s5cmd on Windows.
     text = text.replace("\\", "/")
-    if not text.endswith("/"):
-        text += "/"
+    if trailing_slash:
+        if not text.endswith("/"):
+            text += "/"
+    else:
+        text = text.rstrip("/")
     return text
 
 
@@ -473,6 +489,128 @@ def find_running_batch_job(batch_name: str, dest: str | None = None) -> dict | N
                 continue
             return dict(job)
     return None
+
+
+def prepare_direct_sync_stage(
+    card_root: Path,
+    batch_name: str,
+    files: list[dict],
+) -> Path:
+    """Build a flat folder named ``batch_name`` for ``s5cmd sync`` (hardlink when possible).
+
+    Layout matches the operator CMD::
+
+        F:\\Batches\\batch-29   →   s3://…/raw/batches/
+
+    so the batch folder name becomes the S3 prefix segment.
+    """
+    batch = batch_name.strip().strip("/\\")
+    if not batch:
+        raise ValueError("Batch name required for staging")
+    # Keep stage on the same volume as the card so hardlinks work on NTFS.
+    stage_batch = (card_root / ".wc_aws_stage" / batch).resolve()
+    if stage_batch.exists():
+        shutil.rmtree(stage_batch, ignore_errors=True)
+    stage_batch.mkdir(parents=True, exist_ok=True)
+
+    linked = 0
+    copied = 0
+    for item in files:
+        src = Path(item["source"])
+        dest_rel = str(item.get("dest_rel") or item["rel"])
+        dest = stage_batch / dest_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        if not src.is_file():
+            raise RuntimeError(f"Source missing on card: {src}")
+        try:
+            os.link(src, dest)
+            linked += 1
+        except OSError:
+            # exFAT / FAT SD cards cannot hardlink — copy (JSON is tiny; MP4s cost space).
+            shutil.copy2(src, dest)
+            copied += 1
+    if copied and linked == 0:
+        # All copied — still valid for sync; warn via caller logs.
+        pass
+    return stage_batch
+
+
+def start_direct_card_sync(
+    *,
+    stage_batch_dir: Path,
+    s3_uri: str,
+    batch_name: str,
+    card_id: str,
+) -> dict:
+    """Open CMD and run operator-style ``s5cmd --numworkers N sync --concurrency C``.
+
+    Syncs the staged batch **folder** to the parent ``…/batches/`` URI so keys land
+    under ``…/batches/<batch>/…`` (same as ``F:\\Batches\\batch-29`` → batches/).
+    """
+    tool = preferred_uploader()
+    if not tool:
+        raise RuntimeError(
+            "Neither s5cmd nor AWS CLI found. Install s5cmd (recommended) or AWS CLI v2."
+        )
+    if not stage_batch_dir.is_dir():
+        raise RuntimeError(f"Stage folder missing: {stage_batch_dir}")
+
+    batch = batch_name.strip().strip("/\\")
+    parent = normalize_s3_uri(s3_uri)
+    # If the UI already appended the batch name onto s3_uri, strip it so sync of
+    # the folder named ``batch`` does not create …/batch/batch/.
+    last = parent.rstrip("/").rsplit("/", 1)[-1]
+    if last.lower() == batch.lower():
+        parent = parent.rstrip("/")[: -(len(last))]
+        parent = parent.rstrip("/") + "/"
+
+    return _launch_upload_job(
+        sources=[stage_batch_dir],
+        dest=parent,
+        batch_name=batch,
+        card_id=card_id,
+        s3_uri=s3_uri,
+        tool=tool,
+        keep_source_folder_name=True,
+    )
+
+
+def wait_for_job(
+    job_id: str,
+    *,
+    cancel_check=None,
+    on_progress=None,
+    poll_seconds: float = 1.0,
+) -> dict:
+    """Block until an external upload job finishes (or errors / cancel)."""
+    terminal = {
+        "completed",
+        "verified",
+        "mismatch",
+        "error",
+        "interrupted",
+        "cancelled",
+        "deleted_local",
+    }
+    while True:
+        if cancel_check and cancel_check():
+            try:
+                cancel_job(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError("Upload cancelled")
+        job = get_job(job_id) or {}
+        if on_progress:
+            on_progress(job)
+        status = str(job.get("status") or "")
+        if status in terminal:
+            return job
+        time.sleep(max(0.25, poll_seconds))
 
 
 def start_batch_upload(
@@ -899,6 +1037,7 @@ def _launch_upload_job(
     tool: str,
     reuse_job_id: str | None = None,
     restart: bool = False,
+    keep_source_folder_name: bool = False,
 ) -> dict:
     total_bytes = sum(_dir_bytes(src) for src in sources)
     stamp = int(time.time())
@@ -912,13 +1051,14 @@ def _launch_upload_job(
     script_path = LOG_DIR / f"{safe}{'.bat' if platform.system() == 'Windows' else '.sh'}"
 
     workers = _numworkers()
+    concurrency = _concurrency()
     retries = _upload_retries()
     header = (
         f"AWS S3 upload  {batch_name}"
         + (f" / {card_id}" if card_id else "")
         + f"\nTool: {tool}"
         + (
-            f" · try default sync first, then --numworkers {workers} on failure"
+            f" · s5cmd --numworkers {workers} sync --concurrency {concurrency}"
             if tool == "s5cmd"
             else ""
         )
@@ -938,7 +1078,9 @@ def _launch_upload_job(
         title=f"AWS — {batch_name}",
         tool=tool,
         numworkers=workers,
+        concurrency=concurrency,
         retries=retries,
+        keep_source_folder_name=keep_source_folder_name,
     )
     _launch_external_script(
         script_path,
@@ -948,7 +1090,7 @@ def _launch_upload_job(
     message = (
         f"{'Restarted' if restart else 'CMD'} {tool} upload → {dest}"
         + (
-            f" (default sync, then workers={workers} on fail · retries={retries})"
+            f" (--numworkers {workers} sync --concurrency {concurrency} · retries={retries})"
             if tool == "s5cmd"
             else f" (retries={retries})"
         )
@@ -964,6 +1106,7 @@ def _launch_upload_job(
             "s3_uri": s3_uri,
             "uploader": tool,
             "numworkers": workers if tool == "s5cmd" else None,
+            "concurrency": concurrency if tool == "s5cmd" else None,
             "retries": retries,
             "bytes_done": int(prev.get("bytes_done") or 0) if prev else 0,
             "bytes_total": total_bytes,
@@ -998,12 +1141,15 @@ def _write_external_script(
     title: str,
     tool: str = "aws",
     numworkers: int = 20,
+    concurrency: int = 10,
     retries: int = 5,
+    keep_source_folder_name: bool = False,
 ) -> None:
     """Write a console script that syncs with auto-retry and tees output into log_path.
 
-    For s5cmd: first try plain ``s5cmd sync`` (faster default workers). If that
-    fails, later retries use ``s5cmd --numworkers N`` (helps flaky multipart links).
+    Matches the operator CMD::
+
+        s5cmd --numworkers 20 sync --concurrency 10 "F:\\Batches\\batch-29" "s3://…/batches/"
     """
     if platform.system() == "Windows":
         lines = [
@@ -1015,9 +1161,9 @@ def _write_external_script(
             f"echo   {title}",
             f"echo   Tool: {tool}",
             (
-                f"echo   Strategy: plain s5cmd sync first, then --numworkers {numworkers} if it fails"
+                f"echo   Command: s5cmd --numworkers {numworkers} sync --concurrency {concurrency}"
                 if tool == "s5cmd"
-                else "echo   Strategy: aws s3 sync with retries"
+                else "echo   Command: aws s3 sync"
             ),
             f"echo   Destination: {dest}",
             f"echo   Auto-retries: {retries}",
@@ -1029,37 +1175,28 @@ def _write_external_script(
         ]
         dest_norm = dest if dest.endswith("/") else dest + "/"
         for idx, src in enumerate(sources):
-            src_arg = _sync_local_arg(src)
-            # Prefer quoted paths for cmd.exe (spaces in "batch 1").
+            src_display = str(src).replace("/", "\\")
+            src_arg = _sync_local_arg(src, trailing_slash=not keep_source_folder_name)
             src_q = f'"{src_arg}"'
             dest_q = f'"{dest_norm}"'
             log_q = f'"{log_path}"'
             if tool == "s5cmd":
-                sync_default = f"s5cmd sync {src_q} {dest_q}"
-                sync_workers = f"s5cmd --numworkers {numworkers} sync {src_q} {dest_q}"
+                sync_cmd = (
+                    f"s5cmd --numworkers {numworkers} sync --concurrency {concurrency} "
+                    f"{src_q} {dest_q}"
+                )
             else:
-                sync_default = f"aws s3 sync {src_q} {dest_q}"
-                sync_workers = sync_default
-            lines.append(f"echo Syncing {src_q} → {dest_q}")
+                sync_cmd = f"aws s3 sync {src_q} {dest_q}"
+            lines.append(f"echo Syncing {src_display} → {dest_norm}")
             lines.append(f"echo Syncing {src_q} → {dest_q}>> {log_q}")
+            lines.append(f"echo {sync_cmd}")
+            lines.append(f"echo {sync_cmd}>> {log_q}")
             lines.append(f"set MAX_TRIES={retries}")
             lines.append("set TRY=1")
             lines.append(f":retry_loop_{idx}")
             lines.append("echo --- attempt !TRY! of %MAX_TRIES% ---")
             lines.append(f"echo --- attempt !TRY! of %MAX_TRIES% --->> {log_q}")
-            lines.append("if !TRY! equ 1 (")
-            lines.append(
-                "  echo Using default s5cmd sync" if tool == "s5cmd" else "  echo Using aws s3 sync"
-            )
-            # Run in this CMD window so progress is visible; UI also tracks via S3 size.
-            lines.append(f"  {sync_default}")
-            lines.append(") else (")
-            if tool == "s5cmd":
-                lines.append(f"  echo Using s5cmd --numworkers {numworkers} sync")
-            else:
-                lines.append("  echo Retrying aws s3 sync")
-            lines.append(f"  {sync_workers}")
-            lines.append(")")
+            lines.append(f"  {sync_cmd}")
             lines.append("set SYNC_ERR=%ERRORLEVEL%")
             lines.append(f"echo Sync exit !SYNC_ERR!>> {log_q}")
             lines.append(f"if %SYNC_ERR% equ 0 goto sync_ok_{idx}")
@@ -1088,9 +1225,9 @@ def _write_external_script(
             f'echo "  {title}"',
             f'echo "  Tool: {tool}"',
             (
-                f'echo "  Strategy: plain s5cmd sync first, then --numworkers {numworkers} if it fails"'
+                f'echo "  Command: s5cmd --numworkers {numworkers} sync --concurrency {concurrency}"'
                 if tool == "s5cmd"
-                else 'echo "  Strategy: aws s3 sync with retries"'
+                else 'echo "  Command: aws s3 sync"'
             ),
             f'echo "  Destination: {dest}"',
             f'echo "  Auto-retries: {retries}"',
@@ -1100,30 +1237,21 @@ def _write_external_script(
         ]
         dest_norm = dest if dest.endswith("/") else dest + "/"
         for src in sources:
-            src_arg = _sync_local_arg(src)
+            src_arg = _sync_local_arg(src, trailing_slash=not keep_source_folder_name)
             if tool == "s5cmd":
-                sync_default = f's5cmd sync "{src_arg}" "{dest_norm}"'
-                sync_workers = (
-                    f's5cmd --numworkers {numworkers} sync "{src_arg}" "{dest_norm}"'
+                sync_cmd = (
+                    f's5cmd --numworkers {numworkers} sync --concurrency {concurrency} '
+                    f'"{src_arg}" "{dest_norm}"'
                 )
             else:
-                sync_default = f'aws s3 sync "{src_arg}" "{dest_norm}"'
-                sync_workers = sync_default
+                sync_cmd = f'aws s3 sync "{src_arg}" "{dest_norm}"'
             lines.append(f'echo "Syncing {src} → {dest_norm}"')
             lines.append(f"MAX_TRIES={retries}")
             lines.append("TRY=1")
             lines.append("while true; do")
             lines.append('  echo "--- attempt $TRY of $MAX_TRIES ---"')
-            lines.append('  if [[ "$TRY" -eq 1 ]]; then')
-            lines.append(f'    echo "Using default sync"')
-            lines.append(f'    set +e; {sync_default} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
-            lines.append("  else")
-            if tool == "s5cmd":
-                lines.append(f'    echo "Using s5cmd --numworkers {numworkers}"')
-            else:
-                lines.append('    echo "Retrying aws s3 sync"')
-            lines.append(f'    set +e; {sync_workers} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
-            lines.append("  fi")
+            lines.append(f'  echo "{sync_cmd}"')
+            lines.append(f'  set +e; {sync_cmd} 2>&1 | tee -a "{log_path}"; ec=${{PIPESTATUS[0]}}; set -e')
             lines.append('  if [[ "$ec" -eq 0 ]]; then break; fi')
             lines.append('  echo "Retrying after error (exit $ec)..."')
             lines.append("  sleep 15")

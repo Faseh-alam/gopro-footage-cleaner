@@ -70,12 +70,11 @@ function syncModeUI() {
   }
   if (el.cardsHint) {
     el.cardsHint.innerHTML = direct
-      ? `After <strong>Start auto upload</strong>, keep the session running — cards with
-          <strong>DCIM → xxxGOPRO → MP4 + JSON</strong> upload straight to S3 via <strong>s5cmd</strong>
-          (no separate CMD window — watch each card card; elapsed time updates while a large file is sending).
-          Small JSON files go first so the batch folder appears on S3 quickly. Orphan MP4s (no JSON) stay on the card.
-          After verify, pairs are wiped and the card ejects.
-          <strong>Retry</strong> resumes; already-uploaded objects are skipped. <strong>Cancel</strong> stops without wiping.`
+      ? `After <strong>Start auto upload</strong>, a <strong>CMD window</strong> opens with
+          <code>s5cmd --numworkers 20 sync --concurrency 10</code> (same as your manual upload).
+          That window keeps running even if you restart the offloader. Only MP4+JSON pairs are staged;
+          orphan MP4s stay on the card. After verify, pairs are wiped and the card ejects.
+          Prefer batch names like <code>batch-32</code> (hyphen, no spaces).`
       : `After <strong>Start auto offload</strong>, keep the session running — new SD cards are
           detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
           and enter the transfer pipeline without starting again.

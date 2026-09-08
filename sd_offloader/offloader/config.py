@@ -27,7 +27,8 @@ DEFAULT_CONFIG = {
     # ssd_only | ssd_and_aws | aws_direct (SD→AWS, no SSD)
     "mode": "ssd_and_aws",
     "port": 8877,
-    "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)
+    "s5cmd_numworkers": 20,  # s5cmd --numworkers (matches operator CMD)
+    "s5cmd_concurrency": 10,  # s5cmd sync --concurrency
     "aws_upload_retries": 5,  # auto-retries inside the CMD upload script
     "max_parallel_cards": 3,  # simultaneous SD→SSD copies (1–8)
 }
