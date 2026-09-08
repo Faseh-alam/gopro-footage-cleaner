@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from .config import BATCHES_SUBDIR, STATE_DIR, ensure_dirs, load_config
@@ -170,6 +171,21 @@ def normalize_s3_uri(uri: str) -> str:
     return value
 
 
+def quote_s3_uri(uri: str) -> str:
+    """Percent-encode path segments so spaces (e.g. ``batch 32``) work with s5cmd."""
+    raw = uri.strip()
+    if not raw.startswith("s3://"):
+        raise ValueError("S3 URI must start with s3://")
+    rest = raw[len("s3://") :]
+    bucket, sep, key = rest.partition("/")
+    if not sep:
+        return f"s3://{bucket}"
+    # Encode each path segment; keep '/' separators. Do not encode already-encoded %.
+    parts = key.split("/")
+    encoded = "/".join(urllib.parse.quote(p, safe="()!*._-~,:@$&=+") for p in parts)
+    return f"s3://{bucket}/{encoded}"
+
+
 def batch_s3_prefix(s3_uri: str, batch_name: str) -> str:
     """Build ``s3://bucket/footage/<batch>/`` for a flat batch upload.
 
@@ -189,7 +205,7 @@ def batch_s3_prefix(s3_uri: str, batch_name: str) -> str:
 
 def list_prefix_basenames(prefix: str) -> set[str]:
     """Return object basenames already under an S3 prefix (flat listing)."""
-    dest = normalize_s3_uri(prefix)
+    dest = quote_s3_uri(normalize_s3_uri(prefix))
     names: set[str] = set()
     if s5cmd_available():
         try:
@@ -216,7 +232,8 @@ def list_prefix_basenames(prefix: str) -> set[str]:
                 else:
                     key = key.rstrip("/").rsplit("/", 1)[-1]
                 if key and key != "DIR":
-                    names.add(key)
+                    # ls may return percent-encoded names — decode for collision set.
+                    names.add(urllib.parse.unquote(key))
             return names
 
     if not aws_cli_available():
@@ -238,13 +255,13 @@ def list_prefix_basenames(prefix: str) -> set[str]:
             continue
         parts = line.split()
         if len(parts) >= 4:
-            names.add(parts[-1])
+            names.add(urllib.parse.unquote(parts[-1]))
     return names
 
 
 def s3_object_size(s3_uri: str) -> int | None:
     """Return size in bytes for an exact S3 object URI, or None if missing."""
-    key = s3_uri.strip()
+    key = quote_s3_uri(s3_uri.strip())
     if not key.startswith("s3://"):
         return None
     if s5cmd_available():
@@ -268,8 +285,8 @@ def s3_object_size(s3_uri: str) -> int | None:
 
     if not aws_cli_available():
         return None
-    # s3://bucket/key/path → bucket + key
-    rest = key[len("s3://") :]
+    # s3://bucket/key/path → bucket + key (decode for aws API)
+    rest = urllib.parse.unquote(key[len("s3://") :])
     bucket, _, obj = rest.partition("/")
     if not bucket or not obj:
         return None
@@ -291,36 +308,80 @@ def s3_object_size(s3_uri: str) -> int | None:
         return None
 
 
-def upload_local_file(local_path: Path, s3_uri: str, *, cancel_check=None) -> None:
-    """Upload one local file to an exact S3 object URI via s5cmd (or aws)."""
+def upload_local_file(
+    local_path: Path,
+    s3_uri: str,
+    *,
+    cancel_check=None,
+    progress_callback=None,
+) -> None:
+    """Upload one local file to an exact S3 object URI via s5cmd (or aws).
+
+    Runs in-process (no separate CMD window). ``progress_callback(elapsed_s, msg)``
+    is invoked every ~1.5s while the child process is alive so the UI does not
+    look frozen on multi‑GB files.
+    """
     if not upload_tool_available():
         raise RuntimeError(
             "Neither s5cmd nor AWS CLI found. Install s5cmd (preferred) or AWS CLI v2."
         )
     if not local_path.is_file():
         raise RuntimeError(f"Source missing: {local_path}")
-    dest = s3_uri.strip()
+    dest = quote_s3_uri(s3_uri.strip())
     if not dest.startswith("s3://"):
         raise ValueError("S3 URI must start with s3://")
     tool = preferred_uploader()
-    local = str(local_path)
+    local = str(local_path.resolve())
     # Forward slashes help s5cmd on Windows.
     local_arg = local.replace("\\", "/")
+    size = local_path.stat().st_size
 
     if tool == "s5cmd":
         cmd = ["s5cmd", "cp", local_arg, dest]
     else:
-        cmd = ["aws", "s3", "cp", local, dest]
+        cmd = ["aws", "s3", "cp", local, dest, "--cli-read-timeout", "0", "--cli-connect-timeout", "60"]
+
+    # On Windows, CREATE_NO_WINDOW avoids flashing consoles but keeps the process
+    # attached to our pipes (SSD batch mode uses a visible CMD for whole syncs).
+    creationflags = 0
+    if platform.system() == "Windows":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
     )
+    chunks: list[str] = []
+    stop_heartbeat = threading.Event()
+    started = time.monotonic()
+
+    def _heartbeat() -> None:
+        while not stop_heartbeat.wait(1.5):
+            if cancel_check and cancel_check():
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                return
+            if progress_callback:
+                elapsed = time.monotonic() - started
+                mb = size / (1024 * 1024)
+                progress_callback(
+                    elapsed,
+                    f"Uploading {local_path.name} ({mb:.0f} MB) · {int(elapsed)}s elapsed — "
+                    f"folder appears on S3 after the first file finishes",
+                )
+
+    hb = threading.Thread(target=_heartbeat, daemon=True, name=f"upload-hb-{local_path.name}")
+    hb.start()
     try:
         assert proc.stdout is not None
-        for _line in proc.stdout:
+        while True:
             if cancel_check and cancel_check():
                 proc.terminate()
                 try:
@@ -328,14 +389,33 @@ def upload_local_file(local_path: Path, s3_uri: str, *, cancel_check=None) -> No
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 raise RuntimeError("Upload cancelled")
-        code = proc.wait(timeout=3600 * 6)
+            line = proc.stdout.readline()
+            if line:
+                chunks.append(line)
+                if len(chunks) > 80:
+                    del chunks[:-80]
+                continue
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        code = proc.wait(timeout=30)
     except RuntimeError:
         raise
     except Exception:
-        proc.kill()
+        try:
+            proc.kill()
+        except OSError:
+            pass
         raise
+    finally:
+        stop_heartbeat.set()
+        hb.join(timeout=2)
+
     if code != 0:
-        raise RuntimeError(f"{tool} cp failed for {local_path.name} → {dest} (exit {code})")
+        detail = "".join(chunks).strip() or f"{tool} exited {code} with no output"
+        raise RuntimeError(
+            f"{tool} cp failed for {local_path.name} → {dest} (exit {code}): {detail[:800]}"
+        )
 
 
 def verify_s3_object(s3_uri: str, expected_size: int, *, tolerance: int = 0) -> bool:

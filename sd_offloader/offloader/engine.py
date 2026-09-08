@@ -1196,10 +1196,21 @@ def _upload_card_worker(
     files_done = 0
     wipe_names: list[str] = []
     _resolve_s3_dest_names(files, prog, card_id)
+    # Small JSON sidecars first so the S3 “folder” appears quickly and auth is proven
+    # before multi‑GB MP4s (UI used to sit at 0% for a long time on the first video).
+    files = sorted(
+        files,
+        key=lambda f: (0 if _is_sidecar_rel(str(f.get("dest_rel") or f.get("rel") or "")) else 1, str(f.get("rel") or "")),
+    )
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
     uploaded_any = False
+    tool = aws_upload.preferred_uploader() or "s5cmd"
+    _log_line(
+        f"{card_id}: SD→AWS via {tool} → {dest_prefix} "
+        f"({len(files)} files, JSON first). No separate CMD window — watch this card card."
+    )
 
     def _publish(*, message: str | None = None, force: bool = False) -> None:
         nonlocal last_ui, last_live, last_speed_at
@@ -1265,12 +1276,19 @@ def _upload_card_worker(
             if not src.is_file():
                 raise RuntimeError(f"Source missing on card: {src}")
 
-            _publish(message=f"Uploading {dest_rel}…", force=True)
+            _publish(
+                message=f"Uploading {dest_rel} ({size / (1024 * 1024):.0f} MB) via {tool}…",
+                force=True,
+            )
             try:
+                def _on_progress(_elapsed: float, msg: str) -> None:
+                    _publish(message=msg, force=True)
+
                 aws_upload.upload_local_file(
                     src,
                     s3_key,
                     cancel_check=lambda: _is_cancel_requested(card_id),
+                    progress_callback=_on_progress,
                 )
             except RuntimeError as upload_exc:
                 if "cancel" in str(upload_exc).lower():
