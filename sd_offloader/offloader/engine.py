@@ -1177,18 +1177,15 @@ def _upload_card_worker(
     dest_prefix: str,
     prog: dict,
 ) -> None:
-    """Stage paired files, open CMD ``s5cmd sync``, verify, wipe pairs, eject."""
-    import shutil
-
+    """Open CMD ``s5cmd run`` (direct DCIM→S3, no SD staging), verify, wipe pairs, eject."""
     total_bytes = inventory.total_bytes(files)
     _resolve_s3_dest_names(files, prog, card_id)
     wipe_names = sorted({Path(item["source"]).name for item in files})
-    stage_dir: Path | None = None
 
     _update_card(
         card_id,
         status="uploading",
-        message="Preparing sync stage (hardlinks)…",
+        message="Building s5cmd run list (no SD copy)…",
         dest=dest_prefix,
         bytes_done=0,
         bytes_total=total_bytes,
@@ -1202,7 +1199,6 @@ def _upload_card_worker(
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
-        # Skip files already verified on S3 from the stage set.
         pending: list[dict] = []
         already = 0
         for item in files:
@@ -1227,24 +1223,25 @@ def _upload_card_worker(
             _update_card(
                 card_id,
                 status="uploading",
-                message=f"Staging {len(pending)} file(s) for s5cmd sync…",
+                message=f"Opening CMD s5cmd run ({len(pending)} files, no SD staging)…",
                 files_done=already,
             )
-            stage_dir = aws_upload.prepare_direct_sync_stage(card_root, batch, pending)
             _log_line(
-                f"{card_id}: staged {len(pending)} file(s) at {stage_dir} — opening CMD "
-                f"s5cmd --numworkers {_safe_workers()} sync --concurrency {_safe_concurrency()}"
+                f"{card_id}: direct upload {len(pending)} file(s) via s5cmd run "
+                f"--numworkers {_safe_workers()} --concurrency {_safe_concurrency()} "
+                f"(no copy onto SD)"
             )
 
-            job = aws_upload.start_direct_card_sync(
-                stage_batch_dir=stage_dir,
+            job = aws_upload.start_direct_card_upload(
+                files=pending,
                 s3_uri=s3_uri,
                 batch_name=batch,
                 card_id=card_id,
+                dest_prefix=dest_prefix,
             )
             job_id = str(job.get("id") or "")
             if not job_id:
-                raise RuntimeError("Failed to start CMD sync job")
+                raise RuntimeError("Failed to start CMD s5cmd run job")
 
             def _on_job(j: dict) -> None:
                 if _is_cancel_requested(card_id):
@@ -1252,7 +1249,7 @@ def _upload_card_worker(
                 _update_card(
                     card_id,
                     status="uploading",
-                    message=j.get("message") or f"CMD sync → {j.get('dest') or dest_prefix}",
+                    message=j.get("message") or f"CMD s5cmd run → {j.get('dest') or dest_prefix}",
                     dest=str(j.get("dest") or dest_prefix),
                     bytes_done=int(j.get("bytes_done") or 0),
                     bytes_total=int(j.get("bytes_total") or total_bytes),
@@ -1278,7 +1275,7 @@ def _upload_card_worker(
             if status not in {"completed", "verified"}:
                 raise RuntimeError(
                     finished.get("message")
-                    or f"CMD sync ended with status {status} — check the CMD window / Retry"
+                    or f"CMD s5cmd run ended with status {status} — check the CMD window / Retry"
                 )
 
         _update_card(
@@ -1307,15 +1304,6 @@ def _upload_card_worker(
         prog["status"] = "complete"
         progress.save_progress(card_root, prog)
 
-        if stage_dir and stage_dir.exists():
-            try:
-                shutil.rmtree(stage_dir, ignore_errors=True)
-                parent = stage_dir.parent
-                if parent.name == ".wc_aws_stage" and parent.is_dir() and not any(parent.iterdir()):
-                    parent.rmdir()
-            except OSError:
-                pass
-
         if _is_cancel_requested(card_id):
             raise CopyCancelled(f"{card_id}: cancelled by operator")
 
@@ -1337,7 +1325,7 @@ def _upload_card_worker(
         _update_card(
             card_id,
             status="completed",
-            message=f"Ready — CMD sync to {dest_prefix} · card ejected",
+            message=f"Ready — CMD s5cmd run → {dest_prefix} · card ejected",
             dest=dest_prefix,
             speed_mbps=0,
             eta_seconds=0,
@@ -1364,7 +1352,7 @@ def _upload_card_worker(
         _update_card(
             card_id,
             status="error",
-            message=f"{exc} — click Retry (CMD sync resumes missing files)",
+            message=f"{exc} — click Retry (s5cmd run resumes missing files)",
             dest=dest_prefix,
         )
         _log_line(f"{card_id}: error — {exc}", kind="error")

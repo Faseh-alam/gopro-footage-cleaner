@@ -71,10 +71,10 @@ function syncModeUI() {
   if (el.cardsHint) {
     el.cardsHint.innerHTML = direct
       ? `After <strong>Start auto upload</strong>, a <strong>CMD window</strong> opens with
-          <code>s5cmd --numworkers 20 sync --concurrency 10</code> (same as your manual upload).
-          That window keeps running even if you restart the offloader. Only MP4+JSON pairs are staged;
-          orphan MP4s stay on the card. After verify, pairs are wiped and the card ejects.
-          Prefer batch names like <code>batch-32</code> (hyphen, no spaces).`
+          <code>s5cmd --numworkers 20 --concurrency 10 run</code> uploading straight from the SD
+          (no copy onto the card — works when the card is full). You will see the same <code>cp</code> progress lines.
+          That window keeps running even if you restart the offloader. Only MP4+JSON pairs upload;
+          orphan MP4s stay on the card. Prefer batch names like <code>batch-32</code>.`
       : `After <strong>Start auto offload</strong>, keep the session running — new SD cards are
           detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
           and enter the transfer pipeline without starting again.

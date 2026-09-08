@@ -491,92 +491,78 @@ def find_running_batch_job(batch_name: str, dest: str | None = None) -> dict | N
     return None
 
 
-def prepare_direct_sync_stage(
-    card_root: Path,
-    batch_name: str,
+def write_direct_run_commands(
+    *,
     files: list[dict],
-) -> Path:
-    """Build a flat folder named ``batch_name`` for ``s5cmd sync`` (hardlink when possible).
+    dest_prefix: str,
+    batch_name: str,
+    card_id: str,
+) -> tuple[Path, int]:
+    """Write an s5cmd ``run`` file: one ``cp`` per paired file (no SD staging).
 
-    Layout matches the operator CMD::
-
-        F:\\Batches\\batch-29   →   s3://…/raw/batches/
-
-    so the batch folder name becomes the S3 prefix segment.
+    Commands are stored under ``state/aws_logs/`` on the system drive — never on
+    the full SD card — so WinError 112 from staging copies cannot happen.
     """
-    batch = batch_name.strip().strip("/\\")
-    if not batch:
-        raise ValueError("Batch name required for staging")
-    # Keep stage on the same volume as the card so hardlinks work on NTFS.
-    stage_batch = (card_root / ".wc_aws_stage" / batch).resolve()
-    if stage_batch.exists():
-        shutil.rmtree(stage_batch, ignore_errors=True)
-    stage_batch.mkdir(parents=True, exist_ok=True)
-
-    linked = 0
-    copied = 0
+    ensure_dirs()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time())
+    safe = re.sub(r"[^\w.-]+", "_", f"{batch_name}-{card_id}-{stamp}")
+    run_path = LOG_DIR / f"{safe}.s5cmd.txt"
+    prefix = dest_prefix.rstrip("/") + "/"
+    total = 0
+    lines: list[str] = []
     for item in files:
         src = Path(item["source"])
-        dest_rel = str(item.get("dest_rel") or item["rel"])
-        dest = stage_batch / dest_rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            try:
-                dest.unlink()
-            except OSError:
-                pass
         if not src.is_file():
             raise RuntimeError(f"Source missing on card: {src}")
-        try:
-            os.link(src, dest)
-            linked += 1
-        except OSError:
-            # exFAT / FAT SD cards cannot hardlink — copy (JSON is tiny; MP4s cost space).
-            shutil.copy2(src, dest)
-            copied += 1
-    if copied and linked == 0:
-        # All copied — still valid for sync; warn via caller logs.
-        pass
-    return stage_batch
+        dest_rel = str(item.get("dest_rel") or item["rel"])
+        s3_key = quote_s3_uri(f"{prefix}{dest_rel}")
+        local = str(src.resolve()).replace("\\", "/")
+        # s5cmd run file: one command per line (same cp lines sync would print).
+        lines.append(f'cp "{local}" "{s3_key}"')
+        total += int(item.get("size") or 0)
+    run_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return run_path, total
 
 
-def start_direct_card_sync(
+def start_direct_card_upload(
     *,
-    stage_batch_dir: Path,
+    files: list[dict],
     s3_uri: str,
     batch_name: str,
     card_id: str,
+    dest_prefix: str | None = None,
 ) -> dict:
-    """Open CMD and run operator-style ``s5cmd --numworkers N sync --concurrency C``.
+    """Open CMD and run ``s5cmd --numworkers N run --concurrency C`` over a run file.
 
-    Syncs the staged batch **folder** to the parent ``…/batches/`` URI so keys land
-    under ``…/batches/<batch>/…`` (same as ``F:\\Batches\\batch-29`` → batches/).
+    Uploads straight from DCIM paths to S3 — no copy/hardlink stage on the SD.
     """
     tool = preferred_uploader()
-    if not tool:
+    if tool != "s5cmd":
+        if not tool:
+            raise RuntimeError(
+                "s5cmd not found. Install s5cmd for SD→AWS direct (required when cards are full)."
+            )
         raise RuntimeError(
-            "Neither s5cmd nor AWS CLI found. Install s5cmd (recommended) or AWS CLI v2."
+            "SD→AWS direct on full cards needs s5cmd (run file). AWS CLI alone cannot do this path."
         )
-    if not stage_batch_dir.is_dir():
-        raise RuntimeError(f"Stage folder missing: {stage_batch_dir}")
 
     batch = batch_name.strip().strip("/\\")
-    parent = normalize_s3_uri(s3_uri)
-    # If the UI already appended the batch name onto s3_uri, strip it so sync of
-    # the folder named ``batch`` does not create …/batch/batch/.
-    last = parent.rstrip("/").rsplit("/", 1)[-1]
-    if last.lower() == batch.lower():
-        parent = parent.rstrip("/")[: -(len(last))]
-        parent = parent.rstrip("/") + "/"
-
-    return _launch_upload_job(
-        sources=[stage_batch_dir],
-        dest=parent,
+    prefix = dest_prefix or batch_s3_prefix(s3_uri, batch)
+    run_path, total_bytes = write_direct_run_commands(
+        files=files,
+        dest_prefix=prefix,
+        batch_name=batch,
+        card_id=card_id,
+    )
+    return _launch_run_job(
+        run_path=run_path,
+        dest=prefix,
         batch_name=batch,
         card_id=card_id,
         s3_uri=s3_uri,
-        tool=tool,
-        keep_source_folder_name=True,
+        total_bytes=total_bytes,
+        file_count=len(files),
     )
 
 
@@ -611,6 +597,30 @@ def wait_for_job(
         if status in terminal:
             return job
         time.sleep(max(0.25, poll_seconds))
+
+
+# --- legacy staging helpers kept only if something still imports them ---
+def prepare_direct_sync_stage(
+    card_root: Path,
+    batch_name: str,
+    files: list[dict],
+) -> Path:
+    """Deprecated: staging on full exFAT cards causes WinError 112. Use run file."""
+    raise RuntimeError(
+        "SD staging is disabled — cards are often full/exFAT. "
+        "Use start_direct_card_upload (s5cmd run) instead."
+    )
+
+
+def start_direct_card_sync(
+    *,
+    stage_batch_dir: Path,
+    s3_uri: str,
+    batch_name: str,
+    card_id: str,
+) -> dict:
+    """Deprecated — use start_direct_card_upload."""
+    raise RuntimeError("start_direct_card_sync is disabled; use start_direct_card_upload")
 
 
 def start_batch_upload(
@@ -1025,6 +1035,191 @@ def delete_local_after_verify(job_id: str, *, confirmed: bool = False) -> dict:
 
 def _append_job_log(job: dict, line: str) -> None:
     job["log"] = (job.get("log") or [])[-100:] + [line]
+
+
+def _launch_run_job(
+    *,
+    run_path: Path,
+    dest: str,
+    batch_name: str,
+    card_id: str,
+    s3_uri: str,
+    total_bytes: int,
+    file_count: int,
+) -> dict:
+    """Open CMD: ``s5cmd --numworkers N run --concurrency C runfile.txt``."""
+    stamp = int(time.time())
+    label = f"{batch_name}-{card_id}-run-{stamp}"
+    job_id = f"aws:{label}"
+    safe = re.sub(r"[^\w.-]+", "_", label)
+
+    ensure_dirs()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{safe}.log"
+    script_path = LOG_DIR / f"{safe}{'.bat' if platform.system() == 'Windows' else '.sh'}"
+
+    workers = _numworkers()
+    concurrency = _concurrency()
+    retries = _upload_retries()
+    header = (
+        f"AWS S3 direct upload  {batch_name} / {card_id}\n"
+        f"Tool: s5cmd run (no SD staging — full cards OK)\n"
+        f"Command: s5cmd --numworkers {workers} --concurrency {concurrency} run\n"
+        f"Run file: {run_path}\n"
+        f"Destination: {dest}\n"
+        f"Files: {file_count} · ~{total_bytes} bytes\n"
+        "This CMD window keeps uploading even if you restart the offloader.\n"
+        "============================================\n"
+    )
+    log_path.write_text(header, encoding="utf-8")
+
+    _write_external_run_script(
+        script_path,
+        run_path=run_path,
+        log_path=log_path,
+        title=f"AWS direct — {batch_name} / {card_id}",
+        numworkers=workers,
+        concurrency=concurrency,
+        retries=retries,
+    )
+    _launch_external_script(
+        script_path,
+        title=f"AWS direct — {batch_name} / {card_id}",
+    )
+
+    message = (
+        f"CMD s5cmd run → {dest} "
+        f"(--numworkers {workers} --concurrency {concurrency} · {file_count} files · no SD copy)"
+    )
+    with _lock:
+        _jobs[job_id] = {
+            "id": job_id,
+            "status": "running",
+            "batch": batch_name,
+            "card_id": card_id,
+            "dest": dest,
+            "s3_uri": s3_uri,
+            "uploader": "s5cmd",
+            "mode": "direct_run",
+            "numworkers": workers,
+            "concurrency": concurrency,
+            "retries": retries,
+            "bytes_done": 0,
+            "bytes_total": total_bytes,
+            "files_done": 0,
+            "files_total": file_count,
+            "speed_mbps": 0.0,
+            "eta_seconds": None,
+            "message": message,
+            "log": [f"Run file {run_path}", f"Script {script_path}"],
+            "started_at": time.time(),
+            "external": True,
+            "console": True,
+            "log_path": str(log_path),
+            "script": str(script_path),
+            "run_file": str(run_path),
+            "sources": [],
+            "log_offset": 0,
+            "using_completed_meter": False,
+            "transferred": 0,
+            "verified": False,
+            "progress_via_s3": True,
+        }
+    _persist_jobs()
+    _ensure_monitor()
+    return get_job(job_id) or {"id": job_id, "status": "running"}
+
+
+def _write_external_run_script(
+    script_path: Path,
+    *,
+    run_path: Path,
+    log_path: Path,
+    title: str,
+    numworkers: int = 20,
+    concurrency: int = 10,
+    retries: int = 5,
+) -> None:
+    """CMD/shell wrapper for ``s5cmd run`` with retries (survives Flask restart)."""
+    run_q = str(run_path)
+    log_q = str(log_path)
+    # Global flags (s5cmd): --numworkers / --concurrency before the subcommand.
+    run_cmd = (
+        f's5cmd --numworkers {numworkers} --concurrency {concurrency} run "{run_q}"'
+    )
+    if platform.system() == "Windows":
+        lines = [
+            "@echo off",
+            "setlocal EnableDelayedExpansion",
+            "chcp 65001 >nul",
+            f"title {title}",
+            "echo ============================================",
+            f"echo   {title}",
+            "echo   Mode: s5cmd run (direct from SD — no staging copy)",
+            f"echo   {run_cmd}",
+            f"echo   Auto-retries: {retries}",
+            "echo   Closing this window STOPS the upload.",
+            "echo   Restarting the offloader does NOT stop this window.",
+            "echo ============================================",
+            "echo.",
+            f'set MAX_TRIES={retries}',
+            "set TRY=1",
+            ":retry_loop",
+            "echo --- attempt !TRY! of %MAX_TRIES% ---",
+            f'echo --- attempt !TRY! of %MAX_TRIES% --->> "{log_q}"',
+            f"echo {run_cmd}",
+            f'echo {run_cmd}>> "{log_q}"',
+            f"  {run_cmd}",
+            "set SYNC_ERR=%ERRORLEVEL%",
+            f'echo Run exit !SYNC_ERR!>> "{log_q}"',
+            "if %SYNC_ERR% equ 0 goto run_ok",
+            "echo Retrying after error (exit %SYNC_ERR%)...",
+            f'echo Retrying after error (exit %SYNC_ERR%)>> "{log_q}"',
+            "timeout /t 15 /nobreak >nul",
+            "set /a TRY+=1",
+            "if !TRY! leq %MAX_TRIES% goto retry_loop",
+            f'echo {EXIT_MARKER}%SYNC_ERR%>> "{log_q}"',
+            "echo ERROR: s5cmd run failed after retries. Click Retry in the UI.",
+            "pause",
+            "exit /b %SYNC_ERR%",
+            ":run_ok",
+            f'echo {EXIT_MARKER}0>> "{log_q}"',
+            "echo ============================================",
+            "echo   Upload finished OK — UI will verify sizes next",
+            "echo ============================================",
+            "timeout /t 8 /nobreak >nul",
+        ]
+        script_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    else:
+        lines = [
+            "#!/bin/bash",
+            f'echo "============================================"',
+            f'echo "  {title}"',
+            f'echo "  Mode: s5cmd run (direct from SD)"',
+            f'echo "  {run_cmd}"',
+            'echo "============================================"',
+            f"MAX_TRIES={retries}",
+            "TRY=1",
+            "while true; do",
+            '  echo "--- attempt $TRY of $MAX_TRIES ---"',
+            f'  set +e; {run_cmd} 2>&1 | tee -a "{log_q}"; ec=${{PIPESTATUS[0]}}; set -e',
+            '  if [[ "$ec" -eq 0 ]]; then break; fi',
+            '  echo "Retrying after error..."',
+            "  sleep 15",
+            "  TRY=$((TRY+1))",
+            '  if [[ "$TRY" -gt "$MAX_TRIES" ]]; then',
+            f'    echo "{EXIT_MARKER}${{ec}}" >> "{log_q}"',
+            '    echo "ERROR: s5cmd run failed"',
+            "    read -r",
+            '    exit "$ec"',
+            "  fi",
+            "done",
+            f'echo "{EXIT_MARKER}0" >> "{log_q}"',
+            'echo "Upload finished OK"',
+            "sleep 5",
+        ]
+        script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        script_path.chmod(0o755)
 
 
 def _launch_upload_job(
