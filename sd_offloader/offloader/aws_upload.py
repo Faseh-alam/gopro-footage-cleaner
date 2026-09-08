@@ -179,8 +179,22 @@ def normalize_s3_uri(uri: str) -> str:
     return value
 
 
+def sanitize_batch_name(name: str) -> str:
+    """Normalize batch folder names so S3 keys stay clean.
+
+    ``batch 32`` / ``batch_32`` / ``batch%2032`` → ``batch-32`` (no spaces, no ``%20``).
+    """
+    raw = urllib.parse.unquote((name or "").strip().strip("/\\"))
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[\s_]+", "-", raw)
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", cleaned)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-.")
+    return cleaned
+
+
 def quote_s3_uri(uri: str) -> str:
-    """Percent-encode path segments so spaces (e.g. ``batch 32``) work with s5cmd."""
+    """Percent-encode path segments so odd characters still work with s5cmd."""
     raw = uri.strip()
     if not raw.startswith("s3://"):
         raise ValueError("S3 URI must start with s3://")
@@ -199,13 +213,13 @@ def batch_s3_prefix(s3_uri: str, batch_name: str) -> str:
 
     Local layout is ``Batches/<batch>/*.MP4`` (no card subfolder), so S3 is the
     same flat prefix. If ``s3_uri`` already ends with the batch folder name,
-    do not nest it again (avoids ``…/batch 1/batch 1/``).
+    do not nest it again (avoids ``…/batch-1/batch-1/``).
     """
     base = normalize_s3_uri(s3_uri)
-    name = batch_name.strip().strip("/")
+    name = sanitize_batch_name(batch_name)
     if not name:
         raise ValueError("Batch name is required")
-    last = base.rstrip("/").rsplit("/", 1)[-1]
+    last = sanitize_batch_name(base.rstrip("/").rsplit("/", 1)[-1])
     if last.lower() == name.lower():
         return base.rstrip("/") + "/"
     return f"{base}{name}/"
@@ -478,12 +492,32 @@ def _dir_bytes(root: Path) -> int:
 
 def find_running_batch_job(batch_name: str, dest: str | None = None) -> dict | None:
     """Return a running upload for this batch (same S3 dest when provided)."""
-    batch = batch_name.strip()
+    batch = sanitize_batch_name(batch_name) or batch_name.strip()
     with _lock:
         for job in _jobs.values():
             if job.get("status") != "running":
                 continue
-            if str(job.get("batch") or "").strip() != batch:
+            job_batch = sanitize_batch_name(str(job.get("batch") or "")) or str(job.get("batch") or "").strip()
+            if job_batch != batch:
+                continue
+            if dest and str(job.get("dest") or "").rstrip("/") != dest.rstrip("/"):
+                continue
+            return dict(job)
+    return None
+
+
+def find_running_direct_card_job(card_id: str, dest: str | None = None) -> dict | None:
+    """Return a running SD→AWS direct ``s5cmd run`` job for this card (if any)."""
+    cid = str(card_id or "").strip().upper()
+    if not cid:
+        return None
+    with _lock:
+        for job in _jobs.values():
+            if job.get("status") != "running":
+                continue
+            if str(job.get("mode") or "") != "direct_run":
+                continue
+            if str(job.get("card_id") or "").strip().upper() != cid:
                 continue
             if dest and str(job.get("dest") or "").rstrip("/") != dest.rstrip("/"):
                 continue
@@ -547,8 +581,11 @@ def start_direct_card_upload(
             "SD→AWS direct on full cards needs s5cmd (run file). AWS CLI alone cannot do this path."
         )
 
-    batch = batch_name.strip().strip("/\\")
+    batch = sanitize_batch_name(batch_name) or batch_name.strip().strip("/\\")
     prefix = dest_prefix or batch_s3_prefix(s3_uri, batch)
+    running = find_running_direct_card_job(card_id, dest=prefix)
+    if running:
+        return running
     run_path, total_bytes = write_direct_run_commands(
         files=files,
         dest_prefix=prefix,

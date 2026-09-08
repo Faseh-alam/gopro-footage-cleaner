@@ -40,6 +40,21 @@ function isDirectMode() {
   return el.mode.value === "aws_direct";
 }
 
+/** Match server sanitize: "batch 32" / "batch_32" → "batch-32" (no %20 folders). */
+function sanitizeBatchName(name) {
+  let raw = String(name || "").trim().replace(/^\/+|\/+$/g, "");
+  try {
+    raw = decodeURIComponent(raw);
+  } catch {
+    /* keep raw */
+  }
+  return raw
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+}
+
 function syncModeUI() {
   const direct = isDirectMode();
   el.ssd1Row?.classList.toggle("hidden", direct);
@@ -56,8 +71,12 @@ function syncModeUI() {
     el.s3BaseHint.classList.toggle("hidden", !direct);
     if (direct) {
       const base = (el.s3Uri.value || DEFAULT_S3_BATCHES_URI).replace(/\/?$/, "/");
-      const batch = (el.directBatchName?.value || "batch32").trim() || "batch32";
-      el.s3BaseHint.textContent = `Uploads go to ${base}${batch}/ — only type the batch name above.`;
+      const typed = (el.directBatchName?.value || "batch-32").trim() || "batch-32";
+      const batch = sanitizeBatchName(typed) || "batch-32";
+      el.s3BaseHint.textContent =
+        batch === typed
+          ? `Uploads go to ${base}${batch}/ — only type the batch name above.`
+          : `Uploads go to ${base}${batch}/ (sanitized from "${typed}" — spaces become hyphens).`;
     }
   }
   if (el.startSession) {
@@ -74,7 +93,7 @@ function syncModeUI() {
           <code>s5cmd --numworkers 20 run</code> uploading straight from the SD
           (no copy onto the card — works when the card is full). You will see the same <code>cp</code> progress lines.
           That window keeps running even if you restart the offloader. Only MP4+JSON pairs upload;
-          orphan MP4s stay on the card. Prefer batch names like <code>batch-32</code>.`
+          orphan MP4s stay on the card. Batch names like <code>batch 32</code> become <code>batch-32</code> (no <code>%20</code>).`
       : `After <strong>Start auto offload</strong>, keep the session running — new SD cards are
           detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
           and enter the transfer pipeline without starting again.
@@ -85,7 +104,7 @@ function syncModeUI() {
   }
   if (direct) {
     el.batchHint.textContent =
-      "Direct mode: name the batch (e.g. batch32). All plugged cards upload into that S3 folder.";
+      "Direct mode: name the batch (e.g. batch-32). Spaces are turned into hyphens. All plugged cards upload into that S3 folder.";
     if (!el.s3Uri.value.trim()) el.s3Uri.value = DEFAULT_S3_BATCHES_URI;
   } else {
     onBatchSelectChange();
@@ -157,11 +176,11 @@ function fillVolumeSelect(select, volumes, selected) {
 
 function selectedBatchName() {
   if (isDirectMode()) {
-    return (el.directBatchName?.value || "").trim();
+    return sanitizeBatchName(el.directBatchName?.value || "");
   }
   const pick = el.batchSelect.value;
-  if (pick === "__new__") return el.batchName.value.trim();
-  return (pick || "").trim();
+  if (pick === "__new__") return sanitizeBatchName(el.batchName.value);
+  return sanitizeBatchName(pick || "");
 }
 
 function onBatchSelectChange() {
@@ -729,7 +748,7 @@ el.startSession.addEventListener("click", async () => {
     if (!payload.batch) {
       setStatus(
         isDirectMode()
-          ? "Enter a batch name (e.g. batch32)"
+          ? "Enter a batch name (e.g. batch-32)"
           : "Select an existing batch or create a new one",
         "error",
       );

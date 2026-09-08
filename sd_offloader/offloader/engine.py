@@ -26,7 +26,8 @@ _cards: dict[str, dict] = {}  # card_id -> job state
 _copy_threads: dict[str, threading.Thread] = {}
 _cancel_requested: set[str] = set()
 _waiting_queue: list[dict] = []  # queued starts when at max parallel
-_batch_s3_names: set[str] = set()  # collision basenames in current aws_direct batch
+_batch_s3_names: set[str] = set()  # collision basenames already on S3 for current batch
+_card_reserved_s3: dict[str, set[str]] = {}  # card_id -> names reserved by in-flight uploads
 _watcher_started = False
 _log: list[dict] = []
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
@@ -201,7 +202,7 @@ def start_session(
     ssd2: str,
     s3_uri: str = "",
 ) -> dict:
-    batch = batch.strip()
+    batch = aws_upload.sanitize_batch_name(batch)
     if not batch:
         raise ValueError("Batch name is required")
     if mode not in {"ssd_only", "ssd_and_aws", "aws_direct"}:
@@ -246,6 +247,7 @@ def start_session(
                 _cards.pop(cid, None)
                 _cancel_requested.discard(cid)
         _batch_s3_names.clear()
+        _card_reserved_s3.clear()
 
     save_config(
         {
@@ -932,6 +934,26 @@ def _launch_upload_thread(
     volume_serial: str = "",
 ) -> None:
     with _lock:
+        existing_thread = _copy_threads.get(card_id)
+        if existing_thread and existing_thread.is_alive():
+            _log_line(f"{card_id}: upload thread already running — skip duplicate start")
+            return
+
+    running = aws_upload.find_running_direct_card_job(card_id, dest=dest_prefix)
+    if running:
+        with _lock:
+            existing_thread = _copy_threads.get(card_id)
+            if existing_thread and existing_thread.is_alive():
+                _log_line(
+                    f"{card_id}: CMD already uploading (job {running.get('id')}) — skip second window"
+                )
+                return
+
+    with _lock:
+        # Re-check under lock before publishing queued state / starting thread.
+        existing_thread = _copy_threads.get(card_id)
+        if existing_thread and existing_thread.is_alive():
+            return
         _cards[card_id] = {
             "card_id": card_id,
             "mount": str(card_root),
@@ -958,6 +980,8 @@ def _launch_upload_thread(
         name=f"aws-direct-{card_id}",
     )
     with _lock:
+        if _copy_threads.get(card_id) and _copy_threads[card_id].is_alive():
+            return
         _copy_threads[card_id] = thread
     thread.start()
 
@@ -1030,6 +1054,25 @@ def _sidecar_stem(rel: str) -> str:
     return Path(rel).stem
 
 
+def _dest_stem(dest_rel: str) -> str:
+    """Stem for collision-renamed destinations (handles ``.segments.json``)."""
+    return _sidecar_stem(dest_rel) if _is_sidecar_rel(dest_rel) else Path(dest_rel).stem
+
+
+def _collision_tag(card_id: str) -> str:
+    return f"__{str(card_id).strip().upper()}"
+
+
+def _looks_like_collision_name(dest_rel: str, card_id: str) -> bool:
+    stem = _dest_stem(dest_rel)
+    tag = _collision_tag(card_id)
+    if stem.upper().endswith(tag.upper()):
+        return True
+    # Legacy single-underscore suffix from earlier buggy runs.
+    alt = f"_{str(card_id).strip().upper()}"
+    return stem.upper().endswith(alt.upper())
+
+
 def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str) -> None:
     """Assign collision-safe destination names into the flat batch folder.
 
@@ -1092,10 +1135,28 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         assign_one(item, sidecar_pass=True)
 
 
-def _resolve_s3_dest_names(files: list[dict], prog: dict, card_id: str) -> None:
-    """Assign collision-safe S3 object basenames for aws_direct uploads."""
+def _resolve_s3_dest_names(
+    files: list[dict],
+    prog: dict,
+    card_id: str,
+    *,
+    dest_prefix: str,
+) -> None:
+    """Assign collision-safe S3 object basenames for aws_direct uploads.
+
+    Only renames when the plain basename is already taken on S3 (or reserved by
+    another card in this session). Stale ``__SD-…`` / ``_SD-…`` progress names
+    are dropped when the plain name is free again.
+    """
     entries = prog.get("files") or {}
     stem_map: dict[str, str] = {}
+    cid = str(card_id).strip().upper()
+
+    try:
+        existing = aws_upload.list_prefix_basenames(dest_prefix)
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"{cid}: could not refresh S3 names for collisions: {exc}", kind="error")
+        existing = set()
 
     def assign_one(item: dict, *, sidecar_pass: bool, taken: set[str]) -> None:
         rel = item["rel"]
@@ -1117,43 +1178,70 @@ def _resolve_s3_dest_names(files: list[dict], prog: dict, card_id: str) -> None:
 
         if is_sidecar:
             final_base = stem_map.get(base, base)
+            if suffix.lower() == ".segments.json":
+                plain = f"{final_base}.segments.json"
+            elif suffix.lower() == ".scaleai.json":
+                plain = f"{final_base}.scaleai.json"
+            else:
+                plain = f"{final_base}{suffix}"
+            # Drop stale collision renames when the plain paired name is free.
+            if (
+                recorded
+                and recorded != plain
+                and _looks_like_collision_name(str(recorded), cid)
+                and not name_taken(plain)
+            ):
+                recorded = None
             if recorded:
                 item["dest_rel"] = recorded
-            elif suffix.lower() == ".segments.json":
-                item["dest_rel"] = f"{final_base}.segments.json"
-            elif suffix.lower() == ".scaleai.json":
-                item["dest_rel"] = f"{final_base}.scaleai.json"
             else:
-                item["dest_rel"] = f"{final_base}{suffix}"
+                item["dest_rel"] = plain
             taken.add(item["dest_rel"])
             return
 
+        plain = Path(rel).name
+        if (
+            recorded
+            and recorded != plain
+            and _looks_like_collision_name(str(recorded), cid)
+            and not name_taken(plain)
+        ):
+            recorded = None
+
         if recorded:
             item["dest_rel"] = recorded
-            stem_map[base] = Path(recorded).stem
+            stem_map[base] = _dest_stem(str(recorded))
             taken.add(recorded)
             return
 
-        name = Path(rel).name
-        if name_taken(name):
-            final_base = f"{base}__{card_id.upper()}"
+        if name_taken(plain):
+            final_base = f"{base}{_collision_tag(cid)}"
             item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
             stem_map[base] = final_base
         else:
-            item["dest_rel"] = name
+            item["dest_rel"] = plain
             stem_map[base] = base
         taken.add(item["dest_rel"])
 
     with _lock:
-        taken = set(_batch_s3_names)
+        reserved_others: set[str] = set()
+        for other_cid, names in _card_reserved_s3.items():
+            if str(other_cid).upper() == cid:
+                continue
+            reserved_others.update(names)
+        taken = set(existing) | reserved_others | set(_batch_s3_names)
+        # This card may re-resolve after a failed attempt — free its old holds.
+        taken -= set(_card_reserved_s3.get(cid) or ())
+
         for item in files:
             assign_one(item, sidecar_pass=False, taken=taken)
         for item in files:
             assign_one(item, sidecar_pass=True, taken=taken)
-        for item in files:
-            dest_rel = item.get("dest_rel")
-            if dest_rel:
-                _batch_s3_names.add(str(dest_rel))
+
+        reserved = {str(item.get("dest_rel")) for item in files if item.get("dest_rel")}
+        _card_reserved_s3[cid] = reserved
+        _batch_s3_names.update(existing)
+        _batch_s3_names.update(reserved)
 
 
 def _is_s3_upload_done(prog: dict | None, rel: str, size: int, s3_uri: str) -> bool:
@@ -1179,7 +1267,7 @@ def _upload_card_worker(
 ) -> None:
     """Open CMD ``s5cmd run`` (direct DCIM→S3, no SD staging), verify, wipe pairs, eject."""
     total_bytes = inventory.total_bytes(files)
-    _resolve_s3_dest_names(files, prog, card_id)
+    _resolve_s3_dest_names(files, prog, card_id, dest_prefix=dest_prefix)
     wipe_names = sorted({Path(item["source"]).name for item in files})
 
     _update_card(
