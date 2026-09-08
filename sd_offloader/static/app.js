@@ -1,12 +1,22 @@
+const DEFAULT_S3_BATCHES_URI =
+  "s3://world-context-data-664427478457-ap-south-1-an/worldcontext-data/raw/batches/";
+
 const el = {
   batchSelect: document.getElementById("batch-select"),
   batchName: document.getElementById("batch-name"),
+  directBatchName: document.getElementById("direct-batch-name"),
   newBatchRow: document.getElementById("new-batch-row"),
+  directBatchRow: document.getElementById("direct-batch-row"),
+  batchSelectRow: document.getElementById("batch-select-row"),
   batchHint: document.getElementById("batch-hint"),
   mode: document.getElementById("mode"),
   ssd1: document.getElementById("ssd1"),
   ssd2: document.getElementById("ssd2"),
+  ssd1Row: document.getElementById("ssd1-row"),
+  ssd2Row: document.getElementById("ssd2-row"),
   s3Uri: document.getElementById("s3-uri"),
+  s3UriRow: document.getElementById("s3-uri-row"),
+  s3BaseHint: document.getElementById("s3-base-hint"),
   refreshVolumes: document.getElementById("refresh-volumes"),
   startSession: document.getElementById("start-session"),
   stopSession: document.getElementById("stop-session"),
@@ -15,13 +25,71 @@ const el = {
   sessionStatus: document.getElementById("session-status"),
   cards: document.getElementById("cards"),
   cardsSummary: document.getElementById("cards-summary"),
+  cardsHeading: document.getElementById("cards-heading"),
+  cardsHint: document.getElementById("cards-hint"),
   awsJobs: document.getElementById("aws-jobs"),
+  awsJobsHint: document.getElementById("aws-jobs-hint"),
   log: document.getElementById("log"),
   awsCliStatus: document.getElementById("aws-cli-status"),
   appVersion: document.getElementById("app-version"),
   maxParallel: document.getElementById("max-parallel"),
   capacityPanel: document.getElementById("capacity-panel"),
 };
+
+function isDirectMode() {
+  return el.mode.value === "aws_direct";
+}
+
+function syncModeUI() {
+  const direct = isDirectMode();
+  el.ssd1Row?.classList.toggle("hidden", direct);
+  el.ssd2Row?.classList.toggle("hidden", direct);
+  el.batchSelectRow?.classList.toggle("hidden", direct);
+  el.newBatchRow?.classList.toggle("hidden", direct || el.batchSelect.value !== "__new__");
+  el.directBatchRow?.classList.toggle("hidden", !direct);
+  if (el.uploadBatch) el.uploadBatch.classList.toggle("hidden", direct);
+  if (el.s3UriRow) {
+    // Keep URI editable but prefilled; show locked base hint in direct mode.
+    el.s3Uri.readOnly = direct;
+  }
+  if (el.s3BaseHint) {
+    el.s3BaseHint.classList.toggle("hidden", !direct);
+    if (direct) {
+      const base = (el.s3Uri.value || DEFAULT_S3_BATCHES_URI).replace(/\/?$/, "/");
+      const batch = (el.directBatchName?.value || "batch32").trim() || "batch32";
+      el.s3BaseHint.textContent = `Uploads go to ${base}${batch}/ — only type the batch name above.`;
+    }
+  }
+  if (el.startSession) {
+    el.startSession.textContent = direct
+      ? "Start auto upload (SD → AWS)"
+      : "Start auto offload (SD → SSD → AWS)";
+  }
+  if (el.cardsHeading) {
+    el.cardsHeading.textContent = direct ? "SD → AWS (cards)" : "SD → SSD (cards)";
+  }
+  if (el.cardsHint) {
+    el.cardsHint.innerHTML = direct
+      ? `After <strong>Start auto upload</strong>, keep the session running — cards with
+          <strong>DCIM → xxxGOPRO → MP4 + JSON</strong> upload straight to S3 via <strong>s5cmd</strong>.
+          Only paired files upload; orphan MP4s (no JSON) stay on the card. After verify, pairs are wiped and the card ejects.
+          <strong>Retry</strong> resumes; already-uploaded objects are skipped. <strong>Cancel</strong> stops without wiping.`
+      : `After <strong>Start auto offload</strong>, keep the session running — new SD cards are
+          detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
+          and enter the transfer pipeline without starting again.
+          Plug up to your parallel limit at once; extras wait for a free slot.
+          Failures stay on screen with <strong>Retry</strong> (resumes; already-copied files are skipped).
+          Mid-copy removal marks the card interrupted (Retry after re-insert).
+          <strong>Cancel</strong> stops without wiping the card.`;
+  }
+  if (direct) {
+    el.batchHint.textContent =
+      "Direct mode: name the batch (e.g. batch32). All plugged cards upload into that S3 folder.";
+    if (!el.s3Uri.value.trim()) el.s3Uri.value = DEFAULT_S3_BATCHES_URI;
+  } else {
+    onBatchSelectChange();
+  }
+}
 
 async function api(url, options = {}) {
   const { timeoutMs = 15000, ...fetchOptions } = options;
@@ -87,6 +155,9 @@ function fillVolumeSelect(select, volumes, selected) {
 }
 
 function selectedBatchName() {
+  if (isDirectMode()) {
+    return (el.directBatchName?.value || "").trim();
+  }
   const pick = el.batchSelect.value;
   if (pick === "__new__") return el.batchName.value.trim();
   return (pick || "").trim();
@@ -234,7 +305,7 @@ function renderCards(cards) {
         <span>${pct.toFixed(0)}%</span>
       </div>
       <div class="message">${escapeHtml(card.message || "")}</div>
-      ${card.dest ? `<div class="hint">SSD dest: ${escapeHtml(card.dest)}</div>` : ""}
+      ${card.dest ? `<div class="hint">${escapeHtml(card.dest.startsWith("s3://") ? "S3 dest: " : "SSD dest: ")}${escapeHtml(card.dest)}</div>` : ""}
       <div class="job-actions">
         ${
           canRetry
@@ -533,10 +604,14 @@ async function pollStatus() {
     const session = data.session || {};
     if (session.active) {
       const par = data.parallel || {};
+      const modeLabel =
+        session.mode === "aws_direct"
+          ? "SD→AWS direct"
+          : session.mode === "ssd_and_aws"
+            ? "SSD→AWS auto"
+            : "SSD only";
       setStatus(
-        `Hotplug armed · batch "${session.batch}" · ${
-          session.mode === "ssd_and_aws" ? "SSD→AWS auto" : "SSD only"
-        } · insert/remove SDs anytime · ${par.active || 0}/${par.max || 3} SD slots`,
+        `Hotplug armed · batch "${session.batch}" · ${modeLabel} · insert/remove SDs anytime · ${par.active || 0}/${par.max || 3} SD slots`,
         "ok",
       );
     }
@@ -550,12 +625,13 @@ async function pollStatus() {
 }
 
 function sessionPayload() {
+  const direct = isDirectMode();
   return {
     batch: selectedBatchName(),
     mode: el.mode.value,
-    ssd1: el.ssd1.value,
-    ssd2: el.ssd2.value,
-    s3_uri: el.s3Uri.value.trim(),
+    ssd1: direct ? "" : el.ssd1.value,
+    ssd2: direct ? "" : el.ssd2.value,
+    s3_uri: el.s3Uri.value.trim() || (direct ? DEFAULT_S3_BATCHES_URI : ""),
   };
 }
 
@@ -593,26 +669,38 @@ async function bootstrap() {
   try {
     config = await api("/api/config", { timeoutMs: 5000 });
     el.mode.value = config.mode || "ssd_and_aws";
-    el.s3Uri.value = config.s3_uri || "";
+    el.s3Uri.value = config.s3_uri || DEFAULT_S3_BATCHES_URI;
     if (el.maxParallel) {
       el.maxParallel.value = String(config.max_parallel_cards || 3);
+    }
+    if (el.directBatchName && config.last_batch) {
+      el.directBatchName.value = config.last_batch;
     }
   } catch (error) {
     setStatus(`Config load failed: ${error.message}`, "error");
   }
+
+  syncModeUI();
 
   setStatus("Loading drives…");
   try {
     await refreshVolumes();
     if (config.ssd1) el.ssd1.value = config.ssd1;
     if (config.ssd2) el.ssd2.value = config.ssd2;
-    await refreshBatches(config.last_batch || "");
-    if (config.last_batch && ![...el.batchSelect.options].some((o) => o.value === config.last_batch)) {
-      el.batchSelect.value = "__new__";
-      el.batchName.value = config.last_batch;
-      onBatchSelectChange();
+    if (!isDirectMode()) {
+      await refreshBatches(config.last_batch || "");
+      if (config.last_batch && ![...el.batchSelect.options].some((o) => o.value === config.last_batch)) {
+        el.batchSelect.value = "__new__";
+        el.batchName.value = config.last_batch;
+        onBatchSelectChange();
+      }
     }
-    setStatus("Ready — Start once, then keep inserting SD cards (hotplug auto SD→SSD→AWS)", "ok");
+    setStatus(
+      isDirectMode()
+        ? "Ready — Start once, then keep inserting SD cards (hotplug auto SD→AWS)"
+        : "Ready — Start once, then keep inserting SD cards (hotplug auto SD→SSD→AWS)",
+      "ok",
+    );
   } catch (error) {
     setStatus(`Drive list failed: ${error.message} — click Refresh drives`, "error");
   }
@@ -638,7 +726,16 @@ el.startSession.addEventListener("click", async () => {
   try {
     const payload = sessionPayload();
     if (!payload.batch) {
-      setStatus("Select an existing batch or create a new one", "error");
+      setStatus(
+        isDirectMode()
+          ? "Enter a batch name (e.g. batch32)"
+          : "Select an existing batch or create a new one",
+        "error",
+      );
+      return;
+    }
+    if (isDirectMode() && !payload.s3_uri) {
+      setStatus("S3 base URI is required", "error");
       return;
     }
     if (el.maxParallel) {
@@ -653,12 +750,24 @@ el.startSession.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    setStatus(`Auto offload armed · batch "${payload.batch}" · plug SD cards`, "ok");
-    await refreshBatches(payload.batch);
+    setStatus(
+      isDirectMode()
+        ? `Auto upload armed · batch "${payload.batch}" · plug SD cards`
+        : `Auto offload armed · batch "${payload.batch}" · plug SD cards`,
+      "ok",
+    );
+    if (!isDirectMode()) await refreshBatches(payload.batch);
     await pollStatus();
   } catch (error) {
     setStatus(error.message, "error");
   }
+});
+
+el.mode.addEventListener("change", () => {
+  syncModeUI();
+});
+el.directBatchName?.addEventListener("input", () => {
+  if (isDirectMode()) syncModeUI();
 });
 
 el.maxParallel?.addEventListener("change", async () => {

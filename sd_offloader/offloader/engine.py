@@ -26,6 +26,7 @@ _cards: dict[str, dict] = {}  # card_id -> job state
 _copy_threads: dict[str, threading.Thread] = {}
 _cancel_requested: set[str] = set()
 _waiting_queue: list[dict] = []  # queued starts when at max parallel
+_batch_s3_names: set[str] = set()  # collision basenames in current aws_direct batch
 _watcher_started = False
 _log: list[dict] = []
 SNAPSHOT_FILE = STATE_DIR / "ui_snapshot.json"
@@ -126,7 +127,7 @@ def restore_ui_state() -> None:
         # boot was freezing the web UI on hung card readers. User clicks Start.
         _session["active"] = False
         _log_line(
-            "Previous session was active — click Start SD → SSD to resume watching",
+            "Previous session was active — click Start to resume watching",
             kind="ok",
         )
 
@@ -203,28 +204,39 @@ def start_session(
     batch = batch.strip()
     if not batch:
         raise ValueError("Batch name is required")
-    if mode not in {"ssd_only", "ssd_and_aws"}:
-        raise ValueError("mode must be ssd_only or ssd_and_aws")
-    if not ssd1 and not ssd2:
-        raise ValueError("Pick at least one SSD")
-    if mode == "ssd_and_aws" and not s3_uri.strip():
-        raise ValueError("S3 URI required for SSD + AWS mode")
+    if mode not in {"ssd_only", "ssd_and_aws", "aws_direct"}:
+        raise ValueError("mode must be ssd_only, ssd_and_aws, or aws_direct")
+    if mode == "aws_direct":
+        if not s3_uri.strip():
+            raise ValueError("S3 base URI required for SD → AWS direct mode")
+        if not aws_upload.upload_tool_available():
+            raise ValueError(
+                "Neither s5cmd nor AWS CLI found — install s5cmd (preferred) or AWS CLI v2"
+            )
+    else:
+        if not ssd1 and not ssd2:
+            raise ValueError("Pick at least one SSD")
+        if mode == "ssd_and_aws" and not s3_uri.strip():
+            raise ValueError("S3 URI required for SSD + AWS mode")
 
     ssd1_path = str(Path(ssd1).resolve()) if ssd1 else ""
     ssd2_path = str(Path(ssd2).resolve()) if ssd2 else ""
-    for path in (ssd1_path, ssd2_path):
-        if path and not Path(path).exists():
-            raise ValueError(f"SSD path not found: {path}")
+    if mode != "aws_direct":
+        for path in (ssd1_path, ssd2_path):
+            if path and not Path(path).exists():
+                raise ValueError(f"SSD path not found: {path}")
 
+    s3_clean = s3_uri.strip()
+    cfg_before = load_config()
     with _lock:
         _session.update(
             {
                 "active": True,
                 "batch": batch,
                 "mode": mode,
-                "ssd1": ssd1_path,
-                "ssd2": ssd2_path,
-                "s3_uri": s3_uri.strip(),
+                "ssd1": ssd1_path if mode != "aws_direct" else "",
+                "ssd2": ssd2_path if mode != "aws_direct" else "",
+                "s3_uri": s3_clean,
                 "started_at": time.time(),
             }
         )
@@ -233,25 +245,42 @@ def start_session(
             if card.get("status") == "cancelled":
                 _cards.pop(cid, None)
                 _cancel_requested.discard(cid)
+        _batch_s3_names.clear()
+
     save_config(
         {
             "last_batch": batch,
             "mode": mode,
-            "ssd1": ssd1_path,
-            "ssd2": ssd2_path,
-            "s3_uri": s3_uri.strip(),
+            "ssd1": ssd1_path if mode != "aws_direct" else str(cfg_before.get("ssd1") or ""),
+            "ssd2": ssd2_path if mode != "aws_direct" else str(cfg_before.get("ssd2") or ""),
+            "s3_uri": s3_clean,
         }
     )
-    # Ensure batch folders exist on available SSDs
-    for ssd in (ssd1_path, ssd2_path):
-        if ssd:
-            space.batch_root(ssd, batch).mkdir(parents=True, exist_ok=True)
+
+    if mode == "aws_direct":
+        prefix = aws_upload.batch_s3_prefix(s3_clean, batch)
+        try:
+            existing = aws_upload.list_prefix_basenames(prefix)
+        except Exception as exc:  # noqa: BLE001
+            _log_line(f"Could not list existing S3 objects for {prefix}: {exc}", kind="error")
+            existing = set()
+        with _lock:
+            _batch_s3_names.update(existing)
+        _log_line(
+            f"Session started: {batch} (aws_direct) → {prefix} "
+            f"({len(existing)} existing object(s)) — hotplug armed"
+        )
+    else:
+        # Ensure batch folders exist on available SSDs
+        for ssd in (ssd1_path, ssd2_path):
+            if ssd:
+                space.batch_root(ssd, batch).mkdir(parents=True, exist_ok=True)
+        _log_line(
+            f"Session started: {batch} ({mode}) — hotplug armed "
+            "(insert/remove SDs anytime; new cards auto SD→SSD→AWS)"
+        )
 
     _ensure_watcher()
-    _log_line(
-        f"Session started: {batch} ({mode}) — hotplug armed "
-        "(insert/remove SDs anytime; new cards auto SD→SSD→AWS)"
-    )
     # Immediately scan once
     _scan_for_cards()
     return get_status()
@@ -300,7 +329,7 @@ def cancel_card_job(card_id: str) -> dict:
 
 
 def retry_card_job(card_id: str) -> dict:
-    """Resume a failed/interrupted/cancelled SD→SSD copy (skips files already on SSD)."""
+    """Resume a failed/interrupted/cancelled SD job (skips files already done)."""
     cid = str(card_id or "").strip().upper()
     if not cid:
         raise ValueError("card_id required")
@@ -322,15 +351,17 @@ def retry_card_job(card_id: str) -> dict:
         card["message"] = "Retry queued…"
         card["error"] = ""
     if not batch:
-        raise RuntimeError("No batch selected — Start SD → SSD first")
+        raise RuntimeError("No batch selected — Start a session first")
     if not mount or not Path(mount).exists():
         with _lock:
             if cid in _cards:
                 _cards[cid]["status"] = "error"
                 _cards[cid]["message"] = "Re-insert the SD card, then click Retry"
         raise RuntimeError("Card not mounted — re-insert it, then click Retry")
-    if not ssd1 and not ssd2:
+    if mode != "aws_direct" and not ssd1 and not ssd2:
         raise RuntimeError("Pick SSD 1 / SSD 2 first")
+    if mode == "aws_direct" and not s3_uri:
+        raise RuntimeError("S3 URI required for direct upload")
 
     prog = progress.load_progress(Path(mount))
     _log_line(f"{cid}: retry requested — resume from progress file if present", kind="ok")
@@ -607,19 +638,32 @@ def _pump_waiting_queue() -> None:
                 return
             job = _waiting_queue.pop(0)
         try:
-            _launch_copy_thread(
-                card_root=job["card_root"],
-                card_id=job["card_id"],
-                batch=job["batch"],
-                mode=job["mode"],
-                s3_uri=job["s3_uri"],
-                files=job["files"],
-                dest=job["dest"],
-                prog=job["prog"],
-                ssd_path=job["ssd_path"],
-                total=job["total"],
-                volume_serial=str(job.get("volume_serial") or ""),
-            )
+            if job.get("kind") == "aws_direct":
+                _launch_upload_thread(
+                    card_root=job["card_root"],
+                    card_id=job["card_id"],
+                    batch=job["batch"],
+                    s3_uri=job["s3_uri"],
+                    files=job["files"],
+                    dest_prefix=job["dest_prefix"],
+                    prog=job["prog"],
+                    total=job["total"],
+                    volume_serial=str(job.get("volume_serial") or ""),
+                )
+            else:
+                _launch_copy_thread(
+                    card_root=job["card_root"],
+                    card_id=job["card_id"],
+                    batch=job["batch"],
+                    mode=job["mode"],
+                    s3_uri=job["s3_uri"],
+                    files=job["files"],
+                    dest=job["dest"],
+                    prog=job["prog"],
+                    ssd_path=job["ssd_path"],
+                    total=job["total"],
+                    volume_serial=str(job.get("volume_serial") or ""),
+                )
         except Exception as exc:  # noqa: BLE001
             cid = str(job.get("card_id") or "?")
             _update_card(cid, status="error", message=str(exc))
@@ -638,6 +682,17 @@ def _start_card_job(
     *,
     volume_serial: str = "",
 ) -> None:
+    if mode == "aws_direct":
+        _start_direct_upload_job(
+            card_root,
+            card_id,
+            batch,
+            s3_uri,
+            existing_progress,
+            volume_serial=volume_serial,
+        )
+        return
+
     files = inventory.list_transfer_files(card_root)
     total = inventory.total_bytes(files)
     if not files:
@@ -702,6 +757,7 @@ def _start_card_job(
     progress.save_progress(card_root, prog)
 
     payload = {
+        "kind": "ssd_copy",
         "card_root": card_root,
         "card_id": card_id,
         "batch": batch,
@@ -748,7 +804,162 @@ def _start_card_job(
         _save_snapshot(force=True)
         return
 
-    _launch_copy_thread(**payload)
+    _launch_copy_thread(**{k: v for k, v in payload.items() if k != "kind"})
+
+
+def _start_direct_upload_job(
+    card_root: Path,
+    card_id: str,
+    batch: str,
+    s3_uri: str,
+    existing_progress: dict | None,
+    *,
+    volume_serial: str = "",
+) -> None:
+    files = inventory.list_transfer_files(card_root, pairs_only=True)
+    total = inventory.total_bytes(files)
+    if not files:
+        with _lock:
+            existing = _cards.get(card_id)
+            if existing and existing.get("status") == "completed":
+                return
+        _log_line(f"{card_id}: no MP4+JSON pairs under DCIM/…GOPRO", kind="error")
+        with _lock:
+            _cards[card_id] = {
+                "card_id": card_id,
+                "mount": str(card_root),
+                "volume_serial": volume_serial,
+                "status": "error",
+                "message": "No MP4+JSON pairs under DCIM/xxxGOPRO — orphan MP4s are left alone",
+                "bytes_done": 0,
+                "bytes_total": 0,
+                "speed_mbps": 0,
+                "eta_seconds": None,
+                "started_at": time.time(),
+            }
+        return
+
+    dest_prefix = aws_upload.batch_s3_prefix(s3_uri, batch)
+    prog = existing_progress or {
+        "batch": batch,
+        "card_id": card_id,
+        "dest": dest_prefix,
+        "mode": "aws_direct",
+        "files": {},
+        "status": "in_progress",
+        "bytes_total": total,
+    }
+    prog.update(
+        {
+            "batch": batch,
+            "card_id": card_id,
+            "dest": dest_prefix,
+            "mode": "aws_direct",
+            "status": "in_progress",
+            "bytes_total": total,
+        }
+    )
+    progress.save_progress(card_root, prog)
+
+    payload = {
+        "kind": "aws_direct",
+        "card_root": card_root,
+        "card_id": card_id,
+        "batch": batch,
+        "s3_uri": s3_uri,
+        "files": files,
+        "dest_prefix": dest_prefix,
+        "prog": prog,
+        "total": total,
+        "volume_serial": volume_serial,
+    }
+
+    if _active_copy_count() >= _max_parallel_cards():
+        with _lock:
+            _waiting_queue[:] = [
+                j
+                for j in _waiting_queue
+                if str(j.get("card_id") or "").upper() != card_id.upper()
+            ]
+            _waiting_queue.append(payload)
+            active = _active_copy_count()
+            limit = _max_parallel_cards()
+            _cards[card_id] = {
+                "card_id": card_id,
+                "mount": str(card_root),
+                "volume_serial": volume_serial,
+                "status": "waiting",
+                "message": f"Waiting for free slot ({active}/{limit} active) → {dest_prefix}",
+                "dest": dest_prefix,
+                "bytes_done": 0,
+                "bytes_total": total,
+                "speed_mbps": 0.0,
+                "eta_seconds": None,
+                "files_total": len(files),
+                "files_done": 0,
+                "started_at": time.time(),
+            }
+        _log_line(
+            f"{card_id}: waiting — {_max_parallel_cards()} cards already uploading",
+            kind="ok",
+        )
+        _save_snapshot(force=True)
+        return
+
+    _launch_upload_thread(
+        card_root=card_root,
+        card_id=card_id,
+        batch=batch,
+        s3_uri=s3_uri,
+        files=files,
+        dest_prefix=dest_prefix,
+        prog=prog,
+        total=total,
+        volume_serial=volume_serial,
+    )
+
+
+def _launch_upload_thread(
+    *,
+    card_root: Path,
+    card_id: str,
+    batch: str,
+    s3_uri: str,
+    files: list[dict],
+    dest_prefix: str,
+    prog: dict,
+    total: int,
+    volume_serial: str = "",
+) -> None:
+    with _lock:
+        _cards[card_id] = {
+            "card_id": card_id,
+            "mount": str(card_root),
+            "volume_serial": volume_serial,
+            "status": "queued",
+            "message": f"Queued → {dest_prefix}",
+            "dest": dest_prefix,
+            "bytes_done": 0,
+            "bytes_total": total,
+            "speed_mbps": 0.0,
+            "eta_seconds": None,
+            "files_total": len(files),
+            "files_done": 0,
+            "started_at": time.time(),
+        }
+
+    _log_line(
+        f"{card_id}: starting SD→AWS upload → {dest_prefix} ({len(files)} files, {total} bytes)"
+    )
+    thread = threading.Thread(
+        target=_upload_card_worker,
+        args=(card_root, card_id, batch, s3_uri, files, dest_prefix, prog),
+        daemon=True,
+        name=f"aws-direct-{card_id}",
+    )
+    with _lock:
+        _copy_threads[card_id] = thread
+    thread.start()
 
 
 def _launch_copy_thread(
@@ -879,6 +1090,296 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         assign_one(item, sidecar_pass=False)
     for item in files:
         assign_one(item, sidecar_pass=True)
+
+
+def _resolve_s3_dest_names(files: list[dict], prog: dict, card_id: str) -> None:
+    """Assign collision-safe S3 object basenames for aws_direct uploads."""
+    entries = prog.get("files") or {}
+    stem_map: dict[str, str] = {}
+
+    def assign_one(item: dict, *, sidecar_pass: bool, taken: set[str]) -> None:
+        rel = item["rel"]
+        recorded = (entries.get(rel) or {}).get("dest_rel")
+        is_sidecar = _is_sidecar_rel(rel)
+        if is_sidecar != sidecar_pass:
+            return
+
+        base = _sidecar_stem(rel) if is_sidecar else Path(rel).stem
+        suffix = Path(rel).suffix
+        if rel.lower().endswith(".segments.json"):
+            suffix = ".segments.json"
+        elif rel.lower().endswith(".scaleai.json"):
+            suffix = ".scaleai.json"
+
+        def name_taken(name: str) -> bool:
+            lower = name.lower()
+            return any(str(n).lower() == lower for n in taken)
+
+        if is_sidecar:
+            final_base = stem_map.get(base, base)
+            if recorded:
+                item["dest_rel"] = recorded
+            elif suffix.lower() == ".segments.json":
+                item["dest_rel"] = f"{final_base}.segments.json"
+            elif suffix.lower() == ".scaleai.json":
+                item["dest_rel"] = f"{final_base}.scaleai.json"
+            else:
+                item["dest_rel"] = f"{final_base}{suffix}"
+            taken.add(item["dest_rel"])
+            return
+
+        if recorded:
+            item["dest_rel"] = recorded
+            stem_map[base] = Path(recorded).stem
+            taken.add(recorded)
+            return
+
+        name = Path(rel).name
+        if name_taken(name):
+            final_base = f"{base}__{card_id.upper()}"
+            item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
+            stem_map[base] = final_base
+        else:
+            item["dest_rel"] = name
+            stem_map[base] = base
+        taken.add(item["dest_rel"])
+
+    with _lock:
+        taken = set(_batch_s3_names)
+        for item in files:
+            assign_one(item, sidecar_pass=False, taken=taken)
+        for item in files:
+            assign_one(item, sidecar_pass=True, taken=taken)
+        for item in files:
+            dest_rel = item.get("dest_rel")
+            if dest_rel:
+                _batch_s3_names.add(str(dest_rel))
+
+
+def _is_s3_upload_done(prog: dict | None, rel: str, size: int, s3_uri: str) -> bool:
+    if not prog:
+        return False
+    entry = (prog.get("files") or {}).get(rel)
+    if not entry or entry.get("status") != "done":
+        return False
+    if int(entry.get("size") or 0) != int(size):
+        return False
+    expected = int(entry.get("dest_size") or size)
+    return aws_upload.verify_s3_object(s3_uri, expected, tolerance=0)
+
+
+def _upload_card_worker(
+    card_root: Path,
+    card_id: str,
+    batch: str,
+    s3_uri: str,
+    files: list[dict],
+    dest_prefix: str,
+    prog: dict,
+) -> None:
+    """Upload paired MP4+JSON from the SD card straight to S3, then wipe + eject."""
+    total_bytes = inventory.total_bytes(files)
+    _update_card(
+        card_id,
+        status="uploading",
+        message=f"Uploading → {dest_prefix}",
+        dest=dest_prefix,
+        bytes_done=0,
+        bytes_total=total_bytes,
+        files_done=0,
+        files_total=len(files),
+        speed_mbps=0.0,
+        eta_seconds=None,
+    )
+    started = time.time()
+    done_bytes = 0
+    files_done = 0
+    wipe_names: list[str] = []
+    _resolve_s3_dest_names(files, prog, card_id)
+    last_ui = 0.0
+    last_live = 0
+    last_speed_at = started
+    uploaded_any = False
+
+    def _publish(*, message: str | None = None, force: bool = False) -> None:
+        nonlocal last_ui, last_live, last_speed_at
+        if _is_cancel_requested(card_id):
+            raise CopyCancelled(f"{card_id}: cancelled by operator")
+        now = time.time()
+        live = done_bytes
+        if not force and message is None and now - last_ui < 0.2:
+            return
+        last_ui = now
+        elapsed = max(0.1, now - started)
+        window = max(0.1, now - last_speed_at)
+        delta = max(0, live - last_live)
+        if delta > 0 and window >= 0.2:
+            speed = (delta / (1024 * 1024)) / window
+            last_live = live
+            last_speed_at = now
+        else:
+            speed = (live / (1024 * 1024)) / elapsed if live > 0 else 0.0
+        remaining = max(0, total_bytes - live)
+        eta = int(remaining / (speed * 1024 * 1024)) if speed > 0 else None
+        payload = {
+            "status": "uploading",
+            "dest": dest_prefix,
+            "bytes_done": live,
+            "bytes_total": total_bytes,
+            "files_done": files_done,
+            "files_total": len(files),
+            "speed_mbps": round(speed, 2),
+            "eta_seconds": eta,
+        }
+        if message is not None:
+            payload["message"] = message
+        _update_card(card_id, **payload)
+
+    try:
+        if _is_cancel_requested(card_id):
+            raise CopyCancelled(f"{card_id}: cancelled by operator")
+
+        for item in files:
+            if _is_cancel_requested(card_id):
+                raise CopyCancelled(f"{card_id}: cancelled by operator")
+            rel = item["rel"]
+            src = Path(item["source"])
+            size = int(item["size"])
+            dest_rel = item.get("dest_rel") or rel
+            s3_key = f"{dest_prefix.rstrip('/')}/{dest_rel}"
+            wipe_names.append(src.name)
+
+            if dest_rel != rel and not (prog.get("files") or {}).get(rel):
+                _log_line(
+                    f"{card_id}: {rel} already in batch on S3 — uploading as {dest_rel}"
+                )
+
+            if _is_s3_upload_done(prog, rel, size, s3_key):
+                item["dest_size"] = size
+                done_bytes += size
+                files_done += 1
+                uploaded_any = True
+                _publish(message=f"Skipped (already on S3): {dest_rel}", force=True)
+                continue
+
+            if not src.is_file():
+                raise RuntimeError(f"Source missing on card: {src}")
+
+            _publish(message=f"Uploading {dest_rel}…", force=True)
+            try:
+                aws_upload.upload_local_file(
+                    src,
+                    s3_key,
+                    cancel_check=lambda: _is_cancel_requested(card_id),
+                )
+            except RuntimeError as upload_exc:
+                if "cancel" in str(upload_exc).lower():
+                    raise CopyCancelled(f"{card_id}: cancelled by operator") from upload_exc
+                raise
+            if not aws_upload.verify_s3_object(s3_key, size, tolerance=0):
+                raise RuntimeError(f"S3 verify failed after upload: {dest_rel}")
+
+            item["dest_size"] = size
+            progress.mark_file_done(
+                card_root, prog, rel, size, dest_size=size, dest_rel=dest_rel
+            )
+            done_bytes += size
+            files_done += 1
+            uploaded_any = True
+            _publish(message=f"Uploaded {dest_rel}", force=True)
+
+        if _is_cancel_requested(card_id):
+            raise CopyCancelled(f"{card_id}: cancelled by operator")
+
+        if not uploaded_any and files:
+            raise RuntimeError(f"No files were uploaded to {dest_prefix}")
+
+        _update_card(
+            card_id,
+            status="verifying",
+            message=f"Verifying S3 objects under {dest_prefix}…",
+            dest=dest_prefix,
+        )
+        for item in files:
+            if _is_cancel_requested(card_id):
+                raise CopyCancelled(f"{card_id}: cancelled by operator")
+            dest_rel = item.get("dest_rel") or item["rel"]
+            s3_key = f"{dest_prefix.rstrip('/')}/{dest_rel}"
+            expected = int(item.get("dest_size") or item["size"])
+            if not aws_upload.verify_s3_object(s3_key, expected, tolerance=0):
+                raise RuntimeError(f"Verify failed: {dest_rel} missing/wrong size on S3")
+
+        prog["status"] = "complete"
+        progress.save_progress(card_root, prog)
+
+        _update_card(
+            card_id,
+            status="completed",
+            message="Upload verified — wiping pairs & ejecting…",
+            dest=dest_prefix,
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
+
+        if _is_cancel_requested(card_id):
+            raise CopyCancelled(f"{card_id}: cancelled by operator")
+
+        try:
+            _update_card(card_id, status="wiping", message="Wiping uploaded MP4+JSON pairs on card…")
+            # Unique basenames only — orphan MP4s (no JSON) were never listed.
+            eject.wipe_transferred_tasks(card_root, [], sorted(set(wipe_names)))
+        except Exception as wipe_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
+
+        if _is_cancel_requested(card_id):
+            raise CopyCancelled(f"{card_id}: cancelled by operator")
+
+        try:
+            _update_card(card_id, status="ejecting", message="Ejecting card…")
+            eject.eject_volume(card_root)
+        except Exception as eject_exc:  # noqa: BLE001
+            _log_line(f"{card_id}: eject warning — {eject_exc}", kind="error")
+
+        _update_card(
+            card_id,
+            status="completed",
+            message=f"Ready — uploaded to {dest_prefix} · card ejected",
+            dest=dest_prefix,
+            speed_mbps=0,
+            eta_seconds=0,
+            bytes_done=total_bytes,
+        )
+        _log_line(f"{card_id}: complete → {dest_prefix}", kind="ok")
+    except CopyCancelled as exc:
+        _clear_cancel_requested(card_id)
+        _update_card(
+            card_id,
+            status="cancelled",
+            message=(
+                "Cancelled / card removed — files already on S3 are kept; card was not wiped. "
+                "Re-insert and click Retry to resume (session stays armed)."
+            ),
+            dest=dest_prefix,
+            speed_mbps=0.0,
+            eta_seconds=None,
+        )
+        _log_line(f"{card_id}: {exc}", kind="ok")
+    except Exception as exc:  # noqa: BLE001
+        _clear_cancel_requested(card_id)
+        _update_card(
+            card_id,
+            status="error",
+            message=f"{exc} — click Retry to resume (files already on S3 are skipped)",
+            dest=dest_prefix,
+        )
+        _log_line(f"{card_id}: error — {exc}", kind="error")
+    finally:
+        with _lock:
+            _copy_threads.pop(card_id, None)
+        _pump_waiting_queue()
+
+
 _META_CHECKS = (
     ("complete labeling", lambda p: p.get("complete") is True),
     ("segments", lambda p: bool(p.get("segments"))),

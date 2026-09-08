@@ -14,12 +14,18 @@ PROGRESS_FILENAME = ".gopro_offload_progress.json"
 
 _lock = threading.Lock()
 
+# Fixed World Context raw batches prefix (batch name is appended by the app).
+DEFAULT_S3_BATCHES_URI = (
+    "s3://world-context-data-664427478457-ap-south-1-an/worldcontext-data/raw/batches/"
+)
+
 DEFAULT_CONFIG = {
-    "s3_uri": "",
+    "s3_uri": DEFAULT_S3_BATCHES_URI,
     "ssd1": "",
     "ssd2": "",
     "last_batch": "",
-    "mode": "ssd_and_aws",  # ssd_only | ssd_and_aws — auto SSD→AWS after each card
+    # ssd_only | ssd_and_aws | aws_direct (SD→AWS, no SSD)
+    "mode": "ssd_and_aws",
     "port": 8877,
     "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)
     "aws_upload_retries": 5,  # auto-retries inside the CMD upload script

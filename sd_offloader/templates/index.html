@@ -14,8 +14,8 @@
           <h1>SD Card Offloader</h1>
           <p class="hint">
             Detects GoPro cards by <strong>DCIM/xxxGOPRO + MP4 + JSON</strong> (any volume name) ·
-            up to <strong>3 cards in parallel</strong> · copy to dual SSDs ·
-            <strong>SSD + AWS</strong> after each card · target ~40×120&nbsp;GB / day
+            up to <strong>3 cards in parallel</strong> · copy to dual SSDs and/or
+            <strong>SD → AWS direct</strong> when SSDs are full
           </p>
         </div>
         <div class="header-meta">
@@ -27,15 +27,15 @@
       <section class="panel setup">
         <h2>Session</h2>
         <div class="grid-2">
-          <label>
+          <label id="ssd1-row">
             SSD 1
             <select id="ssd1"></select>
           </label>
-          <label>
+          <label id="ssd2-row">
             SSD 2
             <select id="ssd2"></select>
           </label>
-          <label>
+          <label id="batch-select-row">
             Batch on SSDs
             <select id="batch-select">
               <option value="">Refresh drives to list batches…</option>
@@ -43,13 +43,18 @@
           </label>
           <label id="new-batch-row" class="hidden">
             New batch name
-            <input id="batch-name" type="text" placeholder="batch 6" />
+            <input id="batch-name" type="text" placeholder="batch32" />
+          </label>
+          <label id="direct-batch-row" class="hidden">
+            Batch name (S3 folder)
+            <input id="direct-batch-name" type="text" placeholder="batch32" />
           </label>
           <label>
             Mode
             <select id="mode">
               <option value="ssd_and_aws">SSD + AWS (auto upload after each card · recommended)</option>
               <option value="ssd_only">SSD only (upload to AWS later)</option>
+              <option value="aws_direct">SD → AWS direct (no SSD · s5cmd)</option>
             </select>
           </label>
           <label>
@@ -61,10 +66,11 @@
               <option value="4">4</option>
             </select>
           </label>
-          <label class="full">
+          <label class="full" id="s3-uri-row">
             AWS S3 destination (folder URI — keys stay in `aws configure`)
             <input id="s3-uri" type="text" placeholder="s3://your-bucket/footage/" />
           </label>
+          <p id="s3-base-hint" class="hint full hidden"></p>
         </div>
         <p id="batch-hint" class="hint">Existing batches appear after you pick SSD 1 / SSD 2.</p>
         <div class="row actions">
@@ -80,13 +86,13 @@
 
       <section class="panel">
         <div class="section-head">
-          <h2>SD → SSD (cards)</h2>
+          <h2 id="cards-heading">SD → SSD (cards)</h2>
           <span id="cards-summary" class="hint">No cards yet</span>
         </div>
-        <p class="hint">
+        <p id="cards-hint" class="hint">
           After <strong>Start auto offload</strong>, keep the session running — new SD cards are
           detected by structure (<strong>DCIM → xxxGOPRO → MP4 + JSON</strong>), not by card name,
-          and enter <strong>SD → SSD → AWS</strong> without starting again.
+          and enter the transfer pipeline without starting again.
           Plug up to your parallel limit at once; extras wait for a free slot.
           Failures stay on screen with <strong>Retry</strong> (resumes; already-copied files are skipped).
           Mid-copy removal marks the card interrupted (Retry after re-insert).
@@ -98,11 +104,12 @@
       <section class="panel grid-2-panels">
         <div>
           <h2>AWS uploads (batches)</h2>
-          <p class="hint">
+          <p class="hint" id="aws-jobs-hint">
             In <strong>SSD + AWS</strong> mode, each finished card triggers a batch sync to S3
             (coalesced if one upload is already running). Prefers <strong>s5cmd</strong> with auto-retry.
             Use <strong>Retry</strong> on errors (resume-safe), <strong>Verify sizes</strong>, then
             <strong>Delete local</strong> only when verified.
+            In <strong>SD → AWS direct</strong>, progress appears on the card cards above (no SSD staging).
           </p>
           <div id="aws-jobs" class="jobs"></div>
         </div>

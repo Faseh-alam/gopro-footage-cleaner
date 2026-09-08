@@ -187,6 +187,164 @@ def batch_s3_prefix(s3_uri: str, batch_name: str) -> str:
     return f"{base}{name}/"
 
 
+def list_prefix_basenames(prefix: str) -> set[str]:
+    """Return object basenames already under an S3 prefix (flat listing)."""
+    dest = normalize_s3_uri(prefix)
+    names: set[str] = set()
+    if s5cmd_available():
+        try:
+            result = subprocess.run(
+                ["s5cmd", "ls", dest],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None and result.returncode == 0:
+            for line in (result.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # DATE TIME SIZE KEY  OR  DIR s3://...
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[-1]
+                if key.startswith("s3://"):
+                    key = key.rstrip("/").rsplit("/", 1)[-1]
+                else:
+                    key = key.rstrip("/").rsplit("/", 1)[-1]
+                if key and key != "DIR":
+                    names.add(key)
+            return names
+
+    if not aws_cli_available():
+        return names
+    try:
+        result = subprocess.run(
+            ["aws", "s3", "ls", dest],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return names
+    if result.returncode != 0:
+        return names
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("PRE "):
+            continue
+        parts = line.split()
+        if len(parts) >= 4:
+            names.add(parts[-1])
+    return names
+
+
+def s3_object_size(s3_uri: str) -> int | None:
+    """Return size in bytes for an exact S3 object URI, or None if missing."""
+    key = s3_uri.strip()
+    if not key.startswith("s3://"):
+        return None
+    if s5cmd_available():
+        try:
+            result = subprocess.run(
+                ["s5cmd", "ls", key],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None and result.returncode == 0:
+            for line in (result.stdout or "").splitlines():
+                parts = line.strip().split()
+                # DATE TIME SIZE KEY
+                if len(parts) >= 4 and parts[2].isdigit():
+                    return int(parts[2])
+                if len(parts) >= 3 and parts[1].isdigit() and parts[-1].startswith("s3://"):
+                    return int(parts[1])
+
+    if not aws_cli_available():
+        return None
+    # s3://bucket/key/path → bucket + key
+    rest = key[len("s3://") :]
+    bucket, _, obj = rest.partition("/")
+    if not bucket or not obj:
+        return None
+    try:
+        result = subprocess.run(
+            ["aws", "s3api", "head-object", "--bucket", bucket, "--key", obj],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+        return int(data.get("ContentLength"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def upload_local_file(local_path: Path, s3_uri: str, *, cancel_check=None) -> None:
+    """Upload one local file to an exact S3 object URI via s5cmd (or aws)."""
+    if not upload_tool_available():
+        raise RuntimeError(
+            "Neither s5cmd nor AWS CLI found. Install s5cmd (preferred) or AWS CLI v2."
+        )
+    if not local_path.is_file():
+        raise RuntimeError(f"Source missing: {local_path}")
+    dest = s3_uri.strip()
+    if not dest.startswith("s3://"):
+        raise ValueError("S3 URI must start with s3://")
+    tool = preferred_uploader()
+    local = str(local_path)
+    # Forward slashes help s5cmd on Windows.
+    local_arg = local.replace("\\", "/")
+
+    if tool == "s5cmd":
+        cmd = ["s5cmd", "cp", local_arg, dest]
+    else:
+        cmd = ["aws", "s3", "cp", local, dest]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        for _line in proc.stdout:
+            if cancel_check and cancel_check():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise RuntimeError("Upload cancelled")
+        code = proc.wait(timeout=3600 * 6)
+    except RuntimeError:
+        raise
+    except Exception:
+        proc.kill()
+        raise
+    if code != 0:
+        raise RuntimeError(f"{tool} cp failed for {local_path.name} → {dest} (exit {code})")
+
+
+def verify_s3_object(s3_uri: str, expected_size: int, *, tolerance: int = 0) -> bool:
+    size = s3_object_size(s3_uri)
+    if size is None:
+        return False
+    return abs(int(size) - int(expected_size)) <= max(0, int(tolerance))
+
+
 def _sync_local_arg(path: Path) -> str:
     """Local folder for aws/s5cmd sync — trailing slash syncs folder *contents*."""
     text = str(path)

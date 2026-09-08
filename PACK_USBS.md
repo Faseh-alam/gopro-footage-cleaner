@@ -79,11 +79,11 @@ After rebuilding the app on your Mac:
 
 ```bash
 cd "/Users/faz/Documents/Footage cleaning"
-# plug the USBs (4 at a time is fine)
+# plug the USBs (all remaining, or a few at a time)
 ./start-pack-usbs.sh update-app
 ```
 
-That replaces only `VoiceoverStation/` on each plugged stick. Footage in `voiceover/` stays.
+That replaces only `VoiceoverStation/` on each plugged stick (parallel, with a progress line per USB). Footage in `voiceover/` stays.
 
 ## Notes
 

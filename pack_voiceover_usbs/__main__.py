@@ -231,26 +231,91 @@ def _should_skip(path: Path, root: Path) -> bool:
     return False
 
 
-def copy_app_bundle(app_root: Path, dest: Path) -> None:
+_APP_INCLUDE_FILES = (
+    "requirements.txt",
+    "run.sh",
+    "run.bat",
+    "start-voiceover.sh",
+    "start-voiceover.bat",
+    "VOICEOVER.md",
+)
+
+_APP_PKG_IGNORE = {
+    "frontend",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+}
+
+
+def _should_skip_app_path(rel: Path) -> bool:
+    parts = set(rel.parts)
+    if parts & _APP_PKG_IGNORE:
+        return True
+    name = rel.name
+    if name.startswith(".") or name.startswith("._") or name == ".DS_Store":
+        return True
+    if name.endswith(".pyc"):
+        return True
+    return False
+
+
+def _iter_app_bundle_files(app_root: Path) -> list[tuple[Path, Path, int]]:
+    """(src, relative dest under VoiceoverStation, size) for the slim app bundle."""
+    app_root = app_root.expanduser().resolve()
+    files: list[tuple[Path, Path, int]] = []
+    for name in _APP_INCLUDE_FILES:
+        src = app_root / name
+        if not src.is_file():
+            continue
+        try:
+            size = src.stat().st_size
+        except OSError:
+            continue
+        files.append((src, Path(name), size))
+
+    src_pkg = app_root / "gopro_cleaner"
+    if not src_pkg.is_dir():
+        raise FileNotFoundError(f"Missing {src_pkg}")
+    for path in sorted(src_pkg.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src_pkg)
+        if _should_skip_app_path(rel):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        files.append((path, Path("gopro_cleaner") / rel, size))
+    return files
+
+
+def copy_app_bundle(
+    app_root: Path,
+    dest: Path,
+    progress: CopyProgress | None = None,
+) -> None:
     """Copy a runnable Voiceover Station without .venv / node_modules / .git."""
     app_root = app_root.expanduser().resolve()
     dest = dest.expanduser().resolve()
+    files = _iter_app_bundle_files(app_root)
+    if progress is not None and progress.total_bytes <= 0:
+        progress.total_bytes = sum(size for _, _, size in files) or 1
+
     if dest.exists():
+        if progress is not None:
+            progress.add(0, name="removing old app…")
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
 
-    include_files = [
-        "requirements.txt",
-        "run.sh",
-        "run.bat",
-        "start-voiceover.sh",
-        "start-voiceover.bat",
-        "VOICEOVER.md",
-    ]
-    for name in include_files:
-        src = app_root / name
-        if src.is_file():
-            shutil.copy2(src, dest / name)
+    for src, rel, _size in files:
+        dst = dest / rel
+        if progress is not None:
+            copy_file_progress(src, dst, progress, rel_name=rel.as_posix())
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
 
     # Make Mac double-click friendly.
     command = dest / "start-voiceover.command"
@@ -266,27 +331,11 @@ def copy_app_bundle(app_root: Path, dest: Path) -> None:
         if script.is_file():
             os.chmod(script, 0o755)
 
-    # Copy gopro_cleaner package + built web UI only.
-    src_pkg = app_root / "gopro_cleaner"
-    dst_pkg = dest / "gopro_cleaner"
-    if not src_pkg.is_dir():
-        raise FileNotFoundError(f"Missing {src_pkg}")
-    shutil.copytree(
-        src_pkg,
-        dst_pkg,
-        ignore=shutil.ignore_patterns(
-            "frontend",
-            "node_modules",
-            "__pycache__",
-            "*.pyc",
-            ".pytest_cache",
-            ".DS_Store",
-        ),
-    )
-    web = dst_pkg / "web"
+    web = dest / "gopro_cleaner" / "web"
     if not (web / "index.html").is_file() and not (web / "_shell.html").is_file():
         raise RuntimeError("gopro_cleaner/web UI build missing — run npm run build:flask first")
-
+    if progress is not None:
+        progress.finish()
 
 def _fmt_eta(seconds: float) -> str:
     if not (seconds >= 0) or seconds == float("inf"):
@@ -793,22 +842,69 @@ def cmd_update_app(args: argparse.Namespace) -> int:
     if not volumes:
         print("No external USB volumes found. Plug sticks in and retry.")
         return 1
-    print(f"Will update VoiceoverStation on {len(volumes)} volume(s):")
+
+    try:
+        app_files = _iter_app_bundle_files(app_root)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: cannot build app bundle from {app_root}: {exc}")
+        return 1
+    app_bytes = sum(size for _, _, size in app_files) or 1
+
+    print(f"Will update VoiceoverStation on {len(volumes)} volume(s) (~{_fmt_bytes(app_bytes)} each):")
     for v in volumes:
         print(f"  - {v}")
     confirm = input("Replace app folders now? [Y/n] ").strip().lower()
     if confirm in {"n", "no"}:
         print("Cancelled")
         return 0
+
+    # Short unique labels (many sticks say "NO NAME").
+    labels: list[str] = []
+    used: dict[str, int] = {}
     for volume in volumes:
+        base = volume.name or str(volume)
+        n = used.get(base, 0) + 1
+        used[base] = n
+        labels.append(base if n == 1 else f"{base} ({n})")
+
+    board = MultiProgressBoard(labels)
+    print("\nUpdating in parallel (one progress line per USB):\n")
+    for label in labels:
+        board.update(label, "starting…")
+
+    errors: list[str] = []
+
+    def _worker(volume: Path, label: str) -> None:
         dest = volume / "VoiceoverStation"
-        print(f"Updating {dest} …")
-        try:
-            copy_app_bundle(app_root, dest)
-            print(f"  OK → {dest}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ERROR {volume}: {exc}")
-    print("Done. Footage folders were not modified.")
+        progress = CopyProgress(
+            total_bytes=app_bytes,
+            label=label,
+            board=board,
+            quiet=True,
+        )
+        copy_app_bundle(app_root, dest, progress=progress)
+        board.finish_slot(label, f"DONE {_fmt_bytes(app_bytes)} → {dest}")
+
+    with ThreadPoolExecutor(max_workers=max(1, len(volumes))) as pool:
+        futures = {
+            pool.submit(_worker, volume, label): (volume, label)
+            for volume, label in zip(volumes, labels, strict=True)
+        }
+        for fut in as_completed(futures):
+            volume, label = futures[fut]
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{label} → {volume}: {exc}")
+                board.finish_slot(label, f"ERROR {exc}")
+
+    board.close()
+    if errors:
+        print("\nSome sticks failed:")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+    print("\nDone. Footage folders were not modified.")
     return 0
 
 

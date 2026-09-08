@@ -93,10 +93,13 @@ chmod +x run.sh
 5. Choose mode:
    - **SSD only** — free cards fast; upload to AWS later from the office
    - **SSD + AWS** — when each card finishes, CMD syncs the **whole flat batch folder** (`Batches/<batch>/` → `s3://…/<batch>/`) with **s5cmd** (plain sync first; `--numworkers 20` on failure). If an upload is already running, a follow-up resync is queued so files from later cards are not missed. UI shows progress and re-attaches after restarts.
-6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/`
-7. **Start SD → SSD for this batch** — continues dumping cards into that batch (UI shows each card’s live transfer)
-8. **Upload this batch to AWS (CMD)** — opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
-9. Plug SD cards — parallel copy with live MB/s / ETA; completed cards are verified, transferred files wiped, ejected
+   - **SD → AWS direct** — when SSDs are full: no local staging. Enter only a batch name (e.g. `batch32`). Cards upload paired **MP4 + JSON** straight to  
+     `s3://world-context-data-664427478457-ap-south-1-an/worldcontext-data/raw/batches/<batch>/`  
+     via **s5cmd**. Orphan MP4s (no JSON) are left on the card; verified pairs are wiped and the card ejects. Progress is on each card card in the UI.
+6. Paste S3 folder URI (not keys), e.g. `s3://your-bucket/footage/` — for direct mode the World Context batches base is prefilled
+7. **Start** — continues dumping/uploading cards into that batch (UI shows each card’s live transfer)
+8. **Upload this batch to AWS (CMD)** — SSD modes only; opens CMD (survives server restart) **and** shows live progress. Failed transfers auto-retry; use **Restart** in the job card if needed. After upload, **Verify sizes** compares local vs S3; only then use **Delete local** if you want to free the SSD
+9. Plug SD cards — parallel copy/upload with live MB/s / ETA; completed cards are verified, transferred files wiped, ejected
 
 ### Office resume example (batch 3 dumped at home, no internet)
 
@@ -172,5 +175,6 @@ Override: `SD_OFFLOADER_PORT=8899`
 
 - Wipe/eject happens only after size verification  
 - Only transferred, size-verified MP4s / sidecars / task folders under `DCIM/…GOPRO` are deleted on the card  
-- After upload the UI compares local vs S3 sizes; **Delete local** is optional and only enabled when verified
+- In **SD → AWS direct**, only verified **MP4+JSON pairs** are wiped; MP4s without JSON are left on the card  
+- After SSD→AWS upload the UI compares local vs S3 sizes; **Delete local** is optional and only enabled when verified
 - Config: `s5cmd_numworkers` (default 20 — used only after plain sync fails), `aws_upload_retries` (default 5) in `config.json`
