@@ -49,6 +49,7 @@
             Mode
             <select id="mode">
               <option value="ssd_and_aws">SSD + AWS (auto upload after each card · recommended)</option>
+              <option value="ssd_and_aws_full_v2">SSD + AWS (auto upload once SSD is full · v2)</option>
               <option value="ssd_only">SSD only (upload to AWS later)</option>
             </select>
           </label>
@@ -67,6 +68,10 @@
           </label>
         </div>
         <p id="batch-hint" class="hint">Existing batches appear after you pick SSD 1 / SSD 2.</p>
+        <label class="checkbox-row" title="v2 mode only — ignores ssd_full_reserve_gb for one card, then auto-resets">
+          <input type="checkbox" id="force-sync-next-card" />
+          Force sync after next card finishes (v2 only — ignore the SSD-full threshold, e.g. "this is my last card today")
+        </label>
         <div class="row actions">
           <button id="refresh-volumes" type="button" class="secondary">Refresh drives &amp; batches</button>
           <button id="start-session" type="button" class="primary">Start auto offload (SD → SSD → AWS)</button>
@@ -105,6 +110,25 @@
             <strong>Delete local</strong> only when verified.
           </p>
           <div id="aws-jobs" class="jobs"></div>
+
+          <div class="capacity" id="verify-batch-v2-box">
+            <div class="capacity-title">Whole-batch verify (v2)</div>
+            <p class="hint">
+              Per-job Verify sizes above can be scoped to only one SSD if that job was
+              created before a batch grew onto a second drive. This always rechecks the
+              batch's <strong>current</strong> footprint across every configured SSD, fresh,
+              every click — the answer to "is it really safe to wipe?"
+            </p>
+            <label>
+              Batch to verify
+              <input id="verify-batch-v2-name" type="text" placeholder="bach-31" />
+            </label>
+            <div class="actions">
+              <button type="button" id="verify-batch-v2-btn" class="secondary">Verify full batch (v2)</button>
+              <button type="button" id="delete-local-v2-btn" class="danger" disabled>Delete local — all SSDs (v2)</button>
+            </div>
+            <pre id="verify-batch-v2-result" class="hint"></pre>
+          </div>
         </div>
         <div>
           <h2>Log</h2>

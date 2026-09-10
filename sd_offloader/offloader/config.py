@@ -24,6 +24,10 @@ DEFAULT_CONFIG = {
     "s5cmd_numworkers": 20,  # s5cmd parallelism (helps 1 Gbps + flaky links)
     "aws_upload_retries": 5,  # auto-retries inside the CMD upload script
     "max_parallel_cards": 3,  # simultaneous SD→SSD copies (1–8)
+    "ssd_full_reserve_gb": 10,  # auto-start AWS sync once a selected SSD drops below this much free space
+    "slack_webhook_url": "",  # Slack Incoming Webhook URL — leave empty to disable alerts
+    "aws_auto_retry_max": 3,  # auto re-attempts after a hard sync failure, before giving up
+    "aws_auto_retry_delay_seconds": 300,  # wait between auto-retry attempts
 }
 
 

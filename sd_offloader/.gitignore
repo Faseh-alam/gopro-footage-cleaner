@@ -5,3 +5,5 @@ __pycache__/
 state/*.json
 state/aws_logs/
 *.log
+demo_ssd/
+*.dmg

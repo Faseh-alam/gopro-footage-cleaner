@@ -6,7 +6,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from . import __version__, aws_upload, batches, engine
+from . import __version__, aws_upload, batches, engine, ssd_full_upload_v2
 from .config import load_config, save_config
 from .detect import list_volumes
 
@@ -232,6 +232,68 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"ok": True, "job": job})
 
+    @app.post("/api/session/force-sync-next-card")
+    def session_force_sync_next_card():
+        """v2 addition: one-shot override — the next card's completion fires
+        the AWS sync immediately, ignoring ssd_full_reserve_gb. Only has any
+        effect in ssd_and_aws_full_v2 mode.
+        """
+        payload = request.get_json(silent=True) or {}
+        enabled = bool(payload.get("enabled", True))
+        return jsonify(engine.set_force_sync_next_card(enabled))
+
+    @app.post("/api/aws/verify-batch-v2")
+    def aws_verify_batch_v2():
+        """v2 addition: whole-batch verify, recomputed fresh across both SSDs
+        every call — not scoped to one job's possibly-stale sources snapshot.
+        """
+        payload = request.get_json(silent=True) or {}
+        cfg = load_config()
+        batch = str(payload.get("batch") or cfg.get("last_batch") or "").strip()
+        ssd1 = str(payload.get("ssd1") or cfg.get("ssd1") or "").strip()
+        ssd2 = str(payload.get("ssd2") or cfg.get("ssd2") or "").strip()
+        s3_uri = str(payload.get("s3_uri") or cfg.get("s3_uri") or "").strip()
+        if not batch:
+            return jsonify({"error": "batch required"}), 400
+        if not s3_uri:
+            return jsonify({"error": "s3_uri required"}), 400
+        try:
+            result = ssd_full_upload_v2.verify_batch_v2(
+                batch=batch, ssd1=ssd1, ssd2=ssd2, s3_uri=s3_uri
+            )
+            engine.log_message(
+                f"v2 whole-batch verify {batch}: "
+                f"{'OK' if result.get('ok') else 'MISMATCH'} "
+                f"local={result.get('local_bytes')} s3={result.get('s3_bytes')} "
+                f"roots={result.get('roots')}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "result": result})
+
+    @app.post("/api/aws/delete-local-batch-v2")
+    def aws_delete_local_batch_v2():
+        """v2 addition: delete local on every currently configured SSD for a
+        batch, gated on the fresh whole-batch verify above — not a specific job.
+        """
+        payload = request.get_json(silent=True) or {}
+        cfg = load_config()
+        batch = str(payload.get("batch") or cfg.get("last_batch") or "").strip()
+        ssd1 = str(payload.get("ssd1") or cfg.get("ssd1") or "").strip()
+        ssd2 = str(payload.get("ssd2") or cfg.get("ssd2") or "").strip()
+        s3_uri = str(payload.get("s3_uri") or cfg.get("s3_uri") or "").strip()
+        confirmed = bool(payload.get("confirmed"))
+        if not batch or not s3_uri:
+            return jsonify({"error": "batch and s3_uri required"}), 400
+        try:
+            result = ssd_full_upload_v2.delete_local_batch_v2(
+                batch=batch, ssd1=ssd1, ssd2=ssd2, s3_uri=s3_uri, confirmed=confirmed
+            )
+            engine.log_message(f"v2 whole-batch delete-local: {batch} -> {result.get('deleted')}")
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
     @app.post("/api/aws/test")
     def aws_test():
         payload = request.get_json(silent=True) or {}
@@ -287,6 +349,9 @@ def main() -> None:
             print("Background: restoring session / AWS job list…", flush=True)
             engine.restore_ui_state()
             print("Background: restore finished.", flush=True)
+            from . import ops_alerts_v2
+
+            ops_alerts_v2.ensure_started()  # v2 addition: Slack alerts + auto-retry watcher
         except Exception as exc:  # noqa: BLE001
             print(f"Background restore warning: {exc}", flush=True)
 

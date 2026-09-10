@@ -21,6 +21,11 @@ const el = {
   appVersion: document.getElementById("app-version"),
   maxParallel: document.getElementById("max-parallel"),
   capacityPanel: document.getElementById("capacity-panel"),
+  verifyBatchV2Name: document.getElementById("verify-batch-v2-name"),
+  verifyBatchV2Btn: document.getElementById("verify-batch-v2-btn"),
+  deleteLocalV2Btn: document.getElementById("delete-local-v2-btn"),
+  verifyBatchV2Result: document.getElementById("verify-batch-v2-result"),
+  forceSyncNextCard: document.getElementById("force-sync-next-card"),
 };
 
 async function api(url, options = {}) {
@@ -63,6 +68,27 @@ function formatEta(seconds) {
   if (h) return `${h}h ${m}m`;
   if (m) return `${m}m ${r}s`;
   return `${r}s`;
+}
+
+function diskLabelFromSource(sourcePath) {
+  // A job's `sources` are local folders like ".../SSD-1/Batches/bach-31" —
+  // pull out the disk name (the folder just above "Batches") for display.
+  if (!sourcePath) return null;
+  const parts = String(sourcePath).replace(/\\/g, "/").split("/").filter(Boolean);
+  const idx = parts.lastIndexOf("Batches");
+  if (idx > 0) return parts[idx - 1];
+  return parts[parts.length - 1] || null;
+}
+
+function formatJobScope(job) {
+  // The sync always covers the whole batch on every disk in `sources`, never
+  // just the triggering card (see aws_upload.start_batch_upload) — label it
+  // by disk, with the card noted only as what triggered this run, so it
+  // doesn't read as if the job were scoped to that one card.
+  const disks = (job.sources || []).map(diskLabelFromSource).filter(Boolean);
+  const diskLabel = disks.length ? disks.join(" + ") : "full batch";
+  const trigger = job.card_id ? ` — triggered by ${job.card_id}` : "";
+  return `${diskLabel}${trigger}`;
 }
 
 function setStatus(message, kind = "") {
@@ -327,9 +353,9 @@ function renderAwsJobs(jobs) {
     div.className = "job";
     div.innerHTML = `
       <div class="job-top">
-        <span><strong>${job.batch || "?"}</strong>${
-          job.card_id ? " / " + job.card_id : " · full batch"
-        }${job.uploader ? ` · ${job.uploader}` : ""}</span>
+        <span><strong>${job.batch || "?"}</strong> (${formatJobScope(job)})${
+          job.uploader ? ` · ${job.uploader}` : ""
+        }</span>
         <span class="phase ${job.status || ""}">${statusLabel}</span>
       </div>
       <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
@@ -520,6 +546,82 @@ async function deleteLocalAwsJob(jobId) {
   }
 }
 
+let lastVerifiedBatchV2 = null; // batch name the delete button is currently allowed to act on
+
+async function verifyBatchV2() {
+  const batch = (el.verifyBatchV2Name?.value || "").trim();
+  if (!batch) {
+    setStatus("Enter a batch name to verify", "error");
+    return;
+  }
+  el.deleteLocalV2Btn.disabled = true;
+  lastVerifiedBatchV2 = null;
+  try {
+    setStatus(`v2: verifying whole batch "${batch}" across every configured SSD…`);
+    const data = await api("/api/aws/verify-batch-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch,
+        ssd1: el.ssd1.value,
+        ssd2: el.ssd2.value,
+        s3_uri: el.s3Uri.value.trim(),
+      }),
+    });
+    const result = data.result || {};
+    el.verifyBatchV2Result.textContent = JSON.stringify(result, null, 2);
+    if (result.ok) {
+      setStatus(`v2: verified — every SSD for "${batch}" matches S3`, "ok");
+      lastVerifiedBatchV2 = batch;
+      el.deleteLocalV2Btn.disabled = false;
+    } else {
+      setStatus(
+        `v2: mismatch — local ${result.local_bytes} vs S3 ${result.s3_bytes} (Δ ${result.delta})`,
+        "error",
+      );
+    }
+  } catch (error) {
+    el.verifyBatchV2Result.textContent = "";
+    setStatus(error.message, "error");
+  }
+}
+
+async function deleteLocalBatchV2() {
+  const batch = (el.verifyBatchV2Name?.value || "").trim();
+  if (!batch || batch !== lastVerifiedBatchV2) {
+    setStatus("Run Verify full batch (v2) for this exact batch first", "error");
+    return;
+  }
+  if (
+    !window.confirm(
+      `Delete local data for "${batch}" on EVERY configured SSD?\n\nOnly do this after Verify full batch (v2) shows a match. This cannot be undone.`,
+    )
+  ) {
+    return;
+  }
+  try {
+    setStatus(`v2: deleting local for "${batch}" on all SSDs…`);
+    const data = await api("/api/aws/delete-local-batch-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch,
+        ssd1: el.ssd1.value,
+        ssd2: el.ssd2.value,
+        s3_uri: el.s3Uri.value.trim(),
+        confirmed: true,
+      }),
+    });
+    el.verifyBatchV2Result.textContent = JSON.stringify(data, null, 2);
+    setStatus(`v2: deleted local (${(data.deleted || []).length} folder(s))`, "ok");
+    lastVerifiedBatchV2 = null;
+    el.deleteLocalV2Btn.disabled = true;
+    await pollStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  }
+}
+
 function escapeHtml(text) {
   return text
     .replace(/&/g, "&amp;")
@@ -547,7 +649,11 @@ async function pollStatus() {
       const par = data.parallel || {};
       setStatus(
         `Hotplug armed · batch "${session.batch}" · ${
-          session.mode === "ssd_and_aws" ? "SSD→AWS auto" : "SSD only"
+          session.mode === "ssd_and_aws"
+            ? "SSD→AWS auto"
+            : session.mode === "ssd_and_aws_full_v2"
+              ? "SSD→AWS on full (v2)"
+              : "SSD only"
         } · insert/remove SDs anytime · ${par.active || 0}/${par.max || 3} SD slots`,
         "ok",
       );
@@ -556,6 +662,9 @@ async function pollStatus() {
     renderAwsJobs(data.aws_jobs || []);
     renderLog(data.log || []);
     renderCapacity(data.capacity, data.parallel);
+    if (el.forceSyncNextCard && document.activeElement !== el.forceSyncNextCard) {
+      el.forceSyncNextCard.checked = Boolean(session.force_sync_next_card);
+    }
   } catch {
     /* ignore transient */
   }
@@ -739,6 +848,37 @@ el.testAws?.addEventListener("click", async () => {
   } finally {
     el.testAws.disabled = false;
   }
+});
+
+el.forceSyncNextCard?.addEventListener("change", async () => {
+  const enabled = el.forceSyncNextCard.checked;
+  try {
+    await api("/api/session/force-sync-next-card", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    setStatus(
+      enabled
+        ? "Next card will force an AWS sync on completion (v2)"
+        : "Force-sync-next-card cancelled",
+      "ok",
+    );
+  } catch (error) {
+    el.forceSyncNextCard.checked = !enabled; // revert on failure
+    setStatus(error.message, "error");
+  }
+});
+
+el.verifyBatchV2Btn?.addEventListener("click", () => {
+  verifyBatchV2().catch((error) => setStatus(error.message, "error"));
+});
+el.deleteLocalV2Btn?.addEventListener("click", () => {
+  deleteLocalBatchV2().catch((error) => setStatus(error.message, "error"));
+});
+el.verifyBatchV2Name?.addEventListener("input", () => {
+  el.deleteLocalV2Btn.disabled = true;
+  lastVerifiedBatchV2 = null;
 });
 
 bootstrap().catch((error) => setStatus(error.message, "error"));

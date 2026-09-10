@@ -24,3 +24,8 @@ gopro_cleaner/frontend/.wrangler/
 
 # Optional local binaries (add your platform build if needed)
 bin/udtacopy
+*DEMO.md
+offload_demo/
+sd_offloader_demo/
+patches/
+demo_sd_card/

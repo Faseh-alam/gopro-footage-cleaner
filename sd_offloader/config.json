@@ -3,9 +3,13 @@
   "ssd1": "",
   "ssd2": "",
   "last_batch": "",
-  "mode": "ssd_only",
+  "mode": "ssd_and_aws_full_v2",
   "port": 8877,
   "s5cmd_numworkers": 20,
   "aws_upload_retries": 5,
-  "max_parallel_cards": 3
+  "max_parallel_cards": 3,
+  "ssd_full_reserve_gb": 10,
+  "slack_webhook_url": "",
+  "aws_auto_retry_max": 3,
+  "aws_auto_retry_delay_seconds": 300
 }

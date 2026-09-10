@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import aws_upload, eject, embed_meta, inventory, pairing, progress, space
+from . import aws_upload, eject, embed_meta, inventory, pairing, progress, space, ssd_full_upload_v2
 from .config import STATE_DIR, ensure_dirs, load_config, save_config
 from .detect import find_card_volumes, list_volumes
 from .transfer import copy_file
@@ -21,6 +21,11 @@ _session: dict = {
     "ssd2": "",
     "s3_uri": "",
     "started_at": None,
+    # v2 addition: one-shot manual override — operator can force the next
+    # card's completion to trigger an AWS sync immediately, ignoring the
+    # ssd_full_reserve_gb threshold (e.g. "this is my last card today").
+    # Consumed (reset to False) the moment it's used.
+    "force_sync_next_card": False,
 }
 _cards: dict[str, dict] = {}  # card_id -> job state
 _copy_threads: dict[str, threading.Thread] = {}
@@ -204,11 +209,11 @@ def start_session(
     batch = batch.strip()
     if not batch:
         raise ValueError("Batch name is required")
-    if mode not in {"ssd_only", "ssd_and_aws"}:
-        raise ValueError("mode must be ssd_only or ssd_and_aws")
+    if mode not in {"ssd_only", "ssd_and_aws", "ssd_and_aws_full_v2"}:
+        raise ValueError("mode must be ssd_only, ssd_and_aws, or ssd_and_aws_full_v2")
     if not ssd1 and not ssd2:
         raise ValueError("Pick at least one SSD")
-    if mode == "ssd_and_aws" and not s3_uri.strip():
+    if mode in {"ssd_and_aws", "ssd_and_aws_full_v2"} and not s3_uri.strip():
         raise ValueError("S3 URI required for SSD + AWS mode")
 
     ssd1_path = str(Path(ssd1).resolve()) if ssd1 else ""
@@ -262,6 +267,23 @@ def stop_session() -> dict:
     with _lock:
         _session["active"] = False
     _log_line("Session stopped (hotplug disarmed; in-flight copies continue)")
+    return get_status()
+
+
+def set_force_sync_next_card(enabled: bool) -> dict:
+    """v2 addition: one-shot override, consumed by the next card's completion.
+
+    Only has any effect in ``ssd_and_aws_full_v2`` mode — ignored by the
+    original per-card and manual-upload paths, which never check this flag.
+    """
+    with _lock:
+        _session["force_sync_next_card"] = bool(enabled)
+    _log_line(
+        "Next card will force an AWS sync on completion (ignoring the SSD-full threshold)"
+        if enabled
+        else "Force-sync-next-card cancelled",
+        kind="ok",
+    )
     return get_status()
 
 
@@ -598,6 +620,69 @@ def _active_copy_count() -> int:
         return sum(1 for t in _copy_threads.values() if t and t.is_alive())
 
 
+# How long a card's bytes_done can sit unchanged before we stop treating it
+# as "still legitimately copying" and start treating it as stuck. Not a cap
+# on total wait time — a healthy 256GB card can take 20-40+ minutes and that
+# must not be mistaken for stuck; this only fires on genuine zero progress.
+FORCE_SYNC_STALL_SECONDS = 300
+
+
+def _other_cards_copying(exclude_card_id: str) -> list[str]:
+    with _lock:
+        return [
+            cid
+            for cid, t in _copy_threads.items()
+            if cid != exclude_card_id and t and t.is_alive()
+        ]
+
+
+def _wait_for_other_cards_v2(card_id: str) -> None:
+    """v2 addition: a forced sync ("this is my last card") must capture every
+    card that was actually in-flight at that moment, not just whichever one
+    happens to finish first — with max_parallel_cards > 1, other cards can
+    still be mid-copy when the flagged card completes.
+
+    Waits on real progress (bytes_done increasing), not a wall-clock cap —
+    a big card that's still genuinely moving bytes must never be treated the
+    same as one that's actually stuck (dead reader, hung I/O). Only gives up
+    if NO tracked card has moved a single byte for FORCE_SYNC_STALL_SECONDS.
+    """
+    others = _other_cards_copying(card_id)
+    if not others:
+        return
+    _update_card(
+        card_id,
+        status="uploading",
+        message=f"Forced sync — waiting for {len(others)} other card(s) still copying: {', '.join(others)}",
+    )
+    _log_line(
+        f"{card_id}: forced sync waiting for in-flight card(s): {', '.join(others)}",
+        kind="ok",
+    )
+
+    last_bytes: dict[str, int] = {}
+    last_progress_at = time.time()
+    while True:
+        others = _other_cards_copying(card_id)
+        if not others:
+            return
+        with _lock:
+            current = {cid: int((_cards.get(cid) or {}).get("bytes_done") or 0) for cid in others}
+        progressed = any(current.get(cid, 0) > last_bytes.get(cid, -1) for cid in others)
+        if progressed:
+            last_progress_at = time.time()
+        last_bytes = current
+        stalled_for = time.time() - last_progress_at
+        if stalled_for > FORCE_SYNC_STALL_SECONDS:
+            _log_line(
+                f"{card_id}: forced sync proceeding — no byte progress from "
+                f"{others} for {int(stalled_for)}s (looks stuck, not just slow)",
+                kind="error",
+            )
+            return
+        time.sleep(2.0)
+
+
 def _pump_waiting_queue() -> None:
     """Start waiting card jobs when a parallel slot frees up."""
     while True:
@@ -678,7 +763,20 @@ def _start_card_job(
         return
 
     try:
-        ssd_path, _ = space.pick_ssd_for_bytes(ssd1=ssd1, ssd2=ssd2, needed_bytes=total)
+        # v2 mode: use the SAME "full" threshold for card placement as for the
+        # sync trigger. Otherwise a drive can get excluded from future cards
+        # (5GB margin) without that ever being the moment its own free space
+        # crossed the sync threshold (10GB default) — leaving it full and
+        # abandoned with no sync ever triggered. Old modes keep the original
+        # hardcoded 5GB margin, untouched.
+        placement_kwargs = (
+            {"reserve_bytes": ssd_full_upload_v2.ssd_full_reserve_bytes()}
+            if mode == "ssd_and_aws_full_v2"
+            else {}
+        )
+        ssd_path, _ = space.pick_ssd_for_bytes(
+            ssd1=ssd1, ssd2=ssd2, needed_bytes=total, **placement_kwargs
+        )
         dest = space.batch_root(ssd_path, batch)
         dest.mkdir(parents=True, exist_ok=True)
     except Exception as exc:  # noqa: BLE001
@@ -847,15 +945,53 @@ def _sidecar_stem(rel: str) -> str:
     return Path(rel).stem
 
 
-def _dest_batch_lock(dest: Path) -> threading.Lock:
-    key = str(dest.resolve()).lower()
+def _other_ssd_batch_root(dest: Path, batch: str) -> Path | None:
+    """The other configured SSD's batch folder for this batch, if it has one.
+
+    Read fresh from the live session (not a stale snapshot) so this stays
+    correct even if a card sat queued for a while before its worker started.
+    """
+    with _lock:
+        ssd1 = _session.get("ssd1") or ""
+        ssd2 = _session.get("ssd2") or ""
+    try:
+        current_ssd_root = dest.parent.parent.resolve()
+    except OSError:
+        return None
+    other_ssd = ""
+    if ssd1 and Path(ssd1).resolve() == current_ssd_root:
+        other_ssd = ssd2
+    elif ssd2 and Path(ssd2).resolve() == current_ssd_root:
+        other_ssd = ssd1
+    if not other_ssd:
+        return None
+    return space.batch_root(other_ssd, batch)
+
+
+def _dest_batch_lock(batch: str) -> threading.Lock:
+    """Locked per batch name, not per SSD destination folder.
+
+    A batch can span two SSDs (space.pick_ssd_for_bytes spills over once one
+    fills up). Locking per-destination-folder let two cards land on different
+    SSDs and resolve collision-safe names concurrently, each blind to the
+    other's folder — so two cards with the same GoPro filename could each
+    conclude the name was free and collide once both synced to the same S3
+    prefix. Locking by batch name serializes name resolution across both SSDs.
+    """
+    key = batch.strip().lower()
     with _lock:
         if key not in _batch_dest_locks:
             _batch_dest_locks[key] = threading.Lock()
         return _batch_dest_locks[key]
 
 
-def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str) -> None:
+def _resolve_dest_names(
+    files: list[dict],
+    dest: Path,
+    prog: dict,
+    card_id: str,
+    other_dest: Path | None = None,
+) -> None:
     """Assign collision-safe destination names into the flat batch folder.
 
     GoPro numbering repeats across cards (every card has a GX010001.MP4), so
@@ -863,7 +999,14 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
     the incoming pair is renamed to ``<stem>__<CARDID><ext>``. When the batch
     already holds the same video (size + sidecar identity), the existing name
     is reused so re-offloads do not create duplicates.
+
+    A batch can span two SSDs, so collisions are checked against ``dest`` AND
+    ``other_dest`` (the other configured SSD's folder for this same batch, if
+    it has one yet) — checking only ``dest`` would miss a same-named file
+    already sitting on the other drive, and both would end up syncing to the
+    same S3 key with nothing to tell them apart.
     """
+    roots = [dest] + ([other_dest] if other_dest else [])
     entries = prog.get("files") or {}
     stem_map: dict[str, str] = {}  # source MP4 stem -> final stem
 
@@ -903,15 +1046,19 @@ def _resolve_dest_names(files: list[dict], dest: Path, prog: dict, card_id: str)
         sidecar_payload = (
             pairing.load_sidecar(item["embed_json"]) if item.get("embed_json") else None
         )
-        existing = pairing.find_existing_dest_name(
-            dest, name, card_mp4_size=card_size, sidecar=sidecar_payload
-        )
+        existing = None
+        for root in roots:
+            existing = pairing.find_existing_dest_name(
+                root, name, card_mp4_size=card_size, sidecar=sidecar_payload
+            )
+            if existing:
+                break
         if existing:
             item["dest_rel"] = existing
             stem_map[base] = Path(existing).stem
             return
 
-        if (dest / name).exists():
+        if any((root / name).exists() for root in roots):
             final_base = f"{base}__{card_id.upper()}"
             item["dest_rel"] = f"{final_base}{Path(rel).suffix}"
             stem_map[base] = final_base
@@ -970,8 +1117,9 @@ def _copy_card_worker(
     files_done = 0
     task_names = sorted({f["task"] for f in files if f.get("task")})
     root_rels = sorted(f["rel"] for f in files if not f.get("task"))
-    with _dest_batch_lock(dest):
-        _resolve_dest_names(files, dest, prog, card_id)
+    other_dest = _other_ssd_batch_root(dest, batch)
+    with _dest_batch_lock(batch):
+        _resolve_dest_names(files, dest, prog, card_id, other_dest=other_dest)
     last_ui = 0.0
     last_live = 0
     last_speed_at = started
@@ -1209,6 +1357,30 @@ def _copy_card_worker(
                     message=f"SSD copy done; AWS failed to start: {exc}",
                 )
                 _log_line(f"{card_id}: AWS enqueue failed: {exc}", kind="error")
+        elif mode == "ssd_and_aws_full_v2" and s3_uri:
+            # v2 addition — separate module (ssd_full_upload_v2.py): sync only
+            # once the SSD is actually full, instead of after every card.
+            with _lock:
+                ssd1 = _session.get("ssd1") or ""
+                ssd2 = _session.get("ssd2") or ""
+                force = bool(_session.get("force_sync_next_card"))
+                if force:
+                    _session["force_sync_next_card"] = False  # one-shot — consume it now
+            if force:
+                _wait_for_other_cards_v2(card_id)
+            ssd_full_upload_v2.maybe_trigger_upload(
+                card_id=card_id,
+                dest=dest,
+                batch=batch,
+                s3_uri=s3_uri,
+                total_bytes=total_bytes,
+                ssd1=ssd1,
+                ssd2=ssd2,
+                update_card=_update_card,
+                log_line=_log_line,
+                skip_note=_skip_note,
+                force=force,
+            )
         else:
             _update_card(
                 card_id,
