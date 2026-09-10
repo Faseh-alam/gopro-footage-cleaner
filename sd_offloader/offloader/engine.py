@@ -1116,7 +1116,9 @@ def _copy_card_worker(
     done_bytes = 0
     files_done = 0
     task_names = sorted({f["task"] for f in files if f.get("task")})
-    root_rels = sorted(f["rel"] for f in files if not f.get("task"))
+    root_items = [f for f in files if not f.get("task")]
+    root_rels = sorted(f["rel"] for f in root_items)
+    root_sources = [str(f["source"]) for f in root_items]
     other_dest = _other_ssd_batch_root(dest, batch)
     with _dest_batch_lock(batch):
         _resolve_dest_names(files, dest, prog, card_id, other_dest=other_dest)
@@ -1302,7 +1304,9 @@ def _copy_card_worker(
         try:
             _update_card(card_id, status="wiping", message="Wiping transferred files on card…")
             # Keep completed semantics if wipe/eject races the watcher.
-            eject.wipe_transferred_tasks(card_root, task_names, root_rels)
+            eject.wipe_transferred_tasks(
+                card_root, task_names, root_rels, source_paths=root_sources
+            )
         except Exception as wipe_exc:  # noqa: BLE001
             _log_line(f"{card_id}: wipe warning — {wipe_exc}", kind="error")
 

@@ -135,9 +135,18 @@ def maybe_trigger_upload(
             message=f"SSD copy done; AWS failed to start: {exc}",
         )
         log_line(f"{card_id}: AWS enqueue failed: {exc}", kind="error")
+        disks = " + ".join(
+            slack_alert.disk_label_from_path(s) for s in (ssd1, ssd2) if s
+        )
         slack_alert.send_alert(
-            f":rotating_light: Offloader — AWS upload failed to *start* for batch "
-            f"`{batch}` ({reason} after card {card_id}): {exc}"
+            "AWS upload failed to start"
+            + slack_alert.format_context(batch=batch, disks=disks, card=card_id),
+            severity="critical",
+            fields=[
+                ("Batch", batch),
+                ("Triggered by", f"{reason} after card {card_id}"),
+                ("Error", str(exc)),
+            ],
         )
 
 

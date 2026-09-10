@@ -34,6 +34,8 @@ _TERMINAL_RESET_STATUSES = {"completed", "verified", "cancelled", "deleted_local
 _lock = threading.Lock()
 _started = False
 _seen: dict[str, dict] = {}  # job_id -> {"retry_in_flight": bool, "last_status": str}
+_seen_cards: dict[str, str] = {}  # card_id -> last_status, for SD->SSD card-copy error alerts
+_CARD_ALERT_STATUSES = {"error", "interrupted"}  # not "cancelled" -- that's a deliberate operator action
 
 
 def ensure_started() -> None:
@@ -68,7 +70,60 @@ def _watch_loop() -> None:
             _scan_once()
         except Exception:  # noqa: BLE001 — a watcher bug must never crash the server
             pass
+        try:
+            _scan_cards_once()
+        except Exception:  # noqa: BLE001
+            pass
         time.sleep(_POLL_SECONDS)
+
+
+def _scan_cards_once() -> None:
+    """Alert on SD->SSD card-copy problems (disk full, no space on either SSD,
+    interrupted mid-copy, etc.) — separate from the AWS-job watching above,
+    since a card failing during the SD->SSD leg never even reaches an AWS
+    job at all. Fires once per fresh transition into error/interrupted, same
+    dedup approach as the mismatch alert (not on every 5s poll while it sits
+    there waiting for a manual Retry).
+    """
+    status_payload = engine.get_status()
+    batch = str((status_payload.get("session") or {}).get("batch") or "")
+    for card in status_payload.get("cards") or []:
+        card_id = str(card.get("card_id") or "")
+        if not card_id:
+            continue
+        status = str(card.get("status") or "")
+        with _lock:
+            last_status = _seen_cards.get(card_id, "")
+            already_flagged = last_status == status and status in _CARD_ALERT_STATUSES
+            _seen_cards[card_id] = status
+        if status in _CARD_ALERT_STATUSES and not already_flagged:
+            _handle_card_problem(card, batch=batch)
+
+
+def _handle_card_problem(card: dict, *, batch: str = "") -> None:
+    card_id = card.get("card_id")
+    status = card.get("status")
+    bytes_done = int(card.get("bytes_done") or 0)
+    bytes_total = int(card.get("bytes_total") or 0)
+    pct = f"{(bytes_done / bytes_total * 100):.0f}%" if bytes_total else "?"
+    severity = "critical" if status == "error" else "warning"
+    disk = slack_alert.disk_label_from_path(card.get("dest"))
+    slack_alert.send_alert(
+        f"Card {status}"
+        + slack_alert.format_context(batch=batch, disks=disk, card=str(card_id or "")),
+        severity=severity,
+        fields=[
+            ("Card", str(card_id)),
+            ("Mount", str(card.get("mount"))),
+            ("Destination", str(card.get("dest"))),
+            (
+                "Progress when it stopped",
+                f"{card.get('files_done', 0)}/{card.get('files_total', 0)} files, "
+                f"{pct} ({bytes_done}/{bytes_total} bytes)",
+            ),
+        ],
+        detail=str(card.get("message") or ""),
+    )
 
 
 def _scan_once() -> None:
@@ -118,22 +173,36 @@ def _retry_cycle(job_id: str) -> None:
             job = aws_upload.get_job(job_id) or {}
             batch = job.get("batch")
             dest = job.get("dest")
+            disks = slack_alert.disks_from_sources(job.get("sources"))
+            card_id = job.get("card_id")
+            context = slack_alert.format_context(batch=str(batch or ""), disks=disks, card=str(card_id or ""))
             tail = "\n".join(str(line) for line in (job.get("log") or [])[-5:])
             attempt += 1
 
             if attempt > max_retries:
                 slack_alert.send_alert(
-                    f":x: Offloader — AWS sync for batch `{batch}` → `{dest}` failed "
-                    f"{max_retries} time(s) and gave up auto-retrying. "
-                    f"*Manual Retry needed* in the offloader UI.\nLast log lines:\n{tail}"
+                    "AWS sync gave up auto-retrying" + context,
+                    severity="critical",
+                    fields=[
+                        ("Batch", str(batch)),
+                        ("Destination", str(dest)),
+                        ("Attempts", str(max_retries)),
+                        ("Action needed", "Manual Retry in the offloader UI"),
+                    ],
+                    detail=tail,
                 )
                 return
 
             delay = _auto_retry_delay_seconds()
             slack_alert.send_alert(
-                f":warning: Offloader — AWS sync failed for batch `{batch}` → `{dest}` "
-                f"(attempt {attempt}/{max_retries}). Auto-retrying in {int(delay)}s.\n"
-                f"Last log lines:\n{tail}"
+                f"AWS sync failed — retrying ({attempt}/{max_retries})" + context,
+                severity="warning",
+                fields=[
+                    ("Batch", str(batch)),
+                    ("Destination", str(dest)),
+                    ("Retrying in", f"{int(delay)}s"),
+                ],
+                detail=tail,
             )
             time.sleep(max(0.0, delay))
 
@@ -144,7 +213,9 @@ def _retry_cycle(job_id: str) -> None:
                 aws_upload.restart_job(job_id)
             except Exception as exc:  # noqa: BLE001
                 slack_alert.send_alert(
-                    f":x: Offloader — auto-retry could not start for `{job_id}`: {exc}"
+                    "Auto-retry could not start" + context,
+                    severity="critical",
+                    fields=[("Job", str(job_id)), ("Batch", str(batch)), ("Error", str(exc))],
                 )
                 return
 
@@ -204,8 +275,19 @@ def _handle_mismatch(job: dict) -> None:
             kind="ok",
         )
         return
+    disks = slack_alert.disks_from_sources(job.get("sources"))
+    context = slack_alert.format_context(
+        batch=str(job.get("batch") or ""), disks=disks, card=str(job.get("card_id") or "")
+    )
     slack_alert.send_alert(
-        f":warning: Offloader — size mismatch after upload for batch `{job.get('batch')}` → "
-        f"`{job.get('dest')}`: local {job.get('local_bytes')} vs S3 {job.get('s3_bytes')} "
-        f"(Δ {job.get('size_delta')}). Manual Retry recommended."
+        "Size mismatch after upload" + context,
+        severity="warning",
+        fields=[
+            ("Batch", str(job.get("batch"))),
+            ("Destination", str(job.get("dest"))),
+            ("Local bytes", str(job.get("local_bytes"))),
+            ("S3 bytes", str(job.get("s3_bytes"))),
+            ("Delta", str(job.get("size_delta"))),
+            ("Action needed", "Manual Retry recommended"),
+        ],
     )

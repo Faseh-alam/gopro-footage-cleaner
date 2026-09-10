@@ -65,6 +65,11 @@ def make_card(root: Path, *, with_sidecar: dict | None, legacy: bool = False) ->
         make_mp4(folder / "GX019999.MP4")
         (gopro / "GX010001.THM").write_bytes(b"junk")
         (gopro / "GX010001.LRV").write_bytes(b"junk")
+        (gopro / "GL010001.LRV").write_bytes(b"proxy")
+        (gopro / "GX010001.txt").write_text("meta", encoding="utf-8")
+        (gopro / "GX010001.json").write_text("{}", encoding="utf-8")
+        (gopro / "GX010001.segments.txt").write_text("notes", encoding="utf-8")
+        (gopro / "GX010002.THM").write_bytes(b"keep")
     return gopro
 
 
@@ -271,13 +276,21 @@ def main() -> int:
     print("\n[7] wipe transferred files on card A")
     task_names = sorted({f["task"] for f in files_a if f.get("task")})
     root_rels = sorted(f["rel"] for f in files_a if not f.get("task"))
-    eject.wipe_transferred_tasks(card_a, task_names, root_rels)
+    root_sources = [str(f["source"]) for f in files_a if not f.get("task")]
+    eject.wipe_transferred_tasks(card_a, task_names, root_rels, source_paths=root_sources)
     check("labeled root pair removed",
           not (gopro_a / "GX010001.MP4").exists()
           and not (gopro_a / "GX010001.segments.json").exists())
+    check("clip companions wiped (THM/LRV/txt/json)",
+          not (gopro_a / "GX010001.THM").exists()
+          and not (gopro_a / "GX010001.LRV").exists()
+          and not (gopro_a / "GL010001.LRV").exists()
+          and not (gopro_a / "GX010001.txt").exists()
+          and not (gopro_a / "GX010001.json").exists()
+          and not (gopro_a / "GX010001.segments.txt").exists())
     check("unlabeled MP4 left on card", (gopro_a / "GX010002.MP4").exists())
+    check("unlabeled companions left on card", (gopro_a / "GX010002.THM").exists())
     check("legacy task folder removed", not (gopro_a / "pipe-welding").exists())
-    check("junk untouched (THM/LRV stay)", (gopro_a / "GX010001.THM").exists())
     check("progress file cleared", progress.load_progress(card_a) is None)
 
     shutil.rmtree(tmp, ignore_errors=True)
