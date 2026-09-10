@@ -51,3 +51,17 @@ CHECKLIST_UI = [
     "Also describe environment as if to a blind person.",
     "Aim for ≥25 words per minute; pause-and-describe on fast actions.",
 ]
+
+# Manual QA gates required before Finish & Export (Lightly P0).
+QA_GATES = [
+    {"id": "egocentric", "label": "Egocentric POV confirmed"},
+    {"id": "wearer_task", "label": "Wearer is performing the task"},
+    {"id": "pii_clear", "label": "PII reviewed — no visible/audible PII remains"},
+    {"id": "action_visible", "label": "Main action is clearly visible"},
+    {"id": "not_repetitive", "label": "Source clip is not dominated by repeated identical actions"},
+    {"id": "human_only", "label": "Human narration only (no TTS / synthetic voice)"},
+    {"id": "task_narration", "label": "Narration includes task actions"},
+    {"id": "env_narration", "label": "Narration includes environment description"},
+    {"id": "audio_clear", "label": "Audio is clear"},
+    {"id": "no_reuse", "label": "No narration/audio reused from another clip"},
+]

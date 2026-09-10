@@ -38,6 +38,11 @@ class MediaInfo:
     audio_index: int | None
     gpmf_index: int | None
     has_gpmf: bool
+    width: int | None = None
+    height: int | None = None
+    video_codec: str | None = None
+    rotation: int | None = None
+    audio_stream_count: int = 0
 
 
 def is_video_file(path: Path) -> bool:
@@ -106,6 +111,12 @@ def probe_media(path: Path) -> MediaInfo:
     video_index = None
     audio_index = None
     gpmf_index = None
+    width = None
+    height = None
+    video_codec = None
+    rotation = None
+    audio_stream_count = 0
+    format_tags = (payload.get("format") or {}).get("tags") or {}
 
     for stream in payload.get("streams", []):
         info = StreamInfo(
@@ -118,8 +129,26 @@ def probe_media(path: Path) -> MediaInfo:
         streams.append(info)
         if info.codec_type == "video" and video_index is None:
             video_index = info.index
-        elif info.codec_type == "audio" and audio_index is None:
-            audio_index = info.index
+            video_codec = info.codec_name
+            try:
+                width = int(stream.get("width") or 0) or None
+                height = int(stream.get("height") or 0) or None
+            except (TypeError, ValueError):
+                width = height = None
+            tags = stream.get("tags") or {}
+            rot_raw = tags.get("rotate") or format_tags.get("rotate")
+            for sd in stream.get("side_data_list") or []:
+                if isinstance(sd, dict) and sd.get("rotation") is not None:
+                    rot_raw = sd.get("rotation")
+                    break
+            try:
+                rotation = int(float(rot_raw)) if rot_raw is not None else 0
+            except (TypeError, ValueError):
+                rotation = 0
+        elif info.codec_type == "audio":
+            audio_stream_count += 1
+            if audio_index is None:
+                audio_index = info.index
         elif _is_gpmf_stream(stream):
             gpmf_index = info.index
 
@@ -135,6 +164,11 @@ def probe_media(path: Path) -> MediaInfo:
         audio_index=audio_index,
         gpmf_index=gpmf_index,
         has_gpmf=gpmf_index is not None,
+        width=width,
+        height=height,
+        video_codec=video_codec,
+        rotation=rotation,
+        audio_stream_count=audio_stream_count,
     )
     with _probe_cache_lock:
         if len(_probe_cache) >= _PROBE_CACHE_MAX:

@@ -33,6 +33,11 @@ class VoiceoverClip:
     has_gpmf: bool
     done: bool
     pending: bool = False
+    width: int | None = None
+    height: int | None = None
+    video_codec: str | None = None
+    rotation: int | None = None
+    narrated_path: str | None = None
 
 
 def _now_iso() -> str:
@@ -100,6 +105,12 @@ def _is_junk(path: Path) -> bool:
         return True
     if lower.endswith(".voiceover-pending.webm"):
         return True
+    if lower.endswith(".narrated.mp4"):
+        return True
+    if lower.endswith(".session_events.json"):
+        return True
+    if lower.endswith(".narration.wav"):
+        return True
     if lower == PROGRESS_NAME:
         return True
     return False
@@ -131,6 +142,8 @@ def scan_voiceover_tree(root: Path) -> dict:
         except Exception:  # noqa: BLE001
             media = None
         key = str(video.resolve())
+        narrated = video.with_name(f"{video.stem}.narrated.mp4")
+        narrated_ok = narrated.is_file() and narrated.stat().st_size > 1024
         clip = VoiceoverClip(
             path=video.resolve(),
             name=video.name,
@@ -138,8 +151,13 @@ def scan_voiceover_tree(root: Path) -> dict:
             duration=media.duration if media else None,
             size_bytes=video.stat().st_size,
             has_gpmf=bool(media and media.has_gpmf),
-            done=key in done_map,
+            done=key in done_map or narrated_ok,
             pending=has_pending_take(video),
+            width=media.width if media else None,
+            height=media.height if media else None,
+            video_codec=media.video_codec if media else None,
+            rotation=media.rotation if media else None,
+            narrated_path=str(narrated.resolve()) if narrated_ok else None,
         )
         classes.setdefault(class_name, []).append(clip)
 
@@ -175,6 +193,11 @@ def scan_voiceover_tree(root: Path) -> dict:
                         "has_gpmf": c.has_gpmf,
                         "done": c.done,
                         "pending": c.pending,
+                        "narrated_path": c.narrated_path,
+                        "width": c.width,
+                        "height": c.height,
+                        "video_codec": c.video_codec,
+                        "rotation": c.rotation,
                     }
                     for c in clips
                 ],

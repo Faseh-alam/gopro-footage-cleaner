@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ from flask import Blueprint, jsonify, request, send_file
 from .core import voiceover_store
 from .core.folder_picker import pick_folder
 from .core.probe import probe_media
+from .core.voiceover_timeline import MAX_DURATION_S, MIN_DURATION_S, MIN_HEIGHT
 
 
 def create_voiceover_blueprint() -> Blueprint:
@@ -73,7 +75,11 @@ def create_voiceover_blueprint() -> Blueprint:
 
     @vo.post("/api/voiceover/save-take")
     def voiceover_save_take():
-        """Upload recorded audio and rewrite that same video path in place."""
+        """Upload recorded audio and rewrite that same video path in place.
+
+        Legacy path (no pause timeline). Prefer ``/api/voiceover/export-narration``
+        for Lightly P0 freeze-frame exports that leave the source untouched.
+        """
         video_path = str(request.form.get("path") or "").strip()
         root = str(request.form.get("root") or "").strip()
         narrator = str(request.form.get("narrator") or "").strip()
@@ -131,6 +137,102 @@ def create_voiceover_blueprint() -> Blueprint:
                 except OSError:
                     pass
 
+    @vo.post("/api/voiceover/export-narration")
+    def voiceover_export_narration():
+        """Pause-aware export: freeze frames during SPACE pauses; source unchanged."""
+        from .core import voiceover_timeline
+        from .core.narration_guidelines import QA_GATES
+
+        video_path = str(request.form.get("path") or "").strip()
+        root = str(request.form.get("root") or "").strip()
+        narrator = str(request.form.get("narrator") or "").strip()
+        mic = str(request.form.get("mic") or "").strip()
+        events_raw = str(request.form.get("events") or "[]")
+        session_end_raw = str(request.form.get("session_end") or "").strip()
+        qa_raw = str(request.form.get("qa") or "{}")
+        audio = request.files.get("audio")
+        if not video_path:
+            return jsonify({"error": "path is required"}), 400
+        if audio is None or not audio.filename:
+            return jsonify({"error": "audio file is required"}), 400
+
+        try:
+            events = json.loads(events_raw) if events_raw else []
+            if not isinstance(events, list):
+                raise ValueError("events must be a JSON list")
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({"error": f"Invalid events JSON: {exc}"}), 400
+
+        try:
+            qa = json.loads(qa_raw) if qa_raw else {}
+            if not isinstance(qa, dict):
+                raise ValueError("qa must be an object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({"error": f"Invalid qa JSON: {exc}"}), 400
+
+        missing = [g["id"] for g in QA_GATES if not qa.get(g["id"])]
+        if missing:
+            return (
+                jsonify(
+                    {
+                        "error": "Tick every QA checkbox before export",
+                        "missing_qa": missing,
+                    }
+                ),
+                400,
+            )
+
+        session_end = None
+        if session_end_raw:
+            try:
+                session_end = float(session_end_raw)
+            except ValueError:
+                session_end = None
+
+        suffix = Path(audio.filename).suffix.lower() or ".webm"
+        temp_audio = None
+        try:
+            source = Path(video_path).expanduser().resolve(strict=True)
+            raw = audio.read()
+            if not raw:
+                return jsonify({"error": "empty audio upload"}), 400
+            temp_audio = voiceover_store.save_uploaded_audio(raw, suffix=suffix)
+            # Keep pending copy of the take for recovery.
+            voiceover_store.save_pending_take(source, temp_audio)
+            result = voiceover_timeline.export_pause_aware(
+                source,
+                temp_audio,
+                events=events,
+                session_end=session_end,
+            )
+            if root:
+                try:
+                    voiceover_store.mark_done(
+                        Path(root),
+                        source,
+                        narrator=narrator,
+                        mic=mic,
+                    )
+                except OSError:
+                    pass
+            return jsonify(result)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            if temp_audio is not None:
+                try:
+                    temp_audio.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @vo.get("/api/voiceover/qa-gates")
+    def voiceover_qa_gates():
+        from .core.narration_guidelines import QA_GATES
+
+        return jsonify({"ok": True, "gates": QA_GATES})
+
     @vo.post("/api/voiceover/attach-pending")
     def voiceover_attach_pending():
         """Mux a saved pending take into the original clip (retry / later attach)."""
@@ -166,6 +268,16 @@ def create_voiceover_blueprint() -> Blueprint:
             return jsonify({"error": "File not found"}), 404
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": str(exc)}), 400
+        dur = float(media.duration or 0)
+        height = int(media.height or 0)
+        warnings: list[str] = []
+        blocks: list[str] = []
+        if dur > 0 and dur < MIN_DURATION_S:
+            blocks.append(f"Source is only {dur:.1f}s — need at least {MIN_DURATION_S:.0f}s")
+        if dur > MAX_DURATION_S:
+            blocks.append(f"Source is {dur:.1f}s — max export is {MAX_DURATION_S:.0f}s")
+        if 0 < height < MIN_HEIGHT:
+            warnings.append(f"Source is {media.width}x{height} — below 1080p")
         return jsonify(
             {
                 "ok": True,
@@ -173,6 +285,14 @@ def create_voiceover_blueprint() -> Blueprint:
                 "duration": media.duration,
                 "size_bytes": media.size_bytes,
                 "has_gpmf": media.has_gpmf,
+                "width": media.width,
+                "height": media.height,
+                "video_codec": media.video_codec,
+                "rotation": media.rotation,
+                "audio_stream_count": media.audio_stream_count,
+                "warnings": warnings,
+                "blocks": blocks,
+                "can_start": len(blocks) == 0,
             }
         )
 
