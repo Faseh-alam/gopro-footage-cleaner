@@ -317,13 +317,26 @@ def copy_app_bundle(
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
-    # Make Mac double-click friendly.
+    # Never ship a broken USB .venv (FAT cannot hold Python symlinks).
+    for junk in (dest / ".venv", dest / "venv"):
+        if junk.exists():
+            shutil.rmtree(junk, ignore_errors=True)
+
+    # Make Mac double-click friendly; keep window open on errors.
     command = dest / "start-voiceover.command"
     command.write_text(
         "#!/bin/bash\n"
-        'cd "$(dirname "$0")"\n'
-        'chmod +x ./start-voiceover.sh ./run.sh 2>/dev/null || true\n'
-        './start-voiceover.sh\n',
+        'cd "$(dirname "$0")" || exit 1\n'
+        "chmod +x ./start-voiceover.sh ./run.sh 2>/dev/null || true\n"
+        "set +e\n"
+        "./start-voiceover.sh\n"
+        "status=$?\n"
+        "if [[ $status -ne 0 ]]; then\n"
+        '  echo ""\n'
+        '  echo "Voiceover Station exited with an error ($status)."\n'
+        '  read -r -p "Press Enter to close…" _\n'
+        "fi\n"
+        "exit $status\n",
         encoding="utf-8",
     )
     os.chmod(command, 0o755)

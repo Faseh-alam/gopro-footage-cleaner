@@ -8,7 +8,18 @@ cd /d "%~dp0"
 set "PORT=8765"
 if defined GOPRO_CLEANER_PORT set "PORT=%GOPRO_CLEANER_PORT%"
 
-set "VENV_PY=%CD%\.venv\Scripts\python.exe"
+:: Prefer a local venv when running from USB/FAT (symlinks break on removable media).
+set "VENV_DIR=%CD%\.venv"
+echo %CD%| findstr /I /C:":\\" >nul
+for %%I in ("%CD%") do set "DRIVE=%%~dI"
+:: Removable / USB heuristic: always use LocalAppData for VoiceoverStation copies on USB letters
+:: that are not the system drive. Also used when .venv create fails.
+set "LOCAL_VENV=%LOCALAPPDATA%\WorldContext\VoiceoverStation\venv"
+if /I not "%DRIVE%"=="%SystemDrive%" (
+  set "VENV_DIR=%LOCAL_VENV%"
+)
+
+set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "WEB_DIR=%CD%\gopro_cleaner\web"
 set "FRONTEND_DIR=%CD%\gopro_cleaner\frontend"
 
@@ -25,7 +36,15 @@ if %ERRORLEVEL%==0 (
 
 if not exist "%VENV_PY%" (
   echo Creating virtual environment...
-  %SYS_PY% -m venv .venv
+  echo   location: %VENV_DIR%
+  if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%" >nul 2>&1
+  mkdir "%LOCALAPPDATA%\WorldContext\VoiceoverStation" >nul 2>&1
+  mkdir "%CD%\.venv_parent_placeholder" >nul 2>&1
+  rmdir "%CD%\.venv_parent_placeholder" >nul 2>&1
+  %SYS_PY% -m venv --copies "%VENV_DIR%"
+  if errorlevel 1 (
+    %SYS_PY% -m venv "%VENV_DIR%"
+  )
   if errorlevel 1 (
     echo.
     echo Failed to create venv. Install Python 3.10+ from https://python.org
