@@ -37,6 +37,17 @@ class TimelineSegmentTests(unittest.TestCase):
         self.assertAlmostEqual(total, 15.0, places=2)
         self.assertTrue(any(s.kind == "freeze" for s in segs))
 
+    def test_research_break_is_excluded(self) -> None:
+        events = [
+            {"type": "play", "session_t": 0.0, "video_t": 0.0},
+            {"type": "research_pause", "session_t": 10.0, "video_t": 10.0},
+            {"type": "research_resume", "session_t": 10.0, "video_t": 10.0},
+            {"type": "stop", "session_t": 20.0, "video_t": 20.0},
+        ]
+        segs = build_segments_from_events(events, source_duration=60.0)
+        self.assertFalse(any(s.kind == "freeze" for s in segs))
+        self.assertAlmostEqual(segments_total_duration(segs), 20.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

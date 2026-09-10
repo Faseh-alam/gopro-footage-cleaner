@@ -7,7 +7,10 @@ freeze-frame of the same duration, then muxes narrator audio as the only track.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -38,13 +41,34 @@ def _f(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def move_across_volumes(src: Path, dest: Path) -> None:
+    """Move ``src`` → ``dest`` even when USB/local are different devices (no EXDEV)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.replace(src, dest)
+        return
+    except OSError as exc:
+        # Cross-device rename fails with errno.EXDEV ("cross-device link").
+        if getattr(exc, "errno", None) not in {errno.EXDEV, 18}:
+            # Still fall back to copy — FAT/USB can be quirky.
+            pass
+    shutil.copy2(src, dest)
+    src.unlink(missing_ok=True)
+
+
 def build_segments_from_events(
     events: list[dict],
     *,
     source_duration: float,
     session_end: float | None = None,
 ) -> list[TimelineSegment]:
-    """Turn play/pause/resume/stop events into play + freeze segments."""
+    """Turn play/pause/resume/stop events into play + freeze segments.
+
+    ``research_pause`` / ``research_resume`` gaps are skipped (lookup time is not
+    in the final video or audio). SPACE ``pause`` becomes a freeze-frame.
+    """
     source_duration = max(0.0, float(source_duration or 0.0))
     if not events:
         # No log — treat whole session as continuous play (legacy).
@@ -63,11 +87,17 @@ def build_segments_from_events(
     first = str(ordered[0].get("type") or "").lower()
     if first in {"pause"}:
         state = "paused"
+    elif first in {"research_pause"}:
+        state = "research"
 
     def flush(until_session: float) -> None:
         nonlocal last_session, last_video
         dt = until_session - last_session
         if dt <= 0.001:
+            return
+        if state == "research":
+            # Lookup / ask-lead break — do not freeze or play this gap.
+            last_session = until_session
             return
         if state == "playing":
             if source_duration > 0:
@@ -105,6 +135,14 @@ def build_segments_from_events(
 
         if etype == "pause":
             state = "paused"
+            last_video = video_t
+        elif etype == "research_pause":
+            state = "research"
+            last_video = video_t
+        elif etype == "research_resume":
+            # Continue narration; both mic + video resume from this frame.
+            last_session = max(last_session, session_t)
+            state = "playing"
             last_video = video_t
         elif etype in {"play", "resume"}:
             state = "playing"
@@ -394,12 +432,12 @@ def export_pause_aware(
             raise RuntimeError(err[:800])
 
         out.parent.mkdir(parents=True, exist_ok=True)
-        if out.exists():
-            out.unlink()
-        partial.replace(out)
+        move_across_volumes(partial, out)
 
         if save_wav:
-            convert_audio_to_wav(audio_path, wav_path)
+            local_wav = work / "narration.wav"
+            convert_audio_to_wav(audio_path, local_wav)
+            move_across_volumes(local_wav, wav_path)
         if save_events:
             payload = {
                 "version": 1,
@@ -420,7 +458,10 @@ def export_pause_aware(
                 ],
                 "timeline_duration": round(total, 6),
             }
-            events_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            # Write JSON locally then copy — safer on FAT USB.
+            local_events = work / "session_events.json"
+            local_events.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            move_across_volumes(local_events, events_path)
 
         validation = validate_export_mp4(out, source_height=media.height)
         return {
@@ -439,6 +480,4 @@ def export_pause_aware(
             ),
         }
     finally:
-        import shutil
-
         shutil.rmtree(work, ignore_errors=True)

@@ -53,7 +53,7 @@ type ClassRow = {
 };
 
 type SessionEvent = {
-  type: "play" | "pause" | "resume" | "stop";
+  type: "play" | "pause" | "resume" | "stop" | "research_pause" | "research_resume";
   session_t: number;
   video_t: number;
 };
@@ -121,6 +121,9 @@ function VoiceoverPage() {
   const eventsRef = useRef<SessionEvent[]>([]);
   const videoWasPlayingRef = useRef(false);
   const peakLevelRef = useRef(0);
+  const researchBreakRef = useRef(false);
+  const researchPausedAtRef = useRef<number | null>(null);
+  const researchAccumulatedMsRef = useRef(0);
 
   const [root, setRoot] = useState("");
   const [classes, setClasses] = useState<ClassRow[]>([]);
@@ -157,8 +160,18 @@ function VoiceoverPage() {
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [reviewPath, setReviewPath] = useState<string | null>(null);
   const [reviewMode, setReviewMode] = useState(false);
+  const [researchBreak, setResearchBreak] = useState(false);
 
   recordingRef.current = recording;
+  researchBreakRef.current = researchBreak;
+
+  const effectiveSessionSeconds = useCallback(() => {
+    if (!sessionStartRef.current) return 0;
+    const wall = Date.now() - sessionStartRef.current;
+    const pausedNow =
+      researchPausedAtRef.current != null ? Date.now() - researchPausedAtRef.current : 0;
+    return Math.max(0, (wall - researchAccumulatedMsRef.current - pausedNow) / 1000);
+  }, []);
 
   const clips = useMemo(() => {
     const row = classes.find((c) => c.name === activeClass);
@@ -277,12 +290,15 @@ function VoiceoverPage() {
 
   useEffect(() => () => releaseMic(), [releaseMic]);
 
-  const pushEvent = useCallback((type: SessionEvent["type"], videoT: number) => {
-    const session_t = Math.max(0, (Date.now() - sessionStartRef.current) / 1000);
-    const ev: SessionEvent = { type, session_t, video_t: Math.max(0, videoT) };
-    eventsRef.current = [...eventsRef.current, ev];
-    setSessionEvents(eventsRef.current);
-  }, []);
+  const pushEvent = useCallback(
+    (type: SessionEvent["type"], videoT: number) => {
+      const session_t = Math.max(0, effectiveSessionSeconds());
+      const ev: SessionEvent = { type, session_t, video_t: Math.max(0, videoT) };
+      eventsRef.current = [...eventsRef.current, ev];
+      setSessionEvents(eventsRef.current);
+    },
+    [effectiveSessionSeconds],
+  );
 
   const scanRoot = useCallback(async (path: string, opts?: { keepClass?: string; keepPath?: string }) => {
     const data = await api<{
@@ -348,6 +364,10 @@ function VoiceoverPage() {
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
+    if (researchBreakRef.current) {
+      toast.message("Research break — press R to resume mic + video");
+      return;
+    }
     if (recordingRef.current) {
       // SPACE = video only; mic keeps running. Log pause/resume for freeze export.
       if (v.paused) {
@@ -425,6 +445,10 @@ function VoiceoverPage() {
     }
     releaseMic();
     setRecording(false);
+    setResearchBreak(false);
+    researchBreakRef.current = false;
+    researchPausedAtRef.current = null;
+    researchAccumulatedMsRef.current = 0;
     setPendingBlob(null);
     setSessionEvents([]);
     eventsRef.current = [];
@@ -442,6 +466,60 @@ function VoiceoverPage() {
     setStatus("Session cancelled — source video untouched");
     toast.message("Session discarded");
   }, [releaseMic]);
+
+  const enterResearchBreak = useCallback(() => {
+    if (!recordingRef.current || researchBreakRef.current) return;
+    const recorder = mediaRecorderRef.current;
+    const v = videoRef.current;
+    if (!recorder || recorder.state !== "recording") {
+      toast.error("Start a session before using research break (B)");
+      return;
+    }
+    if (typeof recorder.pause !== "function") {
+      toast.error("This browser cannot pause the mic mid-take — use Chrome/Edge");
+      return;
+    }
+    try {
+      recorder.pause();
+    } catch (error: any) {
+      toast.error(error?.message || "Could not pause microphone");
+      return;
+    }
+    if (v && !v.paused) v.pause();
+    pushEvent("research_pause", v?.currentTime || 0);
+    researchPausedAtRef.current = Date.now();
+    researchBreakRef.current = true;
+    setResearchBreak(true);
+    setStatus("RESEARCH BREAK — mic + video paused. Look it up, then press R to resume both.");
+    toast.message("Research break — press R when ready to continue");
+  }, [pushEvent]);
+
+  const resumeFromResearchBreak = useCallback(() => {
+    if (!recordingRef.current || !researchBreakRef.current) return;
+    const recorder = mediaRecorderRef.current;
+    const v = videoRef.current;
+    if (!recorder) return;
+    if (researchPausedAtRef.current != null) {
+      researchAccumulatedMsRef.current += Date.now() - researchPausedAtRef.current;
+      researchPausedAtRef.current = null;
+    }
+    try {
+      if (recorder.state === "paused" && typeof recorder.resume === "function") {
+        recorder.resume();
+      }
+    } catch (error: any) {
+      toast.error(error?.message || "Could not resume microphone");
+      return;
+    }
+    pushEvent("research_resume", v?.currentTime || 0);
+    researchBreakRef.current = false;
+    setResearchBreak(false);
+    if (v) {
+      void v.play().catch(() => undefined);
+    }
+    setStatus("MIC RECORDING · Space = video pause only · B = research break · Esc cancels");
+    toast.success("Resumed mic + video");
+  }, [pushEvent]);
 
   const markEnvironment = useCallback(() => {
     const t = recording ? recElapsed : sessionEnd;
@@ -629,10 +707,13 @@ function VoiceoverPage() {
         };
         recorder.stop();
       });
-      const endT = Math.max(0, (Date.now() - sessionStartRef.current) / 1000);
+      const endT = Math.max(0, effectiveSessionSeconds());
       releaseMic();
       setRecElapsed(endT);
       setSessionEnd(endT);
+      setResearchBreak(false);
+      researchBreakRef.current = false;
+      researchPausedAtRef.current = null;
 
       if (opts.discard) {
         setPendingBlob(null);
@@ -655,7 +736,7 @@ function VoiceoverPage() {
       );
       toast.message("Recording stopped — complete QA and export");
     },
-    [pushEvent, releaseMic],
+    [effectiveSessionSeconds, pushEvent, releaseMic],
   );
 
   const attachPending = useCallback(async () => {
@@ -727,6 +808,10 @@ function VoiceoverPage() {
       setValidation(null);
       setReviewMode(false);
       setReviewPath(null);
+      setResearchBreak(false);
+      researchBreakRef.current = false;
+      researchPausedAtRef.current = null;
+      researchAccumulatedMsRef.current = 0;
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/webm")
@@ -752,7 +837,7 @@ function VoiceoverPage() {
       setPendingBlob(null);
       toast.message("Describe the environment near the beginning");
       setStatus(
-        `MIC RECORDING · Space = pause/resume VIDEO only · E = environment described · Esc cancels`,
+        `MIC RECORDING · Space = pause video only · B = research break (mic+video) · E = environment · Esc cancels`,
       );
       if (v) {
         try {
@@ -782,18 +867,21 @@ function VoiceoverPage() {
   ]);
 
   const toggleRecord = useCallback(() => {
+    if (researchBreakRef.current) {
+      resumeFromResearchBreak();
+      return;
+    }
     if (recording) void stopRecording();
     else void startRecording();
-  }, [recording, startRecording, stopRecording]);
+  }, [recording, resumeFromResearchBreak, startRecording, stopRecording]);
 
   useEffect(() => {
     if (!recording) return;
-    const started = sessionStartRef.current || Date.now();
     const id = window.setInterval(() => {
-      setRecElapsed((Date.now() - started) / 1000);
+      setRecElapsed(effectiveSessionSeconds());
     }, 200);
     return () => clearInterval(id);
-  }, [recording]);
+  }, [effectiveSessionSeconds, recording]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -809,6 +897,11 @@ function VoiceoverPage() {
       if (event.key === " " || event.code === "Space") {
         event.preventDefault();
         togglePlay();
+        return;
+      }
+      if (event.key === "b" || event.key === "B") {
+        event.preventDefault();
+        if (recordingRef.current && !researchBreakRef.current) enterResearchBreak();
         return;
       }
       if (event.key === "e" || event.key === "E") {
@@ -852,6 +945,7 @@ function VoiceoverPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [
     cancelSession,
+    enterResearchBreak,
     markEnvironment,
     nextClip,
     nudge,
@@ -1057,16 +1151,25 @@ function VoiceoverPage() {
                 <div
                   className={cn(
                     "rounded-sm px-2 py-1 font-mono text-[11px] uppercase tracking-wider",
-                    playing ? "bg-emerald-600/90 text-white" : "bg-amber-500 text-black",
+                    researchBreak
+                      ? "bg-sky-500 text-white"
+                      : playing
+                        ? "bg-emerald-600/90 text-white"
+                        : "bg-amber-500 text-black",
                   )}
                 >
-                  Video {playing ? "playing" : "paused"} · src {formatClock(scrub)}
+                  {researchBreak
+                    ? "Research break — mic + video paused · press R to resume"
+                    : `Video ${playing ? "playing" : "paused"} · src ${formatClock(scrub)}`}
                 </div>
               </div>
             )}
             {saving && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm">
-                Building freeze-frame narrated MP4…
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/55 px-6 text-center text-sm">
+                <p>Building freeze-frame narrated MP4…</p>
+                <p className="font-mono text-[11px] text-white/70">
+                  This can take several minutes on USB. Leave this window open.
+                </p>
               </div>
             )}
           </div>
@@ -1083,7 +1186,20 @@ function VoiceoverPage() {
               disabled={!current || saving || Boolean(pendingBlob)}
             >
               {recording ? <Square className="size-3.5" /> : <Mic className="size-3.5" />}
-              {recording ? "Stop (R)" : "Start session (R)"}
+              {researchBreak
+                ? "Resume mic+video (R)"
+                : recording
+                  ? "Stop (R)"
+                  : "Start session (R)"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={enterResearchBreak}
+              disabled={!recording || researchBreak || saving}
+              title="Pause mic + video to look something up"
+            >
+              Research break (B)
             </Button>
             <Button
               size="sm"
@@ -1299,8 +1415,12 @@ function VoiceoverPage() {
             </p>
             <ul className="list-disc space-y-1 pl-4">
               <li>SPACE pauses/resumes video only — mic never pauses.</li>
-              <li>Export freezes the frame for each pause so narration stays in sync.</li>
-              <li>No seeking or speed changes while recording.</li>
+              <li>
+                <strong>B</strong> = research break (mic + video both pause). Look it up, then{" "}
+                <strong>R</strong> resumes both.
+              </li>
+              <li>Export freezes the frame for each SPACE pause so narration stays in sync.</li>
+              <li>Research-break time is removed from the final video and audio.</li>
               <li>Press E right after you describe the environment.</li>
               <li>Source file is never overwritten — output is *.narrated.mp4.</li>
             </ul>
